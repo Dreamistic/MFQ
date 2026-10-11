@@ -19,6 +19,8 @@ void qwen4_set_rotary_fusion(Qwen4CausalLm&, bool enabled);
 void qwen4_set_attention_grouping(Qwen4CausalLm&, bool enabled);
 std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_logits(
     Qwen4CausalLm&,mfq_tensor_backend::Tensor,int);
+std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
+    Qwen4CausalLm&,mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor* raw_hidden);
 bool qwen4_layer_major_prefill_eligible(const Qwen4CausalLm&, int64_t tokens);
 mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     Qwen4CausalLm&, mfq_tensor_backend::Tensor ids, int64_t compute_chunk = 1024,

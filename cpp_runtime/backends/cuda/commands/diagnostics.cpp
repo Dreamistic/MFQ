@@ -141,6 +141,7 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     bool check_continuous_batching = false;
     bool check_engine_isolation = false;
     bool check_flash_next = false;
+    bool check_qwen4_decode_hidden = false;
     bool check_flash_next_mtp = false;
     bool compare_dsv4_hc_ops = false;
     bool compare_dsv4_hc_model = false;
@@ -587,6 +588,11 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             }
             throw std::runtime_error(
                 "continuous batching requires Qwen35CausalLm");
+        }
+        if (check_qwen4_decode_hidden) {
+            if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+                return run_qwen4_decode_hidden_check(model);
+            throw std::runtime_error("hidden graph diagnostic requires Qwen4CausalLm");
         }
         if (check_flash_next) {
             if constexpr (
@@ -1126,6 +1132,7 @@ void print_diagnostics_help() {
         << "  --check-text-session-state      check session state\n"
         << "  --check-qwen35-mtp              check Qwen3.5 MTP\n"
         << "  --check-flash-next              check Flash-Next\n"
+        << "  --check-qwen4-decode-hidden     check decode graph raw hidden and KV transitions\n"
         << "  --check-flash-next-mtp          check Flash-Next MTP\n"
         << "  --check-continuous-batching     check continuous batching\n"
         << "  --check-engine-isolation        check two concurrent CUDA engines\n"
@@ -1216,7 +1223,7 @@ bool has_diagnostic_action(const DiagnosticsCommandOptions& value) {
         value.check_deepseek_v41 || value.check_text_session_state ||
         value.check_qwen35_mtp || value.check_continuous_batching ||
         value.check_engine_isolation ||
-        value.check_flash_next || value.check_flash_next_mtp ||
+        value.check_flash_next || value.check_qwen4_decode_hidden || value.check_flash_next_mtp ||
         value.check_runtime_assets || value.check_mfq_container ||
         value.compare_dsv4_hc_ops || value.compare_dsv4_hc_model ||
         value.compare_mma_attention || value.compare_decode_splitk ||
@@ -1231,6 +1238,7 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
     DiagnosticsCommandOptions result;
     while (!args.empty()) {
         const std::string_view option = args.next();
+        if(option == "--check-qwen4-decode-hidden") {result.check_qwen4_decode_hidden=true;continue;}
         if(option == "--compare-ram-field-packing") {result.compare_ram_field_packing=true;continue;}
         if(option == "--compare-qsa-fusion") {result.compare_qsa_fusion=true;continue;}
         if(option == "--compare-moe-plan-reuse") {result.compare_moe_plan_reuse=true;continue;}

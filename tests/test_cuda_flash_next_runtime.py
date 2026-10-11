@@ -397,7 +397,7 @@ def write_glm_fixture(path,config,weights,predictor=False):
 
 
 def diagnostics_binary(bridge):
-    path=Path(bridge).with_name("mfq-diagnostics")
+    path=Path(bridge).with_name("mfq-diagnostics"+Path(bridge).suffix)
     return path if path.is_file() else path.parent.parent/path.name
 
 
@@ -862,6 +862,41 @@ def test_qwen_native_complete_graph(tmp_path,interval,ple,silu_gate,independent)
         np.testing.assert_allclose(got[action],got[action+"_reference"],atol=2e-3,rtol=2e-3)
 
 
+@pytest.mark.parametrize("interval,ple",[(1,False),(2,True),(3,True)])
+def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interval,ple):
+    from mfq.formats.nint import NintSpec
+    from mfq.formats.mfe import MfePool,MfeTensor
+    from mfq.quantize.nint_quant import quantize
+    bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
+    if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
+    config,weights=qwen_model_fixture(interval,True,ple)
+    for name,value in list(weights.items()):
+        if name.endswith(".experts.gate_up.weight"):
+            for role,matrix in zip(("gate","up"),np.split(value,2,axis=1)):
+                weights[name.replace("gate_up",role)]=matrix.copy()
+            del weights[name]
+    for name,value in list(weights.items()):
+        if ".experts." in name:
+            experts,output,width=value.shape
+            packed=quantize(value.reshape(experts*output,width),NintSpec(4,8,6))
+            weights[name]=MfeTensor(value.shape,(MfePool(np.arange(experts,dtype=np.int32),packed),))
+        elif ".ngram.shard." in name:
+            weights[name]=quantize(value,NintSpec(4,8,6))
+        elif ".shared_expert." in name and not name.endswith(".router.weight"):
+            weights[name]=quantize(value,NintSpec(4,8,6))
+    path=tmp_path/"qwen-decode-hidden.mfq"
+    write_qwen_fixture(path,config,weights)
+    env={**os.environ,"MFQ_MOE_PIPELINE":"1","MFQ_MOE_ROUTER_LOOKAHEAD":"0",
+        "MFQ_DISABLE_MOE_SSD_RANGES":"0","MFQ_MOE_PREFILL_LAYER":"0",
+        "MFQ_MOE_PRELOAD_ALL":"1","MFQ_MOE_TWO_STAGE_FFN":"1",
+        "MFQ_MOE_HOST_CACHE_BYTES":"1048576"}
+    process=subprocess.run([str(diagnostics_binary(bridge)),"--model",str(path),
+        "--ctx-size","32","--moe-gpu-cache-gb","0.01","--check-qwen4-decode-hidden"],
+        text=True,capture_output=True,timeout=90,env=env)
+    assert process.returncode==0,process.stdout+process.stderr
+    assert "qwen4_decode_hidden_check PASS graph_steps=18 retained_steps=20" in process.stdout
+
+
 @pytest.mark.parametrize("error",["schedule","rotary","ple","linear_width","pool","norm","topk","mtp"])
 def test_qwen_native_rejects_inconsistent_config(tmp_path,error):
     config,w=qwen_model_fixture();c=config["text_config"]
@@ -950,7 +985,8 @@ def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,la
     np.testing.assert_allclose(array(raw["target_normalized"]),target[0],atol=2e-3,rtol=2e-3)
     np.testing.assert_allclose(array(raw["target_raw"]),target[1],atol=2e-3,rtol=2e-3)
     assert len(raw["layers"])==layers and len(raw["greedy"])==12 and raw["cycles"]>0
-    assert raw["drafted"]>=6 and raw["depth_cycles"][3]>=2
+    # The throughput controller can park after its first depth-3 probe.
+    assert raw["drafted"]>=6 and raw["depth_cycles"][3]>=1
 
 
 @pytest.mark.parametrize("family",["qwen","glm"])
