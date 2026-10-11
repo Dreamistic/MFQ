@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import re
 import socket
 import subprocess
@@ -72,8 +73,9 @@ from mfq.server.runtime.native import (
     native_request_capacity,
     native_runtime_environment,
     native_tokenizer_arguments,
+    supports_cuda_ram_expert_pipeline,
 )
-from mfq.server.services.hardware import host_memory_capacity, memory_topology
+from mfq.server.services.hardware import hardware_identity, host_memory_capacity, memory_topology
 
 logger = logging.getLogger(__name__)
 
@@ -3314,13 +3316,24 @@ class RuntimePool:
         *,
         memory_ceiling: int | None = None,
     ) -> ModelLoadRequest:
-        """Choose native Metal expert residency within the runtime budget."""
+        """Choose expert residency within the physical device and runtime budgets."""
 
         ceiling = (
             memory_ceiling
             if memory_ceiling is not None
             else self.max_runtime_memory_bytes
         )
+        if self.backend == "cuda" and request.moe_gpu_cache_gb is None:
+            hardware = hardware_identity()
+            visible = request.device_ids or os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
+            first = visible[0].strip()
+            if hardware.memory_architecture == "discrete" and first.isdecimal():
+                index = int(first)
+                if index < len(hardware.gpu_memory):
+                    capacity = hardware.gpu_memory[index].capacity_bytes
+                    if capacity:
+                        device_ceiling = max(1, capacity - max(1 << 30, capacity // 8))
+                        ceiling = min(ceiling, device_ceiling) if ceiling is not None else device_ceiling
         if (
             request.moe_gpu_cache_gb is not None
             or ceiling is None
@@ -4088,6 +4101,31 @@ class RuntimePool:
             self.executable, self.backend, model=artifact.path
         )
         process_environment.update(self.runtime_environment)
+        if (self.backend == "cuda" and artifact.resource.format == "mfq"
+                and request.moe_gpu_cache_gb is not None and request.moe_gpu_cache_gb > 0
+                and memory_topology()["memory_architecture"] == "discrete"):
+            total, available = host_memory_capacity()
+            host_budget = max(0, min(available or 0, (total or 0) - (4 << 30)) - (2 << 30))
+            cold_bytes = max(0, artifact.routed_expert_bytes - int(request.moe_gpu_cache_gb * (1 << 30)))
+            if host_budget < cold_bytes:
+                raise _job_error("runtime_ram_expert_budget_exceeded",
+                    "remaining experts do not fit in available RAM; reduce the model size or free host memory")
+            if supports_cuda_ram_expert_pipeline(artifact.path):
+                defaults = {
+                    "MFQ_MOE_HOST_CACHE_BYTES": str(host_budget),
+                    "MFQ_MOE_PIPELINE": "1",
+                    "MFQ_MOE_PRELOAD_ALL": "1",
+                    "MFQ_MOE_ASSERT_RESIDENT": "1",
+                    "MFQ_MOE_RAM_PCIE": "1",
+                    "MFQ_MOE_TRANSFER_CACHE": "1",
+                    "MFQ_MOE_MAPPED_COPY": "0",
+                }
+                for name, value in defaults.items():
+                    process_environment.setdefault(name, value)
+            else:
+                # Older expert containers use the resident CPU loader, followed
+                # by the same bounded GPU cache; they must not read SSD per step.
+                process_environment.setdefault("MFQ_DISABLE_MOE_SSD_RANGES", "1")
         process_environment["MFQ_KV_TURBOQUANT_BITS"] = str(request.kv_quantization.bits if request.kv_quantization.enabled else 0)
         process_environment.pop("MFQ_QSA_KV_BUDGET_BYTES", None)
         process_environment.pop("MFQ_QSA_KV_TARGET_CONTEXT", None)

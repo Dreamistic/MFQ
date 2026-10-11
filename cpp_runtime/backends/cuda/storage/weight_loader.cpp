@@ -10,6 +10,7 @@
 #include "moe_expert_cache.h"
 #include "mfe_expert_store.h"
 #include "moe_quant_range_source.h"
+#include "mfq/packed_nint_expert_store.h"
 #include <cstdlib>
 #include <cstdio>
 
@@ -56,6 +57,15 @@ MfeWeight load_mfe_gpu(
             // Sources without retained readers keep the existing CPU loader.
         }
         if (reader) {
+            if (record.dtype == "NINT") {
+                auto store = mfq::make_packed_nint_expert_store(record.nbytes,
+                    [reader](std::size_t offset, std::uint8_t* output, std::size_t bytes) {
+                        reader(offset, reinterpret_cast<std::byte*>(output), bytes);
+                    });
+                const int minimum = std::min(execution.moe_cache_registration_min_slots, store->num_experts());
+                return cache_quant_moe_weight(cache, name,
+                    std::make_shared<MoeQuantRangeSource>(std::move(store)), minimum, layer_id, projection_role);
+            }
             try {
                 auto store =
                     std::make_shared<mfq::cuda::MfeMxfp4ExpertStore>(
