@@ -546,13 +546,12 @@ class Qsa {
         index_.reset();
         graph_keys_={};graph_values_={};graph_pooled_={};
     }
-    void prepare_graph(const Tensor& full_positions, int64_t capacity = 0) {
+    void prepare_graph(const Tensor& full_positions, int64_t capacity) {
         MFQ_RUNTIME_CHECK(!offload_, "streamed QSA KV requires host-controlled block transfers");
         if(graph_keys_.defined())return;
         MFQ_RUNTIME_CHECK(position()>0 && keys_.storage().size(0)==1,
             "QSA graph requires a prefilled single sequence");
         const auto n=position();
-        if(!capacity)capacity=c_.maximum;
         MFQ_RUNTIME_CHECK(capacity>=n && capacity<=c_.maximum,"invalid QSA graph capacity");
         graph_keys_=tb::zeros({1,c_.kv_heads,capacity,c_.width},keys_.storage().options());
         graph_values_=tb::zeros_like(graph_keys_);

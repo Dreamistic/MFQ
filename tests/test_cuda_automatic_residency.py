@@ -72,6 +72,7 @@ def test_cuda_launch_enables_ram_pipeline_when_experts_fit(tmp_path, monkeypatch
     if enabled:
         assert environment["MFQ_MOE_PIPELINE"] == "1"
         assert environment["MFQ_MOE_RAM_PCIE"] == "1"
+        assert environment["MFQ_MOE_PREFILL_LAYER"] == "1"
         assert int(environment["MFQ_MOE_HOST_CACHE_BYTES"]) >= 28 * GIB
 
 

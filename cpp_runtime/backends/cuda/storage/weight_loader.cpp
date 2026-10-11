@@ -314,6 +314,9 @@ Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, con
             return tb::matmul(selected,source.to(w.scalar_type()).unsqueeze(-1)).squeeze(-1);
         };
     }
+    // Predictor layers have their own expert images and must not share the
+    // backbone's layer-zero transfer range or prefill lookahead.
+    if(name.starts_with("predictor."))layer=-1-layer;
     auto w=std::make_shared<MfeWeight>(load_mfe_gpu(execution, file,name,true,layer,role));
     MFQ_RUNTIME_CHECK(w->n_experts==experts && w->out_per_expert==output && w->neuron_len==input,
         "routed tensor shape mismatch: ",name);

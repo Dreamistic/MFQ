@@ -54,10 +54,23 @@ void MoeExpertCache::finalize() {
             "MoE cache has no registered expert sources");
     }
     const auto cuda_context=mfq::cuda::default_context();
-    if(cuda_context->memory_stats().limit)cuda_context->stream().synchronize();
+    cuda_context->stream().synchronize();
+    // The server's file-size estimate cannot account for decoded dense weights
+    // or other workers. Price expert arenas against physical VRAM after loading
+    // those weights, retaining room for prefill, graph warmup and growing KV.
+    size_t device_free=0,device_total=0;
+    MFQ_CUDA_CHECK(cudaMemGetInfo(&device_free,&device_total));
+    const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes();
+    if(device_free<=reserve)
+        throw std::runtime_error("CUDA VRAM leaves no workspace for expert streaming");
+    const auto requested_physical=budget_bytes_;
+    budget_bytes_=static_cast<int64_t>(std::min<std::size_t>(
+        static_cast<std::size_t>(budget_bytes_),device_free-reserve));
+    std::cerr<<"moe_cache_physical_budget free_bytes="<<device_free
+        <<" workspace_reserve_bytes="<<reserve<<" requested_expert_bytes="<<requested_physical
+        <<" expert_budget_bytes="<<budget_bytes_<<std::endl;
     const auto memory=cuda_context->memory_stats();
     if(memory.limit) {
-        const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes();
         const auto model_bytes=std::max(memory.allocated,cuda_context->local_memory_usage());
         if(model_bytes>=memory.limit || reserve>=memory.limit-model_bytes)
             throw std::runtime_error("CUDA VRAM limit leaves no room for expert arenas");

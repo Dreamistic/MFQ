@@ -38,9 +38,8 @@ public:
             values.size(2)==width_,"replacement sequence cache geometry mismatch");
         values_=std::move(values);
     }
-    void prepare_fixed(int64_t capacity = 0) {
+    void prepare_fixed(int64_t capacity) {
         MFQ_RUNTIME_CHECK(values_.defined(), "fixed sequence cache requires a prefilled state");
-        if(!capacity)capacity=maximum_;
         MFQ_RUNTIME_CHECK(capacity>=position_ && capacity<=maximum_, "invalid fixed sequence cache capacity");
         if(values_.size(1)==capacity)return;
         auto expanded=tb::zeros({values_.size(0),capacity,width_},values_.options());

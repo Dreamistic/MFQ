@@ -116,7 +116,10 @@ void qsa_case(int width,int heads,int maximum,int budget=8) {
     actual.forward(execution,inputs.narrow(1,0,6),history,history,true);
     oracle.forward(execution,inputs.narrow(1,0,6),history,history,true);
     int64_t capacity=std::min(maximum,16);
+    const auto allocation_before=default_context()->memory_stats().allocated;
     actual.prepare_graph(history,capacity);
+    if(default_context()->memory_stats().allocated>allocation_before+(1<<20))
+        throw std::runtime_error("small QSA graph allocated KV for the context ceiling");
     std::map<int,std::unique_ptr<Cell>> cells;
     for(int t:{1,3,8,1,3,1,8,1,3,3,1}) {
         const auto pos=actual.position();if(pos+t>maximum)continue;
@@ -705,7 +708,7 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--qsa-select-bench")qsa_selection_benchmark();
     else if(argc==2 && std::string(argv[1])=="--segmented-sort-check")segmented_sort_graph_case();
     else if(argc==1) {
-        layer_profile_case();grouped_norm_case();gated_residual_case();gdn_output_case();gdn_preparation_case();gdn_core_case();segmented_sort_graph_case();qsa_sparse_gate_case();qsa_selection_case();qsa_case(8,4,40);qsa_case(256,24,41);qsa_case(256,24,512,2048);qsa_case(256,24,4096,2048);gdn_case();gdn_case(true);
+        layer_profile_case();grouped_norm_case();gated_residual_case();gdn_output_case();gdn_preparation_case();gdn_core_case();segmented_sort_graph_case();qsa_sparse_gate_case();qsa_selection_case();qsa_case(8,4,40);qsa_case(256,24,41);qsa_case(256,24,512,2048);qsa_case(256,24,4096,2048);qsa_case(256,24,262144,2048);gdn_case();gdn_case(true);
     } else throw std::runtime_error("unknown attention test argument");
     MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));context->end_graph_pool(stream);
     if(argc==1)std::cout<<"MFQ window QSA/GDN changing-position, rollback and fixed-state checks PASS\n";

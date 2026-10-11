@@ -4119,6 +4119,7 @@ class RuntimePool:
                     "MFQ_MOE_RAM_PCIE": "1",
                     "MFQ_MOE_TRANSFER_CACHE": "1",
                     "MFQ_MOE_MAPPED_COPY": "0",
+                    "MFQ_MOE_PREFILL_LAYER": "1",
                 }
                 for name, value in defaults.items():
                     process_environment.setdefault(name, value)

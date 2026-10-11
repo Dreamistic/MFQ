@@ -628,7 +628,12 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         const auto layout=cache_->pipeline_prefill_layers_.at(sources_[0]->layer_id_);
         if(!cache_->pipeline_prefill_layer_buffer_.defined()) {
             int64_t maximum=0;
-            for(const auto& layer:cache_->pipeline_prefill_layers_)maximum=std::max(maximum,layer.second.second);
+            // Predictor images are separate from backbone prefill. Their
+            // packed projections can be much larger than a backbone layer.
+            maximum=layout.second;
+            for(const auto& layer:cache_->pipeline_prefill_layers_)
+                if((layer.first<0)==(sources_[0]->layer_id_<0))
+                    maximum=std::max(maximum,layer.second.second);
             const auto overlap=mfq::cuda::runtime_options::moe_prefill_layer_overlap();
             cache_->pipeline_prefill_layer_overlap_=!overlap || *overlap!=0;
             cache_->pipeline_prefill_layer_stride_=maximum;

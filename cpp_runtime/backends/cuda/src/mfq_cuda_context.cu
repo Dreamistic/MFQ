@@ -723,11 +723,12 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     }
     allocation_budget_->acquire(bytes);
     try {
-        if (async_allocations_) {
-            MFQ_NATIVE_CUDA_CHECK(cudaMallocAsync(&pointer,bytes,allocation_stream));
-        } else {
-            MFQ_NATIVE_CUDA_CHECK(cudaMalloc(&pointer,bytes));
-        }
+        const auto result=async_allocations_ ? cudaMallocAsync(&pointer,bytes,allocation_stream)
+            : cudaMalloc(&pointer,bytes);
+        if(result==cudaErrorMemoryAllocation)
+            throw Error("CUDA allocation failed: requested="+std::to_string(bytes)+
+                " allocated="+std::to_string(memory_stats().allocated));
+        MFQ_NATIVE_CUDA_CHECK(result);
         if(verify_pool_reuse)check_memory_limit();
         if(pooled_allocation) {
             std::lock_guard lock(graph_pool_mutex_);graph_pools_.at(allocation_stream).owned.insert(pointer);
