@@ -76,6 +76,8 @@ def test_cuda_launch_enables_ram_pipeline_when_experts_fit(tmp_path, monkeypatch
         assert environment["MFQ_MOE_RAM_PCIE_FRACTION"] == "1"
         assert environment["MFQ_MOE_DECODE_HOST_PIN"] == "1"
         assert environment["MFQ_MOE_PREFILL_LAYER"] == "1"
+        assert environment["MFQ_MOE_PREFILL_LAYER_ASYNC"] == "0"
+        assert environment["MFQ_MOE_RESIDENCY_INTERVAL"] == "4"
         assert int(environment["MFQ_MOE_HOST_CACHE_BYTES"]) >= 28 * GIB
 
 

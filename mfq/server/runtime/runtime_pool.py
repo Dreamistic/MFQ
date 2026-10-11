@@ -4125,6 +4125,8 @@ class RuntimePool:
                     "MFQ_MOE_TRANSFER_CACHE": "1",
                     "MFQ_MOE_MAPPED_COPY": "0",
                     "MFQ_MOE_PREFILL_LAYER": "1",
+                    "MFQ_MOE_PREFILL_LAYER_ASYNC": "0",
+                    "MFQ_MOE_RESIDENCY_INTERVAL": "4",
                 }
                 for name, value in defaults.items():
                     process_environment.setdefault(name, value)

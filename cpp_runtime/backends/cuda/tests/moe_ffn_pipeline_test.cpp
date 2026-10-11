@@ -1738,6 +1738,7 @@ int main(int argc,char** argv)try {
         }
         if(std::string(argv[2])=="--prefill-graph-check") {verify_prefill_graph_execution(root);return 0;}
         if(std::string(argv[2])=="--prefill-layer-oracle-check") {verify_prefill_graph_execution(root,false,16,true,true,true);return 0;}
+        if(std::string(argv[2])=="--prefill-layer-residency-check") {verify_prefill_graph_execution(root,false,16,true,true,true,false,false,true);return 0;}
         if(std::string(argv[2])=="--prefill-layer-exact-check") {verify_prefill_graph_execution(root,false,16,true,false,true);return 0;}
         if(std::string(argv[2])=="--prefill-layer-batch-check") {verify_prefill_graph_execution(root,false,16,true,true,true,false,true);return 0;}
         if(std::string(argv[2])=="--prefill-layer-layout-check") {verify_prefill_graph_execution(root,false,16,false,false,true,true);return 0;}

@@ -1,6 +1,6 @@
 #pragma once
 
-void verify_prefill_graph_execution(const std::filesystem::path& root,bool grouped=false,int group_size=1,bool sparse=false,bool oracle=false,bool layer_prefill=false,bool layout_only=false,bool batch_check=false) {
+void verify_prefill_graph_execution(const std::filesystem::path& root,bool grouped=false,int group_size=1,bool sparse=false,bool oracle=false,bool layer_prefill=false,bool layout_only=false,bool batch_check=false,bool residency_check=false) {
     struct Setting {
         std::string old;
         std::string old_direct,old_groups,old_group_size,old_mma,old_layer,old_retain;
@@ -42,8 +42,8 @@ void verify_prefill_graph_execution(const std::filesystem::path& root,bool group
             cfg.moe_hybrid_cpu=false;cfg.moe_direct_ram=true;cfg.moe_ram_pcie=true;
             cfg.moe_ram_pcie_fraction=1.;
             // Exercise prefill/decode/repeated-prefill with adaptation requested.
-            // The immutable field-major layout must preserve expert ownership.
-            cfg.moe_residency_adapt=layer_prefill && mode==1;
+            // Same-source exchanges must update the field-major image ownership.
+            cfg.moe_residency_adapt=layer_prefill && mode==1 && residency_check;
             std::array<std::shared_ptr<MoeQuantRangeSource>,3> sources;
             std::vector<std::shared_ptr<MoeQuantRangeSource>> registered;
             int64_t bundle=0;
@@ -210,6 +210,17 @@ void verify_prefill_graph_execution(const std::filesystem::path& root,bool group
                 if(relative>tolerance || difference>.02+1.5*tolerance*scale)
                     throw std::runtime_error("streamed FFN differs from canonical weights: format="+names[0]+" rows="+
                         std::to_string(tokens)+" step="+std::to_string(step)+" relative_rms="+std::to_string(relative));
+            } else if(residency_check) {
+                // Ownership changes can alter FP16 reduction rounding between
+                // the resident and transferred NVQ projection kernels.
+                auto a=result[0].to(tb::kFloat32),b=result[1].to(tb::kFloat32);
+                double squared=0,reference_squared=0;
+                for(int64_t i=0;i<a.numel();++i) {
+                    const double d=double(a.data_ptr<float>()[i])-b.data_ptr<float>()[i];
+                    squared+=d*d;reference_squared+=double(a.data_ptr<float>()[i])*a.data_ptr<float>()[i];
+                }
+                if(std::sqrt(squared/std::max(reference_squared,1e-20))>.001)
+                    throw std::runtime_error("adaptive decode differs from fixed residency");
             } else if(std::memcmp(result[0].data_ptr(),result[1].data_ptr(),result[0].numel()*result[0].element_size())) {
                 auto a=result[0].to(tb::kFloat32),b=result[1].to(tb::kFloat32);
                 float difference=0,scale=0;int64_t worst=0;
@@ -240,6 +251,14 @@ void verify_prefill_graph_execution(const std::filesystem::path& root,bool group
                     throw std::runtime_error("whole-layer prefill did not partition Gate/Up and Down");
                 ++direct_checks;
             }
+        }
+        if(residency_check) {
+            MfqCudaStreamGuard guard(streams[1]);
+            finish_moe_expert_exchanges(caches[1]);
+            std::ostringstream stream;print_moe_expert_cache_stats(caches[1],stream);
+            std::smatch match;const auto stats=stream.str();
+            if(!std::regex_search(stats,match,std::regex("residency_committed_projections=(\\d+)")) || std::stoll(match[1])<=0)
+                throw std::runtime_error("whole-layer layout still disables expert adaptation");
         }
         forward={};caches={};
     }

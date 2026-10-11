@@ -2387,6 +2387,7 @@ public:
         const auto layer_prefill=mfq::cuda::runtime_options::moe_prefill_layer();
         if(!window && tokens>8 && layer_prefill && *layer_prefill!=0 &&
                 cache_->pipeline_ram_registered_bytes_>0 && execution.kl_mmq.mode==KlMmqMode::Default) {
+            if(cache_->moe_residency_)cache_->moe_residency_->before_layer(sources_[0]->layer_id_);
             try {return whole_layer_prefill(execution,input,ids,weights);}
             catch(...) {failed_=true;throw;}
         }
