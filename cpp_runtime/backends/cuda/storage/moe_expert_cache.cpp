@@ -54,10 +54,23 @@ void MoeExpertCache::finalize() {
             "MoE cache has no registered expert sources");
     }
     const auto cuda_context=mfq::cuda::default_context();
-    if(cuda_context->memory_stats().limit)cuda_context->stream().synchronize();
+    cuda_context->stream().synchronize();
+    // The server's file-size estimate cannot account for decoded dense weights
+    // or other workers. Price expert arenas against physical VRAM after loading
+    // those weights, retaining room for prefill, graph warmup and growing KV.
+    size_t device_free=0,device_total=0;
+    MFQ_CUDA_CHECK(cudaMemGetInfo(&device_free,&device_total));
+    const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes();
+    if(device_free<=reserve)
+        throw std::runtime_error("CUDA VRAM leaves no workspace for expert streaming");
+    const auto requested_physical=budget_bytes_;
+    budget_bytes_=static_cast<int64_t>(std::min<std::size_t>(
+        static_cast<std::size_t>(budget_bytes_),device_free-reserve));
+    std::cerr<<"moe_cache_physical_budget free_bytes="<<device_free
+        <<" workspace_reserve_bytes="<<reserve<<" requested_expert_bytes="<<requested_physical
+        <<" expert_budget_bytes="<<budget_bytes_<<std::endl;
     const auto memory=cuda_context->memory_stats();
     if(memory.limit) {
-        const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes();
         const auto model_bytes=std::max(memory.allocated,cuda_context->local_memory_usage());
         if(model_bytes>=memory.limit || reserve>=memory.limit-model_bytes)
             throw std::runtime_error("CUDA VRAM limit leaves no room for expert arenas");
@@ -360,9 +373,15 @@ void MoeExpertCache::preload_complete_residency() {
     for (const auto& item:remaining) if (item.second) throw std::logic_error("expert residency left allocatable GPU slots unfilled");
     std::vector<std::vector<int64_t>> ram_offsets(sources_.size());
     std::map<int,std::vector<MoeCachedSource*>> layer_sources;
+    // Only registered FFN bundles consume the direct-RAM transfer arena.
+    // Packed predictor projections use the ordinary cache uploader; keeping
+    // their CPU fields pageable avoids locking several extra GiB on Windows.
+    std::vector<bool> pipeline_sources(sources_.size(),!config_.moe_pipeline);
+    for(const auto& bundle:pipeline_bundles_)
+        for(const auto id:bundle)pipeline_sources.at(id)=true;
     for(const auto& source:sources_) {
         ram_offsets[source->id_].assign(source->n_experts(),-1);
-        layer_sources[source->layer_id_].push_back(source.get());
+        if(pipeline_sources[source->id_])layer_sources[source->layer_id_].push_back(source.get());
     }
     int64_t ram_allocated=0;
     const auto layer_option=mfq::cuda::runtime_options::moe_prefill_layer();
@@ -491,9 +510,30 @@ void MoeExpertCache::preload_complete_residency() {
     if(config_.moe_pipeline && config_.moe_direct_ram && ram_allocated) {
         registered_host_fields_.reserve(registered_host_fields_.size()+1);
         auto* address=pipeline_ram_complement_->data_ptr();
-        MFQ_CUDA_CHECK(cudaHostRegister(address,static_cast<std::size_t>(ram_allocated),cudaHostRegisterMapped));
-        registered_host_fields_.push_back({address,ram_allocated,true});
-        pipeline_ram_registered_bytes_=ram_allocated;
+        int64_t registered=ram_allocated;
+        if(const auto* value=std::getenv("MFQ_MOE_RAM_PIN_GIB")) {
+            char* end=nullptr;const double gib=std::strtod(value,&end);
+            if(end==value || *end || !std::isfinite(gib) || gib<0 || gib>double(INT64_MAX)/(1ull<<30))
+                throw std::invalid_argument("MFQ_MOE_RAM_PIN_GIB must be finite and non-negative");
+            if(gib>0)registered=std::min(registered,std::max<int64_t>(1,int64_t(gib*(1ull<<30))));
+        }
+        for(;;) {
+            const auto result=cudaHostRegister(address,static_cast<std::size_t>(registered),cudaHostRegisterMapped);
+            if(result==cudaSuccess)break;
+#ifdef _WIN32
+            // WDDM also charges mapped RAM against its shared-memory budget.
+            // Keep the cold complement resident, but leave its tail pageable
+            // when registering all of it would exhaust that separate budget.
+            if(result==cudaErrorMemoryAllocation && registered>(1ll<<30)) {
+                (void)cudaGetLastError();registered-=1ll<<30;continue;
+            }
+#endif
+            MFQ_CUDA_CHECK(result);
+        }
+        registered_host_fields_.push_back({address,registered,true});
+        pipeline_ram_registered_bytes_=registered;
+        if(registered<ram_allocated)
+            std::cerr<<"moe_ram_registration pinned_bytes="<<registered<<" pageable_bytes="<<ram_allocated-registered<<std::endl;
     }
     std::cerr << "moe_residency_h2d bytes=" << h2d_bytes << " cuda_ms=" << h2d_ms << std::endl;
     std::uint64_t dense_materializations=0;

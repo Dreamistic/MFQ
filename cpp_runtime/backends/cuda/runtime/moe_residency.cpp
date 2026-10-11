@@ -71,6 +71,7 @@ struct MoeResidencyManager::Impl {
         std::size_t backed_fields=0;
         MoeGpuArena* cached_arena=nullptr;
         int cached_slot=-1;
+        int prefill_ram_slot=-1;
     };
     struct Map {int source=0,cohort=0;std::vector<int32_t> next;};
     MoeExpertCache* cache;
@@ -257,21 +258,25 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
     using Expert=mfq::MoeResidencyRanker::Expert;
     std::vector<std::vector<Expert>> layout;
     if(cache->config_.moe_residency_warm && cache->config_.moe_residency_projection_heat) {
-        std::map<MoeGpuArena*,std::vector<Expert>> groups;
+        std::map<std::pair<MoeGpuArena*,int>,std::vector<Expert>> groups;
         for(std::size_t b=0;b<cache->pipeline_bundles_.size();++b) {
             const auto& bundle=cache->pipeline_bundles_[b];
             for(int e=0;e<cache->sources_[bundle[0]]->n_experts();++e)for(int p=0;p<3;++p) {
                 const auto& source=*cache->sources_[bundle[p]];
-                groups[source.cohorts_[source.expert_to_cohort_[e]].arena].push_back({int(b),e,p});
+                // Field-major prefill images keep each source's slot count
+                // and geometry. Exchanges within that source retain the image.
+                groups[{source.cohorts_[source.expert_to_cohort_[e]].arena,
+                    cache->pipeline_prefill_layer_layout_?source.id_:-1}].push_back({int(b),e,p});
             }
         }
         for(auto& item:groups)layout.push_back(std::move(item.second));
     } else {
-        std::map<std::array<std::uintptr_t,3>,std::vector<Expert>> groups;
+        std::map<std::array<std::uintptr_t,4>,std::vector<Expert>> groups;
         for(std::size_t b=0;b<cache->pipeline_bundles_.size();++b) {
             const auto& bundle=cache->pipeline_bundles_[b];
             for(int e=0;e<cache->sources_[bundle[0]]->n_experts();++e) {
-                std::array<std::uintptr_t,3> signature;
+                std::array<std::uintptr_t,4> signature{};
+                signature[3]=cache->pipeline_prefill_layer_layout_?b+1:0;
                 for(int p=0;p<3;++p) {
                     const auto& source=*cache->sources_[bundle[p]];
                     signature[p]=reinterpret_cast<std::uintptr_t>(source.cohorts_[source.expert_to_cohort_[e]].arena);
@@ -320,11 +325,11 @@ void MoeResidencyManager::before_layer(int layer) {
     }
 }
 bool MoeResidencyManager::prepare_during_window() const noexcept {
-    return impl_->window_prepare && !impl_->cache->pipeline_prefill_layer_layout_;
+    return impl_->window_prepare;
 }
 void MoeResidencyManager::record_window_expert_fence(int layer,void* raw_stream) {
     auto& s=*impl_;
-    if(!s.expert_fence || !s.window_prepare || s.cache->pipeline_prefill_layer_layout_ || layer!=s.last)return;
+    if(!s.expert_fence || !s.window_prepare || layer!=s.last)return;
     const auto stream=static_cast<cudaStream_t>(raw_stream);
     cudaStreamCaptureStatus status=cudaStreamCaptureStatusNone;
     MFQ_CUDA_CHECK(cudaStreamIsCapturing(stream,&status));
@@ -352,9 +357,6 @@ void MoeResidencyManager::finish_window(int layer) {
 }
 void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight) {
     auto& s=*impl_;
-    // Resident exchanges overwrite the initial cold complement used by the
-    // field-major layer images. Keep their ownership fixed in this opt-in mode.
-    if(s.cache->pipeline_prefill_layer_layout_)return;
     for(std::size_t b=0;b<s.cache->pipeline_bundles_.size();++b)
         if(s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_==layer)
             for(int expert:ids){s.observations[b].at(expert)+=1.0f;++s.observed_routes;}
@@ -408,7 +410,6 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
 }
 void MoeResidencyManager::prepare() {
     auto& s=*impl_;auto& cache=*s.cache;
-    if(cache.pipeline_prefill_layer_layout_)return;
     const PhaseClock clock(s.prepare_ns,s.pending_tokens<=8?&s.decode_prepare_ns:nullptr);
     const MfqCudaGuard guard(cache.sources_.front()->cohorts_.front().active.expert_local.device());
     using Expert=mfq::MoeResidencyRanker::Expert;
@@ -416,6 +417,12 @@ void MoeResidencyManager::prepare() {
         if(!stage.arena) {
             const auto found=cache.pipeline_stages_.find(stage.key);
             if(found!=cache.pipeline_stages_.end())stage.arena=found->second.get();
+            // Decode arenas include their route capacity in the cache key.
+            // Prefer the smallest compatible arena if multiple widths exist.
+            for(const auto& item:cache.pipeline_stages_)
+                if(item.first.starts_with(stage.key+":") &&
+                    (!stage.arena || item.second->slots<stage.arena->slots))
+                    stage.arena=item.second.get();
         }
     auto& pairs=s.ranking->rank([&](const Expert& e){return s.heat[e.bundle][e.expert];},
         [&](const Expert& e) {
@@ -482,11 +489,29 @@ void MoeResidencyManager::prepare() {
             move.incoming=pair.incoming.expert;move.outgoing=pair.outgoing.expert;
             auto& incoming=*cache.sources_[move.incoming_source];auto& outgoing=*cache.sources_[move.outgoing_source];
             move.cohort=incoming.expert_to_cohort_[move.incoming];auto& cohort=incoming.cohorts_[move.cohort];
+            if(cache.pipeline_prefill_layer_layout_) {
+                if(move.incoming_source!=move.outgoing_source)
+                    throw std::logic_error("prefill residency exchange crosses source geometry");
+                const auto row=std::find(cohort.prefill_ram_experts.begin(),cohort.prefill_ram_experts.end(),move.incoming);
+                if(row==cohort.prefill_ram_experts.end())
+                    throw std::logic_error("prefill residency exchange has no cold image row");
+                move.prefill_ram_slot=int(std::distance(cohort.prefill_ram_experts.begin(),row));
+            }
             const auto old_key=outgoing.quant_source_->host_key(move.outgoing);move.slot=cohort.arena->book->slot_for(old_key);
             if(move.slot<0 || cohort.arena->book->inflight(move.slot) ||
                     !cache.host_experts_->contains(incoming.quant_source_->host_key(move.incoming))){valid=false;break;}
             move.lease=incoming.quant_source_->acquire_expert(move.incoming);
             if(move.lease.use_count()!=2){valid=false;break;}
+            if(s.direct && cache.pipeline_ram_registered_bytes_<cache.pipeline_ram_complement_->numel()) {
+                const auto begin=reinterpret_cast<uintptr_t>(cache.pipeline_ram_complement_->data_ptr());
+                const auto end=begin+cache.pipeline_ram_registered_bytes_;
+                for(const auto& field:moe_cache_fields(move.lease->weights)) {
+                    if(!tensor_nbytes(field))continue;
+                    const auto address=reinterpret_cast<uintptr_t>(field.data_ptr());
+                    if(address<begin || address>end || uint64_t(tensor_nbytes(field))>end-address){valid=false;break;}
+                }
+                if(!valid)break;
+            }
             if(s.reuse_transfer && s.direct && cache.pipeline_transfer_cache_) {
                 auto* arena=s.transfer_stages[move.incoming_source][move.cohort].arena;
                 const int slot=arena && arena->book ? arena->book->slot_for(
@@ -732,6 +757,8 @@ void MoeResidencyManager::prepare_direct_exchange() {
         MFQ_CUDA_CHECK(cudaEventRecord(s.done,s.stream));
     });
     if(!committed){rollback();return;}
+    for(const auto& move:s.pending)if(move.prefill_ram_slot>=0)
+        cache.sources_[move.incoming_source]->cohorts_[move.cohort].prefill_ram_experts[move.prefill_ram_slot]=move.outgoing;
     s.committed_bundles+=s.pending_complete_bundles;s.committed_projections+=s.pending.size();
     ++s.direct_exchange_rounds;
     for(const auto& move:s.pending) {
@@ -981,6 +1008,8 @@ void MoeResidencyManager::publish_pending() {
             }
         },prepare_host);
         if(!committed){rollback();return;}
+        for(const auto& move:s.pending)if(move.prefill_ram_slot>=0)
+            cache.sources_[move.incoming_source]->cohorts_[move.cohort].prefill_ram_experts[move.prefill_ram_slot]=move.outgoing;
         s.committed_bundles+=s.pending_complete_bundles;s.committed_projections+=s.pending.size();
         for(const auto& move:s.pending){++cache.stats_.evictions;cache.stats_.gpu_demote_bytes+=cache.sources_[move.incoming_source]->cohorts_[move.cohort].arena->slot_bytes;}
         s.pending.clear();s.maps.clear();

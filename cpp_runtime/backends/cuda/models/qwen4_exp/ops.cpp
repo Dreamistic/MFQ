@@ -605,6 +605,7 @@ struct Qwen4DecodeGraph {
     MfqCudaStream stream,ple_stream;
     std::map<std::pair<int,int>,std::unique_ptr<Cell>> cells;
     std::vector<qwen4_exp::Qsa*> qsa;
+    int64_t kv_capacity=0;
     bool failed=false;
     explicit Qwen4DecodeGraph(Qwen4CausalLm& model):stream(mfq_get_current_cuda_stream()),ple_stream(mfq_get_stream_from_pool()) {
         const bool enabled=model.router_lookahead.value_or(mfq::cuda::runtime_options::router_lookahead());
@@ -628,6 +629,16 @@ struct Qwen4DecodeGraph {
         if(stream.stream()!=mfq_current_cuda_stream())throw std::runtime_error("MFQ model window changed execution stream");
         const int tokens=static_cast<int>(ids.size(1));
         release_moe_prefill_buffers(model.execution->moe_expert_cache);
+        const auto required=model.cache_pos+tokens;
+        MFQ_RUNTIME_CHECK(required<=model.max_position_embeddings(),"Qwen4 graph exceeds context capacity");
+        if(required>kv_capacity) {
+            finish_moe_expert_exchanges(model.execution->moe_expert_cache);
+            restore_legacy();
+            kv_capacity=std::min<int64_t>(model.max_position_embeddings(),std::max<int64_t>(16,kv_capacity));
+            while(kv_capacity<required)
+                kv_capacity=std::min(model.max_position_embeddings(),kv_capacity>model.max_position_embeddings()/2
+                    ? model.max_position_embeddings() : kv_capacity*2);
+        }
         auto& owner=cells[{tokens,kind}];
         if(!owner)owner=std::make_unique<Cell>(tokens,model.config.hidden,model.blocks,stream.stream());
         auto& cell=*owner;
@@ -641,7 +652,7 @@ struct Qwen4DecodeGraph {
                     model.execution->decode_graph_serial_branches);
                 for(const auto& block:model.blocks) {
                     auto& b=static_cast<qwen4_exp::Qwen4Block&>(*block);
-                    if(b.qsa)b.qsa->prepare_graph(model.positions);
+                    if(b.qsa)b.qsa->prepare_graph(model.positions,kv_capacity);
                 }
                 struct State {tb::Tensor* target;tb::Tensor saved;const void* address;};
                 std::vector<State> states;
@@ -838,7 +849,7 @@ bool qwen4_layer_major_prefill_eligible(const Qwen4CausalLm& model, int64_t toke
 
 mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         Qwen4CausalLm& model,mfq_tensor_backend::Tensor ids,int64_t compute_chunk,
-        bool last_only,const std::function<bool()>& cancelled) {
+        bool last_only,const std::function<bool()>& cancelled,mfq_tensor_backend::Tensor* raw_hidden) {
     namespace tb=mfq_tensor_backend;
     using Tensor=tb::Tensor;
     MFQ_RUNTIME_CHECK(ids.dim()==2 && ids.size(0)==1 &&
@@ -850,7 +861,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     const auto tokens=ids.size(1);
     model.adapter_validate_forward(1,tokens,0,false,false,false);
     model.reset(1);
-    model.adapter_begin_forward(false);
+    model.adapter_begin_forward(raw_hidden!=nullptr);
     auto current=tb::arange(tokens,ids.options());
     if(model.decode_position_delta)current=current+model.decode_position_delta;
     auto prepared=model.adapter_prepare_positions(std::move(current),1,tokens);
@@ -931,15 +942,22 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
             auto branch=profiler.measure("prefill.ffn",[&] {
                 if(tokens<=batch_tokens)return qwen_block.ffn(*model.execution,ffn_inputs);
                 Tensor result;
-                for(int64_t begin=0;begin<tokens;begin+=batch_tokens) {
+                for(int64_t begin=0;begin<tokens;) {
                     if(cancelled && cancelled())return Tensor{};
-                    const auto count=std::min(batch_tokens,tokens-begin);
+                    auto count=std::min(batch_tokens,tokens-begin);
+                    const auto tail=tokens-begin-count;
+                    // A tiny final batch would enter the decode FFN path and
+                    // release the shared prefill images halfway through every
+                    // layer. Keep both batches in prefill, including chat inputs
+                    // just above the expert-batch boundary.
+                    if(tail>0 && tail<=8)count-=16-tail;
                     auto part=qwen_block.ffn(*model.execution,ffn_inputs.narrow(1,begin,count));
                     if(!result.defined()) {
                         auto shape=part.sizes().vec();shape[1]=tokens;
                         result=tb::empty(shape,part.options());
                     }
                     result.narrow(1,begin,count).copy_(part);
+                    begin+=count;
                 }
                 return result;
             });
@@ -1003,6 +1021,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     profiler.enabled=restore.enabled;
     model.adapter_finish_forward(prepared.full_positions,1,tokens);
     model.cache_pos=tokens;
+    if(raw_hidden)*raw_hidden=hidden;
     if(last_only) {
         // Use the same final GR dispatch and rounding as chunk-major prefill.
         const auto begin=((tokens-1)/compute_chunk)*compute_chunk;

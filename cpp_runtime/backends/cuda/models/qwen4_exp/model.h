@@ -546,18 +546,19 @@ class Qsa {
         index_.reset();
         graph_keys_={};graph_values_={};graph_pooled_={};
     }
-    void prepare_graph(const Tensor& full_positions) {
+    void prepare_graph(const Tensor& full_positions, int64_t capacity) {
         MFQ_RUNTIME_CHECK(!offload_, "streamed QSA KV requires host-controlled block transfers");
         if(graph_keys_.defined())return;
         MFQ_RUNTIME_CHECK(position()>0 && keys_.storage().size(0)==1,
             "QSA graph requires a prefilled single sequence");
         const auto n=position();
-        graph_keys_=tb::zeros({1,c_.kv_heads,c_.maximum,c_.width},keys_.storage().options());
+        MFQ_RUNTIME_CHECK(capacity>=n && capacity<=c_.maximum,"invalid QSA graph capacity");
+        graph_keys_=tb::zeros({1,c_.kv_heads,capacity,c_.width},keys_.storage().options());
         graph_values_=tb::zeros_like(graph_keys_);
         graph_keys_.narrow(2,0,n).copy_(keys_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
         graph_values_.narrow(2,0,n).copy_(values_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
-        index_.prepare_fixed();
-        graph_pooled_=tb::zeros({1,(c_.maximum+c_.pool-1)/c_.pool,c_.index_width},index_.storage().options());
+        index_.prepare_fixed(capacity);
+        graph_pooled_=tb::zeros({1,(capacity+c_.pool-1)/c_.pool,c_.index_width},index_.storage().options());
         const auto pools=n/c_.pool;
         if(pools) {
             auto pooled=index_.storage().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
@@ -571,7 +572,7 @@ class Qsa {
         MFQ_RUNTIME_CHECK(graph_keys_.defined() && hidden.size(0)==1 && cache_positions.dim()==1,
             "QSA graph cache is not prepared");
         const auto t=hidden.size(1),pools=graph_pooled_.size(1);
-        const bool dense_capacity=c_.maximum<=c_.budget;
+        const bool dense_capacity=graph_keys_.size(2)<=c_.budget;
         auto p=project(execution,hidden,positions,!dense_capacity,cache_positions,graph_keys_,graph_values_);
         if (!p.cache_written) {
             graph_keys_.index_copy_(2,cache_positions,p.key.permute({0,2,1,3}).to(tb::kFloat16));
@@ -579,7 +580,7 @@ class Qsa {
         }
         index_.append_fixed(p.raw,cache_positions);
         if(dense_capacity) {
-            const auto columns=c_.budget+c_.pool-1;
+            const auto columns=std::min(graph_keys_.size(2),c_.budget+c_.pool-1);
             if(fused_projection_ && rotary_->fused() &&
                 (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)) {
                 auto gated=mfq_qwen4_exp::causal_gqa_attention_gate(p.query,graph_keys_,graph_values_,
