@@ -4116,6 +4116,7 @@ class RuntimePool:
                 defaults = {
                     "MFQ_MOE_HOST_CACHE_BYTES": str(host_budget),
                     "MFQ_MOE_PIPELINE": "1",
+                    "MFQ_MOE_TWO_STAGE_FFN": "1",
                     "MFQ_MOE_PRELOAD_ALL": "1",
                     "MFQ_MOE_ASSERT_RESIDENT": "1",
                     "MFQ_MOE_RAM_PCIE": "1",

@@ -71,6 +71,7 @@ def test_cuda_launch_enables_ram_pipeline_when_experts_fit(tmp_path, monkeypatch
     assert (environment.get("MFQ_MOE_PRELOAD_ALL") == "1") == enabled
     if enabled:
         assert environment["MFQ_MOE_PIPELINE"] == "1"
+        assert environment["MFQ_MOE_TWO_STAGE_FFN"] == "1"
         assert environment["MFQ_MOE_RAM_PCIE"] == "1"
         assert environment["MFQ_MOE_RAM_PCIE_FRACTION"] == "1"
         assert environment["MFQ_MOE_DECODE_HOST_PIN"] == "1"
