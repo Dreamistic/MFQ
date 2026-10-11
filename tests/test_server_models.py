@@ -1556,6 +1556,58 @@ def test_catalog_registered_shard_resolves_its_complete_external_family(tmp_path
     asyncio.run(run())
 
 
+def test_managed_runtime_retries_timed_out_startup_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mfq.server.runtime.backend import OpenAIChatBackend
+
+    async def run() -> None:
+        _model(tmp_path / "tiny.mfq", architecture="qwen35")
+        executable = tmp_path / "fake-runtime.py"
+        _fake_runtime(executable)
+        pool = RuntimePool(
+            ModelCatalog([tmp_path], cache_seconds=0), executable,
+            startup_timeout_seconds=5, automatic_memory_budget=False,
+        )
+        pool.memory_policy.prefix_directory = str(tmp_path / "prefix")
+        launch = pool._launch_configuration
+
+        def launch_python(*args, **kwargs):
+            command, environment = launch(*args, **kwargs)
+            return [sys.executable, *command], environment
+
+        monkeypatch.setattr(pool, "_launch_configuration", launch_python)
+        original_capabilities = OpenAIChatBackend.capabilities
+        probes = 0
+        cancelled = False
+
+        async def delayed_capabilities(self, *args, **kwargs):
+            nonlocal probes, cancelled
+            probes += 1
+            if probes == 1:
+                try:
+                    await asyncio.sleep(2)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+            return await original_capabilities(self, *args, **kwargs)
+
+        monkeypatch.setattr(OpenAIChatBackend, "capabilities", delayed_capabilities)
+        context = _TestJobContext()
+        try:
+            result = await pool.load(context, {"model": "tiny", "context_size": 4096})
+            instances = (await pool.instances()).data
+            assert cancelled and probes >= 2
+            assert len(instances) == 1
+            assert instances[0].state == RuntimeInstanceState.READY
+            assert str(instances[0].id) == result["instance_id"]
+        finally:
+            await context.cleanup()
+            await pool.aclose()
+
+    asyncio.run(run())
+
+
 def test_managed_runtime_loads_and_unloads_through_persistent_jobs(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
