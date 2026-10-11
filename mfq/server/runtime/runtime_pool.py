@@ -3332,7 +3332,9 @@ class RuntimePool:
                 if index < len(hardware.gpu_memory):
                     capacity = hardware.gpu_memory[index].capacity_bytes
                     if capacity:
-                        device_ceiling = max(1, capacity - max(1 << 30, capacity // 8))
+                        # Compressed dense projections also materialize CUDA
+                        # layouts lazily; file sizes omit these and graph scratch.
+                        device_ceiling = max(1, capacity - max(2 << 30, capacity // 3))
                         ceiling = min(ceiling, device_ceiling) if ceiling is not None else device_ceiling
         if (
             request.moe_gpu_cache_gb is not None
