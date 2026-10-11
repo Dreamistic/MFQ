@@ -47,7 +47,7 @@ def test_cuda_auto_expert_budget_uses_selected_physical_device(tmp_path, monkeyp
     else:
         capacity = hardware.gpu_memory[int(device)].capacity_bytes
         assert selected.moe_gpu_cache_gb is not None and selected.moe_gpu_cache_gb > 0
-        assert pool._estimated_load_bytes(model, selected) < capacity - capacity // 3
+        assert pool._estimated_load_bytes(model, selected) < capacity - capacity // 4
     explicit = request.model_copy(update={"moe_gpu_cache_gb": 7})
     assert pool._apply_automatic_expert_residency(model, explicit).moe_gpu_cache_gb == 7
 
@@ -72,6 +72,8 @@ def test_cuda_launch_enables_ram_pipeline_when_experts_fit(tmp_path, monkeypatch
     if enabled:
         assert environment["MFQ_MOE_PIPELINE"] == "1"
         assert environment["MFQ_MOE_RAM_PCIE"] == "1"
+        assert environment["MFQ_MOE_RAM_PCIE_FRACTION"] == "1"
+        assert environment["MFQ_MOE_DECODE_HOST_PIN"] == "1"
         assert environment["MFQ_MOE_PREFILL_LAYER"] == "1"
         assert int(environment["MFQ_MOE_HOST_CACHE_BYTES"]) >= 28 * GIB
 

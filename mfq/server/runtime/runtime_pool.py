@@ -3334,7 +3334,7 @@ class RuntimePool:
                     if capacity:
                         # Compressed dense projections also materialize CUDA
                         # layouts lazily; file sizes omit these and graph scratch.
-                        device_ceiling = max(1, capacity - max(2 << 30, capacity // 3))
+                        device_ceiling = max(1, capacity - max(2 << 30, capacity // 4))
                         ceiling = min(ceiling, device_ceiling) if ceiling is not None else device_ceiling
         if (
             request.moe_gpu_cache_gb is not None
@@ -4119,6 +4119,8 @@ class RuntimePool:
                     "MFQ_MOE_PRELOAD_ALL": "1",
                     "MFQ_MOE_ASSERT_RESIDENT": "1",
                     "MFQ_MOE_RAM_PCIE": "1",
+                    "MFQ_MOE_RAM_PCIE_FRACTION": "1",
+                    "MFQ_MOE_DECODE_HOST_PIN": "1",
                     "MFQ_MOE_TRANSFER_CACHE": "1",
                     "MFQ_MOE_MAPPED_COPY": "0",
                     "MFQ_MOE_PREFILL_LAYER": "1",

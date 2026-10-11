@@ -572,7 +572,7 @@ class Qsa {
         MFQ_RUNTIME_CHECK(graph_keys_.defined() && hidden.size(0)==1 && cache_positions.dim()==1,
             "QSA graph cache is not prepared");
         const auto t=hidden.size(1),pools=graph_pooled_.size(1);
-        const bool dense_capacity=c_.maximum<=c_.budget;
+        const bool dense_capacity=graph_keys_.size(2)<=c_.budget;
         auto p=project(execution,hidden,positions,!dense_capacity,cache_positions,graph_keys_,graph_values_);
         if (!p.cache_written) {
             graph_keys_.index_copy_(2,cache_positions,p.key.permute({0,2,1,3}).to(tb::kFloat16));
@@ -580,7 +580,7 @@ class Qsa {
         }
         index_.append_fixed(p.raw,cache_positions);
         if(dense_capacity) {
-            const auto columns=c_.budget+c_.pool-1;
+            const auto columns=std::min(graph_keys_.size(2),c_.budget+c_.pool-1);
             if(fused_projection_ && rotary_->fused() &&
                 (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)) {
                 auto gated=mfq_qwen4_exp::causal_gqa_attention_gate(p.query,graph_keys_,graph_values_,
