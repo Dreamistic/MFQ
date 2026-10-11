@@ -119,6 +119,7 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     bool compare_host_pin = false;
     bool compare_resident_overlap = false;
     bool compare_dma_graph_batch = false;
+    bool compare_ram_field_packing = false;
     bool compare_warp_multi_sum = false;
     int warmup_prefill = -1;
     std::string router_lookahead_audit;
@@ -153,7 +154,7 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     int runtime_comparison_modes() const {
         return int(compare_ffn_transfer_phases) + int(compare_router_lookahead) +
                int(compare_rotary_fusion) + int(compare_attention_grouping) + int(compare_mhc_fusion) + int(compare_mhc_shared_norm) + int(compare_mhc_dense_fusion) + int(compare_mhc_packed_groups) + int(compare_mhc_fixed_formats) + int(compare_mhc_async_normalized) + int(compare_gdn_fixed_geometry) + int(compare_gdn_inplace_state) + int(compare_qsa_fusion) + int(compare_mfe_parallel_gu) + int(compare_mfe_gpu_bundle) + int(compare_mfe_default_math) + int(compare_mfe_e8_narrow) + int(compare_mfe_shared_first) + int(compare_mfe_early_gu) + int(compare_cpu_transfer_budget) + int(compare_cpu_background_calibration) +
-               int(compare_router_topk) + int(compare_route_poll) + int(compare_window_flush) + int(compare_early_no_cpu_ready) + int(compare_gpu_only_cpu_wait) + int(compare_fixed_gpu_timing) + int(compare_window_input_views) + int(compare_route_spin) + int(compare_moe_plan_reuse) + int(compare_shared_gate_fusion) + int(compare_graph_optimizations) + int(compare_host_pin) + int(compare_resident_overlap) + int(compare_dma_graph_batch) + int(compare_warp_multi_sum);
+               int(compare_router_topk) + int(compare_route_poll) + int(compare_window_flush) + int(compare_early_no_cpu_ready) + int(compare_gpu_only_cpu_wait) + int(compare_fixed_gpu_timing) + int(compare_window_input_views) + int(compare_route_spin) + int(compare_moe_plan_reuse) + int(compare_shared_gate_fusion) + int(compare_graph_optimizations) + int(compare_host_pin) + int(compare_resident_overlap) + int(compare_dma_graph_batch) + int(compare_ram_field_packing) + int(compare_warp_multi_sum);
     }
     const char* runtime_comparison_name() const {
         if (compare_route_poll) return "route_poll_comparison";
@@ -171,6 +172,7 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
         if (compare_host_pin) return "host_pin_comparison";
         if (compare_resident_overlap) return "resident_overlap_comparison";
         if (compare_dma_graph_batch) return "dma_graph_batch_comparison";
+        if (compare_ram_field_packing) return "ram_field_packing_comparison";
         if (compare_warp_multi_sum) return "warp_multi_sum_comparison";
         if (compare_router_topk) return "router_topk_comparison";
         if (compare_mhc_fusion) return "mhc_fusion_comparison";
@@ -244,7 +246,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         CudaExecutionContext execution;
         // Operator-only checks do not require loading a model.
         if (check_backend_bf16_add) return run_backend_bf16_add_check(4096, 10000);
-        if (check_backend_argmax) return run_backend_argmax_check(151748, 2000);
+        if (check_backend_argmax) return run_backend_argmax_check(248320, 2000);
         MFQ_RUNTIME_CHECK(!comparison_phase_timings || runtime_comparison_modes(),
             "comparison phase timings require a runtime comparison");
         if(runtime_comparison_modes()) {
@@ -716,6 +718,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             ScopedDiagnosticEnvironment host_pin("MFQ_MOE_DECODE_HOST_PIN");
             ScopedDiagnosticEnvironment resident_overlap("MFQ_MFE_RESIDENT_PLAN_OVERLAP");
             ScopedDiagnosticEnvironment dma_graph_batch("MFQ_MOE_DMA_GRAPH_BATCH");
+            ScopedDiagnosticEnvironment ram_field_packing("MFQ_MOE_RAM_FIELD_PACKING");
             ScopedDiagnosticEnvironment warp_multi_sum("MFQ_CUDA_WARP_MULTI_SUM");
             MFQ_RUNTIME_CHECK(!(compare_mfe_e8_narrow || compare_mfe_default_math || compare_mfe_parallel_gu || compare_mfe_gpu_bundle || compare_mfe_shared_first || compare_mfe_early_gu) || execution.config.moe_two_stage_ffn,
                 "MFE parallel Gate/Up comparison requires two-stage FFN");
@@ -760,6 +763,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 if (compare_host_pin) host_pin.set(phased ? "1" : "0");
                 if (compare_resident_overlap) resident_overlap.set(phased ? "1" : "0");
                 if (compare_dma_graph_batch) dma_graph_batch.set(phased ? "1" : "0");
+                if (compare_ram_field_packing) ram_field_packing.set(phased ? "1" : "0");
                 if (compare_warp_multi_sum) warp_multi_sum.set(phased ? "1" : "0");
                 if (compare_cpu_background_calibration) cpu_background.set(phased ? "1" : "0");
                 if (compare_router_topk) topk_cache.set(phased ? "1" : "0");
@@ -1185,6 +1189,7 @@ void print_diagnostics_help() {
         << "  --compare-host-pin              compare decode host placement, free/pinned/free\n"
         << "  --compare-resident-overlap      compare resident GPU work before host planning, off/on/off\n"
         << "  --compare-dma-graph-batch       compare ordinary/batched/ordinary weight DMA submissions\n"
+        << "  --compare-ram-field-packing     compare direct/packed/direct small RAM fields, fixed decode inputs\n"
         << "  --compare-warp-multi-sum       compare original / Strata multi-row reduction / original\n"
         << "  --warmup-prefill N              prefill warmups, 0-100; default profile=1, otherwise=0\n"
         << "  --ctx-size N                    context size; 0 selects a default\n"
@@ -1226,6 +1231,7 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
     DiagnosticsCommandOptions result;
     while (!args.empty()) {
         const std::string_view option = args.next();
+        if(option == "--compare-ram-field-packing") {result.compare_ram_field_packing=true;continue;}
         if(option == "--compare-qsa-fusion") {result.compare_qsa_fusion=true;continue;}
         if(option == "--compare-moe-plan-reuse") {result.compare_moe_plan_reuse=true;continue;}
         if(option == "--compare-mfe-default-math") {result.compare_mfe_default_math=true;continue;}
