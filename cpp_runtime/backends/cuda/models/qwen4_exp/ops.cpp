@@ -849,7 +849,7 @@ bool qwen4_layer_major_prefill_eligible(const Qwen4CausalLm& model, int64_t toke
 
 mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         Qwen4CausalLm& model,mfq_tensor_backend::Tensor ids,int64_t compute_chunk,
-        bool last_only,const std::function<bool()>& cancelled) {
+        bool last_only,const std::function<bool()>& cancelled,mfq_tensor_backend::Tensor* raw_hidden) {
     namespace tb=mfq_tensor_backend;
     using Tensor=tb::Tensor;
     MFQ_RUNTIME_CHECK(ids.dim()==2 && ids.size(0)==1 &&
@@ -861,7 +861,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     const auto tokens=ids.size(1);
     model.adapter_validate_forward(1,tokens,0,false,false,false);
     model.reset(1);
-    model.adapter_begin_forward(false);
+    model.adapter_begin_forward(raw_hidden!=nullptr);
     auto current=tb::arange(tokens,ids.options());
     if(model.decode_position_delta)current=current+model.decode_position_delta;
     auto prepared=model.adapter_prepare_positions(std::move(current),1,tokens);
@@ -942,15 +942,22 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
             auto branch=profiler.measure("prefill.ffn",[&] {
                 if(tokens<=batch_tokens)return qwen_block.ffn(*model.execution,ffn_inputs);
                 Tensor result;
-                for(int64_t begin=0;begin<tokens;begin+=batch_tokens) {
+                for(int64_t begin=0;begin<tokens;) {
                     if(cancelled && cancelled())return Tensor{};
-                    const auto count=std::min(batch_tokens,tokens-begin);
+                    auto count=std::min(batch_tokens,tokens-begin);
+                    const auto tail=tokens-begin-count;
+                    // A tiny final batch would enter the decode FFN path and
+                    // release the shared prefill images halfway through every
+                    // layer. Keep both batches in prefill, including chat inputs
+                    // just above the expert-batch boundary.
+                    if(tail>0 && tail<=8)count-=16-tail;
                     auto part=qwen_block.ffn(*model.execution,ffn_inputs.narrow(1,begin,count));
                     if(!result.defined()) {
                         auto shape=part.sizes().vec();shape[1]=tokens;
                         result=tb::empty(shape,part.options());
                     }
                     result.narrow(1,begin,count).copy_(part);
+                    begin+=count;
                 }
                 return result;
             });
@@ -1014,6 +1021,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     profiler.enabled=restore.enabled;
     model.adapter_finish_forward(prepared.full_positions,1,tokens);
     model.cache_pos=tokens;
+    if(raw_hidden)*raw_hidden=hidden;
     if(last_only) {
         // Use the same final GR dispatch and rounding as chunk-major prefill.
         const auto begin=((tokens-1)/compute_chunk)*compute_chunk;

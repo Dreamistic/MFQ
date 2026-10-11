@@ -47,6 +47,8 @@ template <class Model> struct CudaMtpOps {
   MtpTarget target;
   bool transformed_prompt;
   int position_axes;
+  int64_t prefill_compute_chunk;
+  InferenceOutput* output;
   const mfq_tensor_backend::TensorOptions options =
       mfq_tensor_backend::TensorOptions()
           .device(mfq_tensor_backend::kCUDA)
@@ -55,13 +57,14 @@ template <class Model> struct CudaMtpOps {
   std::optional<mfq::cuda::Sampler> sampler_;
   bool penalties = false;
 
-  CudaMtpOps(Model &model, MtpModule &mtp, const CudaPreparedPrompt *prepared)
+  CudaMtpOps(Model &model, MtpModule &mtp, const CudaPreparedPrompt *prepared,
+             int64_t compute_chunk, InferenceOutput* output)
       : model(model), mtp(mtp), prepared(prepared), target(model),
         transformed_prompt(prepared && prepared->transformed()),
         position_axes(transformed_prompt && prepared->positions.dim() == 2 &&
                               prepared->positions.size(0) == 3
                           ? 3
-                          : 1) {}
+                          : 1), prefill_compute_chunk(compute_chunk), output(output) {}
   void initialize(const std::vector<int64_t> &prompt,
                   const MfqSamplingParams &sampling) {
     input_ids = ids_for(prompt);
@@ -107,6 +110,14 @@ template <class Model> struct CudaMtpOps {
     PrefillCudaTimer timer;
     Tensor raw;
     auto ids = input_ids.narrow(1, chunk.offset, chunk.count).contiguous();
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(!transformed_prompt && mfq::cuda::qwen4_layer_major_prefill_eligible(model,chunk.count)) {
+        auto hidden=mfq::cuda::qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,false,
+            [&] { return output && output->stopped(); }, &raw);
+        MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+        return {std::move(hidden),std::move(raw),timer.elapsed_ms()};
+      }
+    }
     auto hidden =
         transformed_prompt
             ? model.hidden_forward_inputs(
@@ -252,9 +263,15 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
                    std::size_t reused_tokens,
                    mfq_tensor_backend::Tensor restored_last_hidden,
                    mfq_tensor_backend::Tensor *session_last_hidden) {
+  auto logical_chunk=prefill_chunk_size;
+  if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+    if(reused_tokens==0 && (!prepared || !prepared->transformed()) &&
+        mfq::cuda::qwen4_layer_major_prefill_eligible(model,request.prompt.size()))
+      logical_chunk=request.prompt.size();
+  }
   return mfq::engine::speculative_sequence(
-      CudaMtpOps<Model>{model, mtp, prepared}, request, output,
-      prefill_chunk_size, reused_tokens, std::move(restored_last_hidden),
+      CudaMtpOps<Model>{model, mtp, prepared, prefill_chunk_size, &output}, request, output,
+      logical_chunk, reused_tokens, std::move(restored_last_hidden),
       session_last_hidden);
 }
 #define MFQ_INSTANTIATE_MTP(MODEL)                                             \

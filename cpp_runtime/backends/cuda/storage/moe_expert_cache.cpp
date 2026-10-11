@@ -510,9 +510,30 @@ void MoeExpertCache::preload_complete_residency() {
     if(config_.moe_pipeline && config_.moe_direct_ram && ram_allocated) {
         registered_host_fields_.reserve(registered_host_fields_.size()+1);
         auto* address=pipeline_ram_complement_->data_ptr();
-        MFQ_CUDA_CHECK(cudaHostRegister(address,static_cast<std::size_t>(ram_allocated),cudaHostRegisterMapped));
-        registered_host_fields_.push_back({address,ram_allocated,true});
-        pipeline_ram_registered_bytes_=ram_allocated;
+        int64_t registered=ram_allocated;
+        if(const auto* value=std::getenv("MFQ_MOE_RAM_PIN_GIB")) {
+            char* end=nullptr;const double gib=std::strtod(value,&end);
+            if(end==value || *end || !std::isfinite(gib) || gib<0 || gib>double(INT64_MAX)/(1ull<<30))
+                throw std::invalid_argument("MFQ_MOE_RAM_PIN_GIB must be finite and non-negative");
+            if(gib>0)registered=std::min(registered,std::max<int64_t>(1,int64_t(gib*(1ull<<30))));
+        }
+        for(;;) {
+            const auto result=cudaHostRegister(address,static_cast<std::size_t>(registered),cudaHostRegisterMapped);
+            if(result==cudaSuccess)break;
+#ifdef _WIN32
+            // WDDM also charges mapped RAM against its shared-memory budget.
+            // Keep the cold complement resident, but leave its tail pageable
+            // when registering all of it would exhaust that separate budget.
+            if(result==cudaErrorMemoryAllocation && registered>(1ll<<30)) {
+                (void)cudaGetLastError();registered-=1ll<<30;continue;
+            }
+#endif
+            MFQ_CUDA_CHECK(result);
+        }
+        registered_host_fields_.push_back({address,registered,true});
+        pipeline_ram_registered_bytes_=registered;
+        if(registered<ram_allocated)
+            std::cerr<<"moe_ram_registration pinned_bytes="<<registered<<" pageable_bytes="<<ram_allocated-registered<<std::endl;
     }
     std::cerr << "moe_residency_h2d bytes=" << h2d_bytes << " cuda_ms=" << h2d_ms << std::endl;
     std::uint64_t dense_materializations=0;

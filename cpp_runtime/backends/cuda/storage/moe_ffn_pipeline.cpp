@@ -707,6 +707,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             throw std::logic_error("prefill Gate/Up copy exceeds layer image");
         if(cache_->pipeline_prefill_layer_overlap_ && cache_->pipeline_prefill_layer_read_recorded_[slot])
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(copy_stream,cache_->pipeline_prefill_layer_read_done_[slot],0));
+        int copies=0,direct_copies=0;int64_t direct_bytes=0;
         {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         MfqCudaStreamGuard guard(MfqCudaStream(mfq_current_cuda_device(),copy_stream));
@@ -717,12 +718,19 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             auto* destination=cache_->pipeline_prefill_layer_buffer_.data_ptr<uint8_t>()+
                 slot*cache_->pipeline_prefill_layer_stride_;
             const auto* source=cache_->pipeline_ram_complement_->data_ptr<uint8_t>()+layout.first;
-            if(gate_up_bytes)MFQ_CUDA_CHECK(cudaMemcpyAsync(destination,source,std::size_t(gate_up_bytes),
-                cudaMemcpyHostToDevice,copy_stream));
+            const auto copy=[&](int64_t begin,int64_t bytes) {
+                // CUDA forbids a single host copy spanning registered and
+                // pageable ranges. Split at the registration boundary.
+                const auto pinned=std::clamp<int64_t>(cache_->pipeline_ram_registered_bytes_-layout.first-begin,0,bytes);
+                if(pinned) {MFQ_CUDA_CHECK(cudaMemcpyAsync(destination+begin,source+begin,std::size_t(pinned),
+                    cudaMemcpyHostToDevice,copy_stream));++copies;++direct_copies;direct_bytes+=pinned;}
+                if(bytes>pinned) {MFQ_CUDA_CHECK(cudaMemcpyAsync(destination+begin+pinned,source+begin+pinned,
+                    std::size_t(bytes-pinned),cudaMemcpyHostToDevice,copy_stream));++copies;}
+            };
+            copy(0,gate_up_bytes);
             if(cache_->pipeline_prefill_layer_overlap_)
                 MFQ_CUDA_CHECK(cudaEventRecord(cache_->pipeline_prefill_layer_gate_up_ready_[slot],copy_stream));
-            if(layout.second>gate_up_bytes)MFQ_CUDA_CHECK(cudaMemcpyAsync(destination+gate_up_bytes,
-                source+gate_up_bytes,std::size_t(layout.second-gate_up_bytes),cudaMemcpyHostToDevice,copy_stream));
+            copy(gate_up_bytes,layout.second-gate_up_bytes);
             return 0;
         });
         }
@@ -732,9 +740,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(cache_->pipeline_prefill_layer_overlap_ && prefill_layer_flush())
             mfq::cuda::check_stream_progress(copy_stream);
         auto& stats=cache_->stats_;
-        const auto copies=int(gate_up_bytes>0)+int(layout.second>gate_up_bytes);
-        stats.pipeline_direct_ram_copies+=copies;stats.pipeline_dma_copies+=copies;
-        stats.pipeline_direct_ram_bytes+=layout.second;stats.ram_pcie_bytes+=layout.second;
+        stats.pipeline_direct_ram_copies+=direct_copies;stats.pipeline_dma_copies+=copies;
+        stats.pipeline_direct_ram_bytes+=direct_bytes;stats.pipeline_staged_ram_bytes+=layout.second-direct_bytes;
+        stats.ram_pcie_bytes+=layout.second;
         if(gate_up_bytes<layout.second) {
             ++stats.pipeline_phased_transfer_serves;
             stats.pipeline_gate_up_dma_bytes+=gate_up_bytes;

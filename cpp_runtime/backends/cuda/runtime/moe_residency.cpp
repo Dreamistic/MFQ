@@ -502,6 +502,16 @@ void MoeResidencyManager::prepare() {
                     !cache.host_experts_->contains(incoming.quant_source_->host_key(move.incoming))){valid=false;break;}
             move.lease=incoming.quant_source_->acquire_expert(move.incoming);
             if(move.lease.use_count()!=2){valid=false;break;}
+            if(s.direct && cache.pipeline_ram_registered_bytes_<cache.pipeline_ram_complement_->numel()) {
+                const auto begin=reinterpret_cast<uintptr_t>(cache.pipeline_ram_complement_->data_ptr());
+                const auto end=begin+cache.pipeline_ram_registered_bytes_;
+                for(const auto& field:moe_cache_fields(move.lease->weights)) {
+                    if(!tensor_nbytes(field))continue;
+                    const auto address=reinterpret_cast<uintptr_t>(field.data_ptr());
+                    if(address<begin || address>end || uint64_t(tensor_nbytes(field))>end-address){valid=false;break;}
+                }
+                if(!valid)break;
+            }
             if(s.reuse_transfer && s.direct && cache.pipeline_transfer_cache_) {
                 auto* arena=s.transfer_stages[move.incoming_source][move.cohort].arena;
                 const int slot=arena && arena->book ? arena->book->slot_for(

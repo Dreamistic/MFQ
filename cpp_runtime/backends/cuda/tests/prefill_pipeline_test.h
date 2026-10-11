@@ -1,15 +1,16 @@
 #pragma once
 
-void verify_prefill_graph_execution(const std::filesystem::path& root,bool grouped=false,int group_size=1,bool sparse=false,bool oracle=false,bool layer_prefill=false,bool layout_only=false,bool batch_check=false,bool residency_check=false) {
+void verify_prefill_graph_execution(const std::filesystem::path& root,bool grouped=false,int group_size=1,bool sparse=false,bool oracle=false,bool layer_prefill=false,bool layout_only=false,bool batch_check=false,bool residency_check=false,bool partial_pin=false) {
     struct Setting {
         std::string old;
-        std::string old_direct,old_groups,old_group_size,old_mma,old_layer,old_retain;
+        std::string old_direct,old_groups,old_group_size,old_mma,old_layer,old_retain,old_pin;
         Setting(){if(const auto* p=std::getenv("MFQ_MOE_PREFILL_GRAPH"))old=p;
             if(const auto* p=std::getenv("MFQ_MOE_PREFILL_DIRECT_RAM"))old_direct=p;
             if(const auto* p=std::getenv("MFQ_MOE_PREFILL_GROUPS"))old_groups=p;
             if(const auto* p=std::getenv("MFQ_MOE_PREFILL_GROUP_SIZE"))old_group_size=p;
             if(const auto* p=std::getenv("MFQ_MOE_PREFILL_COMPACT_MMA"))old_mma=p;
             if(const auto* p=std::getenv("MFQ_MOE_PREFILL_LAYER"))old_layer=p;
+            if(const auto* p=std::getenv("MFQ_MOE_RAM_PIN_GIB"))old_pin=p;
             if(const auto* p=std::getenv("MFQ_MOE_PREFILL_POOL_RETAIN"))old_retain=p;}
         static void set_env(const char* key,const char* p) {
 #ifdef _WIN32
@@ -19,7 +20,7 @@ void verify_prefill_graph_execution(const std::filesystem::path& root,bool group
 #endif
         }
         static void set(const char* p){set_env("MFQ_MOE_PREFILL_GRAPH",p);}
-        ~Setting(){set(old.c_str());set_env("MFQ_MOE_PREFILL_DIRECT_RAM",old_direct.c_str());set_env("MFQ_MOE_PREFILL_GROUPS",old_groups.c_str());set_env("MFQ_MOE_PREFILL_GROUP_SIZE",old_group_size.c_str());set_env("MFQ_MOE_PREFILL_COMPACT_MMA",old_mma.c_str());set_env("MFQ_MOE_PREFILL_LAYER",old_layer.c_str());set_env("MFQ_MOE_PREFILL_POOL_RETAIN",old_retain.c_str());}
+        ~Setting(){set(old.c_str());set_env("MFQ_MOE_PREFILL_DIRECT_RAM",old_direct.c_str());set_env("MFQ_MOE_PREFILL_GROUPS",old_groups.c_str());set_env("MFQ_MOE_PREFILL_GROUP_SIZE",old_group_size.c_str());set_env("MFQ_MOE_PREFILL_COMPACT_MMA",old_mma.c_str());set_env("MFQ_MOE_PREFILL_LAYER",old_layer.c_str());set_env("MFQ_MOE_PREFILL_POOL_RETAIN",old_retain.c_str());set_env("MFQ_MOE_RAM_PIN_GIB",old_pin.c_str());}
     } setting;
     int cases=0,direct_checks=0,pool_checks=0,reuse_checks=0,batch_checks=0,wide_row_bits_checks=0;double maximum_relative=0,maximum_batch_relative=0;
     for(const auto& names:std::array<std::array<std::string,3>,3>{
@@ -35,6 +36,7 @@ void verify_prefill_graph_execution(const std::filesystem::path& root,bool group
         const std::array<MfqCudaStream,2> streams={mfq_get_stream_from_pool(),mfq_get_current_cuda_stream()};
         for(int mode=0;mode<2;++mode) {
             Setting::set_env("MFQ_MOE_PREFILL_LAYER",layer_prefill && mode==1?"1":"0");
+            Setting::set_env("MFQ_MOE_RAM_PIN_GIB",partial_pin && mode==1?"0.00390625":setting.old_pin.c_str());
             MfqCudaStreamGuard guard(streams[mode]);
             auto& cfg=execution[mode].config;
             execution[mode].force_moe_prefill_mma_off=sparse && !oracle;
@@ -259,6 +261,8 @@ void verify_prefill_graph_execution(const std::filesystem::path& root,bool group
             std::smatch match;const auto stats=stream.str();
             if(!std::regex_search(stats,match,std::regex("residency_committed_projections=(\\d+)")) || std::stoll(match[1])<=0)
                 throw std::runtime_error("whole-layer layout still disables expert adaptation");
+            if(partial_pin && (!std::regex_search(stats,match,std::regex("pipeline_staged_ram_bytes=(\\d+)")) || std::stoll(match[1])<=0))
+                throw std::runtime_error("partial pin did not exercise pageable expert transfers");
         }
         forward={};caches={};
     }
