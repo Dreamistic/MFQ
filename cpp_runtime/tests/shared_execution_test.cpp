@@ -114,7 +114,7 @@ void batch_test() {
         if (key == "continuous_batching_active" || key == "continuous_batching_prefilling") assert(value == 0);
 }
 
-void packed_prefill_test() {
+void packed_prefill_plain_sample_test() {
     struct PackedOps : BatchOps {
         std::vector<std::vector<std::string>>& groups;
         explicit PackedOps(std::vector<std::vector<std::string>>& value) : groups(value) {}
@@ -240,6 +240,77 @@ void isolated_prefill_failure_test() {
     assert(executor.admit(batch_request("reuse",2,1),nullptr,batch_info(),ops) == Admission::accepted);
     for (int i = 0; i < 10 && !executor.empty(); ++i) tick({"reuse"});
     assert(executor.empty() && tokens["reuse"] == std::vector<int64_t>{10});
+}
+
+struct PackedPrefillLog {
+    int fault = 0;
+    std::vector<std::vector<std::pair<std::string,PrefillChunk>>> groups;
+};
+struct PackedPrefillOps : BatchOps {
+    static constexpr bool isolate_prefill_failures = true;
+    PackedPrefillLog& log;
+    explicit PackedPrefillOps(PackedPrefillLog& value):log(value) {}
+    std::size_t prefill_batch_limit() const {return 3;}
+    std::vector<PrefillBatchResult<Sample>> prefill_batch(
+            const std::vector<std::pair<std::shared_ptr<Request>,PrefillChunk>>& items) {
+        std::vector<std::pair<std::string,PrefillChunk>> group;
+        int64_t tokens=0;
+        for (const auto& [request,chunk]:items) {
+            tokens+=chunk.count;group.emplace_back(request->id,chunk);
+        }
+        assert(tokens<=4 && items.size()<=3);log.groups.push_back(std::move(group));
+        std::vector<PrefillBatchResult<Sample>> result;
+        for (const auto& [request,chunk]:items) {
+            if (log.fault && request->id=="pressure" && chunk.offset>0) {
+                auto error=std::make_exception_ptr(InferenceInputError(
+                    InferenceInputErrorCode::ContextLength,"prefill capacity exhausted"));
+                if (log.fault==2)std::rethrow_exception(error);
+                result.push_back({{},error});
+            } else result.push_back({BatchOps::prefill(request,chunk),{}});
+        }
+        return result;
+    }
+};
+void packed_prefill_test() {
+    struct Execution {
+        ContinuousBatch<PackedPrefillOps> batch;
+        explicit Execution(PackedPrefillLog& log):batch(2,4,log) {}
+        bool can_batch(const EngineRequest&) const {return true;}
+        bool exclusive() const {return false;}
+        bool mtp_available() const {return false;}
+        void execute(const std::vector<RequestId>& ids) {batch.step(ids);}
+        Generation generate(const RequestId& id,ExecutionRequest& request) {
+            return batch.generate(id,request.input,request.output);
+        }
+    };
+    for (int fault:{0,1,2}) {
+        PackedPrefillLog log{fault};Execution ops(log);RequestExecutor executor(3);
+        std::map<std::string,std::vector<int64_t>> tokens;
+        std::map<std::string,int> failures,terminals;
+        const auto tick=[&](std::vector<RequestId> ids) {
+            auto result=executor.step(ids,ops);assert(result.status.healthy);
+            for (const auto& event:result.events) {
+                if (const auto* delta=std::get_if<OutputDelta>(&event.data))
+                    tokens[event.id].insert(tokens[event.id].end(),delta->token_ids.begin(),delta->token_ids.end());
+                failures[event.id]+=std::holds_alternative<Failed>(event.data);
+                terminals[event.id]+=terminal(event.data);
+            }
+        };
+        EngineInfo info{3,100,100};
+        executor.admit(batch_request("survivor",2,8),nullptr,info,ops);
+        for(int i=0;i<12 && tokens["survivor"].empty();++i)tick({"survivor"});
+        assert(tokens["survivor"]==std::vector<int64_t>{10});
+        executor.admit(batch_request("pressure",5,3),nullptr,info,ops);
+        executor.admit(batch_request("peer",3,3),nullptr,info,ops);
+        // Register both coroutines while the established row is paused.
+        for(int i=0;i<80 && !executor.empty();++i)tick({"pressure","peer","survivor"});
+        assert(executor.empty() && !log.groups.empty());
+        assert(tokens["survivor"]==std::vector<int64_t>({10,11,12,13,14,15,16,17}));
+        assert(failures["survivor"]==0 && failures["pressure"]==(fault>0) && failures["peer"]==(fault==2));
+        if(!fault)assert(tokens["pressure"]==std::vector<int64_t>({10,11,12}));
+        if(fault!=2)assert(tokens["peer"]==std::vector<int64_t>({10,11,12}));
+        for(const auto& id:{"survivor","pressure","peer"})assert(terminals[id]==1);
+    }
 }
 
 struct IsolatedGrowthOps : BatchOps {
@@ -1887,12 +1958,13 @@ int main() {
     inner_model_flow_test();
     predictor_flow_test();
     batch_test();
-    packed_prefill_test();
+    packed_prefill_plain_sample_test();
     batch_failure_test();
     batch_recoverable_failure_test();
     batch_alignment_test();
     staggered_decode_batch_test();
     isolated_prefill_failure_test();
+    packed_prefill_test();
     isolated_context_growth_test();
     model_test();
 }
