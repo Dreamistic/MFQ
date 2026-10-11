@@ -156,16 +156,28 @@ template <class Ops> class ContinuousBatch {
             auto it = requests.find(id);
             if (it != requests.end() && it->second->prefill) { prefill = it; break; }
         }
-        const bool has_decode = std::any_of(state.active.begin(), state.active.end(),
+        const bool rows_ready = std::all_of(state.active.begin(), state.active.end(),
+            [&](const auto& request) {
+                return std::find(eligible.begin(), eligible.end(), request->id) == eligible.end() ||
+                    requests.at(request->id)->decode;
+            });
+        // Let eligible peers consume their previous sample and schedule the
+        // next decode before executing it. Otherwise staggered coroutines
+        // alternate single-row decodes and never form a stable batch.
+        const bool has_decode = rows_ready && std::any_of(state.active.begin(), state.active.end(),
             [](const auto& request) { return request->eligible; });
         bool run_decode = has_decode && (prefill == requests.end() || decode_next);
         if constexpr (requires { operations.ready_decode(state, eligible); })
             run_decode = run_decode && operations.ready_decode(state, eligible);
         std::vector<std::shared_ptr<Work>> prefills;
+        bool prefilling_operation = false;
+        bool decoding_operation = false;
         try {
             if constexpr (requires { operations.synchronize(state); }) operations.synchronize(state);
             if (run_decode) {
+                decoding_operation = true;
                 auto decoded = operations.decode(state);
+                decoding_operation = false;
                 for (const auto& request : state.active) if (request->eligible) {
                     auto& work = *requests.at(request->id);
                     work.result = operations.sample(request, decoded);
@@ -188,10 +200,12 @@ template <class Ops> class ContinuousBatch {
                 }
                 operations.suspend_decode();
                 PrefillActivity prefill_activity;
+                prefilling_operation = true;
                 auto samples = [&] {
                     if constexpr (requires { operations.prefill_batch(chunks); }) return operations.prefill_batch(chunks);
                     else return std::vector<Sample>{operations.prefill(chunks.front().first, chunks.front().second)};
                 }();
+                prefilling_operation = false;
                 if (samples.size() != prefills.size()) throw std::logic_error("prefill batch returned an invalid row count");
                 for (std::size_t row = 0; row < prefills.size(); ++row) {
                     auto& work = *prefills[row];
@@ -213,6 +227,46 @@ template <class Ops> class ContinuousBatch {
             }
             decode_next = !decode_next;
         } catch (...) {
+            if constexpr (requires { Ops::isolate_context_growth_failures; }) {
+                bool capacity_failure = false;
+                try { throw; }
+                catch (const InferenceInputError& error) {
+                    capacity_failure = error.code == InferenceInputErrorCode::ContextLength;
+                } catch (...) {}
+                if (Ops::isolate_context_growth_failures && decoding_operation && capacity_failure) {
+                    // Capacity checks run before numerical decode. Release the
+                    // newest eligible request while preserving established rows.
+                    const auto victim = std::find_if(state.active.rbegin(),state.active.rend(),
+                        [](const auto& request) { return request->eligible; });
+                    if (victim != state.active.rend()) {
+                        auto request = *victim;
+                        auto& work = *requests.at(request->id);
+                        work.failure = std::current_exception(); work.decode = false;
+                        std::erase(state.active,request);
+                        try {
+                            operations.retire({request},cache_position());
+                            work.active = false;
+                            return;
+                        } catch (...) { recover(std::current_exception()); throw; }
+                    }
+                }
+            }
+            if constexpr (requires { Ops::isolate_prefill_failures; }) {
+                if (Ops::isolate_prefill_failures && prefilling_operation && prefill != requests.end()) {
+                    try {
+                        for (const auto& item : prefills) {
+                            auto& work = *item;
+                            work.failure = std::current_exception();
+                            work.prefill.reset();
+                            work.decode = work.active = false;
+                            std::erase(state.active, work.request);
+                            operations.discard_prefill(work.request);
+                        }
+                        operations.resume_decode(cache_position());
+                        return;
+                    } catch (...) { recover(std::current_exception()); throw; }
+                }
+            }
             const auto error = std::current_exception();
             if constexpr (requires { operations.recoverable_failure(error); }) {
                 if (operations.recoverable_failure(error)) {
