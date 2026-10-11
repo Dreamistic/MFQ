@@ -3,28 +3,32 @@
 class GdnPipelineScope {
     std::string old_;
     bool present_;
+    const char* key_;
 public:
-    explicit GdnPipelineScope(int mode):present_(std::getenv("MFQ_GDN_PREFILL_PIPELINED")!=nullptr) {
-        if(present_)old_=std::getenv("MFQ_GDN_PREFILL_PIPELINED");set(mode);
+    explicit GdnPipelineScope(int mode,const char* key="MFQ_GDN_PREFILL_PIPELINED"):
+        present_(std::getenv(key)!=nullptr),key_(key) {
+        if(present_)old_=std::getenv(key);set(mode,key);
     }
-    static void set(int mode) {
+    static void set(int mode,const char* key="MFQ_GDN_PREFILL_PIPELINED") {
         const auto value=mode<0?std::string{}:std::to_string(mode);
 #ifdef _WIN32
-        _putenv_s("MFQ_GDN_PREFILL_PIPELINED",value.c_str());
+        _putenv_s(key,value.c_str());
 #else
-        if(value.empty())unsetenv("MFQ_GDN_PREFILL_PIPELINED");else setenv("MFQ_GDN_PREFILL_PIPELINED",value.c_str(),1);
+        if(value.empty())unsetenv(key);else setenv(key,value.c_str(),1);
 #endif
     }
     ~GdnPipelineScope() {
 #ifdef _WIN32
-        _putenv_s("MFQ_GDN_PREFILL_PIPELINED",present_?old_.c_str():"");
+        _putenv_s(key_,present_?old_.c_str():"");
 #else
-        if(present_)setenv("MFQ_GDN_PREFILL_PIPELINED",old_.c_str(),1);else unsetenv("MFQ_GDN_PREFILL_PIPELINED");
+        if(present_)setenv(key_,old_.c_str(),1);else unsetenv(key_);
 #endif
     }
 };
-void gdn_prefill_pipeline_case(bool defaults=false) {
-    GdnPipelineScope option(1);
+void gdn_prefill_pipeline_case(bool defaults=false,bool prepared_decay=false) {
+    GdnPipelineScope pipeline(1);
+    const char* option_key=prepared_decay?"MFQ_GDN_PREFILL_PREPARED_DECAY":"MFQ_GDN_PREFILL_PIPELINED";
+    GdnPipelineScope option(1,option_key);
     gdn_prefill_columns_case();
     GdnColumnsScope columns(4);
     for(int nv:{48,64})for(bool transposed:{false,true}) {
@@ -35,7 +39,7 @@ void gdn_prefill_pipeline_case(bool defaults=false) {
         auto state=data({1,nv,width,width},394,.03f).to(tb::kFloat32);
         std::vector<float> times[2];std::vector<Tensor> reference;
         for(int repeat=0;repeat<8;++repeat)for(int order=0;order<2;++order) {
-            const int mode=order^(repeat&1);GdnPipelineScope::set(mode?(defaults?-1:1):0);
+            const int mode=order^(repeat&1);GdnPipelineScope::set(mode?(defaults?-1:1):0,option_key);
             const auto call=[&] {return (transposed?gdn_transposed_cuda:gdn_cuda)(q,k,v,g,beta,state);};
             auto result=call();result=call();mfq_cuda_synchronize();
             cudaEvent_t begin,end;MFQ_CUDA_CHECK(cudaEventCreate(&begin));MFQ_CUDA_CHECK(cudaEventCreate(&end));
@@ -53,6 +57,7 @@ void gdn_prefill_pipeline_case(bool defaults=false) {
         }
         for(auto& values:times)std::sort(values.begin(),values.end());
         std::cout<<"gdn_prefill_pipeline_pair key_heads="<<nk<<" value_heads="<<nv
+            <<" prepared_decay="<<prepared_decay
             <<" tokens="<<tokens<<" transposed="<<transposed<<" baseline_ms="<<times[0][times[0].size()/2]
             <<" candidate_ms="<<times[1][times[1].size()/2]<<" output_state_bits_equal=1"<<std::endl;
     }

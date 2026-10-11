@@ -578,7 +578,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         execution.profiler.enabled = false;
         mfq_tensor_backend::NoGradGuard no_grad;
         return with_loaded_cuda_model(execution, *this,
-            check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty(),
+            check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty() || (check_qwen4_decode_hidden && profile),
             [&](auto& model, auto& runtime_components,
                     auto t0, auto t1) -> int {
         using Model = std::remove_cvref_t<decltype(model)>;
@@ -590,8 +590,17 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 "continuous batching requires Qwen35CausalLm");
         }
         if (check_qwen4_decode_hidden) {
+            if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+                const auto* variants=std::getenv("MFQ_MTP_GENERATION_VARIANTS");
+                if(profile && variants && variants[0]=='1') {
+                    MFQ_RUNTIME_CHECK(runtime_components.mtp,"MTP variants require a loaded predictor");
+                    return run_qwen4_mtp_generation_variants(model,*runtime_components.mtp,
+                        ids_file.empty()?parse_ids(ids_arg):load_ids_file(ids_file));
+                }
+            }
             if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
-                return run_qwen4_decode_hidden_check(model);
+                return profile?run_qwen4_mtp_profile(model,ids_file.empty()?parse_ids(ids_arg):load_ids_file(ids_file))
+                    :run_qwen4_decode_hidden_check(model);
             throw std::runtime_error("hidden graph diagnostic requires Qwen4CausalLm");
         }
         if (check_flash_next) {
@@ -1437,6 +1446,9 @@ int run_diagnostics(int argc, char** argv) {
         return 0;
     } catch (const UsageError& error) {
         return print_usage_error(error);
+    } catch (const std::exception& error) {
+        std::cerr << "mfq-diagnostics: " << error.what() << '\n';
+        return 1;
     }
 }
 

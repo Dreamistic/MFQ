@@ -92,8 +92,8 @@ void verify_prefill_graph_execution(const std::filesystem::path& root,bool group
         }
 #endif
         const std::vector<int> token_cases=batch_check?
-            std::vector<int>{1,16,31,64,512,513,1,16}:
-            std::vector<int>{1,16,31,64,512,1,16};
+            std::vector<int>{1,16,31,32,33,64,512,513,1,16}:
+            std::vector<int>{1,16,31,32,33,64,512,1,16};
         for(int tokens:token_cases)for(int step=0;step<3;++step) {
             std::vector<float> values(tokens*2560),weights(tokens*3);
             std::vector<int32_t> ids(tokens*3);

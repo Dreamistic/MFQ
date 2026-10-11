@@ -337,6 +337,81 @@ public:
     }
     ~PrefillMixScope(){set(present_?old_.c_str():"");}
 };
+void prefill_vector_decode_check() {
+    const auto* projection_option=std::getenv("MFQ_GR_PREFILL_TRIAL_MODE");
+    const auto* mix_option=std::getenv("MFQ_GR_PREFILL_TRIAL_MIX");
+    const int projection_mode=projection_option?std::atoi(projection_option):21;
+    const int mix_mode=mix_option?std::atoi(mix_option):6;
+    const auto* baseline_projection_option=std::getenv("MFQ_GR_PREFILL_BASELINE_MODE");
+    const auto* baseline_mix_option=std::getenv("MFQ_GR_PREFILL_BASELINE_MIX");
+    const int baseline_projection=baseline_projection_option?std::atoi(baseline_projection_option):17;
+    const int baseline_mix=baseline_mix_option?std::atoi(baseline_mix_option):3;
+    const auto* rows_option=std::getenv("MFQ_GR_PREFILL_TRIAL_ROWS");
+    const int benchmark_rows=rows_option?std::atoi(rows_option):1024;
+    MFQ_RUNTIME_CHECK(benchmark_rows>0,"GR prefill benchmark rows must be positive");
+    int cases=0;
+    for(int group:{5,24,48,64})for(int packing:{0,1,2})for(auto dtype:{tb::kFloat16,tb::kFloat32})
+    for(const auto shape:std::vector<std::array<int,3>>{{20,77,65},{132,263,129}}) {
+        const int out=shape[0],width=shape[1],rows=shape[2];
+        auto fixture=make_weight(out,width,group,packing==2,packing==1);
+        std::vector<float> values(rows*width);
+        for(size_t i=0;i<values.size();++i)values[i]=std::sin(float(i)*.017f)*.13f;
+        auto x=upload(values,tb::kFloat32,{rows,width}).to(dtype);
+        auto normalized=x.narrow(-1,0,1).expand({rows,out}).contiguous();
+        const auto run=[&](bool candidate,bool mix) {
+            PrefillProjectionScope projection(candidate?projection_mode:baseline_projection);
+            PrefillMixScope fusion(candidate?mix_mode:baseline_mix);
+            return mix?nint_float_projection_mix_cuda(fixture.weight,x,normalized,4):
+                nint_float_projection_cuda(fixture.weight,x);
+        };
+        for(bool mix:{false,true}) {
+            exact(run(true,mix),run(false,mix),"GR vector decoder tails and rounding");++cases;
+            if(group==48) {
+                tb::Tensor result;mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+                PrefillProjectionScope projection(projection_mode);PrefillMixScope fusion(mix_mode);
+                window.capture([&]{result=run(true,mix);},[]{},[&]{result={};});
+                for(int step=0;step<2;++step) {
+                    x.copy_(upload(values,tb::kFloat32,{rows,width}).to(dtype)*(1.0+step*.25));
+                    window.run();exact(result,run(false,mix),"GR vector decoder changing graph");++cases;
+                }
+            }
+        }
+    }
+    std::cout<<"gr_prefill_vector_exact_cases="<<cases<<" PASS"<<std::endl;
+    for(const auto shape:std::vector<std::pair<int,int>>{{320,10240},{10240,320},{4,10240}})
+    for(auto dtype:{tb::kFloat16,tb::kFloat32})for(int packing:{0,1,2}) {
+        const int out=shape.first,width=shape.second,rows=benchmark_rows;
+        auto fixture=make_weight(out,width,48,packing==2,packing==1);
+        std::vector<float> values(rows*width);
+        for(size_t i=0;i<values.size();++i)values[i]=std::sin(float(i)*.017f)*.13f;
+        auto x=upload(values,tb::kFloat32,{rows,width}).to(dtype);
+        auto normalized=tb::full({rows,out},.13,x.options());
+        const bool mix=out>width;
+        tb::Tensor reference;
+        std::vector<float> samples[2];
+        for(int repeat=0;repeat<6;++repeat)for(int order=0;order<2;++order) {
+            const int candidate=order^(repeat&1);
+            PrefillProjectionScope projection(candidate?projection_mode:baseline_projection);PrefillMixScope fusion(candidate?mix_mode:baseline_mix);
+            const auto run=[&]{return mix?nint_float_projection_mix_cuda(fixture.weight,x,normalized,4):
+                nint_float_projection_cuda(fixture.weight,x);};
+            auto output=run();
+            if(!reference.defined())reference=output;
+            exact(output,reference,"GR vector decoder real shape");
+            cudaEvent_t first,last;MFQ_CUDA_CHECK(cudaEventCreate(&first));MFQ_CUDA_CHECK(cudaEventCreate(&last));
+            MFQ_CUDA_CHECK(cudaEventRecord(first,mfq_current_cuda_stream()));
+            for(int n=0;n<4;++n)output=run();
+            MFQ_CUDA_CHECK(cudaEventRecord(last,mfq_current_cuda_stream()));MFQ_CUDA_CHECK(cudaEventSynchronize(last));
+            float ms;MFQ_CUDA_CHECK(cudaEventElapsedTime(&ms,first,last));
+            MFQ_CUDA_CHECK(cudaEventDestroy(first));MFQ_CUDA_CHECK(cudaEventDestroy(last));
+            if(repeat)samples[candidate].push_back(ms/4);
+        }
+        for(auto& sample:samples)std::sort(sample.begin(),sample.end());
+        std::cout<<"gr_prefill_vector_pair out="<<out<<" K="<<width<<" half="<<(dtype==tb::kFloat16)
+            <<" packing="<<packing<<" original_ms="<<samples[0][samples[0].size()/2]
+            <<" candidate_ms="<<samples[1][samples[1].size()/2]<<" output_bits_equal=1"<<std::endl;
+    }
+}
+
 void prefill_projection_check(bool benchmark,bool k_tiles=false,int paired_trial=12,int paired_baseline=6) {
     int cases=0;
     for(int kernel:{-1,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20})for(const auto shape:std::vector<std::array<int,3>>{{17,77,5},{128,263,24},{129,320,48},{65,515,64},{320,77,24},{260,77,5}})
@@ -900,6 +975,11 @@ void complete_two_stage_residual() {
 }
 
 int main(int argc,char** argv) try {
+    if(argc==2 && std::string(argv[1])=="--prefill-vector-check") {
+        auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+        const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
+        prefill_vector_decode_check();mfq_cuda_synchronize();context->end_graph_pool(stream);return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--prefill-mix-k64-check") {prefill_mix_fusion_check(4,3);return 0;}
     if(argc==2 && std::string(argv[1])=="--prefill-mix-k64-compact-check") {prefill_mix_fusion_check(5,3);return 0;}
     if(argc==2 && std::string(argv[1])=="--prefill-mix-m256-check") {prefill_mix_fusion_check(3);return 0;}

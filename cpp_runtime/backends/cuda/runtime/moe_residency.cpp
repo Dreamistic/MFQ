@@ -244,6 +244,9 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
     for(const auto& bundle:cache->pipeline_bundles_) {
         const auto& source=cache->sources_.at(bundle[0]);s.heat.emplace_back(std::size_t(source->n_experts()),0.0f);
         s.observations.emplace_back(std::size_t(source->n_experts()),0.0f);
+        // Two row views of combined predictor Gate/Up must never schedule
+        // exchanges of the same compressed source twice.
+        if(bundle[0]==bundle[1])continue;
         for(int id:bundle)if(cache->sources_.at(id)->layer_id_!=source->layer_id_ ||
                 cache->sources_.at(id)->n_experts()!=source->n_experts())
             throw std::invalid_argument("adaptive expert bundle geometry differs");
@@ -261,6 +264,7 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
         std::map<std::pair<MoeGpuArena*,int>,std::vector<Expert>> groups;
         for(std::size_t b=0;b<cache->pipeline_bundles_.size();++b) {
             const auto& bundle=cache->pipeline_bundles_[b];
+            if(bundle[0]==bundle[1])continue;
             for(int e=0;e<cache->sources_[bundle[0]]->n_experts();++e)for(int p=0;p<3;++p) {
                 const auto& source=*cache->sources_[bundle[p]];
                 // Field-major prefill images keep each source's slot count
@@ -274,6 +278,7 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
         std::map<std::array<std::uintptr_t,4>,std::vector<Expert>> groups;
         for(std::size_t b=0;b<cache->pipeline_bundles_.size();++b) {
             const auto& bundle=cache->pipeline_bundles_[b];
+            if(bundle[0]==bundle[1])continue;
             for(int e=0;e<cache->sources_[bundle[0]]->n_experts();++e) {
                 std::array<std::uintptr_t,4> signature{};
                 signature[3]=cache->pipeline_prefill_layer_layout_?b+1:0;

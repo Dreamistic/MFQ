@@ -863,14 +863,39 @@ def test_qwen_native_complete_graph(tmp_path,interval,ple,silu_gate,independent)
 
 
 @pytest.mark.parametrize("interval,ple",[(1,False),(2,True),(3,True)])
-def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interval,ple):
+@pytest.mark.parametrize("quantized_gr",[False,True,"shared-q8","shared-nint","shared-up"])
+def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interval,ple,quantized_gr):
     from mfq.formats.nint import NintSpec
     from mfq.formats.mfe import MfePool,MfeTensor
     from mfq.quantize.nint_quant import quantize
     bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
     if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
     config,weights=qwen_model_fixture(interval,True,ple)
+    if isinstance(quantized_gr,str):
+        from mfq.formats.io import BFloat16Array
+        config["text_config"]["hc_lowrank"]=16
+        stream_repeat=2 if quantized_gr=="shared-up" else 1
+        if stream_repeat==2:config["text_config"]["hc_count"]=4
+        for name,value in list(weights.items()):
+            if ".mhc." not in name:continue
+            if name.endswith(".down.weight"):weights[name]=np.tile(value,(4,stream_repeat))/2
+            elif name.endswith(".up.weight"):weights[name]=np.tile(value,(stream_repeat,4))/2
+            elif name.endswith(".inject.weight"):
+                value=np.tile(value,(stream_repeat,stream_repeat))
+                weights[name]=(np.ascontiguousarray(value).view(np.uint32)>>16).astype(np.uint16).view(BFloat16Array) if quantized_gr=="shared-q8" else value
+            elif name.endswith(".norm.weight"):weights[name]=np.tile(value,stream_repeat)
+        if stream_repeat==2:
+            for name,value in list(weights.items()):
+                if ".position_embedding." not in name:continue
+                if name.endswith(".key.weight"):weights[name]=np.tile(value,(2,1))
+                elif name.endswith((".key_norm.weight",".query_norm.weight",".conv_norm.weight")):
+                    weights[name]=np.tile(value,2)
+                elif name.endswith(".conv.weight"):weights[name]=np.tile(value,(2,1,1))
     for name,value in list(weights.items()):
+        if quantized_gr and ".mhc." in name and name.endswith((".down.weight",".up.weight",".inject.weight")):
+            if quantized_gr=="shared-q8" and name.endswith(".inject.weight"):continue
+            weights[name]=quantize(value,NintSpec(8,32 if isinstance(quantized_gr,str) else 8,6))
+            continue
         if name.endswith(".experts.gate_up.weight"):
             for role,matrix in zip(("gate","up"),np.split(value,2,axis=1)):
                 weights[name.replace("gate_up",role)]=matrix.copy()
@@ -888,6 +913,7 @@ def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interva
     write_qwen_fixture(path,config,weights)
     env={**os.environ,"MFQ_MOE_PIPELINE":"1","MFQ_MOE_ROUTER_LOOKAHEAD":"0",
         "MFQ_DISABLE_MOE_SSD_RANGES":"0","MFQ_MOE_PREFILL_LAYER":"0",
+        "MFQ_MOE_PREFILL_GRAPH":"0",
         "MFQ_MOE_PRELOAD_ALL":"1","MFQ_MOE_TWO_STAGE_FFN":"1",
         "MFQ_MOE_HOST_CACHE_BYTES":"1048576"}
     process=subprocess.run([str(diagnostics_binary(bridge)),"--model",str(path),
@@ -895,6 +921,7 @@ def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interva
         text=True,capture_output=True,timeout=90,env=env)
     assert process.returncode==0,process.stdout+process.stderr
     assert "qwen4_decode_hidden_check PASS graph_steps=18 retained_steps=20" in process.stdout
+    assert "qwen4_mtp_graph_check PASS transactions=20" in process.stdout
 
 
 @pytest.mark.parametrize("error",["schedule","rotary","ple","linear_width","pool","norm","topk","mtp"])
@@ -910,6 +937,51 @@ def test_qwen_native_rejects_inconsistent_config(tmp_path,error):
     elif error=="mtp":c.update(mtp_num_hidden_layers=2,mtp={"num_hidden_layers":1})
     path=tmp_path/"invalid-qwen.mfq";write_qwen_fixture(path,config,w)
     result=run_glm_fixture(path);assert result.returncode!=0 and "flash_next_check " not in result.stdout
+
+
+@pytest.mark.parametrize("graph_enabled",[False,True])
+@pytest.mark.parametrize("layout",["separate","combined-hot","combined-gpu","combined-cpu",
+    "combined-e8-hot","combined-e8-gpu","combined-e8-cpu"])
+def test_qwen_mtp_graph_quantized_predictor(tmp_path,graph_enabled,layout):
+    from mfq.formats.nint import NintSpec
+    from mfq.formats.mfe import MfePool,MfeTensor
+    from mfq.quantize.nint_quant import quantize
+    bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
+    if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
+    config,weights=mtp_fixture("qwen",1)
+    combined_predictor=layout!="separate"
+    for name,value in list(weights.items()):
+        if name.endswith(".experts.gate_up.weight") and not (combined_predictor and name.startswith("predictor.")):
+            for role,matrix in zip(("gate","up"),np.split(value,2,axis=1)):
+                weights[name.replace("gate_up",role)]=matrix.copy()
+            del weights[name]
+    for name,value in list(weights.items()):
+        if ".experts." in name:
+            experts,output,width=value.shape
+            if name.startswith("predictor.") and "-e8-" in layout:
+                from tests.mixed_family_fixtures import make_flat_family
+                packed=make_flat_family("NVQ2J-L",rows=experts*output,neuron_len=width,seed=711)
+            else:
+                packed=quantize(value.reshape(experts*output,width),NintSpec(4,8,6))
+            weights[name]=MfeTensor(value.shape,(MfePool(np.arange(experts,dtype=np.int32),packed),))
+        elif ".mhc." in name and name.endswith((".down.weight",".up.weight",".inject.weight")):
+            weights[name]=quantize(value,NintSpec(8,8,6))
+        elif ".ngram.shard." in name or (".shared_expert." in name and not name.endswith(".router.weight")):
+            weights[name]=quantize(value,NintSpec(4,8,6))
+    path=tmp_path/"qwen-mtp-graph.mfq";write_qwen_fixture(path,config,weights,True)
+    env={**os.environ,"MFQ_MOE_PIPELINE":"1","MFQ_MOE_ROUTER_LOOKAHEAD":"0",
+        "MFQ_DISABLE_MOE_SSD_RANGES":"0","MFQ_MOE_PREFILL_LAYER":"0",
+        "MFQ_MOE_PRELOAD_ALL":"1","MFQ_MOE_TWO_STAGE_FFN":"1",
+        "MFQ_MOE_HOST_CACHE_BYTES":"1048576","MFQ_MOE_PREFILL_GRAPH":"0",
+        "MFQ_MOE_RAM_PCIE":"1","MFQ_MOE_RAM_PCIE_FRACTION":"0" if layout.endswith("-cpu") else "1",
+        "MFQ_MTP_PREDICTOR_GRAPH":str(int(graph_enabled))}
+    process=subprocess.run([str(diagnostics_binary(bridge)),"--model",str(path),
+        "--ctx-size","32","--moe-gpu-cache-gb","0.00001" if layout.endswith(("-gpu","-cpu")) else "0.01","--check-flash-next-mtp"],
+        text=True,capture_output=True,timeout=90,env=env)
+    assert process.returncode==0,process.stdout+process.stderr
+    raw=json.loads(next(line.removeprefix("flash_next_mtp_check ") for line in process.stdout.splitlines()
+        if line.startswith("flash_next_mtp_check ")))
+    assert bool(raw["predictor_graph_replays"])==graph_enabled
 
 
 def test_qwen_native_disabled_predictor_retains_source_config(tmp_path):

@@ -1023,8 +1023,9 @@ int verify_active_nvq(const std::filesystem::path& root) {
 }
 int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cache=false,bool comparison=false,
         bool compare_input_views=false,bool compare_default_math=false,bool compare_e8_narrow=false,
-        bool compare_resident_overlap=false,bool compare_dense=false,bool compare_nint_whole=false) {
-    const bool compare_math=compare_default_math || compare_e8_narrow || compare_resident_overlap || compare_dense || compare_nint_whole;
+        bool compare_resident_overlap=false,bool compare_dense=false,bool compare_nint_whole=false,
+        bool compare_token_groups=false) {
+    const bool compare_math=compare_default_math || compare_e8_narrow || compare_resident_overlap || compare_dense || compare_nint_whole || compare_token_groups;
     struct MathEnvironment {
         const char* option;
         bool enabled;
@@ -1041,7 +1042,7 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
         }
         void select(bool candidate)const {if(enabled)set(candidate?"1":"0");}
         ~MathEnvironment(){if(enabled)set(previous.c_str());}
-    } math_environment(compare_math,compare_nint_whole?"MFQ_MFE_NINT_WHOLE":compare_dense?"MFQ_MOE_NVQ_DENSE":compare_resident_overlap?"MFQ_MFE_RESIDENT_PLAN_OVERLAP":
+    } math_environment(compare_math,compare_token_groups?"MFQ_MFE_TOKEN_GROUPS":compare_nint_whole?"MFQ_MFE_NINT_WHOLE":compare_dense?"MFQ_MOE_NVQ_DENSE":compare_resident_overlap?"MFQ_MFE_RESIDENT_PLAN_OVERLAP":
         compare_e8_narrow?"MFQ_MFE_E8_NARROW":"MFQ_MFE_DEFAULT_MATH");
     struct RestoreEnvironment {
         std::string previous;
@@ -1084,7 +1085,7 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
     const std::array<MfqCudaStream,2> streams={mfq_get_stream_from_pool(),mfq_get_current_cuda_stream()};
     int cases=0;std::int64_t cpu=0,transfers=0,resident=0,mapped_serves=0,mapped_bytes=0,mapped_overlaps=0,phased_serves=0,dense_conversions=0;
     for(bool graph:{false,true})for(auto gate_type:{tb::kFloat16,tb::kBFloat16,tb::kFloat32})
-    for(int tokens:{1,3,6})for(int routes:{3,10}) {
+    for(int tokens:compare_token_groups?std::vector<int>{2,3,4,5,6,8,16,32}:std::vector<int>{1,3,6})for(int routes:{3,10}) {
         std::array<CudaExecutionContext,2> executions;
         std::array<std::shared_ptr<MoeExpertCache>,2> caches;
         std::array<std::array<std::shared_ptr<MoeQuantRangeSource>,3>,2> sources;
@@ -1102,6 +1103,7 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
             if(compare_dense || compare_nint_whole)math_environment.select(mode==1);
             MfqCudaStreamGuard stream_guard(streams[mode]);
             auto& config=executions[mode].config;
+            executions[mode].continuous_batch_cache_serial=compare_token_groups && tokens>8;
             config.moe_two_stage_ffn=mode==1 || compare_input_views || compare_math;
             config.moe_ram_pcie_fraction=transfer_cache && !comparison?1.0:.5;
             if(comparison)config.moe_residency_adapt=false;
@@ -1722,12 +1724,18 @@ void verify_router_lookahead_inputs() {
 #include "prefill_pipeline_test.h"
 #include "compact_prefill_mma_test.h"
 #include "nvq_prefill_k_tile_test.h"
+#include "mfe_token_group_test.h"
 int main(int argc,char** argv)try {
     std::cout.setf(std::ios::unitbuf);
     if(argc!=2 && argc!=3)throw std::runtime_error("expected real-shape range fixture directory");
     const std::filesystem::path root(argv[1]);
     auto cuda_context=mfq::cuda::default_context(mfq_current_cuda_device());
     if(argc==3) {
+        if(std::string(argv[2])=="--mfe-token-group-check") {verify_mfe_token_groups(root);return 0;}
+        if(std::string(argv[2])=="--mfe-token-group-pipeline-check") {
+            for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,false,false,true);
+            return 0;
+        }
         if(std::string(argv[2])=="--nvq-prefill-k-tile-check") {verify_nvq_prefill_k_tiles(root);return 0;}
         if(std::string(argv[2])=="--nvq-prefill-cohort-default-check") {verify_nvq_prefill_k_tiles(root,true,true);return 0;}
         if(std::string(argv[2])=="--nvq-prefill-cohort-check") {verify_nvq_prefill_k_tiles(root,true);return 0;}

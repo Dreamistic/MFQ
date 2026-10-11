@@ -9,15 +9,17 @@ bool gr_prefill_selected(const mfq_tensor_backend::Tensor& input) {
         input.numel()/input.size(-1)>=32;
 }
 
-template<class Input,bool AlignedQ8,bool Zero,int BM=64,int RegisterN=4,int BK=32,int RegisterM=2,bool CompactK=false>
-__global__ __launch_bounds__(BM*32/(RegisterN*RegisterM),1) void gr_prefill_matmul_kernel(const Input* input,
+template<class Input,bool AlignedQ8,bool Zero,int BM=64,int RegisterN=4,int BK=32,int RegisterM=2,bool CompactK=false,bool VectorDecode=false,bool TransposeWeight=false,int TileN=32>
+__global__ __launch_bounds__(BM*TileN/(RegisterN*RegisterM),1) void gr_prefill_matmul_kernel(const Input* input,
         const uint8_t* packed,const uint8_t* row_bits,const int64_t* row_offsets,
         const uint8_t* scales,const uint8_t* minima,const float* row_scales,
         const float* row_minima,const __half* zero_scales,float* output,
         int rows,int width,int outputs,int groups,int gs) {
-    constexpr int BN=32,Pad=BK+1,Threads=BM*32/(RegisterN*RegisterM),Columns=BN/RegisterN;
+    constexpr int BN=TileN,Pad=BK+1,Threads=BM*BN/(RegisterN*RegisterM),Columns=BN/RegisterN;
     static_assert(BK%4==0,"GR K tile must preserve the four FP32 accumulator streams");
-    __shared__ float a[BM][Pad],w[BN][Pad];
+    __shared__ float a[BM][Pad];
+    union WeightTile {float row[BN][Pad];float col[BK][BN];};
+    __shared__ __align__(16) WeightTile w;
     const int tid=threadIdx.x,m=tid/Columns,n=(tid%Columns)*RegisterN;
     const int row0=int(blockIdx.y)*BM,out0=int(blockIdx.x)*BN;
     float acc[RegisterM][RegisterN][4]{};
@@ -26,7 +28,20 @@ __global__ __launch_bounds__(BM*32/(RegisterN*RegisterM),1) void gr_prefill_matm
             const int r=i/BK,c=i%BK;
             a[r][c]=row0+r<rows && k0+c<width ? float(input[(int64_t(row0+r)*width)+k0+c]) : 0;
         }
-        for(int i=tid;i<BN*BK;i+=Threads) {
+        if constexpr(VectorDecode) {
+            for(int i=tid;i<BN*(BK/4);i+=Threads) {
+                const int r=i/(BK/4),c=(i%(BK/4))*4,neuron=out0+r;
+                float values[4]{};
+                if(neuron<outputs && k0+c<width)gr_prefill_decode_four<AlignedQ8,Zero>(
+                    values,packed,row_bits,row_offsets,scales,minima,row_scales,row_minima,zero_scales,
+                    neuron,k0+c,width,groups,gs);
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    if constexpr(TransposeWeight)w.col[c+j][r]=values[j];
+                    else w.row[TileN>32?r^(r>>5):r][c+j]=values[j];
+                }
+            }
+        } else for(int i=tid;i<BN*BK;i+=Threads) {
             const int r=i/BK,c=i%BK,neuron=out0+r,column=k0+c;
             float value=0;
             if(neuron<outputs && column<width) {
@@ -46,10 +61,26 @@ __global__ __launch_bounds__(BM*32/(RegisterN*RegisterM),1) void gr_prefill_matm
                 }
                 value=__fsub_rn(__fmul_rn(scale,q),minimum);
             }
-            w[r][c]=value;
+            w.row[TileN>32?r^(r>>5):r][c]=value;
         }
         __syncthreads();
-        if constexpr(CompactK) {
+        if constexpr(TransposeWeight) {
+            #pragma unroll
+            for(int k=0;k<BK;++k) {
+                float weight[RegisterN];
+                #pragma unroll
+                for(int j=0;j<RegisterN;j+=4) {
+                    const float4 value=*reinterpret_cast<const float4*>(&w.col[k][n+j]);
+                    weight[j]=value.x;weight[j+1]=value.y;weight[j+2]=value.z;weight[j+3]=value.w;
+                }
+                #pragma unroll
+                for(int r=0;r<RegisterM;++r) {
+                    const float x=a[m+r*(BM/RegisterM)][k];
+                    #pragma unroll
+                    for(int j=0;j<RegisterN;++j)acc[r][j][k&3]=fmaf(x,weight[j],acc[r][j][k&3]);
+                }
+            }
+        } else if constexpr(CompactK) {
         // Explicit constant accumulator slots keep the arrays in registers;
         // only four K positions are live rather than the entire shared tile.
         #pragma unroll 1
@@ -61,7 +92,7 @@ __global__ __launch_bounds__(BM*32/(RegisterN*RegisterM),1) void gr_prefill_matm
                     const float x=a[m+r*(BM/RegisterM)][kb+slot];
                     #pragma unroll
                     for(int j=0;j<RegisterN;++j)
-                        acc[r][j][slot]=fmaf(x,w[n+j][kb+slot],acc[r][j][slot]);
+                        acc[r][j][slot]=fmaf(x,w.row[TileN>32?(n+j)^((n+j)>>5):n+j][kb+slot],acc[r][j][slot]);
                 }
             }
         }
@@ -72,7 +103,7 @@ __global__ __launch_bounds__(BM*32/(RegisterN*RegisterM),1) void gr_prefill_matm
             for(int r=0;r<RegisterM;++r) {
                 const float x=a[m+r*(BM/RegisterM)][k];
                 #pragma unroll
-                for(int j=0;j<RegisterN;++j)acc[r][j][k&3]=fmaf(x,w[n+j][k],acc[r][j][k&3]);
+                for(int j=0;j<RegisterN;++j)acc[r][j][k&3]=fmaf(x,w.row[TileN>32?(n+j)^((n+j)>>5):n+j][k],acc[r][j][k&3]);
             }
         }
         }
@@ -97,13 +128,28 @@ mfq_tensor_backend::Tensor gr_prefill_matmul(const NintWeight& weight,
         weight.ng==(weight.neuron_len+weight.gs-1)/weight.gs,
         "GR prefill projection geometry mismatch");
     const auto rows=x.numel()/weight.neuron_len;
+    const auto* trace_geometry=std::getenv("MFQ_GR_PREFILL_GEOMETRY_TRACE");
+    if(trace_geometry && trace_geometry[0]=='1') {
+        thread_local std::map<std::array<int64_t,5>,bool> seen;
+        const std::array<int64_t,5> shape={weight.out,weight.neuron_len,weight.gs,int64_t(x.scalar_type()==tb::kFloat16),int64_t(weight.q8_zero)};
+        if(seen.emplace(shape,true).second)std::fprintf(stderr,
+            "gr_prefill_geometry rows=%lld outputs=%lld width=%lld gs=%lld half=%d zero=%d\n",
+            (long long)rows,(long long)weight.out,(long long)weight.neuron_len,(long long)weight.gs,
+            int(x.scalar_type()==tb::kFloat16),int(weight.q8_zero));
+    }
     MFQ_RUNTIME_CHECK(rows<=65535*16,"GR prefill projection exceeds CUDA grid geometry");
     MfqCudaGuard guard(input.device());
     const auto* option=std::getenv("MFQ_GR_PREFILL_MATMUL");
     int major=0;
     const bool requested_tf32=option && std::atoi(option)==2;
     const bool requested_half2=option && std::atoi(option)==3;
-    int mode=option?std::atoi(option):17;
+    int mode=option?std::atoi(option):31;
+    const bool wide_contraction=mode==24 && weight.out<weight.neuron_len && rows>=128;
+    const bool transpose_weight=mode==22 || mode==23;
+    const bool fewer_registers=mode==23;
+    const bool pipeline_mode=mode==27 || mode==29 || mode==31;
+    const bool vector_decode=mode==21 || mode==24 || pipeline_mode || transpose_weight;
+    if(vector_decode)mode=17;
     const bool compact_k=mode==19 || mode==20;
     if(compact_k)mode=mode==19?6:17;
     if(mode==16 || mode==17 || mode==18) {
@@ -121,8 +167,11 @@ mfq_tensor_backend::Tensor gr_prefill_matmul(const NintWeight& weight,
     auto output=tb::empty(shape,input.options().dtype(tb::kFloat32));
     const auto typed=[&](auto tag,auto aligned_tag,auto zero_tag) {
         using Input=decltype(tag);constexpr bool aligned=decltype(aligned_tag)::value,zero=decltype(zero_tag)::value;
-        const auto launch_kernel=[&](auto kernel,int tile_m,int threads) {
-        kernel<<<dim3(unsigned((weight.out+31)/32),unsigned((rows+tile_m-1)/tile_m)),threads,0,mfq_current_cuda_stream()>>>(
+        if(pipeline_mode && rows>=128 && gr_prefill_pipeline_supported(x)) {
+            launch_gr_prefill_pipeline<false,Input,float,aligned,zero>(weight,x,{},output);return;
+        }
+        const auto launch_kernel=[&](auto kernel,int tile_m,int threads,int tile_n=32) {
+        kernel<<<dim3(unsigned((weight.out+tile_n-1)/tile_n),unsigned((rows+tile_m-1)/tile_m)),threads,0,mfq_current_cuda_stream()>>>(
             x.data_ptr<Input>(),weight.q_packed.data_ptr<uint8_t>(),
             zero?nullptr:weight.row_q_bits.data_ptr<uint8_t>(),zero?nullptr:weight.row_q_bit_offsets.data_ptr<int64_t>(),
             zero?nullptr:weight.sub_scale.data_ptr<uint8_t>(),zero?nullptr:weight.sub_min.data_ptr<uint8_t>(),
@@ -130,6 +179,22 @@ mfq_tensor_backend::Tensor gr_prefill_matmul(const NintWeight& weight,
             zero?weight.q8_zero_scale.data_ptr<__half>():nullptr,output.data_ptr<float>(),int(rows),
             int(weight.neuron_len),int(weight.out),int(weight.ng),int(weight.gs));
         };
+        if(transpose_weight) {
+            if(fewer_registers)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,4,32,2,false,true,true>,128,512);
+            else if(mode==14)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,4,32,4,false,true,true>,256,512);
+            else if(mode==11)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,4,64,2,false,true,true>,128,512);
+            else if(mode==9)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,8,32,2,false,true,true>,256,512);
+            else launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,64,4,32,2,false,true,true>,64,256);
+            return;
+        }
+        if(vector_decode) {
+            if(wide_contraction)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,8,32,2,false,true,false,64>,128,512,64);
+            else if(mode==14)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,4,32,4,false,true>,256,512);
+            else if(mode==11)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,4,64,2,false,true>,128,512);
+            else if(mode==9)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,8,32,2,false,true>,256,512);
+            else launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,64,4,32,2,false,true>,64,256);
+            return;
+        }
         if(compact_k) {
             if(mode==14)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,256,4,32,4,true>,256,512);
             else if(mode==11)launch_kernel(gr_prefill_matmul_kernel<Input,aligned,zero,128,4,64,2,true>,128,512);

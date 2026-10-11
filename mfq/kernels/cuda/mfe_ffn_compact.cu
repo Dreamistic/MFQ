@@ -40,6 +40,45 @@ void down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
         kernel<<<dim3((b.output_width+1)/2,b.tokens),dim3(32,warps),0,stream>>>(b,partition);
     }
 }
+
+// Unshared routes keep the same inlined compact decoder and register budget
+// as ordinary decode. Only their row index comes from the token-group plan.
+template<uint32_t Formats,int Rows>
+__global__ void __launch_bounds__(128,8) token_single_down(MfeFfnBatch b,int partition) {
+    const int group=token_group_index<1>(b,blockIdx.y);
+    if(group<0 || b.token_group_counts[group]!=1)return;
+    const int slot=b.token_group_slots[group*8];
+    const int all_routes=b.routes+int(b.shared!=nullptr),route=slot%all_routes;
+    const bool shared=route==b.routes;
+    const int expert=shared?0:b.ids[(slot/all_routes)*b.routes+route];
+    const int kind=shared?1:route_kind(b,expert);
+    if(kind<=0 || (partition && kind!=partition))return;
+    const int first=(blockIdx.x*blockDim.y+threadIdx.y)*Rows;
+    if(first>=b.output_width)return;
+    int local;const auto* d=projection(b,2,expert,shared,local,b.plan_ready && kind==2);
+    __half values[Rows];
+    if constexpr(Rows==4)project_quad<true,Formats,true>(d,local,first,
+        b.hidden_quantized+int64_t(slot)*b.quantized_stride,b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum);
+    else project_pair<true,Formats,true>(d,local,first,
+        b.hidden_quantized+int64_t(slot)*b.quantized_stride,b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum);
+#pragma unroll
+    for(int r=0;r<Rows;++r)if(threadIdx.x==r && first+r<b.output_width)
+        b.resident_pairs[int64_t(slot)*b.output_width+first+r]=values[r];
+}
+template<uint32_t Formats>
+void single_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
+    partition|=16;
+    if(b.plan_ready && b.resident_plan_overlap && enabled("MFQ_MFE_EARLY_GU"))partition|=8;
+    mfe_ffn_parallel_gate_up_kernel<2,true,Formats,true,false,true>
+        <<<dim3((width+7)/8,b.token_groups),dim3(32,8),0,stream>>>(b,partition);
+}
+template<uint32_t Formats>
+void single_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
+    if(b.shared)token_single_down<Formats,4>
+        <<<dim3((b.output_width+15)/16,b.token_groups),dim3(32,4),0,stream>>>(b,partition);
+    else token_single_down<Formats,2>
+        <<<dim3((b.output_width+7)/8,b.token_groups),dim3(32,4),0,stream>>>(b,partition);
+}
 }
 bool mfe_ffn_compact_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
     if(!launch_contract(b,false))return false;
@@ -51,6 +90,18 @@ bool mfe_ffn_compact_down(const MfeFfnBatch& b,int partition,cudaStream_t stream
     if(!launch_contract(b,true))return false;
     if(!(b.nvq_format_mask&~0x3f820u))down<0x3f820u>(b,partition,stream);
     else down<0x3f922u>(b,partition,stream);
+    return true;
+}
+bool mfe_ffn_compact_token_single_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
+    if(!launch_contract(b,false))return false;
+    if(!(b.nvq_format_mask&~0x3f820u))single_gate_up<0x3f820u>(b,partition,width,stream);
+    else single_gate_up<0x3f922u>(b,partition,width,stream);
+    return true;
+}
+bool mfe_ffn_compact_token_single_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
+    if(!launch_contract(b,true))return false;
+    if(!(b.nvq_format_mask&~0x3f820u))single_down<0x3f820u>(b,partition,stream);
+    else single_down<0x3f922u>(b,partition,stream);
     return true;
 }
 }

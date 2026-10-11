@@ -376,12 +376,21 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
     const char* columns_env = std::getenv("MFQ_GDN_PREFILL_COLUMNS");
     const int columns = columns_env ? std::atoi(columns_env) : (B * Hv >= 16 ? 4 : 0);
     if (use_warp && !kda && D == 128 && T > 8 && (columns == 2 || columns == 4)) {
+        const auto* decay_option=std::getenv("MFQ_GDN_PREFILL_PREPARED_DECAY");
+        const bool prepared_decay=T>=128 && (!decay_option || std::atoi(decay_option)!=0);
+        mfq_tensor_backend::Tensor decay;
+        if(prepared_decay) {
+            decay=mfq_tensor_backend::empty(g.sizes(),opts);
+            gdn_prefill_prepare_decay_kernel<<<unsigned((g.numel()+255)/256),256,0,stream>>>(
+                gd,decay.data_ptr<float>(),g.numel());
+            gd=decay.data_ptr<float>();
+        }
         if (transposed_state) {
-            if (tiled_heads) launch_gdn_prefill_columns<true,true>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream);
-            else launch_gdn_prefill_columns<true,false>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream);
+            if (tiled_heads) launch_gdn_prefill_columns<true,true>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,prepared_decay);
+            else launch_gdn_prefill_columns<true,false>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,prepared_decay);
         } else {
-            if (tiled_heads) launch_gdn_prefill_columns<false,true>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream);
-            else launch_gdn_prefill_columns<false,false>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream);
+            if (tiled_heads) launch_gdn_prefill_columns<false,true>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,prepared_decay);
+            else launch_gdn_prefill_columns<false,false>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream,prepared_decay);
         }
     } else if (use_warp) {
         if (tiled_heads) { DISPATCH_GDN_WARP(true); }

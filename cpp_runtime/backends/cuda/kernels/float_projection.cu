@@ -8,8 +8,12 @@
 #include <mutex>
 #include <type_traits>
 #include <cstdlib>
+#include <array>
+#include <cstdio>
 #include "gr_prefill_tf32.cuh"
 #include "gr_prefill_half2.cuh"
+#include "gr_prefill_decode.cuh"
+#include "gr_prefill_pipeline.cuh"
 #include "gr_prefill_matmul.cuh"
 #include "gr_prefill_mix.cuh"
 

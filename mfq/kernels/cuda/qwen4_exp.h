@@ -7,6 +7,8 @@
 
 namespace mfq_qwen4_exp {
 using mfq_tensor_backend::Tensor;
+void fill_decode_positions(const Tensor& cache_positions, const Tensor& positions,
+    int64_t start, int64_t delta=0);
 
 Tensor grouped_rms_norm(const Tensor&, const Tensor&, int64_t group_size, double eps);
 Tensor gated_residual_bottleneck(const Tensor&, int64_t streams);

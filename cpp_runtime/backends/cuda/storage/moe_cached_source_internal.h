@@ -24,6 +24,14 @@ struct MoeCachedCohort {
 class MoeCachedSource {
 public:
     bool pipeline_enabled() const { return cache_->config_.moe_pipeline; }
+    bool two_stage_compatible() const {
+        return std::all_of(cohorts_.begin(),cohorts_.end(),[](const auto& cohort) {
+            const auto& p=*cohort.cpu;
+            if(p.family==MixedMoeFamily::Nint)return p.nint.gs>0 && p.nint.gs<=64;
+            return p.family==MixedMoeFamily::Nvq && p.nvq.gs==24 &&
+                p.nvq.kernel_format>=1 && p.nvq.kernel_format<=17;
+        });
+    }
     MoeCachedSource(
             MoeExpertCache * cache,
             int id,

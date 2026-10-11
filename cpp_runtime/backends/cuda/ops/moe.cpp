@@ -507,7 +507,10 @@ static void initialize_mixed_nint_dispatch(MixedMoeRuntime& runtime) {
 
 void initialize_mixed_nvq_dispatch(
         MixedMoeRuntime & runtime,
-        const CudaExecutionConfig& config,bool dense_prefill) {
+        const CudaExecutionConfig& config,bool dense_prefill,
+        const std::vector<std::vector<int32_t>>* expert_local_host) {
+    if(expert_local_host && expert_local_host->size()!=runtime.pools.size())
+        throw std::invalid_argument("mixed NVQ host-map pool count mismatch");
     std::unordered_map<const void*,mfq_tensor_backend::Tensor> integer_books;
     for(auto& pool:runtime.pools)if(pool.family==MixedMoeFamily::Nvq) {
         auto& w=pool.nvq;
@@ -555,7 +558,8 @@ void initialize_mixed_nvq_dispatch(
     MixedNvqF16FormatGroup f16_format_group =
         MixedNvqF16FormatGroup::All;
     bool first_nvq_format = true;
-    for (const auto & pool : runtime.pools) {
+    for (std::size_t pool_index=0;pool_index<runtime.pools.size();++pool_index) {
+        const auto& pool=runtime.pools[pool_index];
         if (pool.family != MixedMoeFamily::Nvq) continue;
         const auto & weight = pool.nvq;
         map_ptrs.push_back(static_cast<int64_t>(reinterpret_cast<uintptr_t>(pool.expert_local.data_ptr<int32_t>())));
@@ -614,10 +618,17 @@ void initialize_mixed_nvq_dispatch(
         pool_params.push_back(static_cast<int32_t>(weight.sign_mode));
         pool_params.push_back(format);
 
-        auto local_host = pool.expert_local
-            .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt32)
-            .contiguous();
-        const int32_t * local = local_host.data_ptr<int32_t>();
+        mfq_tensor_backend::Tensor local_host;
+        const int32_t* local=nullptr;
+        if(expert_local_host) {
+            const auto& host=expert_local_host->at(pool_index);
+            if(host.size()!=std::size_t(runtime.n_experts))
+                throw std::invalid_argument("mixed NVQ host-map expert count mismatch");
+            local=host.data();
+        } else {
+            local_host=pool.expert_local.to(mfq_tensor_backend::kCPU,mfq_tensor_backend::kInt32).contiguous();
+            local=local_host.data_ptr<int32_t>();
+        }
         for (int expert = 0; expert < runtime.n_experts; ++expert) {
             if (local[expert] < 0) continue;
             if (local[expert] >= pool.local_experts ||
