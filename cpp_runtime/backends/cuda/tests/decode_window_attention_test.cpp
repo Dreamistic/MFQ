@@ -115,10 +115,16 @@ void qsa_case(int width,int heads,int maximum,int budget=8) {
     auto history=tb::arange(6,inputs.options().dtype(tb::kInt64));
     actual.forward(execution,inputs.narrow(1,0,6),history,history,true);
     oracle.forward(execution,inputs.narrow(1,0,6),history,history,true);
-    actual.prepare_graph(history);
+    int64_t capacity=std::min(maximum,16);
+    actual.prepare_graph(history,capacity);
     std::map<int,std::unique_ptr<Cell>> cells;
     for(int t:{1,3,8,1,3,1,8,1,3,3,1}) {
         const auto pos=actual.position();if(pos+t>maximum)continue;
+        if(pos+t>capacity) {
+            cells.clear();actual.leave_graph();
+            capacity=std::min(maximum,int(capacity*2));
+            actual.prepare_graph(history,capacity);
+        }
         auto positions=tb::arange(pos,pos+t,history.options());
         auto& cell=cells[t];if(!cell)cell=std::make_unique<Cell>(t,hidden);
         cell->x.copy_(inputs.narrow(1,pos,t));cell->pos.copy_(positions);

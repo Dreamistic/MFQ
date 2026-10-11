@@ -546,18 +546,20 @@ class Qsa {
         index_.reset();
         graph_keys_={};graph_values_={};graph_pooled_={};
     }
-    void prepare_graph(const Tensor& full_positions) {
+    void prepare_graph(const Tensor& full_positions, int64_t capacity = 0) {
         MFQ_RUNTIME_CHECK(!offload_, "streamed QSA KV requires host-controlled block transfers");
         if(graph_keys_.defined())return;
         MFQ_RUNTIME_CHECK(position()>0 && keys_.storage().size(0)==1,
             "QSA graph requires a prefilled single sequence");
         const auto n=position();
-        graph_keys_=tb::zeros({1,c_.kv_heads,c_.maximum,c_.width},keys_.storage().options());
+        if(!capacity)capacity=c_.maximum;
+        MFQ_RUNTIME_CHECK(capacity>=n && capacity<=c_.maximum,"invalid QSA graph capacity");
+        graph_keys_=tb::zeros({1,c_.kv_heads,capacity,c_.width},keys_.storage().options());
         graph_values_=tb::zeros_like(graph_keys_);
         graph_keys_.narrow(2,0,n).copy_(keys_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
         graph_values_.narrow(2,0,n).copy_(values_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
-        index_.prepare_fixed();
-        graph_pooled_=tb::zeros({1,(c_.maximum+c_.pool-1)/c_.pool,c_.index_width},index_.storage().options());
+        index_.prepare_fixed(capacity);
+        graph_pooled_=tb::zeros({1,(capacity+c_.pool-1)/c_.pool,c_.index_width},index_.storage().options());
         const auto pools=n/c_.pool;
         if(pools) {
             auto pooled=index_.storage().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());

@@ -605,6 +605,7 @@ struct Qwen4DecodeGraph {
     MfqCudaStream stream,ple_stream;
     std::map<std::pair<int,int>,std::unique_ptr<Cell>> cells;
     std::vector<qwen4_exp::Qsa*> qsa;
+    int64_t kv_capacity=0;
     bool failed=false;
     explicit Qwen4DecodeGraph(Qwen4CausalLm& model):stream(mfq_get_current_cuda_stream()),ple_stream(mfq_get_stream_from_pool()) {
         const bool enabled=model.router_lookahead.value_or(mfq::cuda::runtime_options::router_lookahead());
@@ -628,6 +629,15 @@ struct Qwen4DecodeGraph {
         if(stream.stream()!=mfq_current_cuda_stream())throw std::runtime_error("MFQ model window changed execution stream");
         const int tokens=static_cast<int>(ids.size(1));
         release_moe_prefill_buffers(model.execution->moe_expert_cache);
+        const auto required=model.cache_pos+tokens;
+        if(required>kv_capacity) {
+            finish_moe_expert_exchanges(model.execution->moe_expert_cache);
+            restore_legacy();
+            kv_capacity=std::min<int64_t>(model.max_position_embeddings(),std::max<int64_t>(1024,kv_capacity));
+            while(kv_capacity<required)
+                kv_capacity=std::min(model.max_position_embeddings(),kv_capacity>model.max_position_embeddings()/2
+                    ? model.max_position_embeddings() : kv_capacity*2);
+        }
         auto& owner=cells[{tokens,kind}];
         if(!owner)owner=std::make_unique<Cell>(tokens,model.config.hidden,model.blocks,stream.stream());
         auto& cell=*owner;
@@ -641,7 +651,7 @@ struct Qwen4DecodeGraph {
                     model.execution->decode_graph_serial_branches);
                 for(const auto& block:model.blocks) {
                     auto& b=static_cast<qwen4_exp::Qwen4Block&>(*block);
-                    if(b.qsa)b.qsa->prepare_graph(model.positions);
+                    if(b.qsa)b.qsa->prepare_graph(model.positions,kv_capacity);
                 }
                 struct State {tb::Tensor* target;tb::Tensor saved;const void* address;};
                 std::vector<State> states;
