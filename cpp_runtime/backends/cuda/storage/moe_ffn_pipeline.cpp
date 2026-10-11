@@ -1652,6 +1652,17 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             finish_transfer(cell,true);rollback.published=true;return;
         }
 
+        // Field-major prefill storage separates small scales and format metadata
+        // from each expert's payload. Pack those fields into the existing pinned
+        // wire stage rather than submitting a DMA operation for every field.
+        // Expert-major storage keeps its contiguous direct-copy intervals.
+        const bool pack_small_fields=cache_->pipeline_prefill_layer_layout_ &&
+            mfq::cuda::runtime_options::ram_field_packing();
+        const auto direct_field=[&](const Field& field) {
+            const auto address=reinterpret_cast<uintptr_t>(field.source.data_ptr());
+            return !(pack_small_fields && field.bytes<=16*1024) &&
+                address>=begin && address-begin<=size && uint64_t(field.bytes)<=size-(address-begin);
+        };
         if(cell.phased_transfer) {
             std::array<std::vector<Interval>,2> intervals;
             std::array<int64_t,2> staged_begin{},staged_end{};
@@ -1662,8 +1673,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 std::vector<std::size_t> direct,staged;
                 for(std::size_t i=0;i<fields.size();++i) {
                     if((fields[i].projection==2)!=(phase==1))continue;
-                    const auto address=reinterpret_cast<uintptr_t>(fields[i].source.data_ptr());
-                    if(address>=begin && address-begin<=size && uint64_t(fields[i].bytes)<=size-(address-begin))direct.push_back(i);
+                    if(direct_field(fields[i]))direct.push_back(i);
                     else staged.push_back(i);
                 }
                 std::sort(direct.begin(),direct.end(),[&](auto a,auto b) {
@@ -1757,8 +1767,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
 
         std::vector<std::size_t> direct,staged;
         for(std::size_t i=0;i<fields.size();++i) {
-            const auto address=reinterpret_cast<uintptr_t>(fields[i].source.data_ptr());
-            if(address>=begin && address-begin<=size && uint64_t(fields[i].bytes)<=size-(address-begin))direct.push_back(i);
+            if(direct_field(fields[i]))direct.push_back(i);
             else staged.push_back(i);
         }
         std::sort(direct.begin(),direct.end(),[&](auto a,auto b) {

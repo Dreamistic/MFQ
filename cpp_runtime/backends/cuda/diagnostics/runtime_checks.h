@@ -1050,6 +1050,66 @@ static int run_qwen35_mtp_check(
     return 0;
 }
 
+static int run_qwen4_decode_hidden_check(mfq::cuda::Qwen4CausalLm& model) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(model.max_position_embeddings()>=24 && model.vocab_size()>=8,
+        "Qwen4 hidden graph check requires context>=24 and vocab>=8");
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64);
+    const auto prompt=tb::tensor(std::vector<int64_t>{1,2},options).reshape({1,2});
+    const auto ids_for=[&](int step) {
+        return tb::tensor(std::vector<int64_t>{3+step%5},options).reshape({1,1});
+    };
+    const auto host=[](const tb::Tensor& value) {return value.to(tb::kFloat32).cpu().contiguous();};
+    std::vector<tb::Tensor> reference_hidden,reference_raw,retained_raw;
+    model.reset(1);model.hidden_forward(prompt);
+    for(int step=0;step<20;++step) {
+        tb::Tensor raw;
+        auto hidden=model.hidden_forward(ids_for(step),mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&raw);
+        reference_hidden.push_back(host(hidden));reference_raw.push_back(host(raw));
+    }
+    double maximum_error=0;
+    const auto compare=[&](const tb::Tensor& value,const tb::Tensor& reference) {
+        const auto actual=host(value);
+        MFQ_RUNTIME_CHECK(actual.sizes().vec()==reference.sizes().vec(),"hidden graph shape mismatch");
+        const auto* a=actual.data_ptr<float>();const auto* b=reference.data_ptr<float>();
+        for(int64_t i=0;i<actual.numel();++i) {
+            const double error=std::abs(double(a[i])-b[i]);
+            maximum_error=std::max(maximum_error,error);
+            MFQ_RUNTIME_CHECK(std::isfinite(a[i]) && error<=.015+.015*std::abs(b[i]),
+                "hidden graph differs from eager execution");
+        }
+    };
+    model.reset(1);model.hidden_forward(prompt);
+    int graph_steps=0;
+    for(int step=0;step<20;++step) {
+        tb::Tensor raw,hidden;
+        if(step==7 || step==11) {
+            // Resume eager execution and then return to the graph. A confirmed
+            // transaction must remain ineligible until committed or rejected.
+            const auto input=step==11?tb::cat({ids_for(step),ids_for(step+1)},1):ids_for(step);
+            hidden=model.hidden_forward(input,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&raw,step==11?1:0);
+            if(step==11) {
+                MFQ_RUNTIME_CHECK(!qwen4_decode_graph_hidden(model,ids_for(step),nullptr),
+                    "hidden graph accepted an active speculative transaction");
+                model.rollback_speculative();
+                hidden=hidden.narrow(1,0,1).contiguous();raw=raw.narrow(1,0,1).contiguous();
+            }
+        } else {
+            auto result=qwen4_decode_graph_hidden(model,ids_for(step),&raw);
+            MFQ_RUNTIME_CHECK(result.has_value(),"hidden graph was not exercised");
+            hidden=std::move(*result);++graph_steps;
+        }
+        compare(hidden,reference_hidden[step]);compare(raw,reference_raw[step]);
+        retained_raw.push_back(std::move(raw));
+        MFQ_RUNTIME_CHECK(model.cache_pos==step+3,"hidden graph advanced KV more than once");
+    }
+    for(int step=0;step<20;++step)compare(retained_raw[step],reference_raw[step]);
+    MFQ_RUNTIME_CHECK(model.graph_registry!=nullptr,"hidden graph did not survive KV growth");
+    std::cout<<"qwen4_decode_hidden_check PASS graph_steps="<<graph_steps
+        <<" retained_steps="<<retained_raw.size()<<" max_abs_error="<<maximum_error<<'\n';
+    return 0;
+}
+
 template <typename Model>
 static int run_flash_next_check(Model& model) {
     namespace tb=mfq_tensor_backend;

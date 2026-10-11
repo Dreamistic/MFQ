@@ -587,7 +587,7 @@ struct Qwen4DecodeGraph {
         uint32_t* host(){return static_cast<uint32_t*>(flags.data());}
     };
     struct Cell {
-        mfq_tensor_backend::Tensor ids,positions,cache_positions,host_ids,output;
+        mfq_tensor_backend::Tensor ids,positions,cache_positions,host_ids,output,raw_hidden;
         std::vector<std::unique_ptr<PleStage>> ple;
         DecodeWindow window;
         Cell(int tokens,int hidden,const std::vector<std::unique_ptr<Block>>& blocks,cudaStream_t stream)
@@ -623,7 +623,8 @@ struct Qwen4DecodeGraph {
     ~Qwen4DecodeGraph() {(void)cudaStreamSynchronize(ple_stream.stream());cells.clear();}
     void restore_legacy() {cells.clear();for(auto* attention:qsa)attention->leave_graph();}
 
-    mfq_tensor_backend::Tensor run(Qwen4CausalLm& model,mfq_tensor_backend::Tensor ids,int kind) {
+    mfq_tensor_backend::Tensor run(Qwen4CausalLm& model,mfq_tensor_backend::Tensor ids,int kind,
+                                  mfq_tensor_backend::Tensor* raw_hidden=nullptr) {
         namespace tb=mfq_tensor_backend;
         if(failed)throw std::runtime_error("MFQ model session requires recovery after its previous error");
         if(stream.stream()!=mfq_current_cuda_stream())throw std::runtime_error("MFQ model window changed execution stream");
@@ -704,14 +705,16 @@ struct Qwen4DecodeGraph {
                         hidden=b.execute_graph(*model.execution,std::move(hidden),cell.ids,cell.positions,cell.cache_positions,rows,layer);
                         cell.window.mark(layer++,"block_end");
                     }
+                    if(kind==3)cell.raw_hidden=hidden.clone();
                     hidden=model.adapter_finalize_hidden(std::move(hidden),model.output_norm,1,tokens);
-                    if(kind==2)cell.output=model.adapter_next_token(model.lm_head,model.last_hidden(std::move(hidden)));
+                    if(kind==3)cell.output=std::move(hidden);
+                    else if(kind==2)cell.output=model.adapter_next_token(model.lm_head,model.last_hidden(std::move(hidden)));
                     else if(kind==1)cell.output=model.adapter_last_logits(model.lm_head,model.last_hidden(std::move(hidden)));
                     else cell.output=model.logits_from_hidden(std::move(hidden));
                     cell.window.mark(-1,"window_end");
                     auto audit=static_cast<qwen4_exp::Qwen4Block&>(*model.blocks.front()).router_audit;
                     if(audit)cell.window.enroll({audit.get(),[]{},[]{},[audit]{audit->finish_sample();},{}});
-                },restore,[&]{cell.output={};});
+                },restore,[&]{cell.output={};cell.raw_hidden={};});
             }
             cell.window.run();
             for(const auto& block:model.blocks) {
@@ -719,6 +722,9 @@ struct Qwen4DecodeGraph {
             }
             model.cache_pos+=tokens;
             model.positions=tb::cat({model.positions,cell.positions},-1);model.batch=1;
+            // MTP can retain history until a later probe. Each step must own its
+            // raw residual rather than alias the next replay's capture buffer.
+            if(raw_hidden)*raw_hidden=cell.raw_hidden.clone();
             return cell.output;
         } catch(...) {failed=true;throw;}
     }
@@ -732,6 +738,21 @@ std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_logits(Qwen4CausalL
     MFQ_RUNTIME_CHECK(model.cache_pos+ids.size(1)<=model.max_position_embeddings(),"MFQ window exceeds context");
     if(!model.graph_registry)model.graph_registry=std::make_unique<Qwen4DecodeGraph>(model);
     return model.graph_registry->run(model,model.device_ids(std::move(ids)),kind);
+}
+
+std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
+        Qwen4CausalLm& model,mfq_tensor_backend::Tensor ids,mfq_tensor_backend::Tensor* raw_hidden) {
+    if(model.execution->qsa_kv_store || !model.execution->config.moe_pipeline ||
+            !model.execution->moe_expert_cache || model.cache_pos==0 || model.speculative_start>=0)return {};
+    if(ids.dim()==1)ids=ids.unsqueeze(0);
+    if(ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)!=1 || model.positions.dim()!=1)return {};
+    for(const auto& block:model.blocks) {
+        const auto& b=static_cast<const qwen4_exp::Qwen4Block&>(*block);
+        if(!b.prefetch || (b.ple && !b.ple->graph_supported()))return {};
+    }
+    MFQ_RUNTIME_CHECK(model.cache_pos+1<=model.max_position_embeddings(),"MFQ window exceeds context");
+    if(!model.graph_registry)model.graph_registry=std::make_unique<Qwen4DecodeGraph>(model);
+    return model.graph_registry->run(model,model.device_ids(std::move(ids)),3,raw_hidden);
 }
 
 void qwen4_set_rotary_fusion(Qwen4CausalLm& model, bool enabled) {

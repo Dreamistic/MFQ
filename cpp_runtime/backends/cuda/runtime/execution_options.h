@@ -26,6 +26,7 @@ bool skip_fixed_gpu_timing();
 bool window_input_views();
 bool decode_host_pin();
 bool dma_graph_batch();
+bool ram_field_packing();
 bool warp_multi_sum();
 float residency_heat_retention();
 int residency_interval();

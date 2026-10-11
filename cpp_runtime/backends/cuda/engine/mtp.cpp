@@ -96,6 +96,12 @@ template <class Model> struct CudaMtpOps {
   }
   Tensor target_forward(Tensor ids, Tensor *raw = nullptr,
                         int64_t confirmed = 0) {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(!transformed_prompt && confirmed==0) {
+        if(auto hidden=mfq::cuda::qwen4_decode_graph_hidden(model,ids,raw))
+          return std::move(*hidden);
+      }
+    }
     return model.hidden_forward(ids, mfq_nullopt, mfq_nullopt, nullptr,
                                 mfq_nullopt, raw, confirmed);
   }

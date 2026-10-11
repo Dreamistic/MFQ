@@ -315,6 +315,7 @@ class NgramEmbedding {
                               "Qwen4 ngram vocabulary lies outside embedding shards");
     }
     void reset() { context_ = {}; }
+    bool graph_supported() const { return bool(pipeline_); }
     const Context &context() const { return context_; }
     void restore(Context context) { context_ = std::move(context); }
     void prefetch(const Tensor& host_ids) {
@@ -414,6 +415,7 @@ class Ple {
     }
     const Tensor &conv_state() const { return conv_; }
     std::vector<Tensor*> graph_state() { return {&conv_}; }
+    bool graph_supported() const { return embedding_.graph_supported(); }
     std::shared_ptr<NintRowStage> graph_stage(int64_t tokens,const tb::Device& device) {
         return embedding_.graph_stage(1,tokens,device);
     }

@@ -150,6 +150,7 @@ std::size_t workspace_reserve_bytes() {
     return reserve;
 }
 bool phased_transfer() { return exact_one("MFQ_MOE_FFN_TRANSFER_PHASES", true); }
+bool ram_field_packing() { return exact_one("MFQ_MOE_RAM_FIELD_PACKING", true); }
 bool mapped_copy_overlap() { return exact_one("MFQ_MOE_MAPPED_COPY_OVERLAP"); }
 bool background_calibration() { return exact_one("MFQ_MOE_CPU_BACKGROUND_CALIBRATION", true); }
 bool early_gate_up() { return first_nonzero("MFQ_MFE_EARLY_GU", true); }
