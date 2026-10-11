@@ -373,9 +373,15 @@ void MoeExpertCache::preload_complete_residency() {
     for (const auto& item:remaining) if (item.second) throw std::logic_error("expert residency left allocatable GPU slots unfilled");
     std::vector<std::vector<int64_t>> ram_offsets(sources_.size());
     std::map<int,std::vector<MoeCachedSource*>> layer_sources;
+    // Only registered FFN bundles consume the direct-RAM transfer arena.
+    // Packed predictor projections use the ordinary cache uploader; keeping
+    // their CPU fields pageable avoids locking several extra GiB on Windows.
+    std::vector<bool> pipeline_sources(sources_.size(),!config_.moe_pipeline);
+    for(const auto& bundle:pipeline_bundles_)
+        for(const auto id:bundle)pipeline_sources.at(id)=true;
     for(const auto& source:sources_) {
         ram_offsets[source->id_].assign(source->n_experts(),-1);
-        layer_sources[source->layer_id_].push_back(source.get());
+        if(pipeline_sources[source->id_])layer_sources[source->layer_id_].push_back(source.get());
     }
     int64_t ram_allocated=0;
     const auto layer_option=mfq::cuda::runtime_options::moe_prefill_layer();
