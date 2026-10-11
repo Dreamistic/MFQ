@@ -3309,6 +3309,19 @@ class RuntimePool:
         resident_expert_bytes = min(streamed_bytes, cache_bytes)
         return total_bytes - streamed_bytes + resident_expert_bytes
 
+    @staticmethod
+    def _cuda_discrete_device_capacity(request: ModelLoadRequest) -> int | None:
+        hardware = hardware_identity()
+        visible = request.device_ids or os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
+        first = visible[0].strip()
+        if hardware.memory_architecture != "discrete" or not first.isdecimal():
+            return None
+        index = int(first)
+        if index >= len(hardware.gpu_memory):
+            return None
+        device = hardware.gpu_memory[index]
+        return device.capacity_bytes if not device.unified else None
+
     def _apply_automatic_expert_residency(
         self,
         artifact: DiscoveredModel,
@@ -3324,18 +3337,12 @@ class RuntimePool:
             else self.max_runtime_memory_bytes
         )
         if self.backend == "cuda" and request.moe_gpu_cache_gb is None:
-            hardware = hardware_identity()
-            visible = request.device_ids or os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
-            first = visible[0].strip()
-            if hardware.memory_architecture == "discrete" and first.isdecimal():
-                index = int(first)
-                if index < len(hardware.gpu_memory):
-                    capacity = hardware.gpu_memory[index].capacity_bytes
-                    if capacity:
-                        # Compressed dense projections also materialize CUDA
-                        # layouts lazily; file sizes omit these and graph scratch.
-                        device_ceiling = max(1, capacity - max(2 << 30, capacity // 4))
-                        ceiling = min(ceiling, device_ceiling) if ceiling is not None else device_ceiling
+            capacity = self._cuda_discrete_device_capacity(request)
+            if capacity:
+                # Compressed dense projections also materialize CUDA layouts
+                # lazily; prefill scratch, graph KV growth and MTP need space.
+                device_ceiling = max(1, capacity - max(2 << 30, capacity // 3))
+                ceiling = min(ceiling, device_ceiling) if ceiling is not None else device_ceiling
         if (
             request.moe_gpu_cache_gb is not None
             or ceiling is None
@@ -4128,6 +4135,13 @@ class RuntimePool:
                     "MFQ_MOE_PREFILL_LAYER_ASYNC": "0",
                     "MFQ_MOE_RESIDENCY_INTERVAL": "4",
                 }
+                capacity = self._cuda_discrete_device_capacity(request)
+                if capacity:
+                    # WDDM can page overcommitted allocations into host RAM
+                    # without reporting OOM. The native limit also trims idle
+                    # pool pages before a new allocation reaches that boundary.
+                    device_limit = max(1, capacity - max(1 << 30, capacity // 16))
+                    defaults["MFQ_CUDA_VRAM_LIMIT_GIB"] = str(device_limit / float(1 << 30))
                 for name, value in defaults.items():
                     process_environment.setdefault(name, value)
             else:

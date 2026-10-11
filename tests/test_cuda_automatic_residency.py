@@ -47,7 +47,7 @@ def test_cuda_auto_expert_budget_uses_selected_physical_device(tmp_path, monkeyp
     else:
         capacity = hardware.gpu_memory[int(device)].capacity_bytes
         assert selected.moe_gpu_cache_gb is not None and selected.moe_gpu_cache_gb > 0
-        assert pool._estimated_load_bytes(model, selected) < capacity - capacity // 4
+        assert pool._estimated_load_bytes(model, selected) < capacity - capacity // 3
     explicit = request.model_copy(update={"moe_gpu_cache_gb": 7})
     assert pool._apply_automatic_expert_residency(model, explicit).moe_gpu_cache_gb == 7
 
@@ -56,6 +56,8 @@ def test_cuda_auto_expert_budget_uses_selected_physical_device(tmp_path, monkeyp
 def test_cuda_launch_enables_ram_pipeline_when_experts_fit(tmp_path, monkeypatch, available, enabled):
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "discrete"})
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (64 * GIB, available))
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
+        "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", 24 * GIB),)))
     pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda", automatic_memory_budget=False)
     pool.memory_policy.prefix_directory = str(tmp_path / "prefix")
     model = artifact(tmp_path)
@@ -78,6 +80,7 @@ def test_cuda_launch_enables_ram_pipeline_when_experts_fit(tmp_path, monkeypatch
         assert environment["MFQ_MOE_PREFILL_LAYER"] == "1"
         assert environment["MFQ_MOE_PREFILL_LAYER_ASYNC"] == "0"
         assert environment["MFQ_MOE_RESIDENCY_INTERVAL"] == "4"
+        assert float(environment["MFQ_CUDA_VRAM_LIMIT_GIB"]) == 22.5
         assert int(environment["MFQ_MOE_HOST_CACHE_BYTES"]) >= 28 * GIB
 
 
