@@ -1,10 +1,12 @@
 import { useRef, type ReactNode } from 'react';
+import { QuestionIcon } from '@phosphor-icons/react';
 import type { RuntimeInstance, RuntimeStatus } from '../../shared/api/types';
 import { formatBytes, formatNumber } from '../../app/formatters';
 import { Icon, TMPanel } from '../../app/display';
 import { useSettings } from '../settings/SettingsProvider';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
-import { hasSeparateVram } from './memoryArchitecture';
+import { Tooltip } from '../../shared/ui/Tooltip';
+import { hasSeparateVram, memoryPoolUsage, residentWeightsAndBuffers } from './memoryArchitecture';
 
 type Tier = 'weights' | 'kv' | 'ram-experts' | 'ram-kv' | 'experts' | 'ple' | 'ssd-kv';
 const modelCount = (count: number) => `${count} ${count === 1 ? 'model' : 'models'}`;
@@ -33,7 +35,7 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
   const value = (item: RuntimeInstance, tier: Tier): number | null => {
     const memory = item.memory;
     if (!memory) return null;
-    if (tier === 'weights') return memory.resident_weight_bytes;
+    if (tier === 'weights') return residentWeightsAndBuffers(memory, separate);
     if (tier === 'kv') return memory.kv_bytes;
     if (tier === 'ram-experts') return memory.ram_experts === false ? 0 : memory.ram_expert_bytes ?? null;
     if (tier === 'ram-kv') return memory.ram_kv === false ? 0 : memory.ram_kv_bytes ?? null;
@@ -41,18 +43,17 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
     if (tier === 'ssd-kv') return memory.ssd_kv === false ? 0 : memory.ssd_kv_bytes ?? null;
     return memory.ssd_ple === false ? 0 : memory.ssd_ple_bytes;
   };
-  const weightAmounts = loaded.map((item) => value(item, 'weights'));
-  const weightTotal = weightAmounts.reduce<number>((sum, bytes) => sum + (bytes ?? 0), 0);
-  const memoryCapacity = memoryCapacityBytes != null && Number.isFinite(memoryCapacityBytes) && memoryCapacityBytes >= 0
-    ? memoryCapacityBytes : null;
-  const cacheCapacity = memoryCapacity != null && weightAmounts.every((bytes) => bytes != null)
-    ? Math.max(0, memoryCapacity - weightTotal) : null;
+  const pool = (capacity: number | null | undefined, weights: Tier, caches: Tier, available?: number | null) =>
+    memoryPoolUsage(capacity, loaded.map(item => value(item, weights)), loaded.map(item => value(item, caches)), available);
+  const residentPool = pool(memoryCapacityBytes, 'weights', 'kv',
+    separate ? runtime?.device_free_bytes : runtime?.host_memory_available_bytes);
+  const ramPool = separate ? pool(runtime?.host_memory_total_bytes, 'ram-experts', 'ram-kv', runtime?.host_memory_available_bytes) : residentPool;
   const contextCount = loaded.every((item) => item.memory?.context_count != null)
     ? formatNumber(loaded.reduce((sum, item) => sum + item.memory!.context_count!, 0)) : '--';
   const cacheBlocks = loaded.every((item) => item.memory?.prefix_cache_blocks != null)
     ? formatNumber(loaded.reduce((sum, item) => sum + item.memory!.prefix_cache_blocks!, 0)) : '--';
   const tiers: { id: Tier; title: string; detail: string }[] = [
-    { id: 'weights', title: separate ? tr('显存常驻专家与稠密权重', 'VRAM-resident experts and dense weights') : tr('常驻专家与稠密权重', 'Resident experts and dense weights'),
+    { id: 'weights', title: separate ? tr('显存常驻权重和缓冲区', 'VRAM-resident weights and buffers') : tr('常驻专家与稠密权重', 'Resident experts and dense weights'),
       detail: tr(`${loaded.length} 个模型`, modelCount(loaded.length)) },
     { id: 'kv', title: separate ? tr('显存常驻 KV Cache 与前缀缓存', 'VRAM-resident KV and prefix cache') : tr('常驻 KV Cache 与前缀缓存', 'Resident KV and prefix cache'),
       detail: tr(`${contextCount} 组上下文，${cacheBlocks} 个缓存块`, `${contextCount} contexts · ${cacheBlocks} cache blocks`) },
@@ -98,23 +99,24 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
     <TMPanel className={`overview-memory-panel${detailed ? ' resource-allocation-panel' : ''}`}>
       <div className="overview-memory-heading">
         <div>
-          <h2>{detailed ? tr('资源分配', 'Resource allocation') : tr('运行资源', 'Runtime resources')}</h2>
-          <p>{separate ? tr('右侧上限为系统预留与预算限制后的推理可用显存，不是显卡总容量；KV 与前缀缓存的上限还会扣除常驻权重。',
-            'Right-side limits show usable inference VRAM after system reservations and budget limits, not total GPU capacity; KV and prefix caches use the remainder after resident weights.')
-            : tr('右侧上限为系统预留与预算限制后的推理可用内存，不是硬件总容量；KV 与前缀缓存的上限还会扣除常驻权重。',
-              'Right-side limits show usable inference memory after system reservations and budget limits, not total hardware capacity; KV and prefix caches use the remainder after resident weights.')}</p>
-        </div>
-        <details className="resource-memory-help">
-          <summary aria-label={tr('资源分工说明', 'Resource tier details')}>?</summary>
-          <div>
+          <div className="memory-heading-title">
+            <h2>{detailed ? tr('资源分配', 'Resource allocation') : tr('运行资源', 'Runtime resources')}</h2>
+            <Tooltip content={<div>
             <strong>{tr('资源分工', 'Resource tiers')}</strong>
-            <p>{separate ? tr('VRAM：常驻专家与稠密权重、活跃 KV 和前缀热缓存。', 'VRAM: resident experts and dense weights, active KV and hot prefixes.')
+            <p>{separate ? tr('VRAM：常驻专家与稠密权重、活跃 KV 和前缀热缓存。', 'VRAM: resident weights, buffers, active KV and hot prefixes.')
               : tr('RAM：常驻专家与稠密权重、活跃 KV 和前缀热缓存；统一内存设备由 CPU 与 GPU 共享。', 'RAM: resident experts and dense weights, active KV and hot prefixes; unified-memory devices share it between CPU and GPU.')}</p>
             {separate && <p>{tr('RAM：流式专家和 KV 的中间层，按需传入显存；冷 KV 经 LRU 淘汰后写入 SSD。', 'RAM: an intermediate tier for streamed experts and KV, transferred to VRAM on demand; LRU-evicted cold KV is written to SSD.')}</p>}
             <p>{tr('SSD：流式专家按需加载，PLE 表按 token 读取对应行，流式 KV 按选中的块读取。', 'SSD: experts are loaded on demand, PLE tables supply the rows for each token, and streamed KV supplies selected blocks.')}</p>
             <p>{tr('前缀缓存由内存热层与 SSD 持久化冷层组成。这里的 SSD 流式 KV 不含持久化前缀缓存，后者在缓存管理中单独统计。', 'Prefix caching uses a hot memory tier and a persistent SSD tier. Streamed KV here excludes persistent prefix caches, which are tracked separately in cache management.')}</p>
+          </div>}>
+              <button className="memory-capacity-help" type="button" aria-label={tr('资源分层说明', 'Memory tier details')}>
+                <QuestionIcon size={16} aria-hidden="true" />
+              </button>
+            </Tooltip>
           </div>
-        </details>
+          <p className="memory-capacity-note">{tr('下方内存、显存上限为扣除系统和其他进程占用后的 MFQ 可用容量，包含 MFQ 已占用与当前空余空间。',
+            'Memory and VRAM limits below reflect capacity available to MFQ after system and other process usage, including MFQ allocations and remaining free space.')}</p>
+        </div>
       </div>
       {summary}
       <div className="memory-model-legend" aria-label={tr('模型颜色图例', 'Model color legend')}>
@@ -134,7 +136,7 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
           'Unloading models retain their last reported allocation until release is confirmed.')}
       </p>}
       <div className="overview-memory-tiers">
-        {groups.map((group) => <section className="memory-tier-group" key={group.name} data-memory-group={group.name}>
+        {groups.map((group) => <section className="memory-tier-group" key={group.name} data-memory-group={group.name} data-storage={group.name.toLowerCase()}>
           <div className="memory-tier-group-heading"><h3>{group.name}</h3><i aria-hidden="true" /><span>{group.detail}</span></div>
           {tiers.filter((tier) => group.ids.includes(tier.id)).map((tier) => {
           const amounts = loaded.map((item) => ({ item, bytes: value(item, tier.id) }));
@@ -142,8 +144,9 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
           const unknown = missing.length > 0;
           const reported = amounts.length - missing.length;
           const total = amounts.reduce((sum, { bytes }) => sum + (bytes ?? 0), 0);
-          const resident = tier.id === 'weights' || tier.id === 'kv';
-          const capacity = tier.id === 'weights' ? memoryCapacity : tier.id === 'kv' ? cacheCapacity : total;
+          const resident = tier.id === 'weights' || tier.id === 'kv' || tier.id === 'ram-experts' || tier.id === 'ram-kv';
+          const capacity = tier.id === 'weights' ? residentPool.capacity : tier.id === 'kv' ? residentPool.cacheCapacity
+            : tier.id === 'ram-experts' ? ramPool.capacity : tier.id === 'ram-kv' ? ramPool.cacheCapacity : total;
           const scale = capacity == null ? 0 : Math.max(capacity, total);
           const used = !reported && unknown ? tr('明细未上报', 'Breakdown not reported')
             : `${unknown ? '≥ ' : ''}${resourceBytes(total)}`;
@@ -179,7 +182,9 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
                   const prefix = memory?.prefix_cache_bytes;
                   const liveKv = bytes != null && prefix != null && bytes >= prefix ? bytes - prefix : null;
                   const detail = tier.id === 'weights'
-                    ? [item.devices.join(' + ').toUpperCase(), item.context_size != null ? `${formatNumber(item.context_size)} ctx` : null,
+                    ? [item.devices.join(' + ').toUpperCase(),
+                        separate ? `${tr('权重', 'Weights')} ${memory?.resident_weight_bytes == null ? '--' : resourceBytes(memory.resident_weight_bytes)} · ${tr('缓冲区', 'Buffers')} ${memory?.resident_buffer_bytes == null ? '--' : resourceBytes(memory.resident_buffer_bytes)}` : null,
+                        item.context_size != null ? `${formatNumber(item.context_size)} ctx` : null,
                         memory?.wired_available === true ? `${tr('锁页', 'Wired')} ${memory.wired_bytes == null ? '--' : resourceBytes(memory.wired_bytes)}`
                           : memory?.wired_available === false ? tr('锁页不可用', 'Wiring unavailable') : null].filter(Boolean).join(' · ')
                     : tier.id === 'kv'
