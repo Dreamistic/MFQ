@@ -947,7 +947,7 @@ class RuntimePool:
                 capabilities = await asyncio.wait_for(
                     backend.capabilities(), timeout=request_timeout
                 )
-            except (BackendError, TimeoutError):
+            except (BackendError, asyncio.TimeoutError):
                 await asyncio.sleep(0.25)
                 continue
             if capabilities.model != artifact.resource.name:
@@ -1642,7 +1642,7 @@ class RuntimePool:
             try:
                 await asyncio.wait_for(self._request_state_changed.wait(),
                     timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 raise BackendError("runtime_maintenance_timeout", "runtime maintenance did not finish in time; retry the request",
                     retryable=True, status_code=503) from None
 
@@ -2747,7 +2747,7 @@ class RuntimePool:
                 event.wait(),
                 timeout=max(1.0, self.startup_timeout_seconds),
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
             raise BackendError(
                 "runtime_start_timeout",
                 f"timed out waiting for model runtime: {model}",
@@ -3416,7 +3416,7 @@ class RuntimePool:
 
     async def _idle_reaper(self) -> None:
         while True:
-            with suppress(TimeoutError):
+            with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(
                     self._idle_reaper_wakeup.wait(),
                     timeout=self.metric_interval_seconds,
@@ -3927,7 +3927,7 @@ class RuntimePool:
                     try:
                         await asyncio.wait_for(process.wait(), timeout=10.0)
                         stopped = True
-                    except TimeoutError:
+                    except asyncio.TimeoutError:
                         pass
                     except ProcessLookupError:
                         stopped = True
@@ -3963,7 +3963,7 @@ class RuntimePool:
         if output is not None and output is not current and not output.done() and process.returncode is not None:
             try:
                 await asyncio.wait_for(output, timeout=_RUNTIME_OUTPUT_DRAIN_TIMEOUT_SECONDS)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 if self.store is not None:
                     with suppress(Exception):
                         await asyncio.to_thread(self.store.append_runtime_log, RuntimeLogLevel.WARNING,
