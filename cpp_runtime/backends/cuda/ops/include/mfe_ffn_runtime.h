@@ -11,8 +11,10 @@ class MfeFfnRuntime {
     std::vector<mfq::cuda::MfePackedProjection> host_views_;
     std::vector<int32_t> host_cohorts_;
     mfq_tensor_backend::Tensor transferred_,transfer_indices_,aborted_,resident_pairs_;
+    mfq_tensor_backend::Tensor token_group_counts_,token_group_slots_,token_group_buckets_;
     int quantization_count_=0,quantization_groups_=0;
     bool dispatch_trace_reported_=false;
+    bool combined_gate_up_=false;
     void trace_dispatch();
 public:
     MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
@@ -20,7 +22,9 @@ public:
         const mfq_tensor_backend::Tensor& weights,const mfq_tensor_backend::Tensor& sigmoid,
         const std::array<const NintWeight*,3>& shared={},const mfq_tensor_backend::Tensor& shared_gate={},
         int output_columns=0,int intermediate_columns=0,
-        const std::array<std::vector<int32_t>,3>* cohort_by_expert=nullptr,bool output_pairs=false);
+        const std::array<std::vector<int32_t>,3>* cohort_by_expert=nullptr,bool output_pairs=false,
+        bool combined_gate_up=false);
+    mfq::cuda::MfePackedProjection projection_view(int projection,mfq::cuda::MfePackedProjection view)const;
     void cpu_results(const mfq_tensor_backend::Tensor& kinds,const mfq_tensor_backend::Tensor& pairs,
         const uint32_t* ready=nullptr);
     void asynchronous(const int32_t* kinds,const uint32_t* plan,const uint32_t* transfer,

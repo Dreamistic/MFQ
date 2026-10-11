@@ -1,6 +1,7 @@
 // Keep each value-column recurrence in registers. Several columns share q/k,
 // gate, and token-loop work without changing FP32 reduction order.
-template<int D, int COLUMNS, bool TRANSPOSED_STATE, bool TILED_HEADS, bool PIPELINED=false>
+template<int D, int COLUMNS, bool TRANSPOSED_STATE, bool TILED_HEADS, bool PIPELINED=false,
+         bool PREPARED_DECAY=false>
 __global__ void gdn_prefill_columns_kernel(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ g, const float* __restrict__ beta,
@@ -66,7 +67,7 @@ __global__ void gdn_prefill_columns_kernel(
                 for (int c = 0; c < COLUMNS; ++c) kv[c] += state[c][r] * key[r];
             }
         }
-        const float decay = expf(g[v_seq_off + t]);
+        const float decay = PREPARED_DECAY?g[v_seq_off+t]:expf(g[v_seq_off+t]);
         const float bt = beta[v_seq_off + t];
         float delta[COLUMNS];
         #pragma unroll
@@ -102,24 +103,33 @@ __global__ void gdn_prefill_columns_kernel(
 template<bool TRANSPOSED_STATE, bool TILED_HEADS>
 void launch_gdn_prefill_columns(int columns, int B, int Hq, int Hv, int T,
     const float* q, const float* k, const float* v, const float* g, const float* beta,
-    const float* state, float* out, float* next_state, cudaStream_t stream) {
+    const float* state, float* out, float* next_state, cudaStream_t stream,bool prepared_decay=false) {
     const dim3 block(32, 4);
     const auto* pipeline_option=std::getenv("MFQ_GDN_PREFILL_PIPELINED");
     // The verified single-sequence 48/64-head grids do not lose resident
     // blocks from the extra q/k registers. Other shapes retain the old kernel.
     const bool pipelined=pipeline_option?std::atoi(pipeline_option)!=0:
         B==1 && (Hv==48 || Hv==64);
+    const auto launch=[&](auto prepared) {
+    constexpr bool cached=decltype(prepared)::value;
     if(columns==4 && pipelined) {
-        gdn_prefill_columns_kernel<128,4,TRANSPOSED_STATE,TILED_HEADS,true>
+        gdn_prefill_columns_kernel<128,4,TRANSPOSED_STATE,TILED_HEADS,true,cached>
             <<<dim3(B*Hv,128/(4*4)),block,0,stream>>>
             (q,k,v,g,beta,state,out,next_state,Hq,Hv,T);
     } else if (columns == 4) {
-        gdn_prefill_columns_kernel<128, 4, TRANSPOSED_STATE, TILED_HEADS>
+        gdn_prefill_columns_kernel<128, 4, TRANSPOSED_STATE, TILED_HEADS,false,cached>
             <<<dim3(B * Hv, 128 / (4 * 4)), block, 0, stream>>>
             (q, k, v, g, beta, state, out, next_state, Hq, Hv, T);
     } else {
-        gdn_prefill_columns_kernel<128, 2, TRANSPOSED_STATE, TILED_HEADS>
+        gdn_prefill_columns_kernel<128, 2, TRANSPOSED_STATE, TILED_HEADS,false,cached>
             <<<dim3(B * Hv, 128 / (4 * 2)), block, 0, stream>>>
             (q, k, v, g, beta, state, out, next_state, Hq, Hv, T);
     }
+    };
+    if(prepared_decay)launch(std::true_type{});else launch(std::false_type{});
+}
+
+__global__ void gdn_prefill_prepare_decay_kernel(const float* input,float* output,int64_t count) {
+    const int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<count)output[i]=expf(input[i]);
 }

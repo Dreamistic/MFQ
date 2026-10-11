@@ -4,10 +4,10 @@
 // decoded tile after the last FMA, then reduce in canonical stream order.
 namespace {
 template<int BM,int BN,int BK> union GrPrefillMixShared {
-    struct {float a[BM][BK+1],w[BN][BK+1];} tile;
+    struct {float a[BM][BK+1];union {float w[BN][BK+1];float wt[BK][BN];};} tile;
     float products[BM][BN];
 };
-template<class Input,class Value,bool AlignedQ8,bool Zero,bool Swizzle=false,int BM=128,int HiddenN=16,int BK=32,bool CompactK=false>
+template<class Input,class Value,bool AlignedQ8,bool Zero,bool Swizzle=false,int BM=128,int HiddenN=16,int BK=32,bool CompactK=false,bool VectorDecode=false,bool TransposeWeight=false,int RegisterM=4>
 __global__ __launch_bounds__(512,1) void gr_prefill_mix_kernel(const Input* input,
         const uint8_t* packed,const uint8_t* row_bits,const int64_t* row_offsets,
         const uint8_t* scales,const uint8_t* minima,const float* row_scales,
@@ -15,13 +15,13 @@ __global__ __launch_bounds__(512,1) void gr_prefill_mix_kernel(const Input* inpu
         std::conditional_t<std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>* output,
         int rows,int width,int hidden,int groups,int gs) {
     using Output=std::conditional_t<std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
-    constexpr int BN=HiddenN*4,RN=4,RM=4,Threads=512,Columns=BN/RN;
+    constexpr int BN=HiddenN*4,RN=4,RM=RegisterM,Threads=512,Columns=BN/RN;
     static_assert(BM*BN/(RN*RM)==Threads,"GR fused tile and register geometry mismatch");
     using Shared=GrPrefillMixShared<BM,BN,BK>;
     extern __shared__ __align__(16) unsigned char gr_mix_dynamic[];
     Shared* storage;
     if constexpr(BK>32)storage=reinterpret_cast<Shared*>(gr_mix_dynamic);
-    else {__shared__ Shared fixed;storage=&fixed;}
+    else {__shared__ __align__(16) Shared fixed;storage=&fixed;}
     auto& shared=*storage;
     const int tid=threadIdx.x,m=tid/Columns,n=(tid%Columns)*RN;
     const int row0=int(blockIdx.y)*BM,col0=int(blockIdx.x)*HiddenN;
@@ -31,7 +31,21 @@ __global__ __launch_bounds__(512,1) void gr_prefill_mix_kernel(const Input* inpu
             const int r=i/BK,c=i%BK;
             shared.tile.a[r][c]=row0+r<rows && k0+c<width?float(input[int64_t(row0+r)*width+k0+c]):0;
         }
-        for(int i=tid;i<BN*BK;i+=Threads) {
+        if constexpr(VectorDecode) {
+            for(int i=tid;i<BN*(BK/4);i+=Threads) {
+                const int r=i/(BK/4),c=(i%(BK/4))*4,hcol=col0+r%HiddenN;
+                const int neuron=(r/HiddenN)*hidden+hcol;
+                float values[4]{};
+                if(hcol<hidden && k0+c<width)gr_prefill_decode_four<AlignedQ8,Zero>(
+                    values,packed,row_bits,row_offsets,scales,minima,row_scales,row_minima,zero_scales,
+                    neuron,k0+c,width,groups,gs);
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    if constexpr(TransposeWeight)shared.tile.wt[c+j][r]=values[j];
+                    else shared.tile.w[r][c+j]=values[j];
+                }
+            }
+        } else for(int i=tid;i<BN*BK;i+=Threads) {
             const int r=i/BK,c=i%BK,column=k0+c,hcol=col0+r%HiddenN;
             const int neuron=(r/HiddenN)*hidden+hcol;
             float value=0;
@@ -67,7 +81,19 @@ __global__ __launch_bounds__(512,1) void gr_prefill_mix_kernel(const Input* inpu
                 }
             }
         };
-        if constexpr(CompactK) {
+        if constexpr(TransposeWeight) {
+            #pragma unroll
+            for(int k=0;k<BK;++k) {
+                const float4 vector=*reinterpret_cast<const float4*>(&shared.tile.wt[k][n]);
+                const float weight[4]={vector.x,vector.y,vector.z,vector.w};
+                #pragma unroll
+                for(int r=0;r<RM;++r) {
+                    const float x=shared.tile.a[m+r*(BM/RM)][k];
+                    #pragma unroll
+                    for(int j=0;j<RN;++j)acc[r][j][k&3]=fmaf(x,weight[j],acc[r][j][k&3]);
+                }
+            }
+        } else if constexpr(CompactK) {
             #pragma unroll 1
             for(int k=0;k<BK;k+=4) {
                 accumulate(k,std::integral_constant<int,0>{});
@@ -145,19 +171,28 @@ mfq_tensor_backend::Tensor gr_prefill_fused_mix(const NintWeight& weight,
         using Input=decltype(input_tag);using Value=decltype(value_tag);
         using Output=std::conditional_t<std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
         constexpr bool aligned=decltype(aligned_tag)::value,zero=decltype(zero_tag)::value,swizzle=decltype(swizzle_tag)::value;
-        const auto invoke=[&](auto tile_tag,auto k_tag,auto compact_tag) {
-        constexpr int tile=decltype(tile_tag)::value,columns=tile==256?8:16,k=decltype(k_tag)::value;
+        {
+            const auto* pipeline_option=std::getenv("MFQ_GR_PREFILL_FUSED_MIX");
+            if((!pipeline_option || std::atoi(pipeline_option)==10 || std::atoi(pipeline_option)==12) && gr_prefill_pipeline_supported(input)) {
+                launch_gr_prefill_pipeline<true,Input,Value,aligned,zero>(weight,input,normalized,output);return;
+            }
+        }
+        const auto invoke=[&](auto tile_tag,auto k_tag,auto compact_tag,auto vector_tag,auto transpose_tag,auto register_tag) {
+        constexpr int tile=decltype(tile_tag)::value,register_m=decltype(register_tag)::value;
+        constexpr int columns=register_m==2 || tile==256?8:16,k=decltype(k_tag)::value;
         constexpr bool compact=decltype(compact_tag)::value;
+        constexpr bool vector_decode=decltype(vector_tag)::value;
+        constexpr bool transpose_weight=decltype(transpose_tag)::value;
         constexpr size_t shared_bytes=k>32?sizeof(GrPrefillMixShared<tile,columns*4,k>):0;
         if constexpr(shared_bytes>48*1024) {
             thread_local int configured_device=-1;
             if(configured_device!=input.device().index) {
-                MFQ_CUDA_CHECK(cudaFuncSetAttribute(gr_prefill_mix_kernel<Input,Value,aligned,zero,swizzle,tile,columns,k,compact>,
+                MFQ_CUDA_CHECK(cudaFuncSetAttribute(gr_prefill_mix_kernel<Input,Value,aligned,zero,swizzle,tile,columns,k,compact,vector_decode,transpose_weight,register_m>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize,int(shared_bytes)));
                 configured_device=input.device().index;
             }
         }
-        gr_prefill_mix_kernel<Input,Value,aligned,zero,swizzle,tile,columns,k,compact><<<dim3(unsigned((hidden+columns-1)/columns),unsigned((rows+tile-1)/tile)),512,shared_bytes,mfq_current_cuda_stream()>>>(
+        gr_prefill_mix_kernel<Input,Value,aligned,zero,swizzle,tile,columns,k,compact,vector_decode,transpose_weight,register_m><<<dim3(unsigned((hidden+columns-1)/columns),unsigned((rows+tile-1)/tile)),512,shared_bytes,mfq_current_cuda_stream()>>>(
             input.data_ptr<Input>(),weight.q_packed.data_ptr<uint8_t>(),
             zero?nullptr:weight.row_q_bits.data_ptr<uint8_t>(),zero?nullptr:weight.row_q_bit_offsets.data_ptr<int64_t>(),
             zero?nullptr:weight.sub_scale.data_ptr<uint8_t>(),zero?nullptr:weight.sub_min.data_ptr<uint8_t>(),
@@ -165,14 +200,18 @@ mfq_tensor_backend::Tensor gr_prefill_fused_mix(const NintWeight& weight,
             zero?weight.q8_zero_scale.data_ptr<__half>():nullptr,normalized.data_ptr<Value>(),output.data_ptr<Output>(),
             int(rows),int(weight.neuron_len),int(hidden),int(weight.ng),int(weight.gs));
         };
-        if constexpr(swizzle)invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{});
+        if constexpr(swizzle)invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
         else {
             const auto* option=std::getenv("MFQ_GR_PREFILL_FUSED_MIX");
-            const int mode=option?std::atoi(option):3;
-            if(mode==4)invoke(std::integral_constant<int,256>{},std::integral_constant<int,64>{},std::false_type{});
-            else if(mode==5)invoke(std::integral_constant<int,256>{},std::integral_constant<int,64>{},std::true_type{});
-            else if(mode==3)invoke(std::integral_constant<int,256>{},std::integral_constant<int,32>{},std::false_type{});
-            else invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{});
+            const int requested_mode=option?std::atoi(option):(std::is_same_v<Input,__half>?12:10);
+            const int mode=requested_mode==10 || requested_mode==12?6:requested_mode;
+            if(mode==8)invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::true_type{},std::true_type{},std::integral_constant<int,2>{});
+            else if(mode==7)invoke(std::integral_constant<int,256>{},std::integral_constant<int,32>{},std::false_type{},std::true_type{},std::true_type{},std::integral_constant<int,4>{});
+            else if(mode==6)invoke(std::integral_constant<int,256>{},std::integral_constant<int,32>{},std::false_type{},std::true_type{},std::false_type{},std::integral_constant<int,4>{});
+            else if(mode==4)invoke(std::integral_constant<int,256>{},std::integral_constant<int,64>{},std::false_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
+            else if(mode==5)invoke(std::integral_constant<int,256>{},std::integral_constant<int,64>{},std::true_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
+            else if(mode==3)invoke(std::integral_constant<int,256>{},std::integral_constant<int,32>{},std::false_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
+            else invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
         }
     };
     const auto launch=[&](auto input_tag,auto value_tag) {

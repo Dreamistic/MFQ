@@ -2,6 +2,7 @@
 #include <cuda_runtime_api.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <algorithm>
 
 namespace mfq::cuda {
 struct MfePackedProjection {
@@ -59,6 +60,14 @@ struct MfeFfnBatch {
     float* hidden_scales=nullptr;
     std::uint32_t* completion=nullptr;
     __half* resident_pairs=nullptr;
+    // Sparse expert groups built from this call's device route IDs. Each group
+    // holds up to eight original hidden slots; no weight expansion is stored.
+    std::int32_t* token_group_counts=nullptr;
+    std::int32_t* token_group_slots=nullptr;
+    // Four count buckets: [count, original group indices...], for capacities
+    // 1/2/4/8. The fixed graph grid uses each bucket's safe occupancy bound.
+    std::int32_t* token_group_buckets=nullptr;
+    int token_group_capacity=0,token_groups=0;
     void* output=nullptr;
     int tokens=0,routes=0,experts=0,input_width=0,output_width=0;
     int intermediate=0,shared_intermediate=0;
@@ -78,7 +87,13 @@ struct MfeFfnBatch {
     bool e8_narrow=false;
     // All compact E8/D4 resident and transfer views prove local decoder bounds.
     bool compact_nvq=false;
+    bool token_group_aligned_gu=false;
 };
+inline int mfe_token_group_bound(const MfeFfnBatch& b,int capacity) {
+    return b.token_group_buckets ?
+        std::min(b.token_groups,b.tokens*(b.routes+int(b.shared!=nullptr))/(capacity==1?1:capacity/2+1)):
+        b.token_groups;
+}
 void mfe_ffn_prepare(const MfeFfnBatch&,const MfeInputQuantization*,int count,int groups,cudaStream_t);
 void mfe_ffn_gate_up(const MfeFfnBatch&,cudaStream_t);
 void mfe_ffn_resident(const MfeFfnBatch&,cudaStream_t);

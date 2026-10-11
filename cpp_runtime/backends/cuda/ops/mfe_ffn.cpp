@@ -63,8 +63,9 @@ View pool_view(const MixedMoePool& pool,int rows,std::vector<tb::Tensor>& owners
 MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         const tb::Tensor& input,const tb::Tensor& ids,const tb::Tensor& weights,const tb::Tensor& sigmoid,
         const std::array<const NintWeight*,3>& shared,const tb::Tensor& shared_gate,
-        int output_columns,int intermediate_columns,const std::array<std::vector<int32_t>,3>* cohort_by_expert,bool output_pairs)
-        :sigmoid_(sigmoid),input_(input),ids_(ids),weights_(weights) {
+        int output_columns,int intermediate_columns,const std::array<std::vector<int32_t>,3>* cohort_by_expert,bool output_pairs,
+        bool combined_gate_up)
+        :sigmoid_(sigmoid),input_(input),ids_(ids),weights_(weights),combined_gate_up_(combined_gate_up) {
     if(!projections[0] || !projections[1] || !projections[2] || !input.is_cuda() || input.dim()!=2 ||
         input.scalar_type()!=tb::kFloat16 || !input.is_contiguous() || ids.dim()!=2 || ids.scalar_type()!=tb::kInt32 ||
         !ids.is_cuda() || ids.get_device()!=input.get_device() || !weights.is_cuda() ||
@@ -199,6 +200,17 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
             return mfq::cuda::mfe_e8_narrow_view_eligible(d);
         });
     host_views_=views;host_cohorts_=mapping;
+    if(combined_gate_up_) {
+        if(projections[0]->out_per_expert!=2*batch_.intermediate || batch_.intermediate%2)
+            throw std::invalid_argument("combined MFE Gate/Up requires two equal aligned row ranges");
+        // Bounds for specialized decoders describe an entire projection. The
+        // combined row view retains its full expert stride but computes half.
+        batch_.compact_nvq=false;batch_.e8_narrow=false;
+        for(int i=0;i<batch_.projection_counts[1];++i) {
+            const int index=batch_.projection_offsets[1]+i;
+            views[index]=projection_view(1,views[index]);
+        }
+    }
     descriptors_=upload(views);cohorts_=tb::tensor(mapping).to(tb::kCUDA);
     std::vector<mfq::cuda::MfeInputQuantization> quantization;
     for(const auto& entry:quantizers) {
@@ -226,6 +238,42 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
     batch_.hidden=reinterpret_cast<__half*>(hidden_.data_ptr());batch_.hidden_quantized=quantized_.data_ptr<int8_t>();
     batch_.hidden_scales=scales_.data_ptr<float>();batch_.completion=reinterpret_cast<uint32_t*>(completion_.data_ptr<int32_t>());
     batch_.output=output_.data_ptr();
+    // Pure NINT small batches retain the measured faster routed kernels;
+    // mixed NVQ/NINT batches share decoded NINT chunks with their NVQ routes.
+    if(batch_.tokens>=2 && batch_.tokens<=32 && (batch_.nvq_format_mask || batch_.tokens>8)) {
+        // Small speculative batches favor two accumulators and more CTAs;
+        // larger decode batches amortize decoding across up to eight rows.
+        batch_.token_group_capacity=batch_.tokens<=8?2:8;
+        if(const auto* capacity=std::getenv("MFQ_MFE_TOKEN_GROUP_CAPACITY")) {
+            if(std::strcmp(capacity,"2")==0)batch_.token_group_capacity=2;
+            else if(std::strcmp(capacity,"4")==0)batch_.token_group_capacity=4;
+            else if(std::strcmp(capacity,"8")==0)batch_.token_group_capacity=8;
+        }
+        batch_.token_groups=batch_.tokens*batch_.routes+
+            (shared[0]?(batch_.tokens+batch_.token_group_capacity-1)/batch_.token_group_capacity:0);
+        token_group_counts_=tb::empty({batch_.token_groups},input.options().dtype(tb::kInt32));
+        token_group_slots_=tb::empty({batch_.token_groups,8},input.options().dtype(tb::kInt32));
+        batch_.token_group_counts=token_group_counts_.data_ptr<int32_t>();
+        batch_.token_group_slots=token_group_slots_.data_ptr<int32_t>();
+        const auto* aligned_gu=std::getenv("MFQ_MFE_TOKEN_ALIGNED_GU");
+        // The aligned CTA saves work at four rows. Other short shapes retain
+        // the more parallel Gate/Up split; an explicit setting can compare it.
+        batch_.token_group_aligned_gu=batch_.tokens<=8 &&
+            (aligned_gu?aligned_gu[0]!='0':batch_.tokens==4);
+        const auto aligned_down=[](const View& d) {
+            return d.group_size>=2 && d.group_size<=32 && d.group_size%2==0;
+        };
+        for(int i=0;i<batch_.projection_counts[2];++i)
+            batch_.token_group_aligned_gu &= aligned_down(views[batch_.projection_offsets[2]+i]);
+        if(shared[0])batch_.token_group_aligned_gu &= aligned_down(views.back());
+        const auto* compact_plan=std::getenv("MFQ_MFE_TOKEN_COMPACT_PLAN");
+        if(!compact_plan || compact_plan[0]!='0') {
+            token_group_buckets_=tb::empty({4,batch_.token_groups+1},input.options().dtype(tb::kInt32));
+            batch_.token_group_buckets=token_group_buckets_.data_ptr<int32_t>();
+        }
+        resident_pairs_=tb::empty({batch_.tokens,batch_.routes+(shared[0]?1:0),batch_.output_width},input.options());
+        batch_.resident_pairs=reinterpret_cast<__half*>(resident_pairs_.data_ptr());
+    }
 }
 void MfeFfnRuntime::cpu_results(const tb::Tensor& kinds,const tb::Tensor& pairs,const uint32_t* ready) {
     if(!kinds.is_cuda() || !pairs.is_cuda() || kinds.get_device()!=input_.get_device() ||
@@ -269,6 +317,28 @@ void MfeFfnRuntime::asynchronous(const int32_t* kinds,const uint32_t* plan,const
     batch_.aborted=reinterpret_cast<uint32_t*>(aborted_.data_ptr<int32_t>());batch_.host_aborted=abort;
     batch_.cpu_pairs=reinterpret_cast<const __half*>(cpu_pairs);
     batch_.resident_plan_overlap=mfq::cuda::runtime_options::resident_plan_overlap();
+}
+mfq::cuda::MfePackedProjection MfeFfnRuntime::projection_view(int p,View view)const {
+    if(!combined_gate_up_ || p!=1)return view;
+    const auto shift=[&](int field,int64_t bytes) {
+        if(view.fields[field])view.fields[field]=static_cast<const uint8_t*>(view.fields[field])+bytes;
+    };
+    const int64_t rows=batch_.intermediate;
+    if(view.family==1) {
+        // Packed bit offsets stay absolute within the original expert payload.
+        shift(1,rows);shift(2,rows*sizeof(int64_t));
+        shift(3,rows*view.groups);shift(4,rows*view.groups);
+        shift(5,rows*sizeof(float));shift(6,rows*sizeof(float));
+    } else {
+        for(int f=0;f<3;++f) {
+            if(view.local_experts<=0 || view.sizes[f]%(2*view.local_experts))
+                throw std::invalid_argument("combined NVQ row range is not byte aligned");
+            shift(f,view.sizes[f]/view.local_experts/2);
+        }
+        shift(3,rows*sizeof(float));
+        if(view.fields[6])shift(6,view.decode_record_bytes/view.local_experts/2);
+    }
+    return view;
 }
 mfq::cuda::MfePackedProjection MfeFfnRuntime::expert_view(int p,int expert,
         const std::vector<int64_t>& bytes,int slot)const {
@@ -332,8 +402,14 @@ void MfeFfnRuntime::trace_dispatch() {
             static_cast<void*>(this),format,count,rejected,max_experts);
     }
 }
-void MfeFfnRuntime::prepare(){trace_dispatch();mfq::cuda::mfe_ffn_prepare(batch_,reinterpret_cast<const mfq::cuda::MfeInputQuantization*>(quantization_.data_ptr()),
-    quantization_count_,quantization_groups_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();}
+void MfeFfnRuntime::prepare(){
+    trace_dispatch();
+    auto prepared=batch_;
+    if(const auto* setting=std::getenv("MFQ_MFE_TOKEN_GROUPS"))
+        if(setting[0]=='0')prepared.token_group_counts=nullptr;
+    mfq::cuda::mfe_ffn_prepare(prepared,reinterpret_cast<const mfq::cuda::MfeInputQuantization*>(quantization_.data_ptr()),
+        quantization_count_,quantization_groups_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
 void MfeFfnRuntime::gate_up(){mfq::cuda::mfe_ffn_gate_up(batch_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();}
 void MfeFfnRuntime::resident(){mfq::cuda::mfe_ffn_resident(batch_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();}
 void MfeFfnRuntime::wait_transfer(){mfq::cuda::mfe_ffn_wait_transfer(batch_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();}

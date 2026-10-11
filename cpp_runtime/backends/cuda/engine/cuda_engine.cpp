@@ -104,7 +104,10 @@ struct CudaEngineState {
                 metrics.emplace_back("kv_cache_contexts", language.cache_pos > 0 ? 1.0 : 0.0);
             } else metrics.insert(metrics.end(), {{"qsa_kv_offload_enabled", 0.0},
                 {"qsa_kv_ram_enabled", 0.0}, {"qsa_kv_ram_bytes", 0.0}, {"qsa_kv_ssd_bytes", 0.0}});
-            if (components.mtp) mtp::append_generation_metrics(metrics, components.mtp->last_stats);
+            if (components.mtp) {
+                mtp::append_generation_metrics(metrics, components.mtp->last_stats);
+                metrics.emplace_back("mtp_predictor_graph_replays",double(components.mtp->graph_replay_count()));
+            }
             if (batching) {
                 auto batch = batching->metrics(); metrics.insert(metrics.end(), batch.begin(), batch.end());
             }

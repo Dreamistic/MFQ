@@ -341,18 +341,123 @@ __global__ void gated_residual_down_kernel(MhcInput input,MhcMatrix down,MhcMatr
     }
 }
 
-template<int FixedGroup=0,int FixedStreams=0,int FixedWidth=0>
-__global__ void gated_residual_up_kernel(MhcMatrix down,MhcMatrix up,MhcMatrix inject,
+// Two speculative rows share the original q8 weight decode. Each row keeps
+// its scalar FMA order and the same split/reduction tree as mhc_affine.
+// Read the small normalized batch through the cache instead of allocating a
+// full shared-memory copy per row, keeping enough CTAs for short batches.
+template<int GroupSize,int Capacity=2>
+__global__ void __launch_bounds__(128) gated_residual_batch_projection_kernel(
+    MhcInput input,MhcMatrix down,MhcMatrix inject,const void* normalized,
+    float* parts,int down_splits,int injection_splits,int samples,bool vector_injection) {
+    const int tid=threadIdx.x,lane=tid&31,warp=tid>>5;
+    const int split=blockIdx.x%down_splits,row=(blockIdx.x/down_splits)*4+warp;
+    const int sample=int(blockIdx.y)*Capacity;
+    const int first=down.groups*split/down_splits,last=down.groups*(split+1)/down_splits;
+    const int stride=down.outputs*down_splits+inject.outputs*injection_splits;
+    if(row<down.outputs) {
+        const auto* packed=down.q+(down.offsets[row]>>3);
+        const float outer_scale=down.row_scale[row],outer_minimum=down.row_minimum[row];
+        float sums[Capacity]{};
+        for(int group=first;group<last;++group) {
+            const size_t meta=size_t(row)*down.groups+group;
+            const float scale=__fmul_rn(outer_scale,float(down.scales[meta]));
+            const float minimum=__fmul_rn(outer_minimum,float(down.minima[meta]));
+            #pragma unroll
+            for(int chunk=0;chunk<2;++chunk) {
+                const int j=lane+chunk*32,column=group*GroupSize+j;
+                if(j<GroupSize && column<down.width) {
+                    const float weight=__fsub_rn(__fmul_rn(scale,float(packed[column])),minimum);
+                    #pragma unroll
+                    for(int k=0;k<Capacity;++k)if(sample+k<samples)
+                        sums[k]=fmaf(weight,mhc_read(normalized,size_t(sample+k)*down.width+column,input.output_half),sums[k]);
+                }
+            }
+        }
+        for(int shift=16;shift;shift>>=1) {
+            #pragma unroll
+            for(int k=0;k<Capacity;++k)sums[k]+=__shfl_down_sync(0xffffffffu,sums[k],shift);
+        }
+        if(lane==0) {
+            #pragma unroll
+            for(int k=0;k<Capacity;++k)if(sample+k<samples)
+                parts[size_t(sample+k)*stride+row*down_splits+split]=sums[k];
+        }
+    }
+    if(inject.dense && tid<32) {
+        const int per_block=32/inject.outputs;
+        const int virtual_lane=int(blockIdx.x)*per_block+tid/inject.outputs;
+        const int output=tid%inject.outputs;
+        if(tid<per_block*inject.outputs && virtual_lane<32) {
+            float sums[Capacity]{};
+            for(int begin=virtual_lane*4;begin<inject.width;begin+=128) {
+                #pragma unroll
+                for(int item=0;item<4;++item)if(begin+item<inject.width) {
+                    const size_t at=vector_injection?size_t(begin)*inject.outputs+output*4+item:
+                        size_t(begin+item)*inject.outputs+output;
+                    const float weight=inject.row_scale[at];
+                    #pragma unroll
+                    for(int k=0;k<Capacity;++k)if(sample+k<samples)
+                        sums[k]=fmaf(mhc_read(normalized,size_t(sample+k)*inject.width+begin+item,input.output_half),weight,sums[k]);
+                }
+            }
+            #pragma unroll
+            for(int k=0;k<Capacity;++k)if(sample+k<samples)
+                parts[size_t(sample+k)*stride+down.outputs*down_splits+output*injection_splits+virtual_lane]=sums[k];
+        }
+    }
+    if(!inject.dense && split==0) {
+        const int blocks=(down.outputs+3)/4;
+        for(int part=int(blockIdx.x)/down_splits;part<injection_splits;part+=blocks) {
+            const int begin=inject.groups*part/injection_splits,end=inject.groups*(part+1)/injection_splits;
+            if(warp<inject.outputs) {
+                const auto* packed=inject.q+(inject.offsets[warp]>>3);
+                const float outer_scale=inject.row_scale[warp],outer_minimum=inject.row_minimum[warp];
+                float sums[Capacity]{};
+                for(int group=begin;group<end;++group) {
+                    const size_t meta=size_t(warp)*inject.groups+group;
+                    const float scale=__fmul_rn(outer_scale,float(inject.scales[meta]));
+                    const float minimum=__fmul_rn(outer_minimum,float(inject.minima[meta]));
+                    #pragma unroll
+                    for(int chunk=0;chunk<2;++chunk) {
+                        const int j=lane+chunk*32,column=group*inject.gs+j;
+                        if(j<inject.gs && column<inject.width) {
+                            const float weight=__fsub_rn(__fmul_rn(scale,float(packed[column])),minimum);
+                            #pragma unroll
+                            for(int k=0;k<Capacity;++k)if(sample+k<samples)
+                                sums[k]=fmaf(weight,mhc_read(normalized,size_t(sample+k)*inject.width+column,input.output_half),sums[k]);
+                        }
+                    }
+                }
+                for(int shift=16;shift;shift>>=1) {
+                    #pragma unroll
+                    for(int k=0;k<Capacity;++k)sums[k]+=__shfl_down_sync(0xffffffffu,sums[k],shift);
+                }
+                if(lane==0) {
+                    #pragma unroll
+                    for(int k=0;k<Capacity;++k)if(sample+k<samples)
+                        parts[size_t(sample+k)*stride+down.outputs*down_splits+warp*injection_splits+part]=sums[k];
+                }
+            }
+        }
+    }
+}
+
+template<int FixedGroup=0,int FixedStreams=0,int FixedWidth=0,int Capacity=1>
+__global__ void __launch_bounds__(512,(Capacity==2 && FixedWidth>0)?2:1)
+gated_residual_up_kernel(MhcMatrix down,MhcMatrix up,MhcMatrix inject,
     const void* normalized,const float* parts,void* mixed,void* injection,
-    int hidden,int streams,bool half,int down_splits,int injection_splits,const float* dense_projection) {
+    int hidden,int streams,bool half,int down_splits,int injection_splits,const float* dense_projection,int samples) {
     extern __shared__ float low[];
-    const int tid=threadIdx.x,lane=tid&31,warp=tid>>5,sample=blockIdx.y;
+    const int tid=threadIdx.x,lane=tid&31,warp=tid>>5,sample_begin=int(blockIdx.y)*Capacity;
     if constexpr(FixedStreams>0)streams=FixedStreams;
+    #pragma unroll
+    for(int k=0;k<Capacity;++k)if(sample_begin+k<samples) {
+    const int sample=sample_begin+k;
     const size_t base=size_t(sample)*(down.outputs*down_splits+inject.outputs*injection_splits);
     for(int row=tid;row<down.outputs;row+=blockDim.x) {
         float sum=down_splits==1?parts[base+row]:0.f;
         if(down_splits>1)for(int split=0;split<down_splits;++split)sum+=parts[base+row*down_splits+split];
-        low[row]=mhc_activated(sum,half,streams,false);
+        low[k*down.outputs+row]=mhc_activated(sum,half,streams,false);
     }
     if(inject.dense && !dense_projection && blockIdx.x==0 && tid<32) {
         #pragma unroll
@@ -371,9 +476,10 @@ __global__ void gated_residual_up_kernel(MhcMatrix down,MhcMatrix up,MhcMatrix i
         const bool injection_half=half && !inject.dense;
         mhc_write(injection,size_t(sample)*inject.outputs+tid,mhc_activated(sum,injection_half,streams,true),injection_half);
     }
+    }
     __syncthreads();
     const int column=blockIdx.x*(blockDim.x/32)+warp;if(column>=hidden)return;
-    float sums[4]{};
+    float sums[Capacity][4]{};
     if(up.aligned && !up.zero) {
         const int gs=FixedGroup?FixedGroup:up.gs;
         constexpr int fixed_groups=FixedWidth?(FixedWidth+FixedGroup-1)/FixedGroup:0;
@@ -415,33 +521,45 @@ __global__ void gated_residual_up_kernel(MhcMatrix down,MhcMatrix up,MhcMatrix i
             for(int chunk=0;chunk<2;++chunk) {
                 const int j=lane+chunk*32,at=group*gs+j;
                 if(j<gs && at<width) {
-                    const float activation=low[at];
                     #pragma unroll
                     for(int s=0;s<4;++s)if(s<streams) {
                         const float weight=__fsub_rn(__fmul_rn(scale[s],float(packed[s][at])),minimum[s]);
-                        sums[s]=fmaf(weight,activation,sums[s]);
+                        #pragma unroll
+                        for(int k=0;k<Capacity;++k)if(sample_begin+k<samples)
+                            sums[k][s]=fmaf(weight,low[k*down.outputs+at],sums[k][s]);
                     }
                 }
             }
         }
         for(int stride=16;stride;stride>>=1) {
             #pragma unroll
-            for(int s=0;s<4;++s)if(s<streams)sums[s]+=__shfl_down_sync(0xffffffff,sums[s],stride);
+            for(int s=0;s<4;++s)if(s<streams) {
+                #pragma unroll
+                for(int k=0;k<Capacity;++k)sums[k][s]+=__shfl_down_sync(0xffffffff,sums[k][s],stride);
+            }
         }
     } else {
         #pragma unroll
-        for(int s=0;s<4;++s)if(s<streams)sums[s]=mhc_affine(up,low,s*hidden+column,0,up.groups,lane);
+        for(int s=0;s<4;++s)if(s<streams) {
+            #pragma unroll
+            for(int k=0;k<Capacity;++k)if(sample_begin+k<samples)
+                sums[k][s]=mhc_affine(up,low+k*down.outputs,s*hidden+column,0,up.groups,lane);
+        }
     }
     if(lane==0) {
+        #pragma unroll
+        for(int k=0;k<Capacity;++k)if(sample_begin+k<samples) {
+        const int sample=sample_begin+k;
         float value=0.f;
         #pragma unroll
         for(int s=0;s<4;++s)if(s<streams) {
-            const float projected=mhc_round(sums[s],half);
+            const float projected=mhc_round(sums[k][s],half);
             const float gate=mhc_round(1.f/(1.f+expf(-projected)),half);
             const float product=mhc_round(__fmul_rn(gate,mhc_read(normalized,(size_t(sample)*streams+s)*hidden+column,half)),half);
             value=__fadd_rn(value,product);
         }
         mhc_write(mixed,size_t(sample)*hidden+column,__fdiv_rn(value,float(streams)),half);
+        }
     }
 }
 
@@ -512,7 +630,7 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
     const int tile=projection_threads/32;
     const char* warp_setting=std::getenv("MFQ_GR_DENSE_FUSION");
     const bool dense_warp=(!warp_setting || warp_setting[0]!='0') && share_norm &&
-        rows==1 && dense_injection.defined() && prepared_injection_right.defined() &&
+        rows<=8 && dense_injection.defined() && prepared_injection_right.defined() &&
         ((down.out+tile-1)/tile)*ds >= (32+(32/streams)-1)/(32/streams);
     const int is=dense_warp?32:(dense_injection.defined()?std::min<int64_t>((down.neuron_len+31)/32,resident):splits(*inject));
     const bool bh=after && branch.scalar_type()==tb::kFloat16,rh=residual.scalar_type()==tb::kFloat16,
@@ -563,6 +681,15 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
     }
     const auto launch_down=[&](auto group) {
         constexpr int fixed=decltype(group)::value;
+        const auto* batch_setting=std::getenv("MFQ_GR_BATCH_SHARED_DOWN");
+        if constexpr(fixed>0)if(batch_setting && batch_setting[0]=='1' &&
+                rows>=2 && rows<=8 && share_norm &&
+                (dense_warp || (!dense_injection.defined() && i.aligned && !i.zero))) {
+            gated_residual_batch_projection_kernel<fixed><<<
+                dim3(unsigned((down.out+3)/4*ds),unsigned((rows+1)/2)),128,0,mfq_current_cuda_stream()>>>(
+                projection_input,d,i,projection_normalized,parts.data_ptr<float>(),ds,is,rows,vector_injection);
+            return;
+        }
         if(share_norm) {
             const auto launch=[&](auto threads) {
               const auto format=[&](auto injection_kind,auto static_format) {
@@ -607,8 +734,22 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
     const auto launch_up=[&](auto group) {
         constexpr int fixed=decltype(group)::value;
         const auto launch=[&](auto width) {
-            gated_residual_up_kernel<fixed,fixed?4:0,decltype(width)::value><<<dim3(unsigned((hidden+up_threads/32-1)/(up_threads/32)),unsigned(rows)),unsigned(up_threads),unsigned(down.out*sizeof(float)),mfq_current_cuda_stream()>>>(
-                d,u,i,normalized.data_ptr(),parts.data_ptr<float>(),mixed.data_ptr(),next_injection.data_ptr(),hidden,int(streams),half,ds,is,dense_projection.defined()?dense_projection.data_ptr<float>():nullptr);
+            const auto run=[&](auto capacity) {
+                constexpr int count=decltype(capacity)::value;
+                // The paired accumulator crosses the 64-register occupancy
+                // boundary at 512 threads on Ampere. Keep four 256-thread
+                // blocks resident, with the fixed-width specialization bounded
+                // to 64 registers, instead of one wide block.
+                const int threads=count==2 && !thread_setting?256:up_threads;
+                gated_residual_up_kernel<fixed,fixed?4:0,decltype(width)::value,count><<<dim3(unsigned((hidden+threads/32-1)/(threads/32)),unsigned((rows+count-1)/count)),unsigned(threads),unsigned(count*down.out*sizeof(float)),mfq_current_cuda_stream()>>>(
+                    d,u,i,normalized.data_ptr(),parts.data_ptr<float>(),mixed.data_ptr(),next_injection.data_ptr(),hidden,int(streams),half,ds,is,dense_projection.defined()?dense_projection.data_ptr<float>():nullptr,rows);
+            };
+            const auto* shared_up=std::getenv("MFQ_GR_BATCH_SHARED_UP");
+            if constexpr(fixed>0)if(rows>=2 && rows<=8 && (!shared_up ||
+                (shared_up[0]!='0' && (shared_up[0]!='2' || rows%2==0)))) {
+                run(std::integral_constant<int,2>{});return;
+            }
+            run(std::integral_constant<int,1>{});
         };
         if constexpr(fixed>0) {
             if(up.neuron_len==320)launch(std::integral_constant<int,320>{});

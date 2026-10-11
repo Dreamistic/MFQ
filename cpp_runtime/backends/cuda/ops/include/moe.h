@@ -194,7 +194,8 @@ std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
     bool cuda,
     const CudaExecutionConfig& config = {});
 int64_t mixed_moe_storage_bytes(const MixedMoeRuntime& runtime);
-void initialize_mixed_nvq_dispatch(MixedMoeRuntime& runtime,const CudaExecutionConfig& config,bool dense_prefill=false);
+void initialize_mixed_nvq_dispatch(MixedMoeRuntime& runtime,const CudaExecutionConfig& config,bool dense_prefill=false,
+    const std::vector<std::vector<int32_t>>* expert_local_host=nullptr);
 mfq_tensor_backend::Tensor copy_cpu_weight_to_cuda(
     const mfq_tensor_backend::Tensor& source);
 MfeWeight to_gpu_mixed_moe(

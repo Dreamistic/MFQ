@@ -1,5 +1,9 @@
+// Share generic decoders across the partition/bundle kernel variants. The
+// compact decode translation unit keeps its fully inlined specializations.
+#define MFQ_MFE_PROJECT_INLINE __noinline__
 #include "mfe_ffn_device.cuh"
 #include "mfe_ffn_compact.h"
+#include "mfe_ffn_token_groups.h"
 namespace mfq::cuda {
 namespace {
 bool mfe_group_dot_enabled() {
@@ -93,12 +97,14 @@ bool mfe_e8_narrow_enabled(const MfeFfnBatch& b,bool down) {
         mfe_ffn_e8_narrow_requested(b,down);
 }
 void launch_mfe_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
+    if(mfe_ffn_token_group_down(b,partition,stream))return;
     if(mfe_ffn_compact_down(b,partition,stream))return;
     if(mfe_e8_narrow_enabled(b,true))launch_mfe_down_math<true,true>(b,partition,stream);
     else if(mfe_default_math_enabled(b,true))launch_mfe_down_math<true>(b,partition,stream);
     else launch_mfe_down_math<false>(b,partition,stream);
 }
 void launch_mfe_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
+    if(mfe_ffn_token_group_gate_up(b,partition,width,stream))return;
     if(mfe_ffn_compact_gate_up(b,partition,width,stream))return;
     if(mfe_e8_narrow_enabled(b,false))launch_mfe_gate_up_math<true,true>(b,partition,width,stream);
     else if(mfe_default_math_enabled(b,false))launch_mfe_gate_up_math<true>(b,partition,width,stream);

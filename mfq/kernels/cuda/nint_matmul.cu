@@ -992,7 +992,7 @@ __device__ __forceinline__ float nint_group_partial(
     return partial;
 }
 
-template<bool Single=false,bool Grouped=false>
+template<bool Single=false,bool Grouped=false,int RowCapacity=8>
 __global__ void __launch_bounds__(128) nint_matmul_kernel(
         const uint8_t * __restrict__ bitstream,
         const uint8_t * __restrict__ row_q_bits,
@@ -1023,7 +1023,7 @@ __global__ void __launch_bounds__(128) nint_matmul_kernel(
         bool routed_input,
         uint64_t packed_bytes=0) {
     constexpr int warps_per_block = 4;
-    constexpr int maximum_activation_rows = Single ? 1 : 8;
+    constexpr int maximum_activation_rows = Single ? 1 : RowCapacity;
     constexpr int routed_rows_per_warp = 2;
     const int chunks = (group_size + 3) / 4;
     const int groups_per_warp = 32 / chunks;
@@ -2538,15 +2538,31 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
             (!dense_group_setting || dense_group_setting[0] != '0') &&
             std::getenv("MFQ_NINT_DENSE_REFERENCE") == nullptr) {
         const char* whole_setting=std::getenv("MFQ_NINT_WHOLE_GROUP");
-        if(activation_rows==1 && groups>32 && input.scalar_type()==mfq_tensor_backend::kFloat16 &&
+        const char* batch_whole_setting=std::getenv("MFQ_NINT_BATCH_WHOLE_GROUP");
+        if((activation_rows==1 || (activation_rows<=8 && (!batch_whole_setting || batch_whole_setting[0]!='0'))) &&
+                groups>32 && input.scalar_type()==mfq_tensor_backend::kFloat16 &&
                 (!whole_setting || whole_setting[0]!='0')) {
             const NintWholeArgs args{bitstream.data_ptr<uint8_t>(),row_q_bits.data_ptr<uint8_t>(),
                 subgroup_scale.data_ptr<uint8_t>(),subgroup_minimum.data_ptr<uint8_t>(),
                 row_q_bit_offsets.data_ptr<int64_t>(),neuron_scale.data_ptr<float>(),neuron_minimum.data_ptr<float>(),
                 quantized_input.data_ptr<int8_t>(),input_scale.data_ptr<float>(),
-                reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),uint64_t(bitstream.numel()),output_rows,groups};
-            if(group_size==24)nint_whole_group_kernel<24><<<output_rows,dim3(32,4),0,stream>>>(args);
-            else nint_whole_group_kernel<28><<<output_rows,dim3(32,4),0,stream>>>(args);
+                reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),uint64_t(bitstream.numel()),output_rows,groups,activation_rows};
+            const auto launch_whole=[&](auto gs,auto rows) {
+                nint_whole_group_kernel<decltype(gs)::value,decltype(rows)::value><<<output_rows,dim3(32,4),0,stream>>>(args);
+            };
+            const auto select_whole_rows=[&](auto gs) {
+                if(activation_rows==1)launch_whole(gs,std::integral_constant<int,1>{});
+                else if(activation_rows<=2)launch_whole(gs,std::integral_constant<int,2>{});
+                else if(activation_rows<=4)launch_whole(gs,std::integral_constant<int,4>{});
+                else if(const auto* exact=std::getenv("MFQ_NINT_EXACT_BATCH");!exact || exact[0]!='0') {
+                    if(activation_rows==5)launch_whole(gs,std::integral_constant<int,5>{});
+                    else if(activation_rows==6)launch_whole(gs,std::integral_constant<int,6>{});
+                    else launch_whole(gs,std::integral_constant<int,8>{});
+                }
+                else launch_whole(gs,std::integral_constant<int,8>{});
+            };
+            if(group_size==24)select_whole_rows(std::integral_constant<int,24>{});
+            else select_whole_rows(std::integral_constant<int,28>{});
         } else {
         const auto launch_dense = [&](auto gs, auto rows, auto warps) {
             constexpr int rows_per_block = 4 / decltype(warps)::value;
@@ -2574,7 +2590,8 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         }
     } else {
     const auto launch=[&](auto single,auto grouped) {
-    nint_matmul_kernel<decltype(single)::value,decltype(grouped)::value><<<
+    const auto launch_rows=[&](auto rows) {
+    nint_matmul_kernel<decltype(single)::value,decltype(grouped)::value,decltype(rows)::value><<<
         dim3((output_rows + 3) / 4), dim3(32, 4), 0, stream>>>(
             bitstream.data_ptr<uint8_t>(),
             row_q_bits.data_ptr<uint8_t>(),
@@ -2603,6 +2620,20 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
             0,
             0,
             false,static_cast<uint64_t>(bitstream.numel()));
+    };
+    const auto* exact=std::getenv("MFQ_NINT_EXACT_BATCH");
+    if constexpr(!decltype(single)::value) {
+        if(!exact || exact[0]!='0') {
+            if(activation_rows==1)launch_rows(std::integral_constant<int,1>{});
+            else if(activation_rows<=2)launch_rows(std::integral_constant<int,2>{});
+            else if(activation_rows<=4)launch_rows(std::integral_constant<int,4>{});
+            else if(activation_rows==5)launch_rows(std::integral_constant<int,5>{});
+            else if(activation_rows==6)launch_rows(std::integral_constant<int,6>{});
+            else launch_rows(std::integral_constant<int,8>{});
+            return;
+        }
+    }
+    launch_rows(std::integral_constant<int,8>{});
     };
     const auto* single=std::getenv("MFQ_NINT_SINGLE_ROW");
     if (activation_rows == 1 && single && std::strcmp(single, "1") == 0 &&

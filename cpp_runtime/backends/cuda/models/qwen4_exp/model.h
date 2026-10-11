@@ -71,6 +71,29 @@ class Gdn {
         return state_.defined() && transposed_state_ ? state_.transpose(-1,-2) : state_;
     }
     std::vector<Tensor*> graph_state() { return {&conv_,&state_}; }
+    Tensor forward_graph(CudaExecutionContext& execution,const Tensor& x,int64_t confirmed,
+                         Tensor& checkpoint_conv,Tensor& checkpoint_state) {
+        if(!confirmed)return forward_chunk(execution,x,true);
+        const auto* batch=std::getenv("MFQ_GDN_BATCH_PROJECTION");
+        const bool grouped=grouped_projection_ && w_.input_projection && x.size(1)<=8 && (!batch || batch[0]!='0');
+        // Only recurrence is split at the confirmation boundary. Both parts
+        // share the input projections and one output projection.
+        std::vector<Tensor> projected;if(grouped)projected=w_.input_projection(execution,x);
+        const auto slice=[&](int64_t begin,int64_t count) {
+            std::vector<Tensor> result;for(const auto& value:projected)result.push_back(value.narrow(1,begin,count));
+            return result;
+        };
+        auto prefix=forward_chunk(execution,x.narrow(1,0,confirmed),true,slice(0,confirmed),!grouped);
+        checkpoint_conv.copy_(conv_);checkpoint_state.copy_(state_);
+        auto suffix=forward_chunk(execution,x.narrow(1,confirmed,x.size(1)-confirmed),true,
+            slice(confirmed,x.size(1)-confirmed),!grouped);
+        auto result=tb::cat({prefix,suffix},1);
+        return grouped?w_.output(execution,result):result;
+    }
+    void bind_graph_checkpoint(const Tensor& conv,const Tensor& state) {
+        MFQ_RUNTIME_CHECK(!saved_conv_.defined(),"resolve previous GDN checkpoint");
+        saved_conv_=conv;saved_state_=state;
+    }
     void set_grouped_projection(bool enabled) {
         MFQ_RUNTIME_CHECK(!conv_.defined() && !state_.defined(), "reset GDN before switching projection execution");
         grouped_projection_ = enabled;
@@ -91,7 +114,8 @@ class Gdn {
             [&] { rollback(); },
             [](Tensor prefix, Tensor suffix) { return tb::cat({prefix, suffix}, 1); });
     }
-    Tensor forward_chunk(CudaExecutionContext &execution, const Tensor &x, bool cache) {
+    Tensor forward_chunk(CudaExecutionContext &execution, const Tensor &x, bool cache,
+                         std::vector<Tensor> projections = {},bool project_output=true) {
         const auto b = x.size(0), t = x.size(1), kw = nk_ * d_, vw = nv_ * d_,
                    channels = 2 * kw + vw;
         auto options = x.options().dtype(tb::kFloat32);
@@ -100,7 +124,6 @@ class Gdn {
                           "reset Qwen4 GDN before changing batch/device");
         auto previous =
             cache && conv_.defined() ? conv_ : tb::zeros({b, kernel_ - 1, channels}, options);
-        std::vector<Tensor> projections;
         std::array<Tensor,2> prepared_gates;
         const auto prefill_option=mfq::cuda::runtime_options::gdn_prefill_fused();
         const bool prefill_fused=t>1 && fused_preparation_ && d_<=256 && kernel_<=8 &&
@@ -109,8 +132,10 @@ class Gdn {
             fused_preparation_ && fused_output_ && transposed_state_ && t==1 &&
             (d_==32 || d_==64 || d_==128) &&
             (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32)) {
-            if(grouped_projection_ && w_.input_projection)projections=w_.input_projection(execution,x);
-            else projections={w_.qkv(execution,x),w_.gate(execution,x),w_.alpha(execution,x),w_.beta(execution,x)};
+            if(projections.empty()) {
+                if(grouped_projection_ && w_.input_projection)projections=w_.input_projection(execution,x);
+                else projections={w_.qkv(execution,x),w_.gate(execution,x),w_.alpha(execution,x),w_.beta(execution,x)};
+            }
             MFQ_RUNTIME_CHECK(projections.size()==4,"GDN input projection count mismatch");
             if(projections[0].scalar_type()==tb::kFloat16 &&
                 projections[1].scalar_type()==projections[2].scalar_type() &&
@@ -126,7 +151,7 @@ class Gdn {
                     w_.norm.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
                     x.scalar_type()==tb::kFloat16,true,core_workspace_,
                     [] {const auto value=mfq::cuda::runtime_options::gdn_inplace_state();return !value || *value;}());
-                auto output=w_.output(execution,decoded[0]);
+                auto output=project_output?w_.output(execution,decoded[0]):decoded[0];
                 conv_.copy_(decoded[1]);
                 if(state_.data_ptr()!=decoded[2].data_ptr())state_.copy_(decoded[2]);
                 return output;
@@ -273,10 +298,11 @@ class Gdn {
                 return rms_norm(attended, w_.norm, eps_) * gate;
             },
             [&](Tensor normalized) {
-                if(normalized.dim()==3)return w_.output(execution,normalized);
+                if(normalized.dim()==3)return project_output?w_.output(execution,normalized):normalized;
+                normalized=normalized.permute({0,2,1,3}).reshape({b,t,vw}).to(x.scalar_type());
+                if(!project_output)return normalized;
                 auto result = w_.output(
-                    execution,
-                    normalized.permute({0, 2, 1, 3}).reshape({b, t, vw}).to(x.scalar_type()));
+                    execution,normalized);
                 return result;
             },
             [&](const auto &convolution, const Tensor &next) {
@@ -318,6 +344,11 @@ class NgramEmbedding {
     bool graph_supported() const { return bool(pipeline_); }
     const Context &context() const { return context_; }
     void restore(Context context) { context_ = std::move(context); }
+    Context prefix_context(const Tensor& host_ids,int64_t count) const {
+        auto host=host_ids.narrow(1,0,count).to(tb::kInt64).contiguous();
+        return mfq::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),host.size(0),count,
+            ngram_,heads_,eos_,multipliers_,offsets_,vocab_,context_,true).next;
+    }
     void prefetch(const Tensor& host_ids) {
         if(!pipeline_)return;
         MFQ_RUNTIME_CHECK(host_ids.is_cpu() && host_ids.dim()==2,"PLE prefetch requires host token IDs");
@@ -420,6 +451,23 @@ class Ple {
         return embedding_.graph_stage(1,tokens,device);
     }
     void upload_graph(const Tensor& host_ids,NintRowStage& stage) {embedding_.upload_graph(host_ids,stage);}
+    NgramEmbedding::Context graph_prefix_context(const Tensor& host_ids,int64_t count) const {
+        return embedding_.prefix_context(host_ids,count);
+    }
+    void bind_graph_checkpoint(const Tensor& conv,NgramEmbedding::Context context) {
+        MFQ_RUNTIME_CHECK(!saved_,"resolve previous PLE checkpoint");
+        saved_=true;saved_conv_=conv;saved_context_=std::move(context);
+    }
+    Tensor forward_graph(CudaExecutionContext& execution,const Tensor& x,const Tensor& ids,
+                         const Tensor& rows,int64_t confirmed,Tensor& checkpoint_conv) {
+        if(!confirmed)return forward_chunk(execution,x,ids,true,{},rows);
+        auto prefix=forward_chunk(execution,x.narrow(1,0,confirmed),ids.narrow(1,0,confirmed),
+                                  true,{},rows.narrow(1,0,confirmed));
+        checkpoint_conv.copy_(conv_);
+        auto suffix=forward_chunk(execution,x.narrow(1,confirmed,x.size(1)-confirmed),
+            ids.narrow(1,confirmed,x.size(1)-confirmed),true,{},rows.narrow(1,confirmed,x.size(1)-confirmed));
+        return tb::cat({prefix,suffix},1);
+    }
     void prefetch_tokens(const Tensor& ids) { embedding_.prefetch(ids); }
     Tensor forward(CudaExecutionContext &execution, const Tensor &x, const Tensor &ids, bool cache,
                    int64_t confirmed = 0,const Tensor& host_ids = {}) {

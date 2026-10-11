@@ -2,6 +2,9 @@
 #ifndef MFQ_MFE_COMPACT_NVQ
 #define MFQ_MFE_COMPACT_NVQ 0
 #endif
+#ifndef MFQ_MFE_PROJECT_INLINE
+#define MFQ_MFE_PROJECT_INLINE __forceinline__
+#endif
 #if MFQ_MFE_COMPACT_NVQ
 #include "mfe_nvq_compact_dot.cuh"
 #endif
@@ -23,6 +26,13 @@
 
 namespace mfq::cuda {
 namespace {
+template<int Capacity>
+__device__ __forceinline__ int token_group_index(const MfeFfnBatch& b,int index) {
+    if(!b.token_group_buckets)return index;
+    constexpr int bucket=Capacity==1?0:Capacity==2?1:Capacity==4?2:3;
+    const auto* plan=b.token_group_buckets+bucket*(b.token_groups+1);
+    return index<plan[0]?plan[index+1]:-1;
+}
 template<int Format>
 __device__ __forceinline__ uint64_t nvq1_complete_record(const MfePackedProjection& d,int neuron,int group) {
     const auto* records=static_cast<const uint8_t*>(d.fields[6]);
@@ -702,7 +712,7 @@ __device__ __forceinline__ bool nint_late_group_pair(const MfePackedProjection& 
     return true;
 }
 template<bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
-__device__ __forceinline__ void project_pair(const MfePackedProjection* d,int local,
+__device__ MFQ_MFE_PROJECT_INLINE void project_pair(const MfePackedProjection* d,int local,
         int first,const int8_t* input,const float* scales,__half* result,bool multi_sum=false) {
     result[0]=result[1]=__float2half(0.0f);
     if(!d || local<0 || local>=d->local_experts)return;
@@ -774,7 +784,7 @@ __device__ __forceinline__ void project_pair(const MfePackedProjection* d,int lo
     }
 }
 template<bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
-__device__ __forceinline__ void project_quad(const MfePackedProjection* d,int local,
+__device__ MFQ_MFE_PROJECT_INLINE void project_quad(const MfePackedProjection* d,int local,
         int first,const int8_t* input,const float* scales,__half* result,bool multi_sum=false,bool canonical=false) {
     if constexpr(!Grouped) {
         project_pair<false,Formats,DefaultMath,E8Narrow>(d,local,first,input,scales,result,multi_sum);
@@ -896,6 +906,38 @@ __global__ void __launch_bounds__(64) mfe_ffn_prepare_kernel(MfeFfnBatch b,
     const auto flat=int64_t(blockIdx.x)*64+lane;
     const int slots=b.tokens*(b.routes+(b.shared?1:0));
     if(flat<int64_t(slots)*b.scale_stride)b.completion[flat]=0;
+    if(b.token_group_counts && blockIdx.x==0) {
+        const int entries=b.tokens*b.routes,all_routes=b.routes+int(b.shared!=nullptr);
+        if(b.token_group_buckets) {
+            if(lane<4)b.token_group_buckets[lane*(b.token_groups+1)]=0;
+            __syncthreads();
+        }
+        for(int entry=lane;entry<b.token_groups;entry+=64) {
+            int count=0;
+            if(entry<entries) {
+                const int expert=b.ids[entry];
+                if(unsigned(expert)<unsigned(b.experts)) {
+                    int rank=0;
+                    for(int previous=0;previous<entry;++previous)rank+=b.ids[previous]==expert;
+                    if(rank%b.token_group_capacity==0)
+                        for(int next=entry;next<entries && count<b.token_group_capacity;++next)
+                            if(b.ids[next]==expert)b.token_group_slots[entry*8+count++]=
+                                (next/b.routes)*all_routes+next%b.routes;
+                }
+            }else {
+                const int first=(entry-entries)*b.token_group_capacity;
+                for(int token=first;token<b.tokens && count<b.token_group_capacity;++token)
+                    b.token_group_slots[entry*8+count++]=token*all_routes+b.routes;
+            }
+            b.token_group_counts[entry]=count;
+            if(count && b.token_group_buckets) {
+                const int bucket=count==1?0:count<=2?1:count<=4?2:3;
+                auto* plan=b.token_group_buckets+bucket*(b.token_groups+1);
+                const int index=atomicAdd(plan,1);
+                plan[index+1]=entry;
+            }
+        }
+    }
     // One control block reads mapped host state. Compute warps consume VRAM
     // snapshots after this kernel completes, avoiding PCIe polling per warp.
     if(b.plan_ready && blockIdx.x==0) {
@@ -999,16 +1041,22 @@ __global__ void __launch_bounds__(128) mfe_ffn_gate_up_kernel(MfeFfnBatch b,int 
         if(complete)quantize_completed_group(b,slot,width,gs,group);
     }
 }
-template<int MinimumBlocks,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
+template<int MinimumBlocks,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false,bool TokenSingles=false>
 __global__ void __launch_bounds__(512,MinimumBlocks) mfe_ffn_parallel_gate_up_kernel(MfeFfnBatch b,int partition) {
     const bool grouped=(partition&16)!=0;
     const bool shared_first=(partition&4)!=0;
     const bool early_gu=(partition&8)!=0;
     partition&=3;
     const int all_routes=b.routes+(b.shared?1:0);
-    const int position=int(blockIdx.y)%all_routes,token=int(blockIdx.y)/all_routes;
+    int position=int(blockIdx.y)%all_routes,token=int(blockIdx.y)/all_routes;
+    if constexpr(TokenSingles) {
+        const int group=token_group_index<1>(b,blockIdx.y);
+        if(group<0 || b.token_group_counts[group]!=1)return;
+        const int original=b.token_group_slots[group*8];
+        position=original%all_routes;token=original/all_routes;
+    }
     const int shift=shared_first?(position?-1:b.routes):0;
-    const int route=position+shift,slot=int(blockIdx.y)+shift;
+    const int route=position+shift,slot=token*all_routes+position+shift;
     const bool shared=route==b.routes;
     const int width=shared?b.shared_intermediate:b.intermediate;
     const int lane=threadIdx.x,warp=threadIdx.y;

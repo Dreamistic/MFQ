@@ -378,7 +378,7 @@ void MoeExpertCache::preload_complete_residency() {
     // their CPU fields pageable avoids locking several extra GiB on Windows.
     std::vector<bool> pipeline_sources(sources_.size(),!config_.moe_pipeline);
     for(const auto& bundle:pipeline_bundles_)
-        for(const auto id:bundle)pipeline_sources.at(id)=true;
+        if(bundle[0]!=bundle[1])for(const auto id:bundle)pipeline_sources.at(id)=true;
     for(const auto& source:sources_) {
         ram_offsets[source->id_].assign(source->n_experts(),-1);
         if(pipeline_sources[source->id_])layer_sources[source->layer_id_].push_back(source.get());

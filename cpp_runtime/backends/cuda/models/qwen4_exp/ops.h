@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <functional>
+#include <iosfwd>
 
 namespace mfq::cuda::qwen4_exp { struct Gr; }
 
@@ -20,7 +21,10 @@ void qwen4_set_attention_grouping(Qwen4CausalLm&, bool enabled);
 std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_logits(
     Qwen4CausalLm&,mfq_tensor_backend::Tensor,int);
 std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
-    Qwen4CausalLm&,mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor* raw_hidden);
+    Qwen4CausalLm&,mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor* raw_hidden,int64_t confirmed=0,
+    bool* initialized=nullptr,const mfq_tensor_backend::Tensor& host_ids={},
+    mfq_tensor_backend::Tensor* logits=nullptr,std::vector<int32_t>* greedy_tokens=nullptr);
+void qwen4_report_decode_graph(const Qwen4CausalLm&,std::ostream&);
 bool qwen4_layer_major_prefill_eligible(const Qwen4CausalLm&, int64_t tokens);
 mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     Qwen4CausalLm&, mfq_tensor_backend::Tensor ids, int64_t compute_chunk = 1024,

@@ -1,6 +1,7 @@
 #include "backend_checks.h"
 
 #include "mfq_cuda_activation_ops.h"
+#include "mfq_cuda_sampling_ops.h"
 #include "mfq_tensor_backend.h"
 
 #include <cuda_runtime_api.h>
@@ -375,6 +376,55 @@ int run_backend_argmax_check(int64_t elements, int repetitions) {
             ++cases;
         }
         run_backend_argmax_dtype_check(elements, repetitions, dtype);
+        for (int64_t width : {1LL, 3LL, 257LL, 16383LL, 16384LL, 16385LL, 248320LL, 248321LL}) {
+            constexpr int rows = 6;
+            std::vector<float> values(rows * width, -7.0f);
+            for (int row = 0; row < rows; ++row) {
+                auto begin = values.begin() + row * width;
+                if (row == 0) {
+                    values[std::min<int64_t>(4095, width - 1)] = 5.0f;
+                    values[width - 1] = 5.0f;
+                } else if (row == 1) std::fill(begin, begin + width, std::numeric_limits<float>::quiet_NaN());
+                else if (row == 2) std::fill(begin, begin + width, -std::numeric_limits<float>::infinity());
+                else if (row == 3) {
+                    std::fill(begin, begin + width, std::numeric_limits<float>::quiet_NaN());
+                    begin[std::min<int64_t>(4096, width - 1)] = std::numeric_limits<float>::infinity();
+                    begin[width - 1] = std::numeric_limits<float>::infinity();
+                } else if (row == 4) {
+                    std::fill(begin, begin + width, -0.0f);
+                    begin[width - 1] = 0.0f;
+                } else std::fill(begin, begin + width, std::numeric_limits<float>::lowest());
+            }
+            auto input = tb::tensor(values).reshape({rows, width}).to(dtype).to(tb::kCUDA);
+            auto quantized = input.to(tb::kCPU, tb::kFloat32).contiguous();
+            auto actual = sample_greedy_cuda(input).cpu().contiguous();
+            for (int row = 0; row < rows; ++row) {
+                float best = std::numeric_limits<float>::lowest();
+                int64_t expected = 0;
+                for (int64_t column = 0; column < width; ++column) {
+                    const float value = quantized.data_ptr<float>()[row * width + column];
+                    if (value > best) { best = value; expected = column; }
+                }
+                MFQ_RUNTIME_CHECK(actual.data_ptr<int64_t>()[row] == expected,
+                    "greedy sampler changed tail, tie, NaN, infinity or fallback behavior");
+            }
+            ++cases;
+        }
+        for (int rows : {1, 6}) {
+            auto input = tb::zeros({rows, elements}, tb::TensorOptions().device(tb::kCUDA).dtype(dtype));
+            for (int i = 0; i < 20; ++i) (void)sample_greedy_cuda(input);
+            mfq_cuda_synchronize();
+            cudaEvent_t begin, end;
+            MFQ_CUDA_CHECK(cudaEventCreate(&begin)); MFQ_CUDA_CHECK(cudaEventCreate(&end));
+            const auto stream = mfq_current_cuda_stream();
+            MFQ_CUDA_CHECK(cudaEventRecord(begin, stream));
+            for (int i = 0; i < repetitions; ++i) (void)sample_greedy_cuda(input);
+            MFQ_CUDA_CHECK(cudaEventRecord(end, stream)); MFQ_CUDA_CHECK(cudaEventSynchronize(end));
+            float ms = 0; MFQ_CUDA_CHECK(cudaEventElapsedTime(&ms, begin, end));
+            MFQ_CUDA_CHECK(cudaEventDestroy(begin)); MFQ_CUDA_CHECK(cudaEventDestroy(end));
+            std::cout << "backend_greedy rows=" << rows << " dtype=" << static_cast<int>(dtype)
+                      << " eager_us=" << ms * 1000 / repetitions << "\n";
+        }
     }
     std::cout << "backend_argmax_cases=" << cases
               << " BF16/FP16/FP32, batched rows, tails, ties, keepdim, strided fallback, nonfinite PASS\n";
