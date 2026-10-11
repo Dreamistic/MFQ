@@ -809,6 +809,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         return output;
     }
 
+    bool pipeline_source(const MoeCachedSource& source) const {
+        for(const auto& bundle:cache_->pipeline_bundles_)
+            if(std::find(bundle.begin(),bundle.end(),source.id_)!=bundle.end())return true;
+        return false;
+    }
     MoeGpuArena& stage(int projection,MoeCachedCohort& cohort) {
         const auto key=std::to_string(projection)+":"+cohort.arena->signature;
         auto& arena=cache_->pipeline_stages_[key];
@@ -817,7 +822,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         arena->layouts=cohort.arena->layouts;
         // Full source geometry bounds the number of distinct experts in a
         // cohort, independent of token batching; addresses never grow later.
-        for(const auto& source:cache_->sources_)for(const auto& c:source->cohorts_)
+        for(const auto& source:cache_->sources_)if(pipeline_source(*source))for(const auto& c:source->cohorts_)
             if(c.arena->signature==cohort.arena->signature)arena->slots=std::max(arena->slots,c.cpu->local_experts);
         for(const auto& layout:arena->layouts) {
             auto shape=layout.slot_shape;shape[0]*=arena->slots;
@@ -998,7 +1003,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(!cache_->pipeline_host_stage_.defined()) {
             std::unordered_map<int,int64_t> layer_bytes,layer_fields;
             int64_t experts=0;
-            for(const auto& source:cache_->sources_)if(source->quant_source_) {
+            for(const auto& source:cache_->sources_)if(source->quant_source_ && pipeline_source(*source)) {
                 int64_t fields=0;experts=std::max(experts,static_cast<int64_t>(source->n_experts()));
                 for(int e=0;e<source->n_experts();++e) {
                     const auto n=static_cast<int64_t>(source->cohorts_[source->expert_to_cohort_[e]].bytes_per_expert.size());
@@ -1015,7 +1020,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(cell.tokens<=8) {
             if(!cache_->pipeline_wire_route_bytes_) {
                 std::unordered_map<int,int64_t> layer_bytes,layer_fields;
-                for(const auto& source:cache_->sources_)if(source->quant_source_) {
+                for(const auto& source:cache_->sources_)if(source->quant_source_ && pipeline_source(*source)) {
                     int64_t bytes=0,fields=0;
                     for(int e=0;e<source->n_experts();++e) {
                         const auto n=static_cast<int64_t>(source->cohorts_[source->expert_to_cohort_[e]].bytes_per_expert.size());
