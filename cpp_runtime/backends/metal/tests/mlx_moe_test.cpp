@@ -7,10 +7,12 @@
 #include "mlx_reference.h"
 #include "mfq_container.h"
 #include "mlx_qwen4_causal_lm.h"
+#include "qwen4_ops.h"
 #include "mlx_kernel_prepare.h"
 #include "mlx_inference_warmup.h"
 #include "mlx_resource_telemetry.h"
 #include "mlx_platform.h"
+#include "mlx_resident_budget.h"
 #include "mlx_ane_matmul.h"
 #include "mlx_paged_session_codec.h"
 #include "nlohmann/json.hpp"
@@ -19,6 +21,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <barrier>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -6262,7 +6266,7 @@ void test_streamed_mixed_mfe_residency() {
     const auto nint = make_nint_v2_tensor(
         2 * output, input, 43, 24);
     const auto legacy_nint = make_nint_tensor(
-        5, 2 * output, input, 47, 24);
+        5, 2 * output, input, 47, 28);
     const auto mx = make_mxfp4(2 * output, input);
     const auto vq = make_jsc_nvq(2 * output, input);
     const auto nvq_s = make_nvq1_s(2 * output, input);
@@ -6324,6 +6328,92 @@ void test_streamed_mixed_mfe_residency() {
         "discarding an MFE record retained SSD backing telemetry");
 
     const auto full = mfq::metal::MlxMfeWeight::from_blob(blob);
+    for (const auto budget : {std::size_t{0}, std::size_t{1u << 24}}) {
+        mfq::metal::MlxMfeOffloadCache changing(model, budget);
+        mfq::metal::MlxKernelPreparation preparation(128, 128);
+        preparation.set_routes(routes);
+        changing.prepare_projection("mixed", true);
+        const auto compiled = preparation.size();
+        require(compiled > 0, "SSD expert kernels were not prepared at load time");
+        std::vector<mlx::core::array> outputs;
+        preparation.collect([&] {
+            for (const std::vector<std::int32_t> active : {
+                    std::vector<std::int32_t>{1}, {2}, {0}, {7}, {8}, {9},
+                    {9, 2, 8, 1}, {11, 10, 7, 6, 5, 4, 3, 2, 1, 0}, {1, 2, 8}}) {
+                const auto weight = changing.grouped_mfe("mixed", active);
+                for (const int rows : {1, 2, 3, 4, 5, 6, 8, 17, 22}) {
+                    const auto x = mlx::core::full({rows, input}, 0.125f, mlx::core::float16);
+                    const std::vector<std::int32_t> ids(rows * routes, 0);
+                    const auto ids_array = mlx::core::array(ids.begin(), mlx::core::Shape{rows, routes});
+                    outputs.push_back(weight.routed_matmul(x, ids_array));
+                    preparation.add(outputs.back());
+                    if (rows > 1 && rows <= 6) {
+                        const auto groups = mfq::metal::moe_route_groups_host(ids, rows, routes);
+                        outputs.push_back(weight.routed_matmul(x, ids_array, &*groups));
+                        preparation.add(outputs.back());
+                    }
+                }
+                require(preparation.size() == compiled,
+                    "changing SSD expert count, formats or GS created a new compilation variant");
+                const std::array invalid{-1, static_cast<int>(active.size())};
+                const auto empty = evaluated_floats(weight.routed_matmul(
+                    mlx::core::full({1, input}, 0.125f, mlx::core::float16),
+                    mlx::core::array(invalid.begin(), mlx::core::Shape{1, 2})));
+                require(std::all_of(empty.begin(), empty.end(), [](float value) { return value == 0; }),
+                    "runtime expert bounds accepted an invalid local ID");
+            }
+        });
+        preparation.finish();
+    }
+    for (const int rows : {2, 3, 4, 5, 6}) {
+        const std::vector<float> source(rows * input, 0.125f);
+        const auto x = mlx::core::astype(mlx::core::array(source.begin(), mlx::core::Shape{rows, input}),
+            mlx::core::float16);
+        for (const auto expert : {7, 8, 9}) {
+            const std::vector<std::int32_t> ids(rows * routes, expert);
+            const auto id_array = mlx::core::array(ids.begin(), mlx::core::Shape{rows, routes});
+            const auto groups = mfq::metal::moe_route_groups_host(ids, rows, routes);
+            require(evaluated_floats(full.routed_matmul(x, id_array))
+                == evaluated_floats(full.routed_matmul(x, id_array, &*groups)),
+                "MTP route chunks changed repeated NVQ expert results");
+        }
+    }
+    {
+        const std::array names{std::string("mixed"), std::string("alternate")};
+        mfq::metal::MlxMfeOffloadCache bulk(model, 2 * (blob.size() + alternate_blob.size()));
+        auto layer = bulk.layer_mfe(names);
+        require(layer && layer->size() == names.size(), "bulk MFE layer was not loaded");
+        require(bulk.cached_expert_count() == 0 && bulk.resident_packed_bytes() == 0,
+            "bulk prefill polluted the decode expert cache");
+        std::vector<float> source(input, 0.125f);
+        std::vector<std::int32_t> ids(experts);
+        std::iota(ids.begin(), ids.end(), 0);
+        const auto x = mlx::core::astype(mlx::core::array(source.begin(), mlx::core::Shape{1, input}),
+            mlx::core::float16);
+        const auto routes = mlx::core::array(ids.begin(), mlx::core::Shape{1, experts});
+        const auto expected = evaluated_floats(full.routed_matmul(x, routes));
+        bulk.clear();
+        const auto actual = evaluated_floats((*layer)[0].routed_matmul(x, routes));
+        require(actual == expected, "bulk MFE output or retained storage mismatch");
+        const std::array mixed_name{std::string("mixed")};
+        const std::array repeated{4, 4, 4, 4};
+        require(!bulk.layer_mfe(mixed_name, repeated), "sparse MFE routes triggered full-layer reads");
+        const std::array invalid{experts};
+        bool invalid_rejected = false;
+        try { (void)bulk.layer_mfe(mixed_name, invalid); }
+        catch (const std::out_of_range&) { invalid_rejected = true; }
+        require(invalid_rejected, "bulk MFE accepted an out-of-range expert");
+        bulk.set_cache_limit(1u << 24);
+        (void)bulk.grouped_mfe("mixed", ids);
+        require(!bulk.layer_mfe(mixed_name, ids), "cached MFE routes triggered full-layer reads");
+        bulk.set_cache_limit(1);
+        require(!bulk.layer_mfe(names), "bulk MFE ignored insufficient staging capacity");
+        bulk.set_cache_limit(2 * (blob.size() + alternate_blob.size()));
+        mfq::metal::MlxResidentBudgetScope deny([](std::size_t) {
+            throw std::runtime_error("denied bulk staging should not reserve memory");
+        }, [](std::size_t) { return false; });
+        require(!bulk.layer_mfe(names), "bulk MFE ignored the total resident budget");
+    }
     const auto exercise = [&](const std::vector<std::int32_t>& active) {
         const auto paged = residency.grouped_mfe("mixed", active);
         require(
@@ -6358,6 +6448,16 @@ void test_streamed_mixed_mfe_residency() {
             input_array,
             mlx::core::array(
                 local_ids.begin(), mlx::core::Shape{tokens, routes})));
+        const auto groups = mfq::metal::moe_route_groups_host(local_ids, tokens, routes);
+        require(groups.has_value(), "small-M CPU route grouping was not selected");
+        const auto planned = evaluated_floats(paged.routed_matmul(input_array,
+            mlx::core::array(local_ids.begin(), mlx::core::Shape{tokens, routes}), &*groups));
+        require(actual == planned, "shared CPU route groups changed mixed MFE results");
+        const auto pair = evaluated_floats(paged.routed_swiglu_pair(paged, input_array,
+            mlx::core::array(local_ids.begin(), mlx::core::Shape{tokens, routes})));
+        const auto planned_pair = evaluated_floats(paged.routed_swiglu_pair(paged, input_array,
+            mlx::core::array(local_ids.begin(), mlx::core::Shape{tokens, routes}), 0.0f, &*groups));
+        require(pair == planned_pair, "shared CPU groups changed separate Gate/Up results");
         require(
             actual.size() == expected.size(),
             "mixed streamed MFE output shape mismatch");
@@ -6376,6 +6476,148 @@ void test_streamed_mixed_mfe_residency() {
         residency.cached_expert_count() == experts
             && residency.resident_packed_bytes() > 0,
         "mixed streamed MFE cache accounting mismatch");
+    exercise({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+    const auto reuse_before = residency.reuse_stats();
+    exercise({11, 9, 8, 5, 3, 2, 1});
+    exercise({7, 0, 6, 4});
+    const auto reuse_after = residency.reuse_stats();
+    require(reuse_after.expert_loads == reuse_before.expert_loads
+        && reuse_after.packed_hits == reuse_before.packed_hits + 2,
+        "changing active expert subsets rebuilt packed weights or reread SSD pages");
+    {
+        mfq::metal::MlxMfeOffloadCache concurrent(model, 1u << 24);
+        std::vector<std::int32_t> forward(experts);
+        std::iota(forward.begin(), forward.end(), 0);
+        auto reverse = forward;
+        std::reverse(reverse.begin(), reverse.end());
+        std::array<std::optional<mfq::metal::MlxMfeWeight>, 2> results;
+        std::array<std::exception_ptr, 2> errors;
+        const auto previous_stream = mlx::core::default_stream(mlx::core::Device::gpu);
+        const auto stream = mlx::core::new_thread_unsafe_stream(mlx::core::Device::gpu);
+        mlx::core::set_default_stream(stream);
+        std::barrier start(2);
+        const auto run = [&](int index, const auto& active) {
+            mlx::core::set_default_stream(stream);
+            start.arrive_and_wait();
+            try { results[index] = concurrent.grouped_mfe("mixed", active); }
+            catch (...) { errors[index] = std::current_exception(); }
+        };
+        std::thread first([&] { run(0, forward); });
+        std::thread second([&] { run(1, reverse); });
+        first.join();
+        second.join();
+        for (const auto& error : errors) if (error) std::rethrow_exception(error);
+        const auto stats = concurrent.reuse_stats();
+        require(stats.expert_loads == experts && stats.packed_hits == 1,
+            "concurrent requests duplicated expert reads or packed assembly");
+        require(concurrent.resident_packed_bytes() <= concurrent.cache_limit_bytes(),
+            "concurrent prepared weights exceeded the expert budget");
+        const std::vector<float> source(input, 0.125f);
+        const auto x = mlx::core::astype(mlx::core::array(source.begin(), mlx::core::Shape{1, input}),
+            mlx::core::float16);
+        const auto ids = mlx::core::array(forward.begin(), mlx::core::Shape{1, experts});
+        const auto expected = evaluated_floats(full.routed_matmul(x, ids));
+        concurrent.clear();
+        const auto normal = evaluated_floats(results[0]->routed_matmul(x, ids));
+        const auto reversed = evaluated_floats(results[1]->routed_matmul(x, ids));
+        require(normal == expected, "clearing a cache invalidated concurrent packed views");
+        for (int expert = 0; expert < experts; ++expert)
+            for (int row = 0; row < output; ++row)
+                require(reversed[expert * output + row] == expected[(experts - expert - 1) * output + row],
+                    "reordered shared-storage expert view changed numerical results");
+        const std::array duplicate{2, 2, 7};
+        const auto selected = full.select_experts(duplicate);
+        const std::array local{0, 1, 2};
+        require(evaluated_floats(selected.routed_matmul(x,
+            mlx::core::array(local.begin(), mlx::core::Shape{1, 3})))
+            == evaluated_floats(full.routed_matmul(x,
+                mlx::core::array(duplicate.begin(), mlx::core::Shape{1, 3}))),
+            "duplicate expert descriptor views changed results");
+        const std::array invalid{-1};
+        bool rejected = false;
+        try { (void)full.select_experts(invalid); }
+        catch (const std::out_of_range&) { rejected = true; }
+        require(rejected, "shared MFE view accepted a negative expert ID");
+        const std::array<std::uint32_t, 1> zero{0};
+        rejected = false;
+        try { (void)concurrent.grouped_mfe("mixed", {1}, zero); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "MFE heat accepted zero activations");
+        mlx::core::set_default_stream(previous_stream);
+    }
+    {
+        mfq::metal::MlxMfeOffloadCache bounded(model, 1u << 24);
+        auto retained = bounded.grouped_mfe("mixed", {1, 2, 3});
+        const auto bytes = bounded.resident_packed_bytes();
+        const auto count = bounded.cached_expert_count();
+        require(bounded.set_cache_limit(bytes - 1) > 0 && bounded.cached_expert_count() == count,
+            "shrinking a prepared cache evicted expert pages before packed copies");
+        bounded.set_cache_limit(1u << 24);
+        {
+            mfq::metal::MlxResidentBudgetScope scope([&](std::size_t) { bounded.clear(); });
+            retained = bounded.grouped_mfe("mixed", {1, 2, 3});
+        }
+        require(retained.experts() == 3 && bounded.resident_packed_bytes() == 0,
+            "clearing a cache during preparation admitted stale expert pages");
+        (void)bounded.grouped_mfe("mixed", {1, 2, 3});
+        require(bounded.cached_expert_count() == 3,
+            "cache invalidation stranded the in-flight loading marker");
+    }
+    {
+        const auto previous_stream = mlx::core::default_stream(mlx::core::Device::gpu);
+        const auto stream = mlx::core::new_thread_unsafe_stream(mlx::core::Device::gpu);
+        mlx::core::set_default_stream(stream);
+        bool observed = false;
+        for (int attempt = 0; attempt < 8 && !observed; ++attempt) {
+            mfq::metal::MlxMfeOffloadCache transient(model, 0);
+            std::vector<std::int32_t> ids(experts);
+            std::iota(ids.begin(), ids.end(), 0);
+            std::barrier start(2);
+            std::array<std::exception_ptr, 2> errors;
+            const auto run = [&](int index) {
+                mlx::core::set_default_stream(stream);
+                start.arrive_and_wait();
+                try { (void)transient.grouped_mfe("mixed", ids); }
+                catch (...) { errors[index] = std::current_exception(); }
+            };
+            std::thread first([&] { run(0); });
+            std::thread second([&] { run(1); });
+            first.join();
+            second.join();
+            for (const auto& error : errors) if (error) std::rethrow_exception(error);
+            const auto stats = transient.reuse_stats();
+            if (stats.load_waits) {
+                require(stats.expert_loads == experts && stats.packed_hits == 1,
+                    "zero-budget concurrent requests duplicated in-flight expert reads");
+                observed = true;
+            }
+            require(transient.resident_packed_bytes() == 0 && transient.cached_expert_count() == 0,
+                "sharing active expert leases retained a zero-budget cache");
+        }
+        require(observed, "concurrent transient-expert test never overlapped requests");
+        mlx::core::set_default_stream(previous_stream);
+    }
+    {
+        const auto mx_heat = make_mxfp4(4 * output, input);
+        const auto heat_blob = make_raw_nim2(4, output, input, {
+            {{0, 1, 2, 3}, "MXFP4", {mx_heat.blob, mx_heat.dense, 4 * output, input}, {}},
+        });
+        const TemporaryMfq heat_file({{"heat", "MFE", heat_blob}});
+        const mfq::metal::MfqContainer heat_model(heat_file.path());
+        mfq::metal::MlxMfeOffloadCache heat(heat_model, 0);
+        const auto page = heat.grouped_mfe("heat", {0});
+        heat.set_cache_limit(2 * page.packed_nbytes());
+        const std::array<std::uint32_t, 1> repeated{6};
+        (void)heat.grouped_mfe("heat", {0}, repeated);
+        (void)heat.grouped_mfe("heat", {1});
+        (void)heat.grouped_mfe("heat", {2});
+        const auto before = heat.reuse_stats();
+        (void)heat.grouped_mfe("heat", {0});
+        require(heat.reuse_stats().expert_loads == before.expert_loads,
+            "repeated-token expert heat was lost under cache pressure");
+        require(heat.resident_packed_bytes() <= heat.cache_limit_bytes(),
+            "weighted expert heat exceeded the cache budget");
+    }
     require(mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == blob.size(),
         "MFE cache hits duplicated SSD backing telemetry");
     const auto before = residency.resident_packed_bytes();
@@ -7165,9 +7407,115 @@ void test_mixed_decode_row_packing(
     }
 }
 
+void test_vq_anchor_conversion() {
+    constexpr int rows = 0x7c00;
+    auto fixture = make_nvq1_l(rows, 8);
+    for (std::uint16_t bits = 0; bits < rows; ++bits)
+        std::memcpy(fixture.blob.data() + 40 + bits * sizeof(bits), &bits, sizeof(bits));
+    const auto parsed = mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {});
+    for (std::uint16_t bits = 0; bits < rows; ++bits) {
+        const int exponent = bits >> 10;
+        const int mantissa = bits & 0x3ff;
+        const float expected = exponent == 0 ? std::ldexp(float(mantissa), -24)
+            : std::ldexp(1.0f + float(mantissa) / 1024.0f, exponent - 15);
+        require(std::bit_cast<std::uint32_t>(parsed.anchors[bits]) == std::bit_cast<std::uint32_t>(expected),
+            "VQ FP16 anchor conversion changed a finite value");
+    }
+    const std::uint16_t negative_zero = 0x8000;
+    std::memcpy(fixture.blob.data() + 40, &negative_zero, sizeof(negative_zero));
+    require(std::signbit(mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {}).anchors[0]),
+        "VQ FP16 anchor conversion lost negative zero");
+    for (const std::uint16_t invalid : {0x7c00, 0xfc00, 0x7e00, 0xfe00, 0x8001}) {
+        std::memcpy(fixture.blob.data() + 40, &invalid, sizeof(invalid));
+        bool rejected = false;
+        try { (void)mfq::metal::detail::parse_vq_blob(fixture.dtype, fixture.blob, {}); }
+        catch (const std::exception&) { rejected = true; }
+        require(rejected, "VQ anchor validation accepted an invalid value");
+    }
+}
+
+void test_streamed_nint_selector_boundaries() {
+    constexpr int experts = 19;
+    constexpr int output = 5;
+    constexpr int input = 37;
+    for (const int group_size : {23, 24, 32, 128}) {
+        const auto tensor = make_nint_v2_tensor(
+            experts * output, input, 53, group_size, true);
+        std::vector<std::int32_t> pool_ids(experts);
+        for (int local = 0; local < experts; ++local) pool_ids[local] = experts - local - 1;
+        const auto blob = make_raw_nim2(experts, output, input,
+            {{pool_ids, "NINTv2", tensor, {}}});
+        auto nonfinite = tensor;
+        const auto scale_offset = 42 + (experts - 1 - 7) * output * sizeof(std::uint16_t);
+        nonfinite.blob[scale_offset] = 0;
+        nonfinite.blob[scale_offset + 1] = 0x7e;
+        const auto malformed = make_raw_nim2(experts, output, input,
+            {{pool_ids, "NINTv2", nonfinite, {}}});
+        const TemporaryMfq file({{"valid", "MFE", blob}, {"nonfinite", "MFE", malformed}, {"broken", "MFE", blob}});
+        const mfq::metal::MfqContainer model(file.path());
+        mfq::metal::MlxMfeOffloadCache cache(model, 1);
+        (void)cache.projection_info("valid");
+        (void)cache.projection_info("nonfinite");
+        (void)cache.projection_info("broken");
+        std::filesystem::resize_file(file.path(), model.record("broken").offset);
+        mfq::metal::MlxMfeOffloadCache bulk(model, 6 * blob.size());
+        for (const auto& bad : {std::string("broken"), std::string("nonfinite")}) {
+            const std::array names{std::string("valid"), bad};
+            bool failed = false;
+            try { (void)bulk.layer_mfe(names); }
+            catch (const std::exception&) { failed = true; }
+            require(failed && bulk.cached_expert_count() == 0 && bulk.backing_payload_bytes() == 0,
+                "failed bulk MFE staging committed partial state");
+        }
+        const std::array valid_names{std::string("valid")};
+        require(bulk.layer_mfe(valid_names).has_value(), "bulk MFE workers did not recover after an error");
+        bool rejected = false;
+        try { (void)cache.grouped_mfe("broken", pool_ids); }
+        catch (const std::exception&) { rejected = true; }
+        require(rejected && cache.cached_expert_count() == 0,
+            "failed parallel expert reads committed partial cache pages");
+        rejected = false;
+        try { (void)cache.grouped_mfe("nonfinite", pool_ids); }
+        catch (const std::exception&) { rejected = true; }
+        require(rejected && cache.cached_expert_count() == 0,
+            "failed expert parsing committed partial cache pages");
+        const auto full = mfq::metal::MlxMfeWeight::from_blob(blob);
+        std::vector<float> source(input);
+        for (int column = 0; column < input; ++column) source[column] = float(column - 18) / 256;
+        const auto x = mlx::core::astype(
+            mlx::core::array(source.begin(), mlx::core::Shape{1, input}), mlx::core::float16);
+        for (const std::vector<std::int32_t> active : {
+                 std::vector<std::int32_t>{0, 18, 7, 11},
+                 std::vector<std::int32_t>{17, 2, 9, 1},
+                 pool_ids}) {
+            auto requested = active;
+            requested.push_back(active.front());
+            const auto paged = cache.grouped_mfe("valid", requested);
+            require(paged.experts() == static_cast<int>(active.size()),
+                "streamed NINT duplicate expert was not deduplicated");
+            std::vector<std::int32_t> local(active.size());
+            std::iota(local.begin(), local.end(), 0);
+            const auto expected = evaluated_floats(full.routed_matmul(x,
+                mlx::core::array(active.begin(), mlx::core::Shape{1, static_cast<int>(active.size())})));
+            const auto actual = evaluated_floats(paged.routed_matmul(x,
+                mlx::core::array(local.begin(), mlx::core::Shape{1, static_cast<int>(local.size())})));
+            require(actual.size() == expected.size(), "streamed NINT selector output shape mismatch");
+            for (std::size_t index = 0; index < actual.size(); ++index) {
+                require(std::isfinite(actual[index]) && std::fabs(actual[index] - expected[index]) <= 1e-6f,
+                    "streamed NINT expert prefix rank or unaligned slice mismatch");
+            }
+            require(cache.resident_packed_bytes() <= cache.cache_limit_bytes(),
+                "streamed NINT selector test exceeded cache budget");
+        }
+    }
+}
+
 void test_streamed_nvq1_residency() {
-    constexpr int experts = 3;
+    constexpr int experts = 19;
     constexpr int output = 3;
+    std::vector<std::int32_t> pool_ids(experts);
+    std::iota(pool_ids.begin(), pool_ids.end(), 0);
+    std::rotate(pool_ids.begin(), pool_ids.end() - 1, pool_ids.end());
     // Odd expert row counts exercise unaligned state/index/delta boundaries.
     // Cover both embedded tables and the implicit NVQ1-L table, including K tails.
     for (int variant = 0; variant < 4; ++variant) {
@@ -7199,7 +7547,7 @@ void test_streamed_nvq1_residency() {
         }
         std::vector<std::uint16_t> states, indices, deltas;
         for (int row = 0; row < experts * output; ++row) {
-            append<std::uint16_t>(payload, static_cast<std::uint16_t>(0x3400 + row * 128));
+            append<std::uint16_t>(payload, static_cast<std::uint16_t>(0x3400 + (row % 8) * 128));
             for (int group = 0; group < groups; ++group) {
                 states.push_back((row * 3 + group + 1) % (1 << state_bits));
                 deltas.push_back((row + group) % 2);
@@ -7213,7 +7561,7 @@ void test_streamed_nvq1_residency() {
         append_bytes(payload, pack_vq_values(deltas, 1));
         const auto wrap = [&](const std::vector<std::uint8_t>& bytes) {
             return make_raw_nim2(experts, output, input,
-                {{{2, 0, 1}, dtype, {bytes, {}, experts * output, input}, {}}});
+                {{pool_ids, dtype, {bytes, {}, experts * output, input}, {}}});
         };
         auto truncated = payload;
         truncated.pop_back();
@@ -7285,7 +7633,7 @@ void test_streamed_nvq1_residency() {
                         const float code = static_cast<int>((word >> (2 * (column % 8))) & 3u) - 1;
                         const float delta = (short_profile ? 0.15625f : 0.125f) *
                             (delta_bit ? -1.0f : 1.0f);
-                        const float weight = (0.25f + row * 0.03125f) *
+                        const float weight = (0.25f + (row % 8) * 0.03125f) *
                             states[row * groups + group] * (code + delta);
                         reference += source[(route / 2) * input + column] * weight;
                     }
@@ -7295,6 +7643,7 @@ void test_streamed_nvq1_residency() {
         };
         const auto retained = cache.grouped_mfe("valid", {2, 0});
         check(retained, {2, 0});
+        check(cache.grouped_mfe("valid", pool_ids), pool_ids);
         require(cache.cached_expert_count() == 0, "NVQ1 exceeded its one-byte persistent budget");
         check(cache.grouped_mfe("valid", {1}), {1});
         require(cache.cached_expert_count() == 0, "NVQ1 retained pages above its persistent budget");
@@ -7302,6 +7651,61 @@ void test_streamed_nvq1_residency() {
         require(cache.resident_packed_bytes() == 0, "NVQ1 cache clear retained bytes");
         check(retained, {2, 0});
         check(cache.grouped_mfe("valid", {0, 2, 1}), {0, 2, 1});
+    }
+}
+
+void test_compact_nint_mhc() {
+    using namespace mlx::core;
+    using mfq::metal::MlxLinear;
+    constexpr int hidden = 2560, streams = 4, width = hidden * streams;
+    const MlxLinear down(mfq::metal::MlxNintWeight::from_blob(
+        make_nint_v2_tensor(320, width, 17, 64, true).blob));
+    const MlxLinear up(mfq::metal::MlxNintWeight::from_blob(
+        make_nint_v2_tensor(width, 320, 31, 32, true).blob));
+    const std::optional<MlxLinear> injection{MlxLinear(mfq::metal::MlxNintWeight::from_blob(
+        make_nint_v2_tensor(streams, width, 23, 64, true).blob))};
+    const auto dense_down = down.nint_weight_ref()->dequantize();
+    const auto dense_up = up.nint_weight_ref()->dequantize();
+    const std::optional<array> dense_injection = injection->nint_weight_ref()->dequantize();
+    const auto norm = ones({width}, float16);
+    for (const auto dtype : {float16, bfloat16, float32}) {
+        for (const int rows : {1, 2, 3, 4, 5, 6, 7}) {
+            std::vector<float> values(rows * width);
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = float(int((index * 37) % 257) - 128) / 257.0f;
+            const auto x = astype(array(values.begin(), Shape{1, rows, width}), dtype);
+            const auto actual = mfq::metal::qwen4_gated_residual_pre(
+                x, norm, down, up, injection, hidden, streams);
+            const auto expected = mfq::metal::qwen4_gated_residual_pre(
+                x, norm, dense_down, dense_up, dense_injection, hidden, streams);
+            const auto compare = [](array a, array b) {
+                const auto actual_values = evaluated_floats(a);
+                const auto expected_values = evaluated_floats(b);
+                require(actual_values.size() == expected_values.size(), "packed MHC output shape changed");
+                for (std::size_t index = 0; index < actual_values.size(); ++index)
+                    require(std::isfinite(actual_values[index]) &&
+                        std::fabs(actual_values[index] - expected_values[index])
+                            <= 5e-3f * (1.0f + std::fabs(expected_values[index])),
+                        "compact NINT mHC differs from dequantized reference");
+            };
+            if (rows <= 6 && std::getenv("MFQ_METAL_QWEN_GATED_HC_FAST") == nullptr)
+                require(std::string(actual.branch.primitive().name()) == "PackedHcPrimitive",
+                    "production-shape compact MHC fixture missed packed decode");
+            compare(actual.branch, expected.branch);
+            compare(*actual.injection, *expected.injection);
+            const auto after = mfq::metal::qwen4_gated_residual_pre_after(
+                expected.branch, x, *expected.injection, norm, down, up, injection, hidden, streams);
+            const auto expected_after = mfq::metal::qwen4_gated_residual_pre_after(
+                expected.branch, x, *expected.injection, norm,
+                dense_down, dense_up, dense_injection, hidden, streams);
+            compare(after.branch, expected_after.branch);
+            compare(*after.injection, *expected_after.injection);
+            compare(after.residual, expected_after.residual);
+            compare(mfq::metal::qwen4_gated_residual_pre(
+                x, norm, down, up, std::nullopt, hidden, streams).branch,
+                mfq::metal::qwen4_gated_residual_pre(
+                    x, norm, dense_down, dense_up, std::nullopt, hidden, streams).branch);
+        }
     }
 }
 
@@ -7861,10 +8265,13 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--test-streamed-mfe") {
+            test_compact_nint_mhc();
             test_qwen4_online_expert_offload(false);
             test_qwen4_online_expert_offload(true);
             test_streamed_mixed_mfe_residency();
             test_streamed_nvq1_residency();
+            test_streamed_nint_selector_boundaries();
+            test_vq_anchor_conversion();
             test_materialized_mfe_projections();
             test_direct_mfe_projection_tails();
             std::cout << "MFQ streamed MFE residency tests passed\n";
@@ -7983,8 +8390,10 @@ int main(int argc, char** argv) {
         test_grouped_mxfp4_vq_mmq_prefill();
         test_grouped_mxfp4_vq_mmq_prefill(129, 224);
         test_concatenate_resident_mfe_experts();
+        test_compact_nint_mhc();
         test_streamed_mixed_mfe_residency();
         test_streamed_nvq1_residency();
+        test_streamed_nint_selector_boundaries();
         test_materialized_mfe_projections();
         test_direct_mfe_projection_tails();
         test_banked_vq_input_views();

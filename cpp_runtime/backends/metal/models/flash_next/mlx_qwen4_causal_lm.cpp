@@ -934,7 +934,7 @@ public:
                 global_ids.eval();
                 std::vector<std::int32_t> active;
                 active.reserve(static_cast<std::size_t>(global_ids.size()));
-                std::vector<std::uint8_t> seen(
+                std::vector<std::uint32_t> seen(
                     static_cast<std::size_t>(config_.num_experts), 0);
                 const auto* ids = global_ids.data<std::int32_t>();
                 for (std::size_t index = 0; index < global_ids.size(); ++index) {
@@ -944,8 +944,18 @@ public:
                             "Qwen4 routed expert ID is out of range");
                     }
                     if (seen[static_cast<std::size_t>(expert)] == 0) {
-                        seen[static_cast<std::size_t>(expert)] = 1;
                         active.push_back(expert);
+                    }
+                    ++seen[static_cast<std::size_t>(expert)];
+                }
+                if (tokens > 6) {
+                    std::vector<std::string> names{gate_name_, down_name_};
+                    if (up_name_) names.push_back(*up_name_);
+                    if (auto layer = mfe_offload_cache_->layer_mfe(names, active)) {
+                        auto intermediate = up_name_
+                            ? (*layer)[0].routed_swiglu_pair((*layer)[2], source, global_ids)
+                            : (*layer)[0].routed_swiglu(source, global_ids);
+                        return (*layer)[1].routed_matmul(intermediate, global_ids);
                     }
                 }
                 std::vector<std::int32_t> global_to_local(
@@ -959,18 +969,29 @@ public:
                         global_to_local.begin(),
                         Shape{static_cast<int>(config_.num_experts)}),
                     global_ids);
+                std::vector<std::uint32_t> activation_counts;
+                activation_counts.reserve(active.size());
+                for (const auto expert : active) activation_counts.push_back(seen[expert]);
+                std::optional<array> groups;
+                if (tokens > 1 && tokens <= 6) {
+                    std::vector<std::int32_t> local_routes(global_ids.size());
+                    for (std::size_t index = 0; index < local_routes.size(); ++index)
+                        local_routes[index] = global_to_local[ids[index]];
+                    groups = moe_route_groups_host(local_routes, tokens, global_ids.shape(1));
+                }
+                const auto* local_groups = groups ? &*groups : nullptr;
                 auto gate = mfe_offload_cache_->grouped_mfe(
-                    gate_name_, active);
+                    gate_name_, active, activation_counts);
                 auto down = mfe_offload_cache_->grouped_mfe(
-                    down_name_, active);
+                    down_name_, active, activation_counts);
                 auto intermediate = [&]() {
                     if (up_name_) {
                         auto up = mfe_offload_cache_->grouped_mfe(
-                            *up_name_, active);
+                            *up_name_, active, activation_counts);
                         return gate.routed_swiglu_pair(
-                            up, source, local_ids);
+                            up, source, local_ids, 0.0f, local_groups);
                     }
-                    return gate.routed_swiglu(source, local_ids);
+                    return gate.routed_swiglu(source, local_ids, 0.0f, local_groups);
                 }();
                 if (detail::component_profile_active()) {
                     detail::profile_eval(
@@ -983,7 +1004,7 @@ public:
                           intermediate,
                           local_ids,
                           routes.weights)
-                    : down.routed_matmul(intermediate, local_ids);
+                    : down.routed_matmul(intermediate, local_ids, local_groups);
                 routed_is_reduced = combine_routes;
                 if (detail::component_profile_active()) {
                     detail::profile_eval(
@@ -1169,6 +1190,9 @@ private:
         if (mfe_offload_cache_) {
             for (const auto& name : {gate_name_, up_name_.value_or(gate_name_), down_name_})
                 mfe_offload_cache_->activate_record(name);
+            mfe_offload_cache_->prepare_projection(gate_name_, true, !up_name_);
+            if (up_name_) mfe_offload_cache_->prepare_projection(*up_name_, true);
+            mfe_offload_cache_->prepare_projection(down_name_, false);
         }
         if (auto* preparation = MlxKernelPreparation::current(); preparation && !cached) {
             preparation->collect([&] {
@@ -4934,6 +4958,13 @@ MlxQwen4CausalLm::ssd_expert_cache_stats() const {
         return std::nullopt;
     }
     MlxSsdExpertCacheStats stats;
+    const auto reuse = impl_->mfe_offload_cache->reuse_stats();
+    stats.loads = reuse.expert_loads;
+    stats.misses = reuse.expert_loads;
+    stats.hits = reuse.expert_hits;
+    stats.requests = stats.hits + stats.misses;
+    stats.coalesced = reuse.load_waits;
+    stats.packed_reuses = reuse.packed_hits;
     stats.resident_experts =
         impl_->mfe_offload_cache->cached_expert_count();
     stats.resident_bytes =
