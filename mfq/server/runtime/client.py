@@ -222,7 +222,7 @@ class RuntimeClient(Protocol):
 
     async def set_cache_budget(self, target_bytes: int, disk_target_bytes: int | None = None) -> dict[str, Any]: ...
     async def refresh_cache_index(self) -> dict[str, Any]: ...
-    async def set_resident_memory_budget(self, target_bytes: int) -> dict[str, Any]: ...
+    async def set_resident_memory_budget(self, target_bytes: int, weight_target_bytes: int | None = None) -> dict[str, Any]: ...
 
     def realtime_connect(self, *, mode: str = "audio") -> Any: ...
 
@@ -365,8 +365,11 @@ class HttpRuntimeClient:
     async def refresh_cache_index(self) -> dict[str, Any]:
         return await self._json_request("POST", "/runtime/cache/refresh", json_body={})
 
-    async def set_resident_memory_budget(self, target_bytes: int) -> dict[str, Any]:
-        return await self._json_request("POST", "/runtime/memory/budget", json_body={"target_bytes": target_bytes})
+    async def set_resident_memory_budget(self, target_bytes: int, weight_target_bytes: int | None = None) -> dict[str, Any]:
+        body = {"target_bytes": target_bytes}
+        if weight_target_bytes is not None:
+            body["weight_target_bytes"] = weight_target_bytes
+        return await self._json_request("POST", "/runtime/memory/budget", json_body=body)
 
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         import websockets
@@ -643,8 +646,11 @@ class StdioRuntimeClient:
     async def refresh_cache_index(self) -> dict[str, Any]:
         return await self._unary("cache.refresh", {})
 
-    async def set_resident_memory_budget(self, target_bytes: int) -> dict[str, Any]:
-        return await self._unary("memory.budget", {"target_bytes": target_bytes})
+    async def set_resident_memory_budget(self, target_bytes: int, weight_target_bytes: int | None = None) -> dict[str, Any]:
+        body = {"target_bytes": target_bytes}
+        if weight_target_bytes is not None:
+            body["weight_target_bytes"] = weight_target_bytes
+        return await self._unary("memory.budget", body)
 
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         return _StdioRealtimeConnection(self, mode)

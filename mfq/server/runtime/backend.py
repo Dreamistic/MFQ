@@ -679,9 +679,11 @@ class OpenAIChatBackend:
     async def refresh_prefix_cache_index(self) -> dict[str, Any]:
         return await self._runtime.refresh_cache_index()
 
-    async def set_resident_memory_budget(self, target_bytes: int) -> dict[str, Any]:
-        if target_bytes < 0:
+    async def set_resident_memory_budget(self, target_bytes: int, weight_target_bytes: int | None = None) -> dict[str, Any]:
+        if target_bytes < 0 or weight_target_bytes is not None and weight_target_bytes < 0:
             raise ValueError("resident budget must be non-negative")
+        if weight_target_bytes is not None:
+            return await self._runtime.set_resident_memory_budget(target_bytes, weight_target_bytes)
         return await self._runtime.set_resident_memory_budget(target_bytes)
 
     def realtime_connect(self, *, mode: str = "audio") -> Any:

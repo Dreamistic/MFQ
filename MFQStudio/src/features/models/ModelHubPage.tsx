@@ -10,6 +10,7 @@ import { Icon } from '../../app/display';
 import { useJobStore } from '../../stores/jobStore';
 import { ModelBrowser, type DownloadOrigin, type ModelBrowserTab } from './ModelBrowser';
 import { DownloadQueue, downloadProgress, isActiveDownload, isModelDownload } from './DownloadQueue';
+import { DownloadDirectoryControl } from './DownloadDirectoryControl';
 
 export function ModelHubPage() {
   const { tr } = useSettings();
@@ -20,6 +21,7 @@ export function ModelHubPage() {
   const active = downloads.filter(isActiveDownload);
   const progress = active.length ? active.reduce((sum, job) => sum + downloadProgress(job), 0) / active.length : 0;
   const [tab, setTab] = useState<ModelBrowserTab>('official');
+  const [downloadDirectory, setDownloadDirectory] = useState<string | undefined>();
   const circle = useRef<HTMLButtonElement>(null);
   const page = useRef<HTMLDivElement>(null);
   const [flight, setFlight] = useState<{ id: string; origin: DownloadOrigin; dx: number; dy: number } | null>(null);
@@ -33,7 +35,7 @@ export function ModelHubPage() {
         if (active) setJobKinds(items);
       })
       .catch((cause) => {
-        if (active) toast.error(errorMessage(cause));
+        if (active) toast.error(errorMessage(cause, tr));
       });
     return () => {
       active = false;
@@ -63,6 +65,8 @@ export function ModelHubPage() {
         tab={tab}
         onTabChange={setTab}
         downloadQueue={<DownloadQueue jobs={downloads} onJobCreated={trackDownload} />}
+        downloadDirectory={downloadDirectory}
+        downloadDirectoryControl={<DownloadDirectoryControl onDirectoryChange={setDownloadDirectory} />}
         tr={tr}
       />
       <button ref={circle} className={`download-circle${flight ? ' receiving' : ''}`} type="button"

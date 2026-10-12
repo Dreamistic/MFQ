@@ -4,9 +4,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+class MfqResourceExhausted : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct MfqSamplingParams {
     int32_t max_tokens = 4096;

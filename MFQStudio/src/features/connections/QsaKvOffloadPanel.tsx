@@ -18,9 +18,11 @@ interface Props {
   onEnabledChange: (value: boolean) => void;
   onBudgetChange: (value: string) => void;
   onRamBudgetChange?: (value: string) => void;
+  onBudgetBlur?: () => void;
+  onRamBudgetBlur?: () => void;
 }
 
-export function QsaKvOffloadPanel({ model, context, enabled, budget, separateVram = false, ramBudget = '', profile, metadataError, disabled, onEnabledChange, onBudgetChange, onRamBudgetChange }: Props) {
+export function QsaKvOffloadPanel({ model, context, enabled, budget, separateVram = false, ramBudget = '', profile, metadataError, disabled, onEnabledChange, onBudgetChange, onRamBudgetChange, onBudgetBlur, onRamBudgetBlur }: Props) {
   const { tr } = useSettings();
   const contentId = useId();
   const [expanded, setExpanded] = useState(false);
@@ -59,13 +61,13 @@ export function QsaKvOffloadPanel({ model, context, enabled, budget, separateVra
           <span>{separateVram ? tr('KV 显存常驻预算', 'Resident VRAM KV budget') : tr('KV 常驻预算', 'Resident KV budget')}</span>
           <div className="qsa-kv-input"><input type="number" step="any" min="0" max={2 ** 20}
             aria-label={separateVram ? tr('KV 显存常驻预算', 'Resident VRAM KV budget') : tr('KV 常驻预算', 'Resident KV budget')} value={budget} disabled={!supported || disabled}
-            onChange={event => onBudgetChange(event.target.value)} /><span>GiB</span></div>
+            onChange={event => onBudgetChange(event.target.value)} onBlur={onBudgetBlur} /><span>GiB</span></div>
         </label>
         {separateVram && <label className="qsa-kv-field" title={tr('留空根据可用内存自动设置；0 表示直接溢出到 SSD。', 'Leave empty to size from available RAM; zero spills directly to SSD.')}>
           <span>{tr('内存流式 KV 预算', 'RAM streaming KV budget')}</span>
           <div className="qsa-kv-input"><input type="number" step="any" min="0" max={2 ** 20}
             aria-label={tr('内存流式 KV 预算', 'RAM streaming KV budget')} value={ramBudget} disabled={!supported || disabled}
-            placeholder={tr('自动', 'Automatic')} onChange={event => onRamBudgetChange?.(event.target.value)} /><span>GiB</span></div>
+            placeholder={tr('自动', 'Automatic')} onChange={event => onRamBudgetChange?.(event.target.value)} onBlur={onRamBudgetBlur} /><span>GiB</span></div>
         </label>}
         <div className="qsa-kv-field" title={tr('跟随该模型上方的上下文设置，保存时一并应用。', 'Follows the model context setting above and applies with the same save.')}>
           <span>{tr('最大上下文', 'Maximum context')}</span>

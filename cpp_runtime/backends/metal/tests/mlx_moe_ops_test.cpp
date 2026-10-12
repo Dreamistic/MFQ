@@ -397,14 +397,14 @@ void test_small_m_softmax_topk() {
     for (const auto dtype : {
              mlx::core::float16, mlx::core::bfloat16, mlx::core::float32}) {
         for (const int experts : {32, 512, 4096}) {
-            for (int rows = 2; rows <= 6; ++rows) {
+            for (const int rows : {2, 3, 4, 5, 6, 7, 8, 12, 16}) {
                 constexpr int top_k = 10;
                 std::vector<float> logits(rows * experts);
                 for (int row = 0; row < rows; ++row) {
                     for (int expert = 0; expert < experts; ++expert) {
                         logits[row * experts + expert] = row == rows - 1
                             ? 0.0f
-                            : static_cast<float>((expert * 13 + row * 7) % 61 - 30) / 16.0f;
+                            : static_cast<float>((expert * 13 + (row % 2 ? row * 7 : 0)) % 61 - 30) / 16.0f;
                     }
                 }
                 auto source = mlx::core::astype(
@@ -421,11 +421,14 @@ void test_small_m_softmax_topk() {
                     std::vector<int> matched;
                     for (int route = 0; route < rows * top_k; ++route)
                         if (ids[route] == ids[index]) matched.push_back(route);
-                    require(groups[index * 8 + 1] == static_cast<int>(matched.size()) &&
+                    const auto position = std::find(matched.begin(), matched.end(), index) - matched.begin();
+                    const auto first = position / 6 * 6;
+                    const auto count = std::min<std::size_t>(6, matched.size() - first);
+                    require(groups[index * 8 + 1] == static_cast<int>(count) &&
                             groups[index * 8] == ids[index], "route group count or expert mismatch");
                     for (int slot = 0; slot < 6; ++slot)
                         require(groups[index * 8 + slot + 2] ==
-                            (slot < static_cast<int>(matched.size()) ? matched[slot] : -1),
+                            (slot < static_cast<int>(count) ? matched[first + slot] : -1),
                             "route group members or padding mismatch");
                 }
                 for (int row = 0; row < rows; ++row) {

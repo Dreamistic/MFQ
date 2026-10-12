@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,7 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from mfq.server.api.auth import ApiKeyManager, required_scope
+from mfq.server.api.auth import ApiKeyManager, AuthenticationPolicy, required_scope
 from mfq.server.api.anthropic_compat import error_body as anthropic_error_body, error_type as anthropic_error_type, is_anthropic_request
 from mfq.server.api.routes.anthropic import router as anthropic_router
 from mfq.server.api.routes import ERROR_RESPONSES as ERROR_RESPONSES
@@ -41,6 +40,7 @@ def create_app(
     web_root: str | Path | None = None,
     api_key: str = "",
     api_keys: ApiKeyManager | None = None,
+    auth_settings_path: str | Path | None = None,
 ) -> FastAPI:
     """Create an executable app, or a route-only contract app when service is omitted."""
 
@@ -64,6 +64,8 @@ def create_app(
     app.state.service = service
     app.state.api_key = api_key
     app.state.api_keys = api_keys
+    app.state.auth_policy = AuthenticationPolicy(api_key or (api_keys.root_key if api_keys else ""),
+        enabled=api_keys is not None, path=Path(auth_settings_path) if auth_settings_path is not None else None)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -81,14 +83,15 @@ def create_app(
 
     @app.middleware("http")
     async def protect_and_harden(request: Request, call_next: Any) -> Response:
-        if (api_key or api_keys is not None) and request.url.path.startswith(("/api/", "/v1")):
+        policy = app.state.auth_policy
+        if policy.enabled and request.method != "OPTIONS" and request.url.path.startswith(("/api/", "/v1")):
             authorization = request.headers.get("authorization", "")
             supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
             anthropic = is_anthropic_request(request)
             if not supplied and anthropic:
                 supplied = request.headers.get("x-api-key", "")
-            authenticated = api_keys.authenticate(supplied) if api_keys is not None else None
-            legacy = api_key and secrets.compare_digest(supplied, api_key)
+            authenticated = api_keys.authenticate(supplied, include_root=False) if api_keys is not None else None
+            legacy = policy.matches(supplied)
             scope = required_scope(request.method, request.url.path)
             if not legacy and authenticated is None:
                 detail = ErrorDetail(code="unauthorized", message="invalid API credential")

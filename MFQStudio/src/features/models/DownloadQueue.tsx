@@ -38,7 +38,7 @@ export function DownloadQueue({ jobs, onJobCreated }: {
       if (!current()) return;
       if (retry) onJobCreated(next, origin); else addJob(next);
     } catch (cause) {
-      if (current()) toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause, tr));
     } finally {
       if (current()) setBusyId(null);
     }
@@ -52,7 +52,7 @@ export function DownloadQueue({ jobs, onJobCreated }: {
       await jobsApi.deleteJob(job.id);
       if (!current()) return;
       useJobStore.getState().setJobs(useJobStore.getState().jobs.filter((item) => item.id !== job.id));
-    } catch (cause) { if (current()) toast.error(errorMessage(cause)); }
+    } catch (cause) { if (current()) toast.error(errorMessage(cause, tr)); }
     finally { if (current()) setBusyId(null); }
   }
 

@@ -114,6 +114,57 @@ void batch_test() {
         if (key == "continuous_batching_active" || key == "continuous_batching_prefilling") assert(value == 0);
 }
 
+void packed_prefill_test() {
+    struct PackedOps : BatchOps {
+        std::vector<std::vector<std::string>>& groups;
+        explicit PackedOps(std::vector<std::vector<std::string>>& value) : groups(value) {}
+        std::vector<Sample> prefill_batch(
+            const std::vector<std::pair<std::shared_ptr<Request>, PrefillChunk>>& chunks) {
+            int64_t total = 0;
+            std::vector<std::string> group;
+            std::vector<Sample> result;
+            for (const auto& [request, chunk] : chunks) {
+                assert(chunk.offset == request->prefill_offset);
+                total += chunk.count;
+                group.push_back(request->id);
+                result.push_back({10, {}});
+            }
+            assert(total <= 8);
+            groups.push_back(std::move(group));
+            return result;
+        }
+    };
+    std::vector<std::vector<std::string>> groups;
+    ContinuousBatch<PackedOps> batch(8, 8, groups);
+    std::array<InferenceRequest, 3> inputs;
+    std::vector<std::unique_ptr<InferenceOutput>> outputs;
+    std::vector<Generation> generations;
+    const std::array<int, 3> lengths{3, 4, 9};
+    for (int row = 0; row < 3; ++row) {
+        inputs[row].prompt.assign(lengths[row], 1);
+        inputs[row].sampling.max_tokens = 2;
+        outputs.push_back(std::make_unique<InferenceOutput>(inputs[row], nullptr, std::to_string(row)));
+        generations.push_back(batch.generate(std::to_string(row), inputs[row], *outputs.back()));
+    }
+    std::array<bool, 3> done{};
+    std::array<std::vector<int64_t>, 3> tokens;
+    for (int tick = 0; tick < 40 && !std::all_of(done.begin(), done.end(), [](bool x) { return x; }); ++tick) {
+        std::vector<std::string> eligible;
+        for (int row = 0; row < 3; ++row) if (!done[row]) eligible.push_back(std::to_string(row));
+        batch.step(eligible);
+        for (int row = 0; row < 3; ++row) if (!done[row]) {
+            auto step = generations[row].next();
+            if (!step) { done[row] = true; continue; }
+            if (step.value) if (auto* delta = std::get_if<OutputDelta>(&*step.value))
+                tokens[row].insert(tokens[row].end(), delta->token_ids.begin(), delta->token_ids.end());
+        }
+    }
+    assert(batch.empty() && groups.size() == 3);
+    assert(groups[0] == std::vector<std::string>({"0", "1"}));
+    assert(groups[1] == std::vector<std::string>{"2"} && groups[2] == std::vector<std::string>{"2"});
+    for (const auto& row : tokens) assert(row == std::vector<int64_t>({10, 11}));
+}
+
 void batch_failure_test() {
     enum Stage { suspend, prefill, activate, resume };
     struct Fault { Stage stage; bool armed = false; size_t recovered = 0; };
@@ -185,6 +236,66 @@ void batch_failure_test() {
         try { ContinuousBatch<BatchOps> batch(limits.first, limits.second); assert(false); }
         catch (const std::invalid_argument&) {}
     }
+}
+
+void batch_recoverable_failure_test() {
+    struct CapacityError : MfqResourceExhausted { using MfqResourceExhausted::MfqResourceExhausted; };
+    struct LimitedOps : BatchOps {
+        Sample prefill(const std::shared_ptr<Request>& request, PrefillChunk chunk) {
+            if (request->id == "too-large") throw CapacityError("request memory limit");
+            return BatchOps::prefill(request, chunk);
+        }
+        bool recoverable_failure(std::exception_ptr error) const {
+            try { std::rethrow_exception(error); }
+            catch (const CapacityError&) { return true; }
+            catch (...) { return false; }
+        }
+    };
+    BatchExecution<LimitedOps> ops;
+    RequestExecutor executor(2);
+    executor.admit(batch_request("peer"), nullptr, batch_info(), ops);
+    executor.admit(batch_request("too-large"), nullptr, batch_info(), ops);
+    int failed = 0, completed = 0;
+    std::vector<int64_t> tokens;
+    for (int tick = 0; tick < 60 && !executor.empty(); ++tick) {
+        auto result = executor.step({"too-large", "peer"}, ops);
+        assert(result.status.healthy);
+        for (const auto& event : result.events) {
+            if (std::holds_alternative<Failed>(event.data)) {
+                assert(event.id == "too-large");
+                assert(std::get<Failed>(event.data).code == "resource_exhausted" && std::get<Failed>(event.data).retryable);
+                ++failed;
+            }
+            if (std::holds_alternative<Completed>(event.data)) {
+                assert(event.id == "peer");
+                ++completed;
+            }
+            if (auto* delta = std::get_if<OutputDelta>(&event.data))
+                tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
+        }
+    }
+    assert(executor.empty() && ops.batch.empty() && failed == 1 && completed == 1);
+    assert(tokens == std::vector<int64_t>({10, 11, 12}));
+    assert(executor.admit(batch_request("replacement", 1, 1), nullptr, batch_info(), ops) == Admission::accepted);
+}
+
+void batch_alignment_test() {
+    struct AlignedOps : BatchOps {
+        std::size_t& maximum;
+        explicit AlignedOps(std::size_t& value) : maximum(value) {}
+        int decode(State& state) {
+            maximum = std::max(maximum, static_cast<std::size_t>(std::count_if(
+                state.active.begin(), state.active.end(), [](const auto& row) { return row->eligible; })));
+            return 0;
+        }
+    };
+    std::size_t maximum = 0;
+    BatchExecution<AlignedOps> ops(maximum);
+    RequestExecutor executor(2);
+    executor.admit(batch_request("a", 1, 12), nullptr, batch_info(), ops);
+    executor.admit(batch_request("b", 1, 12), nullptr, batch_info(), ops);
+    for (int tick = 0; tick < 80 && !executor.empty(); ++tick) executor.step({"a", "b"}, ops);
+    assert(executor.empty() && maximum == 2);
 }
 
 struct Block {
@@ -1666,6 +1777,9 @@ int main() {
     inner_model_flow_test();
     predictor_flow_test();
     batch_test();
+    packed_prefill_test();
     batch_failure_test();
+    batch_recoverable_failure_test();
+    batch_alignment_test();
     model_test();
 }

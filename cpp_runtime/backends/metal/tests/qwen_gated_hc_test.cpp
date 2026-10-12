@@ -1055,10 +1055,12 @@ void test_packed_mhc(const char* path) {
             input, norm, dense_down, dense_up, dense_injection, hidden, streams);
         auto actual = mfq::metal::qwen4_gated_residual_pre(
             input, norm, down, up, injection, hidden, streams);
-        if (rows <= 6 && down.nint_weight_ref() && up.nint_weight_ref()
+        if (rows <= 16 && down.nint_weight_ref() && up.nint_weight_ref()
             && injection->nint_weight_ref() && std::getenv("MFQ_METAL_QWEN_GATED_HC_FAST") == nullptr
             && std::string(actual.branch.primitive().name()) != "PackedHcPrimitive")
             throw std::runtime_error("packed MHC did not dispatch its native two-stage primitive");
+        if (rows > 16 && std::string(actual.branch.primitive().name()) == "PackedHcPrimitive")
+            throw std::runtime_error("large MHC rows entered the small-batch dispatch");
         require_close(actual.branch, expected.branch, 5e-3f, "packed MHC branch");
         require_close(*actual.injection, *expected.injection, 5e-3f, "packed MHC injection");
         if (rows >= 64) {
@@ -1075,7 +1077,7 @@ void test_packed_mhc(const char* path) {
             require_close(*actual_after.injection, *expected_after.injection, 5e-3f,
                           "prefill MHC chained injection");
         }
-        if (rows <= 6) {
+        if (rows <= 16) {
             std::vector<array> branches, gates;
             for (int row = 0; row < rows; ++row) {
                 auto one = mfq::metal::qwen4_gated_residual_pre(
@@ -1140,7 +1142,7 @@ void test_packed_mhc(const char* path) {
         }
     };
     for (auto dtype : {float16, bfloat16, float32}) {
-        for (int rows : {1, 2, 3, 4, 5, 6, 7, 64, 2048, 4096}) {
+        for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 17, 24, 64, 2048, 4096}) {
             try { compare(dtype, rows); }
             catch (const std::exception& error) {
                 throw std::runtime_error("dtype=" + std::to_string(static_cast<int>(dtype.val())) + " rows=" +

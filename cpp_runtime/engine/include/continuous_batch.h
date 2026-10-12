@@ -85,6 +85,11 @@ template <class Ops> class ContinuousBatch {
     struct SequenceOps {
         ContinuousBatch& batch;
         Work& work;
+        PrefillChunk prefill_chunk(PrefillChunk chunk) {
+            if constexpr (requires { batch.operations.prefill_chunk(work.request, chunk); })
+                return batch.operations.prefill_chunk(work.request, chunk);
+            return chunk;
+        }
         void schedule_prefill(PrefillChunk chunk) { work.result.reset(); work.prefill = chunk; }
         void schedule_decode() { work.result.reset(); work.decode = true; }
         bool ready() const { return work.result.has_value() || work.failure; }
@@ -95,6 +100,14 @@ template <class Ops> class ContinuousBatch {
         double prefill(PrefillChunk) { return sample().timing.llm_ms; }
         int64_t first_token() { return sample().token; }
         int64_t advance() { return sample().token; }
+        std::optional<Generation> generate_decode(InferenceOutput& output) {
+            if constexpr (requires { batch.operations.generate_decode(work.request, output,
+                    std::function<void()>{}, std::function<bool()>{}, std::function<void()>{}); })
+                return batch.operations.generate_decode(work.request, output,
+                    [this] { schedule_decode(); }, [this] { return ready(); },
+                    [this] { (void)sample(); });
+            return std::nullopt;
+        }
         void accept(int64_t token) {
             auto& request = *work.request;
             // activate() initializes counts for the first sample.
@@ -105,6 +118,7 @@ template <class Ops> class ContinuousBatch {
     };
 
   public:
+    bool empty() const noexcept { return requests.empty(); }
     template <class... Args>
     explicit ContinuousBatch(int64_t chunk_size, int64_t token_budget, Args&&... args)
         : prefill_chunk_size(std::min(chunk_size, token_budget)),
@@ -121,7 +135,12 @@ template <class Ops> class ContinuousBatch {
             throw std::invalid_argument("duplicate batch request id");
         ExecutionCleanup cleanup{output.cleanup_failure, [&] { release(*work); }};
         SequenceOps ops{*this, *work};
-        auto sequence = generate_sequence(ops, output, input.prompt.size(), 0, 0, prefill_chunk_size);
+        int64_t reused = 0, prefix = 0;
+        if constexpr (requires { operations.prepare(work->request); })
+            reused = operations.prepare(work->request);
+        if constexpr (requires { operations.prefix_tokens(work->request); })
+            prefix = operations.prefix_tokens(work->request);
+        auto sequence = generate_sequence(ops, output, input.prompt.size(), reused, prefix, prefill_chunk_size);
         while (auto step = sequence.next()) co_yield std::move(step);
         cleanup.finish();
     }
@@ -139,38 +158,79 @@ template <class Ops> class ContinuousBatch {
         }
         const bool has_decode = std::any_of(state.active.begin(), state.active.end(),
             [](const auto& request) { return request->eligible; });
+        bool run_decode = has_decode && (prefill == requests.end() || decode_next);
+        if constexpr (requires { operations.ready_decode(state, eligible); })
+            run_decode = run_decode && operations.ready_decode(state, eligible);
+        std::vector<std::shared_ptr<Work>> prefills;
         try {
-            if (has_decode && (prefill == requests.end() || decode_next)) {
+            if constexpr (requires { operations.synchronize(state); }) operations.synchronize(state);
+            if (run_decode) {
                 auto decoded = operations.decode(state);
                 for (const auto& request : state.active) if (request->eligible) {
                     auto& work = *requests.at(request->id);
                     work.result = operations.sample(request, decoded);
-                    ++request->cache_length;
+                    if constexpr (requires { operations.cache_length(request); })
+                        request->cache_length = operations.cache_length(request);
+                    else ++request->cache_length;
                     work.decode = false;
                 }
             } else if (prefill != requests.end()) {
-                auto& work = *prefill->second;
-                auto& request = work.request;
-                const auto chunk = *work.prefill;
+                std::vector<std::pair<std::shared_ptr<Request>, PrefillChunk>> chunks;
+                int64_t remaining = prefill_chunk_size;
+                for (const auto& id : eligible) {
+                    const auto it = requests.find(id);
+                    if (it == requests.end() || !it->second->prefill || it->second->prefill->count > remaining) continue;
+                    auto work = it->second;
+                    chunks.emplace_back(work->request, *work->prefill);
+                    prefills.push_back(work);
+                    remaining -= work->prefill->count;
+                    if constexpr (!requires { operations.prefill_batch(chunks); }) break;
+                }
                 operations.suspend_decode();
                 PrefillActivity prefill_activity;
-                auto sample = operations.prefill(request, chunk);
-                request->prefill_offset = chunk.offset + chunk.count;
-                ++prefill_chunks;
-                if (request->prefill_offset == static_cast<int64_t>(request->prompt.size())) {
-                    request->cache_length = request->prompt.size();
-                    operations.activate(request, sample);
-                    state.active.push_back(request);
-                    work.active = true;
-                    ++admissions;
-                } else ++prefill_yields;
+                auto samples = [&] {
+                    if constexpr (requires { operations.prefill_batch(chunks); }) return operations.prefill_batch(chunks);
+                    else return std::vector<Sample>{operations.prefill(chunks.front().first, chunks.front().second)};
+                }();
+                if (samples.size() != prefills.size()) throw std::logic_error("prefill batch returned an invalid row count");
+                for (std::size_t row = 0; row < prefills.size(); ++row) {
+                    auto& work = *prefills[row];
+                    auto& request = work.request;
+                    const auto chunk = *work.prefill;
+                    request->prefill_offset = chunk.offset + chunk.count;
+                    ++prefill_chunks;
+                    if (request->prefill_offset == static_cast<int64_t>(request->prompt.size())) {
+                        request->cache_length = request->prompt.size();
+                        operations.activate(request, samples[row]);
+                        state.active.push_back(request);
+                        work.active = true;
+                        ++admissions;
+                    } else ++prefill_yields;
+                    work.result = std::move(samples[row]);
+                    work.prefill.reset();
+                }
                 operations.resume_decode(cache_position());
-                work.result = std::move(sample);
-                work.prefill.reset();
             }
             decode_next = !decode_next;
         } catch (...) {
-            recover(std::current_exception());
+            const auto error = std::current_exception();
+            if constexpr (requires { operations.recoverable_failure(error); }) {
+                if (operations.recoverable_failure(error)) {
+                    if (!run_decode && prefill != requests.end()) {
+                        for (const auto& item : prefills) {
+                            auto& work = *item;
+                            work.failure = error;
+                            work.prefill.reset();
+                            work.decode = work.active = false;
+                            std::erase(state.active, work.request);
+                            operations.discard_prefill(work.request);
+                        }
+                        operations.resume_decode(cache_position());
+                    } else recover(error);
+                    return;
+                }
+            }
+            recover(error);
             throw;
         }
     }

@@ -1138,6 +1138,7 @@ add_test(
 add_executable(mfq-metal-qwen4-config-test
     tests/qwen4_config_test.cpp
 )
+
 target_link_libraries(mfq-metal-qwen4-config-test PRIVATE
     mfq-metal-runtime
 )
@@ -1150,6 +1151,11 @@ add_test(
     NAME mfq-metal-qwen4-config-test
     COMMAND mfq-metal-qwen4-config-test
 )
+
+add_executable(mfq-metal-qwen4-batching-test tests/mlx_qwen4_batching_test.cpp)
+target_link_libraries(mfq-metal-qwen4-batching-test PRIVATE mfq-metal-runtime mfq-engine)
+target_compile_features(mfq-metal-qwen4-batching-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-qwen4-batching-test PROPERTIES BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
 
 add_executable(mfq-metal-sparse-attention-test
     tests/mlx_sparse_attention_test.cpp

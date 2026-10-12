@@ -48,7 +48,7 @@ test('resource telemetry and service profiles have separate responsive homes', a
   await page.locator('.resource-monitor-panel').screenshot({ path: testInfo.outputPath('resource-monitor.png') });
   await page.goto('/runtime');
   await expect(page.getByRole('heading', { name: 'Service', exact: true })).toBeVisible();
-  await expect(page.getByText('Runtime profiles', { exact: true })).toBeVisible();
+  await expect(page.getByText('Runtime profiles', { exact: true })).toHaveCount(0);
   await expect(page.getByText('Resource monitoring', { exact: true })).toHaveCount(0);
   await page.goto('/resources');
   await expect(page.getByRole('meter', { name: 'CPU: Apple M5 Max 18C' })).toHaveAttribute('aria-valuenow', '43');

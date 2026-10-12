@@ -39,6 +39,13 @@ struct MlxMfeCacheReuseStats {
     std::size_t expert_hits = 0;
     std::size_t packed_hits = 0;
     std::size_t load_waits = 0;
+    std::size_t bytes_read = 0;
+    std::size_t read_calls = 0;
+    std::size_t evictions = 0;
+    double io_seconds = 0;
+    double wait_seconds = 0;
+    double prepare_seconds = 0;
+    double view_seconds = 0;
 };
 
 // Optional bounded per-expert residency for MFE records.
@@ -86,6 +93,11 @@ public:
     // MXFP8 reuse their existing packed kernels after paging.
     MlxMfeWeight grouped_mfe(
         const std::string& name,
+        const std::vector<std::int32_t>& active_experts,
+        std::span<const std::uint32_t> activation_counts = {});
+
+    std::vector<MlxMfeWeight> grouped_mfe(
+        std::span<const std::string> names,
         const std::vector<std::int32_t>& active_experts,
         std::span<const std::uint32_t> activation_counts = {});
 
@@ -140,6 +152,7 @@ class MlxMfeWeight {
 public:
     static MlxMfeWeight from_blob(
         std::span<const std::uint8_t> blob);
+    static MlxMfeWeight from_blob(const mlx::core::array& blob);
     static MlxMfeWeight from_nint_blob(
         std::span<const std::uint8_t> blob);
 
@@ -318,7 +331,8 @@ private:
 
     static MlxMfeWeight from_projection_blobs_impl(
         std::span<const std::span<const std::uint8_t>> blobs,
-        bool nint_tensor);
+        bool nint_tensor,
+        const mlx::core::array* storage = nullptr);
 
     explicit MlxMfeWeight(std::shared_ptr<const Impl> impl);
 

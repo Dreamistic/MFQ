@@ -35,6 +35,8 @@ interface ModelBrowserProps {
   tab: ModelBrowserTab;
   onTabChange(tab: ModelBrowserTab): void;
   downloadQueue?: ReactNode;
+  downloadDirectory?: string;
+  downloadDirectoryControl?: ReactNode;
   tr: Translate;
 }
 
@@ -199,7 +201,7 @@ function ConfigurationDetails({ status, planned = false, rows, tr }: { status: M
   return (
     <div className={`configuration-details ${status.status} ${status.recommendation.replaceAll("_", "-")}`}>
       <div>
-        <span>{planned ? tr('最低档权重 + KV/递推状态', 'Smallest tier weights + KV/recurrent state') : tr("最低档预计权重常驻", "Smallest tier estimated resident weights")}</span>
+        <span>{planned ? tr('最低档权重 + KV/递推状态', 'Smallest tier weights + KV/recurrent state') : tr("最低档权重", "Smallest tier weights")}</span>
         <strong>{formatBytes(status.required_memory_bytes)}</strong>
       </div>
       <div>
@@ -238,7 +240,7 @@ function VariantList({
           <div className="model-variant" key={variant.id}>
             <div>
               <strong>{variant.label}</strong>
-              <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)} · {variant.estimated_resident_weight_bytes != null ? tr("预计权重常驻", "est. resident weights") : variant.resident_weight_bytes != null ? tr("权重常驻基线", "resident weight baseline") : tr("权重占用估计", "est. weight memory")} {formatBytes(variant.estimated_resident_weight_bytes ?? variant.resident_weight_bytes ?? (variant.configuration.required_memory_bytes == null ? null : variant.configuration.required_memory_bytes - cacheBytes))}{(variant.ssd_ple_bytes ?? 0) > 0 && ` · SSD PLE ${formatBytes(variant.ssd_ple_bytes)}`}</small>
+              <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)}{(variant.ssd_ple_bytes ?? 0) > 0 && ` · SSD PLE ${formatBytes(variant.ssd_ple_bytes)}`}</small>
               {cacheBytes > 0 && <small>{tr('规划 KV/递推状态', 'Planned KV/recurrent state')} {formatBytes(cacheBytes)} · {tr('预计总常驻', 'Est. total residency')} {formatBytes(variant.configuration.required_memory_bytes)}</small>}
             </div>
             <ModelPressureBars weights={variant.estimated_resident_weight_bytes ?? variant.resident_weight_bytes
@@ -260,7 +262,7 @@ function VariantList({
   );
 }
 
-export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange, downloadQueue, tr }: ModelBrowserProps) {
+export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange, downloadQueue, downloadDirectory, downloadDirectoryControl, tr }: ModelBrowserProps) {
   const [official, setOfficial] = useState<OfficialModelList | null>(null);
   const [officialSelection, setOfficialSelection] = useState<string | null>(null);
   const [officialSource, setOfficialSource] = useState<OfficialModelSource | null>(null);
@@ -311,7 +313,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
     ? estimateCacheBytes(communityModel.cache_profile, communityContext) : 0;
   const applyPlan = (key: string, context: number | undefined) => setPlannedContexts((current) => ({ ...current, [key]: context }));
   const canDownload = (targetProvider: HubModelSummary["provider"]) =>
-    jobKinds.some((item) => item.kind === `download.${targetProvider}`);
+    (!downloadDirectoryControl || downloadDirectory !== undefined) && jobKinds.some((item) => item.kind === `download.${targetProvider}`);
 
   async function loadOfficial(refresh = false) {
     const request = ++catalogRequest.current;
@@ -438,6 +440,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
       const created = await jobsApi.createJob(`download.${source.provider}`, {
         repo_id: source.repo_id,
         destination: `models/${source.provider}/${repositoryPath}/${variantPath}`,
+        ...(downloadDirectory ? { download_directory: downloadDirectory } : {}),
         revision: source.revision,
         include: downloadPatterns(variant),
         expected_bytes: variant.byte_size || null,
@@ -455,21 +458,20 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   return (
     <section className="model-browser">
       <header className="model-browser-header">
-        <div>
-          <h2>{tr("模型浏览器", "Model browser")}</h2>
+        <h2>{tr("模型浏览器", "Model browser")}</h2>
+        <label className="download-concurrency">{tr('最大并发下载上限', 'Maximum concurrent downloads')}
+          <select aria-label={tr('最大并发下载上限', 'Maximum concurrent downloads')} value={maxWorkers} onChange={(event) => setMaxWorkers(Number(event.target.value))}>
+            {[1, 2, 4, 8, 16].map((count) => <option key={count} value={count}>{count}</option>)}
+          </select>
+        </label>
+        <div className="model-browser-description">
           <p>{tr("查找官方优化模型或浏览社区仓库。", "Find optimized official models or browse community repositories.")}</p>
+          {downloadDirectoryControl}
         </div>
-        <div className="model-browser-actions">
-          <label className="download-concurrency">{tr('最大并发下载上限', 'Maximum concurrent downloads')}
-            <select aria-label={tr('最大并发下载上限', 'Maximum concurrent downloads')} value={maxWorkers} onChange={(event) => setMaxWorkers(Number(event.target.value))}>
-              {[1, 2, 4, 8, 16].map((count) => <option key={count} value={count}>{count}</option>)}
-            </select>
-          </label>
         <div className="model-browser-tabs" role="tablist">
           <button aria-selected={tab === "official"} onClick={() => onTabChange("official")} role="tab" type="button">{tr("官方模型", "Official")}</button>
           <button aria-selected={tab === "community"} onClick={() => onTabChange("community")} role="tab" type="button">{tr("第三方模型", "Community")}</button>
           <button aria-selected={tab === "downloads"} onClick={() => onTabChange("downloads")} role="tab" type="button">{tr("下载队列", "Download queue")}</button>
-        </div>
         </div>
       </header>
 

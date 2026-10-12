@@ -2,9 +2,12 @@
 
 #include <cstddef>
 #include <functional>
+#include "mfq/runtime.h"
 #include <utility>
 
 namespace mfq::metal {
+
+using MlxResidentBudgetExceeded = MfqResourceExhausted;
 
 class MlxResidentBudgetScope {
 public:

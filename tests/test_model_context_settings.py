@@ -43,7 +43,7 @@ def test_one_save_reloads_once_with_yarn_and_streaming_then_persists_together(tm
             assert service.store.runtime_context_policy() == {}
             assert pool.context_policy.model_overrides == {} and pool.context_policy.model_yarn_enabled == {}
             assert payload['context_size'] == target and payload['yarn_enabled'] is True
-            assert payload['qsa_kv_offload'] == {'enabled': True, 'budget_bytes': 128 << 10, 'target_context': target}
+            assert payload['qsa_kv_offload'] == {'enabled': True, 'budget_bytes': 128 << 10, 'ram_budget_bytes': None, 'target_context': target}
             assert payload['pin'] and payload['idle_ttl_seconds'] == 300
             await pool.configure_context_policy(RuntimeContextPolicy(max_context_size=65536))
             return {'instance_id': str(uuid4()), 'model': model.resource.name, 'context_size': target}
@@ -58,7 +58,7 @@ def test_one_save_reloads_once_with_yarn_and_streaming_then_persists_together(tm
         assert saved['max_context_size'] == 65536
         assert saved['model_overrides'] == {model.resource.name: target}
         assert saved['model_yarn_enabled'] == {model.resource.name: True}
-        assert saved['model_qsa_kv_offload'] == {model.resource.name: {'enabled': True, 'budget_bytes': 128 << 10}}
+        assert saved['model_qsa_kv_offload'] == {model.resource.name: {'enabled': True, 'budget_bytes': 128 << 10, 'ram_budget_bytes': None}}
         restored = RuntimeContextPolicy.model_validate(saved)
         assert restored.model_qsa_kv_offload[model.resource.name].enabled
         assert pool._instances[other.id] is other

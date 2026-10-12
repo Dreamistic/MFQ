@@ -69,6 +69,7 @@ export function OverviewPage() {
     return () => { disposed = true; clearInterval(poll); window.removeEventListener('focus', refresh); };
   }, [serviceUrl, connectionRevision]);
   const availableModelNames = runtimeModelNames(models, instances);
+  const hasLoadedModel = Boolean(runtime?.model) || availableModelNames.length > 0;
   const last = runtime?.last_request;
   const lastPrefill = displayPrefillMetric(last);
   const lastTtftMs = preferPositiveMetric(last?.ttft_ms, last?.complete_prefill_ms);
@@ -216,19 +217,23 @@ export function OverviewPage() {
         <MetricTile
           label={tr('前缀复用', 'Prefix reuse')}
           value={
-            !prefixCacheSupported
-              ? tr('不支持', 'Unavailable')
-              : prefixCacheQueries > 0
-                ? `${formatNumber(prefixCacheHitRate, 1)}%`
-                : '--'
+            !hasLoadedModel
+              ? '--'
+              : !prefixCacheSupported
+                ? tr('不支持', 'Unavailable')
+                : prefixCacheQueries > 0
+                  ? `${formatNumber(prefixCacheHitRate, 1)}%`
+                  : '--'
           }
           detail={
-            !prefixCacheSupported
-              ? prefixCacheUnavailableReason
-              : tr(
-                  `已恢复 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`,
-                  `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens restored`,
-                )
+            !hasLoadedModel
+              ? '--'
+              : !prefixCacheSupported
+                ? prefixCacheUnavailableReason
+                : tr(
+                    `已恢复 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`,
+                    `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens restored`,
+                  )
           }
           icon="reuse"
         />

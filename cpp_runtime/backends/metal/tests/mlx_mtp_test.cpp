@@ -17,6 +17,56 @@ MfqTokenConstraintPtr alternating_constraint() {
     return mfq::metal::test::grammar_constraint(3, "root ::= \"a\" \"b\" root");
 }
 
+void check_prepared_target_tokens() {
+    using namespace mfq::metal;
+    using namespace mlx::core;
+    for (int mode = 0; mode < 4; ++mode) {
+        std::vector<std::int64_t> reference;
+        MlxMtpGenerationStats reference_stats;
+        for (bool prepared : {false, true}) {
+            int position = 0;
+            std::vector<std::int64_t> output;
+            MlxMtpEngineCallbacks callbacks;
+            callbacks.predictor = MlxMtpPredictorDescriptor::recurrent(2);
+            callbacks.draft_depth = [] { return 2; };
+            callbacks.target_cache_position = [&] { return position; };
+            callbacks.prepare_draft = [](const MlxMtpDraftContext& context, const MlxMtpTokenSelector& select) {
+                for (int row = 0; row < context.requested_depth; ++row)
+                    (void)select(array({4.f, 2.f, 0.f}, Shape{1, 3}));
+            };
+            callbacks.verify_target = [&](std::int32_t, const array&, int depth) {
+                std::vector<float> values((depth + 1) * 3, 0.f);
+                for (int row = 0; row <= depth; ++row) values[row * 3 + (position + row + 1) % 3] = 4.f;
+                auto logits = array(values.begin(), Shape{depth + 1, 3});
+                std::optional<array> selected;
+                if (prepared) {
+                    selected = mode == 1 || mode == 2 ? zeros(Shape{depth + 1}, int32) : sample_greedy(logits);
+                    selected->eval();
+                }
+                position += depth + 1;
+                return MlxMtpTargetBatch{std::move(logits), zeros(Shape{1, depth + 1, 1}), std::move(selected)};
+            };
+            callbacks.resolve_target = [&](int accepted, int depth) { position -= depth - accepted; };
+            MlxSamplingParams sampling;
+            sampling.mtp_max_draft_tokens = 2;
+            sampling.seed = 42;
+            if (mode == 1) sampling.repetition_penalty = 1.1;
+            if (mode == 2) { sampling.temperature = .6; sampling.top_k = 3; }
+            MlxMtpGenerationStats stats;
+            const auto generated = run_mlx_mtp_generation({3, 24, 128,
+                array({4.f, 2.f, 0.f}, Shape{1, 3}), sampling,
+                mode == 1 ? std::optional<array>{zeros(Shape{1, 3}, int32)} : std::nullopt, {},
+                [&](std::int64_t token) { output.push_back(token); return true; }, 0u,
+                mode == 3 ? alternating_constraint() : MfqTokenConstraintPtr{}}, callbacks, stats);
+            if (generated != 24 || position != 23) throw std::runtime_error("prepared MTP cache boundary mismatch");
+            if (!prepared) { reference = output; reference_stats = stats; }
+            else if (output != reference || stats.accepted_tokens != reference_stats.accepted_tokens ||
+                stats.drafted_tokens != reference_stats.drafted_tokens || stats.cycles != reference_stats.cycles)
+                throw std::runtime_error("prepared MTP changed tokens, acceptance, or sampling RNG");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -25,6 +75,7 @@ int main() {
     using mfq::metal::verify_stochastic_mtp_top_k_device;
     using mfq::metal::verify_stochastic_mtp_top_k_chain_device;
     try {
+        check_prepared_target_tokens();
         {
             bool rejected = false;
             try {

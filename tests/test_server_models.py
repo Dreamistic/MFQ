@@ -1833,8 +1833,9 @@ def test_managed_native_runtime_leaves_default_prefill_chunk_to_model_autotune(
     asyncio.run(run())
 
 
-def test_managed_cuda_runtime_leaves_continuous_batching_validation_to_worker(
-    tmp_path: Path,
+@pytest.mark.parametrize("backend", ["cuda", "metal"])
+def test_managed_native_runtime_leaves_continuous_batching_validation_to_worker(
+    tmp_path: Path, backend: str,
 ) -> None:
     async def run() -> None:
         model = tmp_path / "tiny.mfq"
@@ -1844,7 +1845,7 @@ def test_managed_cuda_runtime_leaves_continuous_batching_validation_to_worker(
         pool = RuntimePool(
             catalog,
             tmp_path / "mfq-runtime",
-            backend="cuda",
+            backend=backend,
             max_requests_per_instance=6,
         )
         request = ModelLoadRequest(model="tiny")

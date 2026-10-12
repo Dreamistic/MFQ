@@ -12,6 +12,12 @@ import type {
 import { request } from '../client';
 
 export const modelsApi = {
+  downloadDirectory(): Promise<{ directory: string | null; actual_directory: string; default_directory: string }> {
+    return request('/api/v1/hub/download-directory');
+  },
+  configureDownloadDirectory(directoryId: string | null): Promise<{ directory: string | null; actual_directory: string; default_directory: string }> {
+    return request('/api/v1/hub/download-directory', { method: 'PUT', body: JSON.stringify({ directory_id: directoryId }) });
+  },
   /** 列出模型资产；refresh 为真时要求服务重新扫描。 */
   async modelArtifacts(refresh = false): Promise<ModelArtifact[]> {
     return (

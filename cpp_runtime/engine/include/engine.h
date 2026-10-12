@@ -78,6 +78,7 @@ struct SessionCommand {
     std::string source, target;
     std::uint64_t bytes = 0;
     std::optional<std::uint64_t> disk_bytes;
+    std::optional<std::uint64_t> weight_bytes;
 };
 struct SessionResult { std::uint64_t count = 0; Metrics metrics; };
 struct DecodeTokens {

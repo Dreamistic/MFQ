@@ -2,8 +2,7 @@ import { useRuntime } from '../../app/RuntimeProvider';
 import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
 import { useSettings } from '../settings/SettingsProvider';
-import { PrefixCacheDirectory } from './PrefixCacheDirectory';
-import { PrefixDiskBudgetControls } from './PrefixDiskBudgetControls';
+import { PrefixCacheControls } from './PrefixCacheControls';
 import { hasSeparateVram } from '../runtime/memoryArchitecture';
 
 export function PrefixCacheSettingsPanel() {
@@ -44,8 +43,7 @@ export function PrefixCacheSettingsPanel() {
             disabled readOnly type="checkbox"
           />}
         />
-        <PrefixCacheDirectory />
-        <PrefixDiskBudgetControls budget={diskBudget} />
+        <PrefixCacheControls budget={diskBudget} />
       </div>
     </TMPanel>
   </>;

@@ -62,7 +62,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-it('shows the resident estimate rather than the payload baseline and keeps PLE separate', async () => {
+it('keeps file and PLE sizes without repeating a resident weight estimate', async () => {
   const data = catalog(false, true);
   const variant = data.data[0].variants[0];
   variant.byte_size = 110 * 2 ** 30;
@@ -76,8 +76,9 @@ it('shows the resident estimate rather than the payload baseline and keeps PLE s
   data.data[0].configuration = variant.configuration;
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
   render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
-  expect(await screen.findByText(/file 110.0 GiB · est. resident weights 88.0 GiB · SSD PLE 30.0 GiB/)).toBeInTheDocument();
-  expect(screen.getByText('Smallest tier estimated resident weights')).toBeInTheDocument();
+  expect(await screen.findByText(/file 110.0 GiB · SSD PLE 30.0 GiB/)).toBeInTheDocument();
+  expect(screen.getByText('Smallest tier weights')).toBeInTheDocument();
+  expect(screen.queryByText(/est\. resident weights/)).not.toBeInTheDocument();
   expect(screen.queryByText(/resident weight baseline 80.0 GiB/)).not.toBeInTheDocument();
 });
 
@@ -87,7 +88,9 @@ it('keeps older servers without a resident estimate readable', async () => {
   data.data[0].variants[0].configuration.required_memory_bytes = 80 * 2 ** 30;
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
   render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
-  expect(await screen.findByText(/resident weight baseline 80.0 GiB/)).toBeInTheDocument();
+  expect(await screen.findByText('first-S4')).toBeInTheDocument();
+  expect(document.querySelector('.model-variant small')).toHaveTextContent('MFQ · file');
+  expect(screen.queryByText(/resident weight baseline/)).not.toBeInTheDocument();
 });
 
 it.each([true, false])('shows logical parameter components and the requested nine metadata cells: PLE=%s', async (ple) => {
@@ -197,7 +200,7 @@ it('applies KV planning to every precision tier and recommendations without chan
   fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
   expect(screen.getByRole('progressbar', { name: 'Estimated share of runtime budget: 120.0%' })).toHaveAttribute('aria-valuenow', '100');
   expect(screen.getByRole('progressbar', { name: 'Estimated share of runtime budget: 130.0%' })).toBeInTheDocument();
-  expect(screen.getByText(/est. resident weights 8.0 GiB/)).toBeInTheDocument();
+  expect(screen.queryByText(/est\. resident weights/)).not.toBeInTheDocument();
   expect(screen.getByText('Planned KV/recurrent state 4.0 GiB · Est. total residency 12.0 GiB')).toBeInTheDocument();
   expect(screen.getByText('Resident weights + planned KV/recurrent state: 0/2 tiers fit the budget.')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: /secondTest/ }));

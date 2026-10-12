@@ -3,10 +3,11 @@ import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import type { JobResource, OfficialModelList } from '../../shared/api/types';
 import { modelsApi } from '../../shared/api/resources/models';
 import { jobsApi } from '../../shared/api/resources/jobs';
+import { ApiError } from '../../shared/api/client';
 import { useJobStore } from '../../stores/jobStore';
 import { ModelHubPage } from './ModelHubPage';
 
-vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { officialHubModels: vi.fn() } }));
+vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { officialHubModels: vi.fn(), downloadDirectory: vi.fn(), modelDirectories: vi.fn(), configureDownloadDirectory: vi.fn() } }));
 vi.mock('../../shared/api/resources/jobs', () => ({ jobsApi: { jobKinds: vi.fn(), createJob: vi.fn(), cancelJob: vi.fn(), retryJob: vi.fn(), deleteJob: vi.fn() } }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ addJob: (job: JobResource) => useJobStore.getState().addJob(job) }) }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
@@ -28,6 +29,7 @@ function download(id = 'download-1'): JobResource {
 beforeEach(() => {
   useJobStore.getState().setJobs([]);
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(catalog);
+  vi.mocked(modelsApi.downloadDirectory).mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models' });
   vi.mocked(jobsApi.jobKinds).mockResolvedValue([{ kind: 'download.modelscope', payload_schema: {} }]);
   Element.prototype.scrollIntoView = vi.fn();
 });
@@ -36,11 +38,17 @@ afterEach(() => { vi.clearAllMocks(); useJobStore.getState().setJobs([]); });
 it('keeps a submitted download on this page, animates into the circle and opens the third tab', async () => {
   vi.mocked(jobsApi.createJob).mockResolvedValue(download());
   const { container } = render(<ModelHubPage />);
+  const header = container.querySelector('.model-browser-header')!;
+  expect(header.children[0]).toBe(screen.getByRole('heading', { name: 'Model browser' }));
+  expect(header.children[1]).toHaveClass('download-concurrency');
+  expect(header.children[2]).toHaveClass('model-browser-description');
+  expect(header.children[2].querySelector('.download-directory-control')).toBeInTheDocument();
   expect(screen.getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['Official', 'Community', 'Download queue']);
   const button = await screen.findByRole('button', { name: 'Download' });
   await waitFor(() => expect(button).toBeEnabled());
   fireEvent.click(button);
   await waitFor(() => expect(container.querySelector('.download-flight')).toBeInTheDocument());
+  expect(jobsApi.createJob).toHaveBeenCalledWith('download.modelscope', expect.objectContaining({ download_directory: '/workspace/models' }));
   expect(screen.getByRole('tab', { name: 'Official' })).toHaveAttribute('aria-selected', 'true');
   expect(container.querySelector('.download-circle-count')).toHaveTextContent('1');
   fireEvent.click(screen.getByRole('button', { name: 'Download queue' }));
@@ -67,6 +75,23 @@ it('distinguishes two precisions of one repository by their file paths and lists
   expect(screen.queryByText('*.json')).not.toBeInTheDocument();
 });
 
+it('displays and changes the real server download folder before submitting another download', async () => {
+  vi.mocked(modelsApi.modelDirectories).mockResolvedValue({ current_id: 'chosen-folder', current_path: '/chosen/downloads', current_name: 'downloads', parent_id: null, data: [], files: [], model_file_count: 0 });
+  vi.mocked(modelsApi.configureDownloadDirectory).mockResolvedValue({ directory: '/chosen/downloads', actual_directory: '/chosen/downloads', default_directory: '/workspace/models' });
+  vi.mocked(jobsApi.createJob).mockResolvedValue(download());
+  render(<ModelHubPage />);
+  await screen.findByText('/workspace/models');
+  fireEvent.click(screen.getByRole('button', { name: 'Change' }));
+  expect(await screen.findByRole('dialog', { name: 'Choose download folder' })).toBeInTheDocument();
+  const use = await screen.findByRole('button', { name: 'Use this folder' });
+  await waitFor(() => expect(use).toBeEnabled());
+  fireEvent.click(use);
+  await screen.findByText('/chosen/downloads');
+  expect(modelsApi.configureDownloadDirectory).toHaveBeenCalledWith('chosen-folder');
+  fireEvent.click(screen.getByRole('button', { name: 'Download' }));
+  await waitFor(() => expect(jobsApi.createJob).toHaveBeenCalledWith('download.modelscope', expect.objectContaining({ download_directory: '/chosen/downloads' })));
+});
+
 it('filters model-load and quantization jobs, retains downloads across remount and updates live progress', async () => {
   useJobStore.getState().setJobs([download(), { ...download('load'), kind: 'model.load', payload: { repo_id: 'not-a-download' } }]);
   const first = render(<ModelHubPage />);
@@ -79,6 +104,21 @@ it('filters model-load and quantization jobs, retains downloads across remount a
   render(<ModelHubPage />);
   fireEvent.click(screen.getByRole('button', { name: 'Download queue' }));
   expect(screen.getByText('25%')).toBeInTheDocument();
+});
+
+it('explains a missing folder and restores the last valid location without changing the download folder', async () => {
+  vi.mocked(modelsApi.modelDirectories).mockResolvedValueOnce({ current_id: 'current', current_path: '/workspace/models', current_name: 'models', parent_id: null, data: [], files: [], model_file_count: 0 });
+  vi.mocked(modelsApi.modelDirectories).mockRejectedValueOnce(new ApiError(404, { error: { code: 'model_directory_not_found', message: 'model directory not found: /missing', retryable: false, details: {} } }));
+  render(<ModelHubPage />);
+  await screen.findByText('/workspace/models');
+  fireEvent.click(screen.getByRole('button', { name: 'Change' }));
+  const location = await screen.findByLabelText('Current directory');
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeEnabled());
+  fireEvent.change(location, { target: { value: '/missing' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Go' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent('This folder could not be found');
+  expect(location).toHaveValue('/workspace/models');
+  expect(modelsApi.configureDownloadDirectory).not.toHaveBeenCalled();
 });
 
 it('cancels and retries only the chosen download through the existing jobs API', async () => {

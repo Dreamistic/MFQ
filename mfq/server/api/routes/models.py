@@ -39,6 +39,7 @@ from mfq.server.protocol.models import (
     ProbabilityScoreRequest,
     ProbabilityScoreResult,
     RegisterModelDirectoryRequest,
+    ConfigureDownloadDirectoryRequest,
     RemoteNodeList,
     RemoteNodeResource,
     UpdateRemoteNodeRequest,
@@ -47,6 +48,22 @@ from mfq.server.services.service import ServiceError
 
 hub_router = APIRouter()
 router = APIRouter()
+
+@hub_router.get("/api/v1/hub/download-directory", responses=ERROR_RESPONSES, tags=["models"])
+async def download_directory(service: ServiceDependency) -> dict[str, str | None]:
+    return service.tool_handlers.download_directories.status()
+
+
+@hub_router.put("/api/v1/hub/download-directory", responses=ERROR_RESPONSES, tags=["models"])
+async def configure_download_directory(service: ServiceDependency, body: ConfigureDownloadDirectoryRequest) -> dict[str, str | None]:
+    from mfq.server.state.catalog import ModelDirectoryNotFoundError
+    try:
+        directory = service.catalog.directory_path(body.directory_id) if body.directory_id else None
+        return await service.tool_handlers.download_directories.configure(directory)
+    except (ModelDirectoryNotFoundError, ValueError) as error:
+        raise ServiceError(400, "invalid_download_directory", str(error)) from error
+    except OSError:
+        raise ServiceError(500, "download_directory_save_failed", "could not save download directory") from None
 
 
 @hub_router.get(

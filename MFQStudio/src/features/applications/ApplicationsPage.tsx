@@ -64,7 +64,7 @@ export function ApplicationsPage() {
       {APPLICATIONS.map(app => {
         const snippet = applicationConfiguration(app.id, model, openAI, anthropic);
         return <section className="application-entry" key={app.id}>
-          <div className="application-entry-heading"><span className="application-mark" aria-hidden="true">{app.name[0]}</span>
+          <div className="application-entry-heading"><img className="application-mark" alt="" aria-hidden="true" src={`${import.meta.env.BASE_URL}application-icons/${app.id}.svg`} />
             <div><h2>{app.name}</h2><small>{app.protocol}</small></div>
             <button type="button" onClick={() => void openStudioExternal(app.url).catch(cause => setError(errorMessage(cause)))}>{tr('官网', 'Website')}<Icon name="link" size={14} /></button>
             <button type="button" disabled={!model || !snippet} onClick={() => void copy(app.id, snippet)}><Icon name={copied === app.id ? 'check' : 'copy'} />{copied === app.id ? tr('已复制', 'Copied') : tr('复制配置', 'Copy configuration')}</button>
