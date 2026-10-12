@@ -639,8 +639,11 @@ static void check_expert_budget_transition(MlxQwen4CausalLm& runtime) {
     const auto resident = runtime.resident_full_expert_bytes();
     const auto budget = std::max<std::size_t>(1, (resident ? resident : runtime.expert_cache_limit_bytes()) / 2);
     runtime.set_expert_cache_limit(budget);
-    require(runtime.resident_full_expert_bytes() == 0, "budget pressure retained cold whole expert layers");
-    require(runtime.expert_cache_limit_bytes() <= budget && runtime.dynamic_weight_bytes() <= budget,
+    require(runtime.resident_full_expert_bytes() <= budget &&
+        (!resident || runtime.resident_full_expert_bytes() < resident),
+        "budget pressure failed to reduce resident expert layers");
+    require(runtime.expert_cache_limit_bytes() <= budget &&
+        runtime.resident_full_expert_bytes() + runtime.dynamic_weight_bytes() <= budget,
         "expert cache transition exceeded its budget");
     for (int row = 0; row < 2; ++row) {
         runtime.resolve_request(*caches[row], row ? 2 : 0);
@@ -659,7 +662,8 @@ static void check_expert_budget_transition(MlxQwen4CausalLm& runtime) {
     auto decoded = runtime.decode_requests(caches, {7, 8});
     for (int row = 0; row < 2; ++row)
         near(slice(decoded, {row, 0, 0}, {row + 1, 1, decoded.shape(2)}), next[row]);
-    require(runtime.dynamic_weight_bytes() <= budget, "streamed decode grew beyond its expert budget");
+    require(runtime.resident_full_expert_bytes() + runtime.dynamic_weight_bytes() <= budget,
+        "streamed decode grew beyond its expert budget");
     caches.clear();
     committed.clear();
     runtime.clear_cache();
