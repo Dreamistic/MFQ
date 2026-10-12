@@ -62,7 +62,7 @@ export function StudioSidebar() {
         active: view === 'dashboard' && dashboardPage === 'models', current: true },
       { label: ['服务', 'Service'], icon: 'server-rack', path: '/runtime',
         active: view === 'dashboard' && dashboardPage === 'connections', current: true },
-      { label: ['资源', 'Resources'], icon: 'memory', path: dashboard('cache'),
+      { label: ['资源', 'Resources'], icon: 'droplet', path: dashboard('cache'),
         active: view === 'dashboard' && dashboardPage === 'cache', current: true },
     ] },
     { label: ['交互', 'Playground'], items: [
@@ -76,7 +76,7 @@ export function StudioSidebar() {
         active: view === 'lab' && labPage === 'models' },
       { label: ['测评', 'Evaluations'], icon: 'activity', path: lab('evaluations'),
         active: view === 'lab' && labPage === 'evaluations' },
-      { label: ['量化', 'Quantization'], icon: 'tools', path: lab('quantization'),
+      { label: ['量化', 'Quantization'], icon: 'quantize', path: lab('quantization'),
         active: view === 'lab' && labPage === 'quantization' },
     ] },
     { label: ['系统', 'System'], items: [

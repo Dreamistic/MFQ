@@ -7,5 +7,5 @@
 }
 
 .service-view, .model-download-page {
-  --small-numerals-font: "MFQ Small Numerals", "SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", "Segoe UI", sans-serif;
+  --small-numerals-font: "MFQ Small Numerals", var(--text-font);
 }
