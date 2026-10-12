@@ -1427,8 +1427,11 @@ public:
         const std::vector<Qwen4RequestLayerCache*>& caches) {
         std::vector<std::int64_t> contexts;
         contexts.reserve(caches.size() * static_cast<std::size_t>(config_.ngram_size - 1));
-        for (const auto* cache : caches)
-            contexts.insert(contexts.end(), cache->ple_context.begin(), cache->ple_context.end());
+        for (const auto* cache : caches) {
+            if (cache->ple_context.empty() && cache->ngram_batch == 0)
+                contexts.insert(contexts.end(), static_cast<std::size_t>(config_.ngram_size - 1), config_.eos_token_id);
+            else contexts.insert(contexts.end(), cache->ple_context.begin(), cache->ple_context.end());
+        }
         return std::async(std::launch::async,
             [this, lookup = select_rows(ids, true, &contexts, &offsets)]() mutable {
                 return read_rows(std::move(lookup), true);
@@ -1457,9 +1460,9 @@ public:
         const array& token_ids,
         bool use_cache,
         Prefetched* prefetched = nullptr) {
-        auto lookup = prefetched && prefetched->valid()
-            ? prefetched->get()
-            : read_rows(select_rows(token_ids, use_cache));
+        auto pending = prefetched && prefetched->valid()
+            ? std::move(*prefetched) : prefetch(token_ids, use_cache);
+        auto lookup = pending.get();
         if (lookup.batch != token_ids.shape(0) || lookup.tokens != token_ids.shape(1)) {
             throw std::runtime_error("Qwen4 PLE prefetched shape disagrees");
         }
@@ -3583,32 +3586,8 @@ public:
         bool uniform = true;
         for (int row = 0; row < batch; ++row)
             uniform = uniform && offsets[row + 1] - offsets[row] == offsets[1];
-        const auto row = [&](const array& value, int index) {
-            auto end = value.shape();
-            auto begin = Shape(end.size(), 0);
-            begin[1] = offsets[index];
-            end[1] = offsets[index + 1];
-            return mlx::core::slice(value, begin, end);
-        };
-        std::vector<array> parts;
-        parts.reserve(batch);
         if (ple_) {
-            if (decode) {
-                streams = streams + ple_->forward_requests(streams, ids, offsets, caches, confirmed, prefetched_ple);
-            } else for (int index = 0; index < batch; ++index) {
-                exchange_cache(*caches[index]);
-                try {
-                    auto value = row(streams, index);
-                    parts.push_back(value + ple_->forward(value, row(ids, index), true,
-                        value.shape(1) > 1 ? confirmed : 0));
-                } catch (...) {
-                    exchange_cache(*caches[index]);
-                    throw;
-                }
-                exchange_cache(*caches[index]);
-            }
-            if (!decode) streams = mlx::core::concatenate(parts, 1);
-            parts.clear();
+            streams = streams + ple_->forward_requests(streams, ids, offsets, caches, confirmed, prefetched_ple);
             detail::profile_eval("qwen4.ple", streams);
         }
         auto av = attention_gr_.pre(streams);
@@ -4624,7 +4603,7 @@ struct MlxQwen4CausalLm::Impl {
         auto ids = token_ids.dtype() == mlx::core::int32
             ? token_ids : mlx::core::astype(token_ids, mlx::core::int32);
         std::vector<Qwen4NgramEmbedding::Prefetched> ple_pipeline;
-        if (tokens <= 6 && !config.ple_layer_ids.empty()) {
+        if (!config.ple_layer_ids.empty()) {
             ple_pipeline.resize(layers.size());
             for (const auto layer : config.ple_layer_ids) {
                 const auto index = static_cast<std::size_t>(layer - 1);
@@ -4917,6 +4896,13 @@ std::vector<array> MlxQwen4CausalLm::prefill_requests(
     if (caches.size() == 1) return {prefill_request(*caches[0], tokens[0], mtp[0])};
     const int count = static_cast<int>(packed.size());
     const array ids(packed.begin(), Shape{1, count}, mlx::core::int32);
+    std::vector<Qwen4NgramEmbedding::Prefetched> ple_pipeline(impl_->layers.size());
+    for (const auto layer : impl_->config.ple_layer_ids) {
+        const auto index = static_cast<std::size_t>(layer - 1);
+        std::vector<Qwen4RequestLayerCache*> state;
+        for (const auto& cache : caches) state.push_back(&cache->layers[index]);
+        ple_pipeline[index] = impl_->layers[index].prefetch_ple_requests(ids, offsets, state);
+    }
     auto hidden = impl_->embedding(ids, mlx::core::float16);
     auto streams = mlx::core::reshape(mlx::core::broadcast_to(mlx::core::expand_dims(hidden, -2),
         Shape{1, count, static_cast<int>(impl_->config.hc_count), static_cast<int>(impl_->config.hidden_size)}),
@@ -4933,7 +4919,7 @@ std::vector<array> MlxQwen4CausalLm::prefill_requests(
         for (const auto& cache : caches) layer_caches.push_back(&cache->layers[index]);
         auto* prefetched = routed[index % 2] ? &*routed[index % 2] : nullptr;
         streams = impl_->layers[index].forward_packed_requests(std::move(streams), ids,
-            layer_caches, positions, offsets, false, 0, prefetched);
+            layer_caches, positions, offsets, false, 0, prefetched, &ple_pipeline[index]);
         if (prefetched) {
             detail::eval_with_timing(streams);
             routed[index % 2].reset();

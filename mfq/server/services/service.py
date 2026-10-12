@@ -1276,7 +1276,9 @@ class ServerService:
                 status = await self.runtime_manager.runtime_status(instance_id)
             except BackendError as error:
                 raise ServiceError(
-                    error.status_code,
+                    error.status_code
+                    if error.status_code in {400, 404, 409, 413, 415, 422, 429, 501, 502, 503, 504}
+                    else 503,
                     error.code,
                     str(error),
                     retryable=error.retryable,

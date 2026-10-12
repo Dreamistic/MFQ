@@ -15,6 +15,7 @@ struct FakeEngine final : Engine {
     std::map<std::string, Work> active;
     std::array<std::atomic<int>, 16> advances{};
     std::atomic<int> released{0}, reloads{0};
+    std::atomic<bool> blocked{false}, resume{false};
     std::thread::id owner;
     bool fail = false;
     EngineInfo info() const override { return {2, 128, 64, false, false, true, {}}; }
@@ -43,6 +44,10 @@ struct FakeEngine final : Engine {
                 result.events.push_back({id, Cancelled{}}); continue;
             }
             if (std::find(eligible.begin(), eligible.end(), id) == eligible.end()) { ++it; continue; }
+            if (work.request.token_ids == std::vector<int64_t>{59} && !resume) {
+                blocked = true;
+                while (!resume) std::this_thread::sleep_for(1ms);
+            }
             if (work.request.token_ids == std::vector<int64_t>{63}) throw std::runtime_error("device failure");
             ++advances.at(std::stoi(id));
             ++work.steps;
@@ -82,7 +87,7 @@ struct FakeEngine final : Engine {
         ++reloads; return context;
     }
     void shutdown() override { check_thread(); assert(active.empty()); }
-    ControlResult control(ControlRequest) override { check_thread(); return Metrics{}; }
+    ControlResult control(ControlRequest) override { check_thread(); return Metrics{{"released", released.load()}}; }
 };
 EngineRequest request(int id, int tokens = 12) {
     EngineRequest result;
@@ -177,6 +182,24 @@ int main() {
     test_probability_contract();
     test_benchmark_input_contract();
     test_decode_timing();
+    {
+        FakeEngine engine;
+        MfqScheduler scheduler(engine);
+        auto input = request(0, 1); input.token_ids = {59};
+        auto handle = scheduler.submit(input);
+        while (!engine.blocked) std::this_thread::yield();
+        const auto started = Clock::now();
+        for (int index = 0; index < 1000; ++index) {
+            const auto snapshot = scheduler.snapshot();
+            assert(snapshot.status.healthy && snapshot.runtime == Metrics({{"released", 0}}));
+        }
+        assert(Clock::now() - started < 100ms);
+        assert(engine.advances[0] == 0);
+        engine.resume = true;
+        drain(handle);
+        scheduler.control(RuntimeMetrics{});
+        assert(scheduler.snapshot().runtime == Metrics({{"released", 1}}));
+    }
     {
         FakeEngine engine;
         MfqScheduler scheduler(engine, {8, 4096});
