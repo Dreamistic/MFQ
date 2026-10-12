@@ -18,6 +18,10 @@ for (const language of ['zh-CN', 'en'] as const) {
     await expect(interaction.getByRole('button', { name: en ? 'Applications' : '应用', exact: true })).toHaveCount(1);
     await expect(tools.getByRole('button', { name: en ? 'Applications' : '应用', exact: true })).toHaveCount(0);
     await expect(page.locator('.application-entry')).toHaveCount(5);
+    const marks = page.locator('img.application-mark');
+    await expect(marks).toHaveCount(5);
+    await expect.poll(() => marks.evaluateAll(images => images.every(image => image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0))).toBe(true);
+    expect(await marks.evaluateAll(images => images.map(image => ({ width: image.getBoundingClientRect().width, height: image.getBoundingClientRect().height })))).toEqual(Array.from({ length: 5 }, () => ({ width: 28, height: 28 })));
     await expect(page.getByRole('combobox', { name: en ? 'Model' : '模型' })).toHaveValue('my-model');
     await expect(page.getByText('http://127.0.0.1:8091/v1/messages', { exact: true })).toBeVisible();
     const opencode = page.locator('.application-entry').filter({ has: page.getByRole('heading', { name: 'OpenCode', exact: true }) });

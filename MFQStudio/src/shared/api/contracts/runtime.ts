@@ -237,35 +237,6 @@ export interface RuntimeInstance {
   error?: ApiErrorBody['error'] | null;
 }
 
-export interface RuntimeProfile {
-  id: string;
-  name: string;
-  load: {
-    model: string;
-    artifact_uri?: string | null;
-    device_ids: string[];
-    idle_ttl_seconds?: number | null;
-    pin: boolean;
-    context_size: number | null;
-    prefill_chunk_size: number;
-    moe_gpu_cache_gb?: number | null;
-    prefix_cache_max_sessions?: number | null;
-    prefix_cache_max_snapshots_per_session?: number | null;
-    prefix_cache_max_bytes?: number | null;
-    prefix_cache_enabled?: boolean;
-    prefix_cache_disk_bytes?: number | null;
-    prefix_cache_hot_bytes?: number | null;
-    prefix_cache_block_tokens?: number | null;
-    prefix_cache_pending_bytes?: number | null;
-    sampling_defaults?: SamplingParams | null;
-  };
-  artifact_id: string;
-  artifact_modified_at: string;
-  drifted: boolean;
-  drift_reason?: string | null;
-  created_at: string;
-  updated_at: string;
-}
 
 export interface RuntimeMetricSnapshot {
   sequence: number;

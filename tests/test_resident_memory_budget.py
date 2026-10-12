@@ -8,6 +8,7 @@ import pytest
 from mfq.server.protocol.models import ModelLoadRequest, RuntimeInstanceState, RuntimeMemoryPolicy, RuntimeMemoryResources
 from mfq.server.runtime.client import BackendError
 from mfq.server.runtime.runtime_pool import RuntimePool
+from mfq.server.services.jobs import JobExecutionError
 from mfq.server.state.catalog import ModelCatalog
 from tests.test_runtime_memory_policy import GIB, artifact
 from tests.test_server_models import _TestJobContext
@@ -23,6 +24,7 @@ class BudgetBackend:
         self.dense, self.experts, self.kv, self.prefix, self.limit = dense, experts, kv, prefix, limit
         self.events = events
         self.fail = False
+        self.weight_limit = 0
 
     @property
     def used(self):
@@ -33,11 +35,17 @@ class BudgetBackend:
         self.prefix = min(self.prefix, target)
         return {'status': 'ok'}
 
-    async def set_resident_memory_budget(self, target):
+    async def set_resident_memory_budget(self, target, weight_target_bytes=None):
         self.events.append(('budget', target))
         if self.fail:
             raise RuntimeError('injected native failure')
-        room = target - min(256 << 20, target // 20)
+        if weight_target_bytes is not None:
+            if weight_target_bytes and weight_target_bytes < self.dense:
+                raise RuntimeError('non-offloadable weights do not fit')
+            self.weight_limit = weight_target_bytes
+        if self.weight_limit:
+            self.experts = min(self.experts, self.weight_limit - self.dense)
+        room = target - min(256 << 20, target // 20) if target else 1 << 63
         self.prefix -= min(self.prefix, max(0, self.used - room))
         self.experts -= min(self.experts, max(0, self.used - room))
         if self.used > room:
@@ -47,6 +55,8 @@ class BudgetBackend:
 
     async def runtime_status(self):
         return {'resident_memory_dynamic_budget': 1, 'resident_memory_budget_bytes': self.limit,
+            'resident_weight_dynamic_budget': 1, 'resident_weight_budget_bytes': self.weight_limit,
+            'prefix_cache_dynamic_budget': 1,
             'resident_memory_used_bytes': self.used, 'resident_reclaimable_weight_bytes': self.experts,
             'resident_weight_bytes': self.dense + self.experts, 'kv_cache_bytes': self.kv,
             'prefix_cache_hot_bytes': self.prefix}
@@ -57,6 +67,7 @@ def instance(tmp_path, name, *, dense=GIB, experts=3 * GIB, kv=GIB, prefix=GIB, 
     return SimpleNamespace(id=uuid4(), artifact=artifact(tmp_path, name, 8, 6), backend=backend, process=None,
         state=RuntimeInstanceState.READY, active_requests=0, queued_requests=0, control_leases=0,
         resident_dynamic_budget=True, resident_budget_limit=limit, resident_memory_used=backend.used, prefix_pending_writes=0,
+        resident_weight_dynamic_budget=True, resident_weight_budget_limit=0,
         reclaimable_weight_bytes=experts, prefix_dynamic_budget=True, prefix_pressure_bytes=0,
         memory=RuntimeMemoryResources(prefix_cache_bytes=prefix), started_at=datetime.now(timezone.utc), last_used_at=None,
         context_size=4096, pinned=True, idle_ttl_seconds=None)
@@ -148,6 +159,80 @@ def test_native_failure_restores_previously_applied_caps(tmp_path):
             await pool._rebalance_resident_budget(b.id)
         assert a.backend.limit == a.resident_budget_limit == 8 * GIB
         assert a.control_leases == b.control_leases == 0
+        pool._instances.clear()
+        await pool.aclose()
+    asyncio.run(run())
+
+
+def test_model_ceiling_changes_online_and_preserves_context_streaming_settings_and_identity(tmp_path):
+    async def run():
+        pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime', max_runtime_memory_bytes=20 * GIB)
+        a = instance(tmp_path, 'a', experts=6 * GIB, prefix=0)
+        a.artifact = artifact(tmp_path, 'a', 8, 7)
+        pool._instances = {a.id: a}
+        pool._load_requests = {'a': ModelLoadRequest(model='a', context_size=4096,
+            qsa_kv_offload={'enabled': True, 'budget_bytes': 2 * GIB, 'target_context': 4096})}
+        original = pool._load_requests['a'].model_copy(deep=True)
+        context = _TestJobContext()
+        context.job_id, context.cancel_requested = uuid4(), False
+        result = await pool.configure_memory_policy(context, {'model_limit_bytes': 4 * GIB})
+        assert result['models_replanned'] == 0 and pool._instances[a.id] is a
+        assert a.backend.dense + a.backend.experts <= 4 * GIB
+        assert a.backend.weight_limit == a.resident_weight_budget_limit == 4 * GIB
+        assert a.context_size == 4096 and a.backend.kv == GIB
+        assert pool._load_requests['a'] == original
+        events = list(a.backend.events)
+        await pool.configure_memory_policy(context, pool.memory_policy.model_dump())
+        assert a.backend.events == events
+        result = await pool.configure_memory_policy(context, {'model_limit_bytes': None})
+        assert result['models_replanned'] == 0 and a.backend.weight_limit == 0
+        assert pool._instances[a.id] is a and pool._load_requests['a'] == original
+        pool._instances.clear()
+        await pool.aclose()
+    asyncio.run(run())
+
+
+def test_total_and_model_limits_can_change_together_without_reload_or_kv_policy_changes(tmp_path):
+    async def run():
+        pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime', max_runtime_memory_bytes=20 * GIB)
+        a = instance(tmp_path, 'a', experts=6 * GIB, prefix=0)
+        a.artifact = artifact(tmp_path, 'a', 8, 7)
+        pool._instances = {a.id: a}
+        pool._load_requests = {'a': ModelLoadRequest(model='a', context_size=4096,
+            qsa_kv_offload={'enabled': True, 'budget_bytes': 2 * GIB, 'target_context': 4096})}
+        original = pool._load_requests['a'].model_copy(deep=True)
+        context = _TestJobContext()
+        context.job_id, context.cancel_requested = uuid4(), False
+        await pool.configure_memory_policy(context, {'total_limit_bytes': 6 * GIB, 'model_limit_bytes': 4 * GIB})
+        assert a.backend.used < 6 * GIB and a.backend.dense + a.backend.experts <= 4 * GIB
+        await pool.configure_memory_policy(context, {'total_limit_bytes': 5 * GIB, 'model_limit_bytes': 4 * GIB})
+        assert a.backend.used < 5 * GIB and a.backend.weight_limit == 4 * GIB
+        assert pool._instances[a.id] is a and pool._load_requests['a'] == original and a.backend.kv == GIB
+        saved = pool.memory_policy.model_copy(deep=True)
+        with pytest.raises(JobExecutionError) as rejected:
+            await pool.configure_memory_policy(context, {'total_limit_bytes': 3 * GIB // 2, 'model_limit_bytes': 4 * GIB})
+        assert rejected.value.detail.code == 'resident_budget_exhausted'
+        assert pool.memory_policy == saved and pool._instances[a.id] is a
+        assert a.backend.kv == GIB and pool._load_requests['a'] == original
+        pool._instances.clear()
+        await pool.aclose()
+    asyncio.run(run())
+
+
+def test_model_weight_budget_is_online_even_without_a_total_ceiling(tmp_path):
+    async def run():
+        pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime', automatic_memory_budget=False)
+        a = instance(tmp_path, 'a', experts=6 * GIB, prefix=0, limit=0)
+        a.artifact = artifact(tmp_path, 'a', 8, 7)
+        pool._instances = {a.id: a}
+        pool._load_requests = {'a': ModelLoadRequest(model='a')}
+        context = _TestJobContext()
+        context.job_id, context.cancel_requested = uuid4(), False
+        await pool.configure_memory_policy(context, {'model_limit_bytes': 4 * GIB})
+        assert a.backend.weight_limit == 4 * GIB and a.backend.limit == 0
+        assert a.backend.kv == GIB and pool._instances[a.id] is a
+        await pool.configure_memory_policy(context, {'model_limit_bytes': None})
+        assert a.backend.weight_limit == 0 and a.backend.limit == 0
         pool._instances.clear()
         await pool.aclose()
     asyncio.run(run())

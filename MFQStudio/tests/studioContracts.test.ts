@@ -131,12 +131,12 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
   });
 
   it('test_studio_defaults_global_settings_to_inherited_model_parameters', () => {
-    expect(APP).toContain('className="settings-page-inherited" disabled={settingsDraft.inheritModelDefaults}');
-    expect(APP).toContain('checked={settingsDraft.inheritModelDefaults}');
+    expect(APP).toContain('inheritModelDefaults: true');
+    expect(APP).not.toContain('className="settings-page-inherited"');
     expect(APP).toContain('inherit_global_settings: preset.inheritGlobalSettings');
     expect(APP).toContain('typeof raw.inheritGlobalSettings === "boolean" ? raw.inheritGlobalSettings : true');
     expect(APP).toContain('typeof preset.metadata?.inherit_global_settings === "boolean"');
-    expect(STYLES).toContain('.settings-page-inherited:disabled');
+    expect(STYLES).not.toContain('.settings-page-inherited:disabled');
     expect(APP).not.toContain('className="role-inherited-fields"');
   });
 
@@ -262,13 +262,13 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
       ['ContextManagementPanel', 'features/connections/ContextManagementPanel.tsx', 'Context management'],
       ['PrefixCacheSettingsPanel', 'features/connections/PrefixCacheSettingsPanel.tsx', 'Persistent prefix cache'],
       ['InferencePolicyPanel', 'features/connections/InferencePolicyPanel.tsx', 'Inference controls'],
-      ['RuntimeProfilesPanel', 'features/runtime/RuntimeProfilesPanel.tsx', 'Runtime profiles'],
       ['RemoteRoutingPanel', 'features/connections/RemoteRoutingPanel.tsx', 'Remote routing'],
     ]) {
       expect(connection).toContain(`<${component} />`);
       expect(readSources(path)).toContain(label);
     }
     expect(connection).toContain('<ModelAliasMapping');
+    expect(connection).not.toContain('RuntimeProfilesPanel');
     expect(readSources('features/connections/ModelAliasMapping.tsx')).toContain('Alias mapping');
     expect(connection).not.toContain('InferenceDefaultsPanel');
     expect(readSources('features/chat/components/ChatPageHeader.tsx')).toContain('<InferenceDefaultsPanel />');

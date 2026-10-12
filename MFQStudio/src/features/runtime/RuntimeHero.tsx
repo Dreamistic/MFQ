@@ -16,7 +16,7 @@ export function RuntimeHero() {
   const jobs = useJobStore((state) => state.jobs);
   const { tr } = useSettings();
   const navigate = useNavigate();
-  const openStudioPage = () => navigate(STUDIO_PATHS.models);
+  const openStudioPage = (localCheckpoints = false) => navigate(`${STUDIO_PATHS.models}${localCheckpoints ? '#local-checkpoints' : ''}`);
   const openChatPage = () => navigate(STUDIO_PATHS.chat);
   const runtimeModelName = runtime?.model || 'Empty';
   const modelHero = useMemo(() => {
@@ -111,9 +111,9 @@ export function RuntimeHero() {
       <div className="runtime-hero-actions">
         <ModelVendorMark name={modelHero.name} size={34}
           architecture={modelHero.name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
-        <button className={modelHero.state === 'ready' ? undefined : 'primary'} onClick={() => openStudioPage()} type="button">
+        <button className={modelHero.state === 'ready' ? undefined : 'primary'} onClick={() => openStudioPage(modelHero.state === 'idle')} type="button">
           <Icon name="folder" size={15} />
-          {tr('模型', 'Models')}
+          {modelHero.state === 'idle' ? tr('加载', 'Load') : tr('模型', 'Models')}
         </button>
         <button className={modelHero.state === 'ready' ? 'primary runtime-hero-chat' : undefined} onClick={openChatPage} type="button">
           <Icon name="chat" size={15} />

@@ -414,8 +414,13 @@ public:
                 if (op == "memory.budget") {
                     const auto bytes = integer_field(params, "target_bytes", 0);
                     if (bytes < 0) throw ApiError(400, "invalid_request_error", "target_bytes must be non-negative");
-                    auto result = json{{"status", "ok"}, {"released_bytes", scheduler.session(
-                        {mfq::engine::SessionCommand::Kind::memory_budget, {}, {}, static_cast<uint64_t>(bytes)}).count}};
+                    mfq::engine::SessionCommand command{mfq::engine::SessionCommand::Kind::memory_budget, {}, {}, static_cast<uint64_t>(bytes)};
+                    if (params.contains("weight_target_bytes")) {
+                        const auto weight = integer_field(params, "weight_target_bytes", 0);
+                        if (weight < 0) throw ApiError(400, "invalid_request_error", "weight_target_bytes must be non-negative");
+                        command.weight_bytes = static_cast<uint64_t>(weight);
+                    }
+                    auto result = json{{"status", "ok"}, {"released_bytes", scheduler.session(command).count}};
                     add_session_metrics(result);
                     send_result(id, std::move(result));
                     continue;
@@ -916,6 +921,8 @@ public:
             } catch (const mfq::engine::InferenceInputError & error) {
                 send_error(
                     id, 400, input_error_type(error.code), error.what());
+            } catch (const MfqResourceExhausted & error) {
+                send_error(id, 413, "resident_budget_exhausted", error.what());
             } catch (const json::exception & error) {
                 send_error(id, 400, "backend_protocol_error", error.what());
             } catch (const std::invalid_argument& error) {

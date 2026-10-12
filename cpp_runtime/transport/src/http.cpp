@@ -644,11 +644,17 @@ int run_mfq_http_transport(
             const auto body = parse_body(req);
             const auto bytes = integer_field(body, "target_bytes", 0);
             if (bytes < 0) throw ApiError(400, "invalid_request_error", "target_bytes must be non-negative");
-            json result = {{"status", "ok"}, {"released_bytes", scheduler.session(
-                {mfq::engine::SessionCommand::Kind::memory_budget, {}, {}, static_cast<uint64_t>(bytes)}).count}};
+            mfq::engine::SessionCommand command{mfq::engine::SessionCommand::Kind::memory_budget, {}, {}, static_cast<uint64_t>(bytes)};
+            if (body.contains("weight_target_bytes")) {
+                const auto weight = integer_field(body, "weight_target_bytes", 0);
+                if (weight < 0) throw ApiError(400, "invalid_request_error", "weight_target_bytes must be non-negative");
+                command.weight_bytes = static_cast<uint64_t>(weight);
+            }
+            json result = {{"status", "ok"}, {"released_bytes", scheduler.session(command).count}};
             add_session_metrics(result);
             set_json(res, result);
         } catch (const ApiError& error) { handle_api_error(res, error); }
+        catch (const MfqResourceExhausted& error) { set_json(res, error_body(error.what(), "resident_budget_exhausted"), 413); }
         catch (const std::exception& error) { set_json(res, error_body(error.what(), "server_error"), 500); }
     });
 

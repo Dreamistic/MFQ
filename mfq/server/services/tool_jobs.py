@@ -26,6 +26,7 @@ from mfq.server.api.network import download_environment
 from mfq.server.protocol.models import ErrorDetail
 from mfq.server.protocol.quantization import Wt2ReferencePayload
 from mfq.server.services.jobs import JobContext, JobExecutionError, TypedJobHandler
+from mfq.server.services.download_directory import DownloadDirectorySettings
 from mfq.server.services.inference_benchmark import InferenceBenchmarkPayload, WikitextQualityPayload, run_inference_benchmark
 from mfq.server.services.accuracy_benchmark import AccuracyBenchmarkPayload, run_accuracy_benchmark
 from mfq.server.services.evaluation_datasets import OfficialDatasetDownloadPayload, download_official_dataset, materialize_wt2, WT2_TEXT_SHA256
@@ -48,6 +49,7 @@ class VoiceOutputInstallPayload(_Payload):
 class ModelScopeDownloadPayload(_Payload):
     repo_id: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
     destination: str = Field(min_length=1, max_length=1024)
+    download_directory: str | None = Field(default=None, min_length=1, max_length=4096)
     revision: str = Field(default="master", min_length=1, max_length=255)
     repo_type: Literal["model", "dataset"] = "model"
     include: list[str] = Field(default_factory=list, max_length=4096)
@@ -60,6 +62,7 @@ class ModelScopeDownloadPayload(_Payload):
 class HuggingFaceDownloadPayload(_Payload):
     repo_id: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
     destination: str = Field(min_length=1, max_length=1024)
+    download_directory: str | None = Field(default=None, min_length=1, max_length=4096)
     revision: str = Field(default="main", min_length=1, max_length=255)
     repo_type: Literal["model", "dataset", "space"] = "model"
     include: list[str] = Field(default_factory=list, max_length=4096)
@@ -245,6 +248,7 @@ class ToolJobHandlers:
         self.paths = paths
         self.root = paths.work_root.expanduser().resolve()
         self.model_root = catalog.roots[0] if catalog.roots else self.root / "models"
+        self.download_directories = DownloadDirectorySettings(self.root, self.model_root)
         self.voice_component = voice_component
         self.activate_voice_output = activate_voice_output
         self.runtime_manager = runtime_manager
@@ -511,7 +515,7 @@ class ToolJobHandlers:
         self, context: JobContext, payload: dict[str, Any]
     ) -> dict[str, Any]:
         request = ModelScopeDownloadPayload.model_validate(payload)
-        destination = self._output(request.destination, directory=True)
+        destination = self._download_output(request.destination, request.download_directory)
         self._preflight_download(destination, request.expected_bytes)
         if self.paths.internal_modelscope:
             argv = self._mfq_command(
@@ -563,7 +567,7 @@ class ToolJobHandlers:
         self, context: JobContext, payload: dict[str, Any]
     ) -> dict[str, Any]:
         request = HuggingFaceDownloadPayload.model_validate(payload)
-        destination = self._output(request.destination, directory=True)
+        destination = self._download_output(request.destination, request.download_directory)
         self._preflight_download(destination, request.expected_bytes)
         if self.paths.internal_huggingface:
             argv = self._mfq_command(
@@ -1183,6 +1187,12 @@ class ToolJobHandlers:
                 f"downloaded {total} bytes, expected at least {expected}",
                 retryable=True,
             )
+        if not destination.is_relative_to(self.model_root) and any(destination.is_relative_to(root) for root in self.download_directories.roots.values()):
+            from mfq.server.state.catalog import ModelRegistrationError
+            try:
+                await self.catalog.register_directory(path=destination)
+            except ModelRegistrationError:
+                pass
         uri = self._artifact_uri(destination)
         await context.artifact(
             name=repo_id,
@@ -1224,6 +1234,24 @@ class ToolJobHandlers:
             raise self._failure("input_not_found", f"input does not exist: {value}")
         return path
 
+    def _download_output(self, value: str, directory: str | None) -> Path:
+        if directory is None:
+            return self._output(value, directory=True)
+        try:
+            root = self.download_directories.directory(directory)
+        except ValueError as error:
+            raise self._failure("invalid_download_directory", str(error)) from error
+        relative = Path(value)
+        if relative.is_absolute():
+            raise self._failure("absolute_path_not_allowed", "download destinations must be relative")
+        if relative.parts[:1] == ("models",):
+            relative = Path(*relative.parts[1:])
+        destination = (root / relative).resolve()
+        if destination == root or not destination.is_relative_to(root):
+            raise self._failure("path_outside_workspace", "download destination must stay inside its folder")
+        destination.mkdir(parents=True, exist_ok=True)
+        return destination
+
     def _output(self, value: str, *, directory: bool = False) -> Path:
         path = self._resolve(value)
         if directory:
@@ -1237,6 +1265,14 @@ class ToolJobHandlers:
                 "absolute_path_not_allowed", "tool job paths must be workspace-relative"
             )
         model_path = path.parts[:1] == ("models",)
+        if path.parts[:1] == ("download-roots",):
+            root = self.download_directories.roots.get(path.parts[1] if len(path.parts) > 1 else "")
+            if root is None:
+                raise self._failure("path_outside_workspace", "download folder is not registered")
+            resolved = (root / Path(*path.parts[2:])).resolve()
+            if not resolved.is_relative_to(root):
+                raise self._failure("path_outside_workspace", "path is outside the download folder")
+            return resolved
         root = self.model_root if model_path else self.root
         resolved = (root / Path(*path.parts[1:]) if model_path else root / path).resolve()
         if not resolved.is_relative_to(root):
@@ -1246,6 +1282,10 @@ class ToolJobHandlers:
         return resolved
 
     def _artifact_uri(self, path: Path) -> str:
+        if not path.is_relative_to(self.model_root) and not path.is_relative_to(self.root):
+            for identifier, root in self.download_directories.roots.items():
+                if path.is_relative_to(root):
+                    return f"workspace://download-roots/{identifier}/{path.relative_to(root).as_posix()}"
         relative = (
             Path("models") / path.relative_to(self.model_root)
             if path.is_relative_to(self.model_root)
@@ -1258,7 +1298,7 @@ class ToolJobHandlers:
             raise self._failure("invalid_artifact_uri", "artifact must use workspace://")
         relative = artifact_uri.removeprefix("workspace://")
         target = self._resolve(relative)
-        if target == self.root:
+        if target in {self.root, self.model_root, *self.download_directories.roots.values()}:
             raise self._failure("unsafe_artifact_target", "workspace root cannot be removed")
         if not target.exists():
             raise self._failure("artifact_not_found", "workspace artifact does not exist")

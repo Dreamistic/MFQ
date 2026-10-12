@@ -101,6 +101,8 @@ struct MlxQwen4TextSessionState {
     std::size_t bytes = 0;
 };
 
+struct MlxQwen4RequestCache;
+
 std::pair<std::int32_t, mlx::core::array> qwen4_mtp_logits_from_state(
     const MfqContainer& model, const MfqContainer& predictor_source,
     const MlxQwen4TextSessionState& state, bool fp16);
@@ -122,6 +124,38 @@ public:
         const mlx::core::array& token_ids,
         bool use_cache = true);
 
+    std::shared_ptr<MlxQwen4RequestCache> make_request_cache();
+    void adopt_request_cache(MlxQwen4RequestCache& cache);
+    mlx::core::array prefill_request(MlxQwen4RequestCache& cache,
+        const std::vector<std::int64_t>& tokens, bool mtp = false);
+    std::vector<mlx::core::array> prefill_requests(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<std::vector<std::int64_t>>& tokens,
+        const std::vector<bool>& mtp);
+    mlx::core::array decode_requests(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<std::int64_t>& tokens);
+    std::pair<mlx::core::array, mlx::core::array> forward_request_tokens(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<std::int64_t>& tokens);
+    std::pair<mlx::core::array, mlx::core::array> verify_requests(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<std::vector<std::int64_t>>& tokens);
+    std::vector<std::pair<mlx::core::array, mlx::core::array>> forward_request_windows(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<std::vector<std::int64_t>>& tokens,
+        std::optional<mlx::core::array>* packed_logits = nullptr);
+    void resolve_request(MlxQwen4RequestCache& cache, int accepted_drafts);
+    int request_cache_position(const MlxQwen4RequestCache& cache) const;
+    MlxMtpEngineCallbacks request_mtp_callbacks(const std::shared_ptr<MlxQwen4RequestCache>& cache,
+        bool batched_drafts = false);
+    void draft_request_heads(const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<std::optional<mlx::core::array>>& previous_tokens);
+    MlxQwen4TextSessionState capture_request_cache(MlxQwen4RequestCache& cache,
+        const std::vector<std::int64_t>& tokens);
+    void restore_request_cache(MlxQwen4RequestCache& cache,
+        const MlxQwen4TextSessionState& state);
+
     void reset_cache(int batch = 1);
     mlx::core::array score_forward(const mlx::core::array& token_ids, bool last_token_only);
     void clear_cache() noexcept;
@@ -142,6 +176,7 @@ public:
     std::size_t layer_count() const noexcept;
     int cache_position() const noexcept;
     bool supports_mtp() const noexcept;
+    bool supports_batch_mtp() const noexcept;
     const MlxMtpGenerationStats& last_mtp_stats() const noexcept;
     std::size_t expert_cache_limit_bytes() const noexcept;
     std::optional<MlxSsdExpertCacheStats> ssd_expert_cache_stats() const;
@@ -174,6 +209,12 @@ public:
     std::vector<std::pair<std::string, double>> mtp_session_metrics() const;
 
 private:
+    std::pair<mlx::core::array, mlx::core::array> forward_requests(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<std::int64_t>& tokens, int rows, bool speculative);
+    std::pair<mlx::core::array, mlx::core::array> forward_packed_requests(
+        const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
+        const std::vector<std::int64_t>& tokens, const std::vector<int>& offsets, bool speculative);
     struct Impl;
     explicit MlxQwen4CausalLm(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;

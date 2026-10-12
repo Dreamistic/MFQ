@@ -53,6 +53,9 @@ def test_listener_changes_port_without_restarting_service(tmp_path: Path) -> Non
                 async with httpx.AsyncClient(trust_env=False) as client:
                     failed = await client.put(f"http://127.0.0.1:{new_port}/api/v1/runtime/listener", json={"port": unavailable})
                     assert failed.status_code == 409
+                    assert failed.json()["error"]["code"] == "listener_port_in_use"
+                    assert failed.json()["error"]["details"]["port"] == unavailable
+                    assert "Errno" not in failed.json()["error"]["message"]
                     assert (await client.get(f"http://127.0.0.1:{new_port}/state")).json() == state
             assert server.config.port == new_port
             assert saved_service_port(tmp_path / "listener.json") == new_port
@@ -130,6 +133,7 @@ def test_independent_listeners_keep_live_requests_and_shared_service(tmp_path: P
                 collision = await client.put(f"http://127.0.0.1:{oai}/api/v1/runtime/listener",
                                              json={"port": oai, "protocol": "anthropic"})
                 assert collision.status_code == 409
+                assert collision.json()["error"]["code"] == "listener_port_conflict"
                 assert server.anthropic_port == new_port
                 assert saved_service_port(tmp_path / "listener.json", "anthropic") == new_port
                 assert saved_service_port(tmp_path / "listener.json") == oai

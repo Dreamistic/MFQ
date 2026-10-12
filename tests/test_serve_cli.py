@@ -17,7 +17,6 @@ from mfq.commands.serve import (
 )
 from mfq.server.runtime.native import (
     NativeRuntime,
-    NativeRuntimeError,
     native_request_capacity,
     native_runtime_environment,
 )
@@ -317,7 +316,7 @@ def test_native_request_capacity_is_backend_based() -> None:
         backend="metal",
         routed_expert_bytes=0,
         requested=8,
-    ) == 1
+    ) == 8
     assert native_request_capacity(
         backend="cuda",
         routed_expert_bytes=1,
@@ -325,7 +324,7 @@ def test_native_request_capacity_is_backend_based() -> None:
     ) == 8
 
 
-def test_native_metal_worker_rejects_cuda_continuous_batching(
+def test_native_metal_worker_receives_continuous_batching(
     tmp_path: Path,
 ) -> None:
     runtime = NativeRuntime(
@@ -336,8 +335,8 @@ def test_native_metal_worker_rejects_cuda_continuous_batching(
         continuous_batching=2,
     )
 
-    with pytest.raises(NativeRuntimeError, match="requires CUDA"):
-        runtime.command(43123)
+    command = runtime.command(43123)
+    assert command[command.index("--continuous-batching") + 1] == "2"
 
 
 def test_native_metal_worker_receives_prefill_chunk_size(tmp_path: Path) -> None:

@@ -44,7 +44,7 @@ function CacheInventory() {
       setInventory(value);
       setError('');
     } catch (cause) {
-      if (!signal?.aborted && current() && version === inventorySequence.current) setError(errorMessage(cause));
+      if (!signal?.aborted && current() && version === inventorySequence.current) setError(errorMessage(cause, tr));
     }
   }, [connectionScope]);
   useEffect(() => {
@@ -76,7 +76,7 @@ function CacheInventory() {
     try {
       const value = await runtimeApi.prefixCacheEntries(namespace, offset, controller.signal, nextFilters);
       if (version === sequence.current && current()) setDetail(value);
-    } catch (cause) { if (version === sequence.current && current()) toast.error(errorMessage(cause)); }
+    } catch (cause) { if (version === sequence.current && current()) toast.error(errorMessage(cause, tr)); }
     finally { if (version === sequence.current && current()) setReading(false); }
   }
   function updateFilters(next: PrefixCacheFilters) {
@@ -100,7 +100,7 @@ function CacheInventory() {
     try {
       const value = await runtimeApi.prefixCacheText(selected, block, offset);
       if (version === sequence.current && current()) setText(value);
-    } catch (cause) { if (version === sequence.current && current()) toast.error(errorMessage(cause)); }
+    } catch (cause) { if (version === sequence.current && current()) toast.error(errorMessage(cause, tr)); }
     finally { if (version === sequence.current && current()) setReading(false); }
   }
   async function clear(namespace?: string) {
@@ -129,7 +129,7 @@ function CacheInventory() {
         `Cleared ${formatNumber(result.removed_blocks)} blocks; released ${formatBytes(result.released_bytes)}`);
       if (result.failed_blocks) toast.error(`${summary} · ${tr('部分块未能删除', 'Some blocks could not be removed')}`);
       else toast.success(summary);
-    } catch (cause) { if (current()) toast.error(errorMessage(cause)); }
+    } catch (cause) { if (current()) toast.error(errorMessage(cause, tr)); }
     finally { clearing.current = false; if (current()) setBusy(false); }
   }
   const reasons: Record<string, string> = {

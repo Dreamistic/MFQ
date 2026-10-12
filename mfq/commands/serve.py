@@ -294,7 +294,7 @@ def _run(args: argparse.Namespace) -> int:
         executable,
         startup_timeout_seconds=args.runtime_startup_timeout,
         max_instances=args.max_runtime_instances,
-        max_requests_per_instance=args.max_requests_per_runtime,
+        max_requests_per_instance=args.max_requests_per_runtime or (8 if selected_backend == "metal" else 1),
         max_queued_requests_per_instance=args.max_queued_requests_per_runtime,
         max_runtime_memory_bytes=args.max_runtime_memory or None,
         automatic_memory_budget=(
@@ -351,8 +351,11 @@ def _run(args: argparse.Namespace) -> int:
     if web_root is None:
         print("Web UI assets were not found; serving the API only")
     listener_settings = data_dir / "listener.json"
+    app = create_app(service, web_root=web_root, api_keys=api_keys, auth_settings_path=data_dir / "auth.json")
+    if error := network_auth_error(args.host, "configured" if app.state.auth_policy.enabled else ""):
+        raise ValueError(error)
     RuntimeServer(uvicorn.Config(
-        create_app(service, web_root=web_root, api_keys=api_keys),
+        app,
         host=args.host,
         port=args.port if args.port is not None else saved_service_port(listener_settings),
         log_level=args.log_level,
@@ -460,7 +463,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     parser.add_argument("--max-runtime-instances", type=_positive_int, default=2)
-    parser.add_argument("--max-requests-per-runtime", type=_positive_int, default=1)
+    parser.add_argument("--max-requests-per-runtime", type=_positive_int, default=None)
     parser.add_argument(
         "--max-queued-requests-per-runtime",
         type=_nonnegative_int,

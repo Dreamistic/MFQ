@@ -33,7 +33,7 @@ export function useModelCatalog() {
   const observedActiveLoadJobIds = useRef(new Set<string>());
   const reportedFailedJobIds = useRef(new Set<string>());
   const reportError = (cause: unknown) => {
-    toast.error(errorMessage(cause));
+    toast.error(errorMessage(cause, tr));
   };
   const [modelFilter, setModelFilter] = useState('');
   const [loadPinned, setLoadPinned] = useState(false);
@@ -200,6 +200,8 @@ export function useModelCatalog() {
   async function openModelDirectory(directoryId?: string | null, path?: string | null) {
     const current = connectionScope();
     if (busy) return;
+    const previousBrowser = modelBrowser;
+    const previousPath = modelBrowser?.current_path || modelFolderPath || '/';
     const request = ++directoryRequest.current;
     setModelBrowserError('');
     setModelBrowser(null);
@@ -213,7 +215,10 @@ export function useModelCatalog() {
       setModelBrowser(listing);
       setModelDirectoryPath(listing.current_path ?? '');
     } catch (cause) {
-      if (current() && request === directoryRequest.current) setModelBrowserError(errorMessage(cause));
+      if (current() && request === directoryRequest.current) {
+        setModelBrowser(previousBrowser); setModelDirectoryPath(previousPath);
+        setModelBrowserError(errorMessage(cause, tr));
+      }
     } finally {
       if (current() && request === directoryRequest.current) { setBusy(false); setModelBrowserLoading(false); }
     }

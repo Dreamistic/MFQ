@@ -102,5 +102,13 @@ Copyright (c) 2026 Niko1221 and the Strata contributors
 License: MIT (`LICENSES/Strata-MIT.txt`)
 Source: https://github.com/Niko1221/strata
 
+oMLX
+----
+MFQ's continuous-batch MTP depth policy is adapted from oMLX's BatchPolicy and
+ParkMemory algorithms, with native coroutine and per-request cache integration.
+License: Apache-2.0 (`LICENSE`)
+Source: https://github.com/jundot/omlx
+Reference: omlx/patches/mlx_lm_mtp/batch_policy.py
+
 The third-party license notices above must accompany source and binary
 distributions that contain these components or substantial portions of them.

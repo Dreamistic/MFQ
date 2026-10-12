@@ -65,6 +65,14 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
     { id: 'ple', title: tr('SSD 流式加载 PLE 表', 'SSD-streamed PLE tables'), detail: streamedCount('ssd_ple') },
     { id: 'ssd-kv', title: tr('SSD 流式 KV', 'SSD-streamed KV'), detail: streamedCount('ssd_kv') },
   ];
+  const groups: { name: string; ids: Tier[]; detail: string }[] = [
+    ...(separate ? [{ name: 'VRAM', ids: ['weights', 'kv'] as Tier[],
+      detail: tr('常驻权重与热缓存', 'Resident weights and hot caches') }] : []),
+    { name: 'RAM', ids: separate ? ['ram-experts', 'ram-kv'] : ['weights', 'kv'],
+      detail: separate ? tr('流式专家与 KV', 'Streamed experts and KV') : tr('常驻权重与热缓存', 'Resident weights and hot caches') },
+    { name: 'SSD', ids: ['experts', 'ple', 'ssd-kv'],
+      detail: tr('按需加载的权重与 KV', 'Weights and KV loaded on demand') },
+  ];
   function streamedCount(field: 'ram_experts' | 'ram_kv' | 'ssd_experts' | 'ssd_ple' | 'ssd_kv'): string {
     const known = loaded.filter((item) => item.memory?.[field] === true).length;
     const unknown = loaded.filter((item) => item.memory?.[field] == null).length;
@@ -91,10 +99,22 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
       <div className="overview-memory-heading">
         <div>
           <h2>{detailed ? tr('资源分配', 'Resource allocation') : tr('运行资源', 'Runtime resources')}</h2>
-          <p>{separate ? tr('显存承载常驻权重与热缓存；RAM 承载流式专家和 KV，KV 经 LRU 淘汰后溢出到 SSD。前缀缓存使用显存热层与 SSD 冷层。',
-            'VRAM holds resident weights and hot caches. RAM holds streamed experts and KV; LRU-evicted KV spills to SSD. Prefix caching uses VRAM and SSD.') : tr('前两项为常驻内存，其余为 SSD 上的流式权重和 KV。',
-            'The first two tiers reside in memory; the others are streamed weights and KV on SSD.')}</p>
+          <p>{separate ? tr('右侧上限为系统预留与预算限制后的推理可用显存，不是显卡总容量；KV 与前缀缓存的上限还会扣除常驻权重。',
+            'Right-side limits show usable inference VRAM after system reservations and budget limits, not total GPU capacity; KV and prefix caches use the remainder after resident weights.')
+            : tr('右侧上限为系统预留与预算限制后的推理可用内存，不是硬件总容量；KV 与前缀缓存的上限还会扣除常驻权重。',
+              'Right-side limits show usable inference memory after system reservations and budget limits, not total hardware capacity; KV and prefix caches use the remainder after resident weights.')}</p>
         </div>
+        <details className="resource-memory-help">
+          <summary aria-label={tr('资源分工说明', 'Resource tier details')}>?</summary>
+          <div>
+            <strong>{tr('资源分工', 'Resource tiers')}</strong>
+            <p>{separate ? tr('VRAM：常驻专家与稠密权重、活跃 KV 和前缀热缓存。', 'VRAM: resident experts and dense weights, active KV and hot prefixes.')
+              : tr('RAM：常驻专家与稠密权重、活跃 KV 和前缀热缓存；统一内存设备由 CPU 与 GPU 共享。', 'RAM: resident experts and dense weights, active KV and hot prefixes; unified-memory devices share it between CPU and GPU.')}</p>
+            {separate && <p>{tr('RAM：流式专家和 KV 的中间层，按需传入显存；冷 KV 经 LRU 淘汰后写入 SSD。', 'RAM: an intermediate tier for streamed experts and KV, transferred to VRAM on demand; LRU-evicted cold KV is written to SSD.')}</p>}
+            <p>{tr('SSD：流式专家按需加载，PLE 表按 token 读取对应行，流式 KV 按选中的块读取。', 'SSD: experts are loaded on demand, PLE tables supply the rows for each token, and streamed KV supplies selected blocks.')}</p>
+            <p>{tr('前缀缓存由内存热层与 SSD 持久化冷层组成。这里的 SSD 流式 KV 不含持久化前缀缓存，后者在缓存管理中单独统计。', 'Prefix caching uses a hot memory tier and a persistent SSD tier. Streamed KV here excludes persistent prefix caches, which are tracked separately in cache management.')}</p>
+          </div>
+        </details>
       </div>
       {summary}
       <div className="memory-model-legend" aria-label={tr('模型颜色图例', 'Model color legend')}>
@@ -114,7 +134,9 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
           'Unloading models retain their last reported allocation until release is confirmed.')}
       </p>}
       <div className="overview-memory-tiers">
-        {tiers.map((tier) => {
+        {groups.map((group) => <section className="memory-tier-group" key={group.name} data-memory-group={group.name}>
+          <div className="memory-tier-group-heading"><h3>{group.name}</h3><i aria-hidden="true" /><span>{group.detail}</span></div>
+          {tiers.filter((tier) => group.ids.includes(tier.id)).map((tier) => {
           const amounts = loaded.map((item) => ({ item, bytes: value(item, tier.id) }));
           const missing = amounts.filter(({ bytes }) => bytes == null);
           const unknown = missing.length > 0;
@@ -194,7 +216,8 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
               </small>}
             </div>
           );
-        })}
+          })}
+        </section>)}
       </div>
     </TMPanel>
   );

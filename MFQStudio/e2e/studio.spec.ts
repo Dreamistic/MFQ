@@ -48,7 +48,7 @@ test('resource telemetry and service profiles have separate responsive homes', a
   await page.locator('.resource-monitor-panel').screenshot({ path: testInfo.outputPath('resource-monitor.png') });
   await page.goto('/runtime');
   await expect(page.getByRole('heading', { name: 'Service', exact: true })).toBeVisible();
-  await expect(page.getByText('Runtime profiles', { exact: true })).toBeVisible();
+  await expect(page.getByText('Runtime profiles', { exact: true })).toHaveCount(0);
   await expect(page.getByText('Resource monitoring', { exact: true })).toHaveCount(0);
   await page.goto('/resources');
   await expect(page.getByRole('meter', { name: 'CPU: Apple M5 Max 18C' })).toHaveAttribute('aria-valuenow', '43');
@@ -154,7 +154,7 @@ test('每个模型独立保留 ctx 草稿，保存整套设置且不丢失另一
   await selected.selectOption(instances[1].model);
   await expect(save).toBeEnabled();
   await expect(dense).toHaveValue('65536');
-  await expect(page.locator('.memory-budget-actions')).toContainText('96.3');
+  await expect(page.locator('.server-memory-panel .memory-budget-actions')).toContainText('96.3');
   await page.screenshot({ path: testInfo.outputPath('per-model-context.png'), animations: 'disabled' });
   complete();
   await selected.selectOption(instances[0].model);
@@ -373,7 +373,7 @@ test('下载来源与九宫格保留统一字体，仅降低文字对比度', as
       });
     });
     for (const css of styles) {
-      expect(css.font).toBe(css.expectedFont);
+      expect(css.font.replace(/^"MFQ Small Numerals",\s*/, '')).toBe(css.expectedFont);
       expect(css.weight).toBe('400');
       expect(css.color).toBe(css.expectedColor);
       expect(css.color).not.toBe(css.primaryColor);
@@ -531,7 +531,7 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
     ['/evaluations', '/api/v1/evaluations'],
     ['/model-hub', null],
     ['/quantization', null],
-    ['/settings', '/api/v1/presets'],
+    ['/settings', null],
     ['/runtime', '/api/v1/cluster/nodes'],
     ['/resources', '/api/v1/runtime/resources'],
     ['/logs', '/api/v1/runtime/logs'],
@@ -540,6 +540,7 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
     await navigateClient(page, path);
     await expect(page.locator('main h1')).toBeVisible();
     if (endpoint) await expect.poll(() => state.requests.includes(`GET ${endpoint}`)).toBe(true);
+    if (path === '/settings') expect(state.requests).not.toContain('GET /api/v1/presets');
   }
   expect(errors).toEqual([]);
   expect(state.unexpected).toEqual([]);
@@ -775,12 +776,8 @@ test('明暗主题的页面内容保持在工作区内且可滚动访问', async
   for (const theme of ['light', 'dark']) {
     await page.goto('/settings');
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
-    const inherit = page.getByRole('switch', { name: 'Use model or architecture defaults' });
-    await expect(inherit).toBeChecked();
-    await inherit.click();
-    await expect(page.locator('#settings-system-prompt')).toBeEnabled();
-    await inherit.click();
-    await expect(page.locator('#settings-system-prompt')).toBeDisabled();
+    await expect(page.getByRole('switch', { name: 'Use model or architecture defaults' })).toHaveCount(0);
+    await expect(page.locator('#settings-system-prompt')).toHaveCount(0);
     await page.getByRole('combobox', { name: 'Theme', exact: true }).selectOption(theme);
     await page.getByRole('button', { name: 'Apply settings', exact: true }).first().click();
     await expect(page.locator('html')).toHaveAttribute('data-theme', theme);

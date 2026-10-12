@@ -73,7 +73,7 @@ function ResourcePageContent() {
       if (!current()) return;
       toast.success(tr('缓存已清除', 'Cache cleared successfully'));
     } catch (cause) {
-      if (current()) toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause, tr));
     } finally {
       clearing.current = false;
       if (current()) setBusy(false);

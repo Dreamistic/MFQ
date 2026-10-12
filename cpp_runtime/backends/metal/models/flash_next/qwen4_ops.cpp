@@ -1759,7 +1759,7 @@ bool can_fuse_gated_hc_two_stage(
     if (!gated_hc_fast_path_enabled() ||
         hidden_size != 2560 || hc_count != 4 ||
         input.ndim() != 3 || input.shape(0) != 1 ||
-        input.shape(1) < 1 || input.shape(1) > 6 || input.shape(2) != 10240 ||
+        input.shape(1) < 1 || input.shape(1) > 16 || input.shape(2) != 10240 ||
         norm_weight.shape() != Shape{10240} ||
         (down_weight.output_size() != 320 || down_weight.input_size() != 10240) ||
         (up_weight.output_size() != 10240 || up_weight.input_size() != 320) ||

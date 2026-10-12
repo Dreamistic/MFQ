@@ -1,4 +1,5 @@
 #include "speculative_sequence.h"
+#include "mtp_batch_policy.h"
 
 #include <iostream>
 #include <thread>
@@ -208,6 +209,61 @@ void run_batched_greedy(bool penalties) {
         (penalties ? batches != 0 : batches == 0))
         throw std::runtime_error("batched greedy sampling changed rejection/cache/penalty behavior");
 }
+
+void batch_policy() {
+    mtp::BatchDepthPolicy policy({"one", "two"}, 1);
+    auto now = mtp::BatchDepthPolicy::Clock::time_point{};
+    const std::array<int, 2> rejected{0, 0};
+    const auto observe = [&](int depth, int milliseconds, bool stable = true, bool interrupted = false) {
+        const auto started = now;
+        now += std::chrono::milliseconds(milliseconds);
+        policy.observe(depth, rejected, started, now, stable, interrupted);
+    };
+    observe(0, 500, false);
+    observe(0, 500, true, true);
+    if (policy.cost(0) || policy.depth()) throw std::runtime_error("interrupted batch polluted normal calibration");
+    for (int index = 0; index < 5; ++index) observe(0, 10);
+    if (policy.depth() != 1 || policy.cost(0) != 10)
+        throw std::runtime_error("batch normal warmup/median mismatch");
+    policy.interrupt();
+    now += std::chrono::seconds(3);
+    observe(0, 10);
+    if (policy.cost(0) != 10) throw std::runtime_error("prefill gap entered batch timing");
+    for (int index = 0; index < 30 && !policy.parks(); ++index) observe(1, 40);
+    if (policy.depth() != 0 || policy.parks() != 1 || policy.remaining() != 128)
+        throw std::runtime_error("losing batch MTP did not park");
+    mtp::BatchParkMemory memory;
+    memory.parked(policy);
+    memory.tick();
+    mtp::BatchDepthPolicy replacement({"three", "four"}, 1);
+    memory.seed(replacement);
+    if (replacement.remaining() != 127 || replacement.cooldown() != 256)
+        throw std::runtime_error("batch membership reset park countdown");
+    mtp::BatchDepthPolicy larger({"one", "two", "three"}, 1);
+    memory.seed(larger);
+    if (larger.remaining()) throw std::runtime_error("smaller-batch loss parked a larger cohort");
+    mtp::BatchDepthPolicy smaller({"one"}, 1);
+    memory.seed(smaller);
+    if (smaller.remaining()) throw std::runtime_error("larger-batch loss parked a smaller cohort");
+    mtp::BatchDepthPolicy mixed({"one", "two"}, 1, 1);
+    memory.seed(mixed);
+    if (mixed.remaining()) throw std::runtime_error("pure MTP loss parked a mixed cohort");
+    mixed.start_parked(64);
+    memory.parked(mixed);
+    mtp::BatchDepthPolicy pure({"one", "two"}, 1);
+    memory.seed(pure);
+    if (pure.remaining() != 127) throw std::runtime_error("mixed MTP verdict replaced pure MTP verdict");
+    mtp::BatchDepthPolicy deeper({"one", "two"}, 3);
+    memory.seed(deeper);
+    if (deeper.remaining()) throw std::runtime_error("different draft sweep inherited a park verdict");
+    for (int index = 0; index < 127; ++index) memory.tick();
+    mtp::BatchDepthPolicy expired({"one", "two"}, 1);
+    memory.seed(expired);
+    if (expired.remaining()) throw std::runtime_error("batch park verdict did not expire");
+    for (int index = 0; index < 128; ++index) observe(0, 10);
+    if (policy.remaining() || policy.depth() != 1 || policy.cost(1))
+        throw std::runtime_error("batch MTP did not restart a clean depth sweep");
+}
 }
 
 int main() {
@@ -216,5 +272,6 @@ int main() {
     run_target_initialization();
     run_batched_greedy(false);
     run_batched_greedy(true);
+    batch_policy();
     std::cout << "shared speculative sequence output/cache/dispatch tests passed\n";
 }

@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, Base64Bytes, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, Base64Bytes, BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 PROTOCOL_VERSION: Final[Literal["1.0"]] = "1.0"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -935,6 +935,10 @@ class RegisterModelDirectoryRequest(ProtocolModel):
         return self
 
 
+class ConfigureDownloadDirectoryRequest(ProtocolModel):
+    directory_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+
 class HubModelSummary(ProtocolModel):
     provider: Literal["huggingface", "modelscope"]
     repo_id: str = Field(min_length=3, max_length=255)
@@ -1336,12 +1340,18 @@ class JobEventList(ProtocolModel):
     data: list[JobEventResource]
 
 
+class AuthenticationPolicyRequest(ProtocolModel):
+    enabled: bool = Field(strict=True)
+    api_key: SecretStr | None = None
+
+
 class RuntimeListenerRequest(ProtocolModel):
     port: int = Field(strict=True, ge=1, le=65535)
     protocol: Literal["openai", "anthropic"] = "openai"
 
 
 class RuntimeReloadRequest(ProtocolModel):
+    apply_global_cap: bool = Field(default=False, strict=True)
     context_size: int | None = Field(default=None, ge=512, le=2147483647)
     instance_id: UUID | None = None
     yarn_enabled: bool | None = Field(default=None, strict=True)

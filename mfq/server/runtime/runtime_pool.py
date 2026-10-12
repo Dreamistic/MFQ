@@ -173,6 +173,8 @@ class _Runtime(BaseModel):
     prefix_pending_writes: int = 0
     resident_dynamic_budget: bool = False
     resident_budget_limit: int = 0
+    resident_weight_dynamic_budget: bool = False
+    resident_weight_budget_limit: int = 0
     resident_memory_used: int = 0
     reclaimable_weight_bytes: int = 0
 
@@ -1118,6 +1120,7 @@ class RuntimePool:
     async def _rebalance_resident_budget(self, preferred: UUID | None = None, *, additional_bytes: int = 0, prospective_model: str | None = None, activating: _Runtime | None = None, wait: bool = True) -> int | None:
         total = self._resident_total_limit()
         if total is None:
+            await self._rebalance_weight_budget(activating=activating)
             return None
         if not wait and self._resident_budget_lock.locked():
             return None
@@ -1184,7 +1187,12 @@ class RuntimePool:
                     self._resident_load_limits[prospective_model] = additional_bytes
                     self._resident_load_owners[prospective_model] = asyncio.current_task()
                 previous = {item.id: item.resident_budget_limit for item in idle}
-                changed = [item for item in idle if targets[item.id] != previous[item.id] or item.id in trims]
+                previous_weights = {item.id: getattr(item, "resident_weight_budget_limit", 0) for item in idle}
+                weight_targets = {item.id: self._policy_model_limits.get(item.artifact.resource.name, 0)
+                    if self.memory_policy.model_limit_bytes is not None else 0 for item in idle}
+                weight_changes = {item.id for item in idle if getattr(item, "resident_weight_dynamic_budget", False)
+                    and weight_targets[item.id] != previous_weights[item.id]}
+                changed = [item for item in idle if targets[item.id] != previous[item.id] or item.id in trims or item.id in weight_changes]
                 for item in changed:
                     item.control_leases += 1
             applied = []
@@ -1196,20 +1204,25 @@ class RuntimePool:
                             raise RuntimeError("prefix RAM could not be reclaimed for the shared resident budget")
                 changes = sorted(changed, key=lambda item: (targets[item.id] > previous[item.id] and previous[item.id] != 0, targets[item.id]))
                 for item in changes:
-                    if targets[item.id] == previous[item.id]:
+                    if targets[item.id] == previous[item.id] and item.id not in weight_changes:
                         continue
-                    result = await item.backend.set_resident_memory_budget(targets[item.id])
+                    kwargs = {"weight_target_bytes": weight_targets[item.id]} if item.id in weight_changes else {}
+                    result = await item.backend.set_resident_memory_budget(targets[item.id], **kwargs)
                     if result.get("status") != "ok":
                         raise RuntimeError("native shared resident budget was not applied")
                     applied.append(item)
                     item.resident_budget_limit = targets[item.id]
+                    if item.id in weight_changes:
+                        item.resident_weight_budget_limit = weight_targets[item.id]
             except BaseException:
                 if prospective_model is not None:
                     self._resident_load_limits.pop(prospective_model, None)
                 for item in reversed(applied):
                     try:
-                        await item.backend.set_resident_memory_budget(previous[item.id])
+                        kwargs = {"weight_target_bytes": previous_weights[item.id]} if item.id in weight_changes else {}
+                        await item.backend.set_resident_memory_budget(previous[item.id], **kwargs)
                         item.resident_budget_limit = previous[item.id]
+                        item.resident_weight_budget_limit = previous_weights[item.id]
                     except Exception:
                         pass
                 raise
@@ -1220,6 +1233,43 @@ class RuntimePool:
                 for item in changed:
                     await self._refresh_instance_usage(item)
             return additional_bytes or targets[ordered[-1].id]
+
+    async def _rebalance_weight_budget(self, *, activating: _Runtime | None = None) -> None:
+        async with self._resident_budget_lock:
+            async with self._lock:
+                candidates = [item for item in self._instances.values()
+                    if getattr(item, "resident_weight_dynamic_budget", False)
+                    and (item.state == RuntimeInstanceState.READY or item is activating)
+                    and not item.active_requests and not item.queued_requests
+                    and item.control_leases == getattr(item, "read_control_leases", 0) + (1 if item is activating else 0)]
+                previous = {item.id: getattr(item, "resident_weight_budget_limit", 0) for item in candidates}
+                targets = {item.id: self._policy_model_limits.get(item.artifact.resource.name, 0)
+                    if self.memory_policy.model_limit_bytes is not None else 0 for item in candidates}
+                changes = [item for item in candidates if targets[item.id] != previous[item.id]]
+                changes.sort(key=lambda item: targets[item.id] == 0 or targets[item.id] > previous[item.id] and previous[item.id] != 0)
+                for item in changes:
+                    item.control_leases += 1
+            applied = []
+            try:
+                for item in changes:
+                    result = await item.backend.set_resident_memory_budget(item.resident_budget_limit, weight_target_bytes=targets[item.id])
+                    if result.get("status") != "ok":
+                        raise RuntimeError("native model weight budget was not applied")
+                    item.resident_weight_budget_limit = targets[item.id]
+                    applied.append(item)
+            except BaseException:
+                for item in reversed(applied):
+                    try:
+                        await item.backend.set_resident_memory_budget(item.resident_budget_limit, weight_target_bytes=previous[item.id])
+                        item.resident_weight_budget_limit = previous[item.id]
+                    except Exception:
+                        pass
+                raise
+            finally:
+                for item in changes:
+                    await self._release_control_lease(item)
+            for item in changes:
+                await self._refresh_instance_usage(item)
 
     def _prefix_cache_directory(self) -> Path:
         if self.memory_policy.prefix_directory is not None:
@@ -1247,7 +1297,7 @@ class RuntimePool:
             limit = min(limit, available) if limit is not None else available
         if limit is None:
             limit = sum(totals)
-        floors = [min(size, (64 << 20) if policy.total_limit_bytes is not None else (5 << 30)) for size in experts]
+        floors = [min(size, (64 << 20) if policy.total_limit_bytes is not None or policy.model_limit_bytes is not None else (5 << 30)) for size in experts]
         minimum = sum(dense) + sum(floors)
         if limit < minimum:
             raise _job_error("memory_budget_too_small", f"these models require at least {minimum} weight bytes plus prefix and live KV headroom")
@@ -1386,12 +1436,19 @@ class RuntimePool:
                 raise _job_error("cache_directory_unwritable", str(error)) from error
             policy = policy.model_copy(update={"prefix_directory": str(directory.resolve())})
         async with self._lock:
+            if additional is None and policy == self.memory_policy:
+                return {**policy.model_dump(), "models_replanned": 0}
             if self._memory_configuration_job is not None or self._loading_model_names:
                 raise _job_error("memory_plan_busy", "a model or memory plan is already loading", retryable=True)
             current = list(self._instances.values())
             previous = self.memory_policy
-            cache_only = policy.model_limit_bytes == previous.model_limit_bytes and policy.prefix_directory == previous.prefix_directory \
-                and all(getattr(item, "prefix_dynamic_budget", False) for item in current)
+            model_changed = policy.model_limit_bytes != previous.model_limit_bytes
+            weight_online = all(getattr(item, "resident_weight_dynamic_budget", False) and getattr(item, "resident_dynamic_budget", False)
+                and getattr(item, "prefix_dynamic_budget", False) for item in current)
+            if model_changed and policy.prefix_directory == previous.prefix_directory and not weight_online:
+                raise _job_error("resident_budget_unsupported", "this runtime does not support online model weight budgets; models were not reloaded")
+            cache_only = policy.prefix_directory == previous.prefix_directory \
+                and all(getattr(item, "prefix_dynamic_budget", False) for item in current) and (not model_changed or weight_online)
             if any(item.state != RuntimeInstanceState.READY or item.active_requests or item.queued_requests
                 or item.control_leases > (getattr(item, "read_control_leases", 0) if cache_only else 0) for item in current):
                 raise _job_error("runtime_busy", "wait for model requests to finish before applying memory budgets", retryable=True)
@@ -1409,16 +1466,20 @@ class RuntimePool:
         if cache_only:
             try:
                 self.memory_policy = policy
+                self._policy_model_limits, self._policy_prefix_limits = limits, hot
                 await self._rebalance_prefix_cache_budget()
                 await self._rebalance_resident_budget()
                 await self._maintain_prefix_disk_budget(force=True)
                 if self.store is not None:
                     await asyncio.to_thread(self.store.save_runtime_memory_policy, policy.model_dump())
                 return {**policy.model_dump(), "models_replanned": 0}
-            except BaseException:
+            except BaseException as error:
                 self.memory_policy = previous
+                self._policy_model_limits, self._policy_prefix_limits = previous_limits, previous_hot
                 await self._rebalance_prefix_cache_budget()
                 await self._rebalance_resident_budget()
+                if isinstance(error, BackendError):
+                    raise _job_error(error.code, str(error), retryable=error.retryable) from error
                 raise
             finally:
                 async with self._lock:
@@ -2216,11 +2277,30 @@ class RuntimePool:
         request = RuntimeReloadRequest.model_validate(payload)
         context.raise_if_cancelled()
         try:
+            if request.apply_global_cap:
+                return await self._reload_global_context_cap(context)
             if request.qsa_kv_offload is not None or request.kv_quantization is not None:
                 return await self._configure_model_context(context, request)
             return await self.reload_runtime(request.context_size, request.instance_id, context=context, yarn_enabled=request.yarn_enabled)
         except BackendError as error:
             raise _job_error(error.code, str(error), retryable=error.retryable) from error
+
+    async def _reload_global_context_cap(self, context: JobContext) -> dict[str, Any]:
+        cap = self.context_policy.max_context_size
+        if cap is None:
+            return {"models_reloaded": 0}
+        async with self._lock:
+            candidates = [item for item in self._instances.values()
+                if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY} and item.context_size > cap]
+            if any(item.active_requests or item.queued_requests or item.control_leases or item.context_job for item in candidates):
+                raise BackendError("runtime_busy", "wait for model requests to finish before reloading the global context cap", retryable=True, status_code=409)
+        results = []
+        for index, instance in enumerate(candidates):
+            context.raise_if_cancelled()
+            result = await self.reload_runtime(cap, instance.id,
+                context=_MemoryPlanContext(context, index / len(candidates), (index + 1) / len(candidates)), save_policy=False)
+            results.append(result)
+        return {"models_reloaded": len(results), "max_context": cap, "models": results}
 
     async def _configure_model_context(self, context: JobContext, settings: RuntimeReloadRequest) -> dict[str, Any]:
         async with self._lock:
@@ -2297,7 +2377,7 @@ class RuntimePool:
         self,
         context_size: int | None,
         instance_id: UUID | None = None,
-        *, context: JobContext | None = None, yarn_enabled: bool | None = None,
+        *, context: JobContext | None = None, yarn_enabled: bool | None = None, save_policy: bool = True,
     ) -> dict[str, Any]:
         async with self._runtime_control_lease(instance_id) as (instance, backend):
             if backend is None:
@@ -2338,21 +2418,22 @@ class RuntimePool:
                             self._load_requests[name] = request.model_copy(update={"context_size": instance.context_size,
                                 "yarn_enabled": enabled,
                                 "qsa_kv_offload": request.qsa_kv_offload.model_copy(update={"target_context": instance.context_size})})
-                async with self._context_policy_lock:
-                    overrides = dict(self.context_policy.model_overrides)
-                    if requested is None:
-                        overrides.pop(instance.artifact.resource.name, None)
-                    else:
-                        overrides[instance.artifact.resource.name] = actual
-                    yarn_settings = dict(self.context_policy.model_yarn_enabled)
-                    if enabled:
-                        yarn_settings[instance.artifact.resource.name] = True
-                    else:
-                        yarn_settings.pop(instance.artifact.resource.name, None)
-                    policy = self.context_policy.model_copy(update={"model_overrides": overrides, "model_yarn_enabled": yarn_settings})
-                    if self.store is not None:
-                        await asyncio.to_thread(self.store.save_runtime_context_policy, policy.model_dump())
-                    self.context_policy = policy
+                if save_policy:
+                    async with self._context_policy_lock:
+                        overrides = dict(self.context_policy.model_overrides)
+                        if requested is None:
+                            overrides.pop(instance.artifact.resource.name, None)
+                        else:
+                            overrides[instance.artifact.resource.name] = actual
+                        yarn_settings = dict(self.context_policy.model_yarn_enabled)
+                        if enabled:
+                            yarn_settings[instance.artifact.resource.name] = True
+                        else:
+                            yarn_settings.pop(instance.artifact.resource.name, None)
+                        policy = self.context_policy.model_copy(update={"model_overrides": overrides, "model_yarn_enabled": yarn_settings})
+                        if self.store is not None:
+                            await asyncio.to_thread(self.store.save_runtime_context_policy, policy.model_dump())
+                        self.context_policy = policy
                 if context is not None:
                     await context.progress(1.0, message="Context settings applied", data={"phase": "ready", "context_size": actual})
                 return {**result, "instance_id": str(instance.id), "context_override": actual if requested is not None else None,
@@ -3841,11 +3922,13 @@ class RuntimePool:
                 instance.prefix_dynamic_budget = status.get("prefix_cache_dynamic_budget") == 1
                 instance.prefix_concurrent_maintenance = status.get("prefix_cache_concurrent_maintenance") == 1
                 instance.resident_dynamic_budget = status.get("resident_memory_dynamic_budget") == 1
+                instance.resident_weight_dynamic_budget = status.get("resident_weight_dynamic_budget") == 1
                 if "qsa_kv_offload_supported" in status:
                     instance.qsa_kv_offload_supported = self.backend in {"metal", "cuda"} and status["qsa_kv_offload_supported"] == 1
                 if "kv_quantization_supported" in status:
                     instance.kv_quantization_supported = self.backend == "metal" and status["kv_quantization_supported"] == 1
                 for field, metric in (("resident_budget_limit", "resident_memory_budget_bytes"),
+                    ("resident_weight_budget_limit", "resident_weight_budget_bytes"),
                     ("resident_memory_used", "resident_memory_used_bytes"), ("reclaimable_weight_bytes", "resident_reclaimable_weight_bytes")):
                     value = status.get(metric)
                     if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
@@ -4095,7 +4178,7 @@ class RuntimePool:
         if (self.backend == "metal" and yarn_enabled
             and artifact.resource.yarn_context_capacity is not None):
             command.append("--yarn-context-extension")
-        if self.backend == "cuda" and request_capacity > 1:
+        if self.backend in {"cuda", "metal"} and request_capacity > 1:
             command.extend(
                 [
                     "--continuous-batching",

@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import { MemoryHierarchy } from './MemoryHierarchy';
 
@@ -35,6 +35,37 @@ function model(id: string, bytes: number): RuntimeInstance {
       ssd_kv: true, ssd_kv_bytes: bytes,
     } };
 }
+
+it.each([false, true])('groups the same resource tiers into RAM and SSD on unified memory: detailed=%s', (detailed) => {
+  const { container } = render(<MemoryHierarchy instances={[model('1', 1024)]} runtime={{ memory_architecture: 'unified' }} detailed={detailed} />);
+  expect([...container.querySelectorAll('[data-memory-group]')].map(group => group.getAttribute('data-memory-group'))).toEqual(['RAM', 'SSD']);
+  expect(container.querySelector('[data-memory-group="RAM"]')?.querySelectorAll('[data-tier]')).toHaveLength(2);
+  expect(container.querySelector('[data-memory-group="SSD"]')?.querySelectorAll('[data-tier]')).toHaveLength(3);
+  expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('usable inference memory after system reservations and budget limits, not total hardware capacity');
+  expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('remainder after resident weights');
+  expect(container.querySelector('.overview-memory-heading > div > p')).not.toHaveTextContent('RAM holds');
+  for (const heading of container.querySelectorAll('.memory-tier-group-heading')) {
+    expect(heading.children[0].tagName).toBe('H3');
+    expect(heading.children[1].tagName).toBe('I');
+    expect(heading.children[1]).toHaveAttribute('aria-hidden', 'true');
+  }
+  const help = container.querySelector('.resource-memory-help')!;
+  expect(help).not.toHaveAttribute('open');
+  fireEvent.click(screen.getByLabelText('Resource tier details'));
+  expect(help).toHaveAttribute('open');
+  expect(help).toHaveTextContent('unified-memory devices share it between CPU and GPU');
+  expect(help).toHaveTextContent('excludes persistent prefix caches');
+});
+
+it('keeps separate VRAM, RAM and SSD categories and their device-specific explanations', () => {
+  const { container } = render(<MemoryHierarchy instances={[model('1', 1024)]} runtime={{ memory_architecture: 'discrete' }} />);
+  expect([...container.querySelectorAll('[data-memory-group]')].map(group => group.getAttribute('data-memory-group'))).toEqual(['VRAM', 'RAM', 'SSD']);
+  expect(container.querySelector('[data-memory-group="VRAM"]')?.querySelectorAll('[data-tier]')).toHaveLength(2);
+  expect(container.querySelector('[data-memory-group="RAM"]')?.querySelectorAll('[data-tier]')).toHaveLength(2);
+  expect(container.querySelector('.resource-memory-help')).toHaveTextContent('transferred to VRAM on demand');
+  expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('usable inference VRAM');
+  expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('not total GPU capacity');
+});
 
 it('shows prefix usage against the combined quota without adding it to KV twice', () => {
   const first = model('1', 1024), second = model('2', 3072);

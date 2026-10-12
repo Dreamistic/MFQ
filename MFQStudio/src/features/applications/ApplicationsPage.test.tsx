@@ -25,6 +25,19 @@ it('shows five configuration snippets without application management actions', a
   expect(screen.queryByRole('button', { name: /install|configure and connect|download|launch/i })).not.toBeInTheDocument();
 });
 
+it('uses local official application images instead of initials', async () => {
+  const { container } = render(<ApplicationsPage />);
+  await waitFor(() => expect(screen.getByRole('combobox')).toHaveValue('alias'));
+  const marks = Array.from(container.querySelectorAll('.application-mark'));
+  expect(marks).toHaveLength(5);
+  for (const [index, id] of ['dsh', 'opencode', 'claude', 'openclaw', 'hermes'].entries()) {
+    expect(marks[index].tagName).toBe('IMG');
+    expect(marks[index]).toHaveAttribute('src', `/application-icons/${id}.svg`);
+    expect(marks[index]).toHaveAttribute('alt', '');
+    expect(marks[index]).toHaveTextContent('');
+  }
+});
+
 it('copies a snippet but neither launches an app nor calls a write API', async () => {
   render(<ApplicationsPage />);
   await waitFor(() => expect(screen.getByRole('combobox')).toHaveValue('alias'));
