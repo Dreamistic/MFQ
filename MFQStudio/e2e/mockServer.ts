@@ -92,6 +92,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
     const method = route.request().method();
     state.requests.push(`${method} ${path}`);
     const json = async (value: unknown) => route.fulfill({ json: value });
+    if (path === '/api/v1/auth/policy' && method === 'GET') return json({ enabled: false, has_key: false });
     if (path === '/api/v1/hub/official') return json(officialCatalog);
     if (path === '/api/v1/hub/download-directory') return json({ directory: null, actual_directory: '/tmp/studio/models', default_directory: '/tmp/studio/models' });
     if (path === '/api/v1/quantization/workspace' && method === 'GET')

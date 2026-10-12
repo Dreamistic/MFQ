@@ -70,7 +70,7 @@ for (const mode of ['light', 'dark', 'system-light', 'system-dark'] as const) {
     expect(selection.background).toBe(expected);
     expect(contrast(selection.foreground, selection.background)).toBeGreaterThanOrEqual(4.5);
     await expect(page.getByRole('switch', { name: 'Vision input', exact: true })).toHaveCount(0);
-    await page.goto('/server');
+    await page.goto('/runtime');
     const vision = page.getByRole('switch', { name: 'Vision input', exact: true });
     await expect(vision).toBeChecked();
     await expect(vision).toHaveCSS('background-color', expected);

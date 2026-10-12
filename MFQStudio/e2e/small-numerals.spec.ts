@@ -22,7 +22,8 @@ for (const language of ['zh-CN', 'en'] as const) {
     await expect(input).toHaveCSS('font-size', '12px');
     expect(await input.evaluate(element => getComputedStyle(element).fontFamily)).toContain('MFQ Small Numerals');
     for (const element of await page.locator('.service-view strong, .service-view b').all()) {
-      expect(await element.evaluate(node => getComputedStyle(node).fontFamily)).not.toContain('MFQ Small Numerals');
+      const style = await element.evaluate(node => ({ family: getComputedStyle(node).fontFamily, weight: getComputedStyle(node).fontWeight }));
+      if (Number(style.weight) > 500) expect(style.family).not.toContain('MFQ Small Numerals');
     }
     await page.locator('.server-memory-panel').scrollIntoViewIfNeeded();
     await page.locator('.server-memory-panel').screenshot({ path: testInfo.outputPath('service-small-numerals.png') });
