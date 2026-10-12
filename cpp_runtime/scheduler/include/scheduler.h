@@ -29,6 +29,11 @@ private:
 class MfqScheduler {
 public:
     struct Limits { std::size_t events = 64, bytes = 1024 * 1024; };
+    struct Snapshot {
+        mfq::engine::EngineStatus status;
+        mfq::engine::Metrics runtime, session;
+        mfq::engine::Clock::time_point captured;
+    };
     explicit MfqScheduler(mfq::engine::Engine& engine);
     MfqScheduler(mfq::engine::Engine& engine, Limits limits);
     ~MfqScheduler();
@@ -39,6 +44,7 @@ public:
     void shutdown();
     mfq::engine::EngineInfo info() const;
     mfq::engine::EngineStatus status() const;
+    Snapshot snapshot() const;
     mfq::engine::ControlResult control(mfq::engine::ControlRequest request) const;
     mfq::engine::SessionResult session(mfq::engine::SessionCommand command) const;
     std::int64_t reload(std::int64_t context) const;
@@ -74,6 +80,7 @@ private:
     void publish(Request& request, mfq::engine::EngineEvent event);
     void flush(Request& request);
     void cancel(Request& request);
+    void refresh_snapshot(bool healthy, bool blocked, bool metrics);
 
     mfq::engine::Engine& engine_;
     Limits limits_;
@@ -81,6 +88,8 @@ private:
     std::shared_ptr<std::condition_variable> wake_ = std::make_shared<std::condition_variable>();
     mutable std::deque<Command> mailbox_;
     mfq::engine::EngineInfo info_;
+    Snapshot snapshot_;
+    mutable bool snapshot_requested_ = false;
     bool stopping_ = false;
     std::thread worker_;
     std::unordered_map<std::string, Request> requests_;

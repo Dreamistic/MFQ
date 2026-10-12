@@ -130,9 +130,14 @@ public:
             mtp.push_back(request->mtp);
         }
         auto logits = runtime_.prefill_requests(caches, tokens, mtp);
+        const auto computed = std::chrono::steady_clock::now();
         for (const auto& [request, chunk] : pending) checkpoint(*request, chunk.offset + chunk.count);
+        const auto checkpointed = std::chrono::steady_clock::now();
         const double elapsed = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - started).count();
+            checkpointed - started).count();
+        prefill_compute_ms_ += std::chrono::duration<double, std::milli>(computed - started).count();
+        prefill_checkpoint_ms_ += std::chrono::duration<double, std::milli>(checkpointed - computed).count();
+        prefill_maximum_ms_ = std::max(prefill_maximum_ms_, elapsed);
         std::vector<Sample> result(pending.size());
         for (std::size_t row = 0; row < pending.size(); ++row) {
             const auto& [request, chunk] = pending[row];
@@ -299,7 +304,10 @@ public:
             {"continuous_batching_mtp_draft_maximum_batch", double(mtp_draft_maximum_)},
             {"continuous_batching_prefill_batches", double(prefill_batches_)},
             {"continuous_batching_prefill_rows", double(prefill_rows_)},
-            {"continuous_batching_prefill_maximum_batch", double(prefill_maximum_)}};
+            {"continuous_batching_prefill_maximum_batch", double(prefill_maximum_)},
+            {"continuous_batching_prefill_compute_ms", prefill_compute_ms_},
+            {"continuous_batching_prefill_checkpoint_ms", prefill_checkpoint_ms_},
+            {"continuous_batching_prefill_maximum_ms", prefill_maximum_ms_}};
         for (int depth = 0; depth <= 5; ++depth) {
             const auto prefix = "continuous_batching_mtp_depth_" + std::to_string(depth);
             result.emplace_back(prefix + "_cycles", double(mtp_cycle_counts_[depth]));
@@ -585,6 +593,7 @@ private:
     std::size_t mtp_batches_ = 0, mtp_rows_ = 0, mtp_maximum_batch_ = 0;
     std::size_t mtp_draft_batches_ = 0, mtp_draft_rows_ = 0, mtp_draft_maximum_ = 0;
     std::size_t prefill_batches_ = 0, prefill_rows_ = 0, prefill_maximum_ = 0;
+    double prefill_compute_ms_ = 0, prefill_checkpoint_ms_ = 0, prefill_maximum_ms_ = 0;
     std::array<std::uint64_t, 6> mtp_cycle_counts_{};
     std::array<double, 6> mtp_cycle_totals_{}, mtp_cycle_maxima_{};
     std::shared_ptr<mfq::engine::mtp::BatchDepthPolicy> policy_;

@@ -532,7 +532,10 @@ int run_mfq_http_transport(
 
     const auto add_runtime_metrics = [&](json & value) {
 
-        const auto metrics = std::get<mfq::engine::Metrics>(scheduler.control(mfq::engine::RuntimeMetrics{}));
+        const auto snapshot = scheduler.snapshot();
+        const auto& metrics = snapshot.runtime;
+        value["runtime_metrics_age_ms"] = std::chrono::duration<double, std::milli>(
+            mfq::engine::Clock::now() - snapshot.captured).count();
 
         for (const auto& item : metrics) {
             value[item.first] = item.second;
@@ -540,14 +543,14 @@ int run_mfq_http_transport(
     };
     const auto add_session_metrics = [&](json & value) {
 
-        for (const auto & item : scheduler.session({mfq::engine::SessionCommand::Kind::metrics}).metrics) {
+        for (const auto & item : scheduler.snapshot().session) {
             value[item.first] = item.second;
         }
     };
 
     server.Get("/runtime/health", [&](const httplib::Request &, httplib::Response & res) {
         json health = {
-            {"status", reloading.load() ? "loading" : (scheduler.status().healthy ? "ok" : "unhealthy")},
+            {"status", reloading.load() ? "loading" : (scheduler.snapshot().status.healthy ? "ok" : "unhealthy")},
             {"model", config.model_name},
             {"model_type", config.model_type},
             {"probability_available", scheduler.info().probability},
