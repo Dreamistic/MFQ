@@ -19,24 +19,44 @@
 //
 // The mask is dropped: the translated kernels only exchange data within
 // converged 32-lane groups, which the non-sync variants already satisfy.
-// Call sites that pass an explicit sub-warp width (8/16) must be rewritten
-// to the direct width form (__shfl_down(var, delta, 8)); they cannot go
-// through these macros.
 #ifndef MFQ_HIP_COMPAT_SHFL
 #define MFQ_HIP_COMPAT_SHFL
-#define __shfl_sync(mask, var, src, ...) __shfl(var, src, 32)
-#define __shfl_down_sync(mask, var, delta, ...) __shfl_down(var, delta, 32)
-#define __shfl_up_sync(mask, var, delta, ...) __shfl_up(var, delta, 32)
-#define __shfl_xor_sync(mask, var, lane, ...) __shfl_xor(var, lane, 32)
+namespace mfq::hip_compat {
+template<typename T>
+__device__ __forceinline__ T shuffle(T value, int source, int width = 32) {
+    return __shfl(value, source, width);
+}
+template<typename T>
+__device__ __forceinline__ T shuffle_down(T value, unsigned delta, int width = 32) {
+    return __shfl_down(value, delta, width);
+}
+template<typename T>
+__device__ __forceinline__ T shuffle_up(T value, unsigned delta, int width = 32) {
+    return __shfl_up(value, delta, width);
+}
+template<typename T>
+__device__ __forceinline__ T shuffle_xor(T value, int lane, int width = 32) {
+    return __shfl_xor(value, lane, width);
+}
+}
+#define __shfl_sync(mask, ...) ::mfq::hip_compat::shuffle(__VA_ARGS__)
+#define __shfl_down_sync(mask, ...) ::mfq::hip_compat::shuffle_down(__VA_ARGS__)
+#define __shfl_up_sync(mask, ...) ::mfq::hip_compat::shuffle_up(__VA_ARGS__)
+#define __shfl_xor_sync(mask, ...) ::mfq::hip_compat::shuffle_xor(__VA_ARGS__)
 #endif
 
 // CUDA bf16 conversion intrinsic absent from hip_bf16.h. HIP's
 // __float2bfloat16 already rounds to nearest even.
-// Ballot over the wave, truncated to the low 32 lanes, which matches the
-// 32-lane warp groups of the translated CUDA code.
 #if !defined(MFQ_HIP_COMPAT_BALLOT)
 #define MFQ_HIP_COMPAT_BALLOT
-#define __ballot_sync(mask, predicate) ((unsigned)__ballot(predicate))
+namespace mfq::hip_compat {
+__device__ __forceinline__ unsigned ballot(unsigned mask, bool predicate) {
+    const unsigned thread = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+    const auto votes = static_cast<unsigned long long>(__ballot(predicate));
+    return static_cast<unsigned>(votes >> ((thread % warpSize) & 32u)) & mask;
+}
+}
+#define __ballot_sync(mask, predicate) ::mfq::hip_compat::ballot(mask, predicate)
 #endif
 
 // cuBLAS enum names left behind by partial hipify passes map onto the

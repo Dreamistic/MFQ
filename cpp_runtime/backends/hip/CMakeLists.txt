@@ -358,6 +358,10 @@ if(BUILD_TESTING)
         ${MFQ_HIP_ROOT}/tests/mfq_cuda_context_test.cu)
     target_link_libraries(mfq-hip-context-test PRIVATE mfq-hip-core)
 
+    mfq_add_hip_test(mfq-hip-wave-test
+        ${MFQ_HIP_ROOT}/tests/mfq_hip_wave_test.hip)
+    target_link_libraries(mfq-hip-wave-test PRIVATE hip::host)
+
     mfq_add_hip_test(mfq-hip-activation-test
         ${MFQ_HIP_ROOT}/tests/mfq_cuda_activation_test.cu)
     target_link_libraries(mfq-hip-activation-test PRIVATE

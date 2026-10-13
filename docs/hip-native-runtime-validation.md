@@ -48,6 +48,12 @@ After both resolutions the HIP operator suite passes 7/7 (repeated
 runs): context, activation, native tensor (single device), nint rows,
 nint q8, packed prefill, and paged KV.
 
+The additional `mfq-hip-wave-test` checks width-8/16/32 shuffle semantics and
+independent 32-lane ballots on multidimensional blocks. Run it on an AMD host
+with `ctest --test-dir build/cpp_runtime -R mfq-hip-wave-test --output-on-failure`.
+CPU shim and source-isolation tests in `tests/test_hip_portability.py` do not
+replace this device check.
+
 ## Torch JIT extension
 
 `mfq.kernels.hip._ext` builds the unified torch extension (`mfq_hip`, 139
@@ -59,8 +65,10 @@ to it on ROCm hosts. Two operational findings:
   host, its hipify pass treats every walked `hip/<name>.cuh` as the output
   of `cuda/<name>.cuh` and rewrites it from the CUDA original, silently
   discarding hand fixes. Builds that must preserve fixed HIP headers have
-  to keep the CUDA kernel sources out of the hipify include walk (the
-  validation builds stage a copy without `kernels/cuda/*.{cu,cuh,h,cpp}`).
+  to keep the CUDA kernel sources out of the hipify include walk. The loader
+  now stages HIP kernels and their required headers in a content-addressed
+  directory under the torch extension cache, without CUDA sibling trees.
+  Unchanged inputs reuse that directory; changed inputs select a new one.
 - **The imported binding was stale.** The WIP-era `mfq_hip.cpp` predated
   the current CUDA binding's argument lists (for example
   `fp8_128_sq_dequant_cuda` had six integer parameters instead of the
