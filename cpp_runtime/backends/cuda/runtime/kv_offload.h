@@ -14,6 +14,8 @@ struct KvOffloadConfig {
     std::size_t ram_budget_bytes = 0;
     std::size_t buffer_bytes = 64ULL << 20;
     std::string directory;
+    bool preallocate = false;
+    bool ssd_enabled = true;
 };
 
 // Immutable microblocks have one native GPU hot copy. Eviction transfers to

@@ -14,6 +14,7 @@
 #include "models/minicpmo45/ops.h"
 #include "models/qwen35/ops.h"
 #include "models/qwen4_exp/ops.h"
+#include "moe_expert_cache.h"
 
 #include <cuda_runtime_api.h>
 
@@ -49,6 +50,8 @@ template <class Model> struct CudaMtpOps {
   int position_axes;
   int64_t prefill_compute_chunk;
   InferenceOutput* output;
+  // Destroy after local/result tensors, including cancellation of priming.
+  std::unique_ptr<MoePrefillWorkspaceLoan> predictor_loan;
   const mfq_tensor_backend::TensorOptions options =
       mfq_tensor_backend::TensorOptions()
           .device(mfq_tensor_backend::kCUDA)
@@ -62,7 +65,26 @@ template <class Model> struct CudaMtpOps {
   std::optional<mfq::cuda::Sampler> sampler_;
   bool penalties = false;
   bool target_maintenance = false;
+  std::uint64_t target_transfer_bytes=0;
   bool take_target_maintenance() { return std::exchange(target_maintenance,false); }
+  bool gradual_mtp_warmup() const {return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>;}
+  std::size_t predictor_history_merge_limit() const {
+    return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>?128:0;
+  }
+  std::size_t predictor_history_flush_threshold() const {
+    // During plain-decode calibration, consume a full warmed graph tile
+    // while that short cycle has room. Re-entry otherwise pays for several
+    // history replays immediately before drafting and target verification.
+    const auto* option=std::getenv("MFQ_MTP_HISTORY_EARLY_FLUSH");
+    return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm> && (!option || option[0]!='0')?4:512;
+  }
+  void trace_cycle(uint64_t cycle,int depth,int accepted,double draft_ms,double verify_ms,double commit_ms) {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+      if(cycle<=32 && draft_ms+verify_ms+commit_ms>=55.0)
+        std::cerr<<"runtime_mtp_slow_cycle cycle="<<cycle<<" depth="<<depth<<" accepted="<<accepted
+            <<" draft_ms="<<draft_ms<<" verify_ms="<<verify_ms<<" commit_ms="<<commit_ms
+            <<" target_transfer_mb="<<target_transfer_bytes/1048576.0<<'\n';
+  }
 
   CudaMtpOps(Model &model, MtpModule &mtp, const CudaPreparedPrompt *prepared,
              int64_t compute_chunk, InferenceOutput* output)
@@ -105,14 +127,17 @@ template <class Model> struct CudaMtpOps {
                         int64_t confirmed = 0) {
     projected_target_hidden = {}; projected_target_logits = {};
     projected_target_greedy.clear();
+    target_transfer_bytes = 0;
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(!transformed_prompt) {
+        const auto transfer_before=moe_expert_streamed_bytes(model.execution->moe_expert_cache);
         bool initialized=false;
         const auto host_ids = known_ids_device.defined() &&
             ids.data_ptr() == known_ids_device.data_ptr() && ids.sizes() == known_ids_device.sizes()
             ? known_ids_host : Tensor{};
         Tensor logits;
         if(auto hidden=mfq::cuda::qwen4_decode_graph_hidden(model,ids,raw,confirmed,&initialized,host_ids,&logits,&projected_target_greedy)) {
+          target_transfer_bytes=moe_expert_streamed_bytes(model.execution->moe_expert_cache)-transfer_before;
           target_maintenance=target_maintenance || initialized;
           projected_target_hidden = *hidden; projected_target_logits = std::move(logits);
           return std::move(*hidden);
@@ -136,6 +161,24 @@ template <class Model> struct CudaMtpOps {
     Tensor raw;
     auto ids = input_ids.narrow(1, chunk.offset, chunk.count).contiguous();
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(!transformed_prompt && model.reuse_decode_graphs && model.graph_registry &&
+          model.cache_pos>0 && chunk.count<=128) {
+        // A short continuation should not transfer every expert in each layer.
+        // Existing MTP windows already batch these rows and reuse routed weights.
+        std::vector<Tensor> hidden_rows,raw_rows;
+        for(int64_t offset=0;offset<chunk.count;) {
+          const auto rows=std::min<int64_t>(4,chunk.count-offset);
+          Tensor part;
+          hidden_rows.push_back(target_forward(ids.narrow(1,offset,rows),&part,rows>1?1:0).clone());
+          raw_rows.push_back(std::move(part));
+          if(rows>1)model.commit_speculative();
+          offset+=rows;
+        }
+        auto hidden=hidden_rows.size()==1?std::move(hidden_rows.front()):concatenate(hidden_rows,1);
+        raw=raw_rows.size()==1?std::move(raw_rows.front()):concatenate(raw_rows,1);
+        MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+        return {std::move(hidden),std::move(raw),timer.elapsed_ms()};
+      }
       if(!transformed_prompt && mfq::cuda::qwen4_layer_major_prefill_eligible(model,chunk.count)) {
         auto hidden=mfq::cuda::qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,false,
             [&] { return output && output->stopped(); }, &raw);
@@ -178,6 +221,17 @@ template <class Model> struct CudaMtpOps {
                : result;
   }
   MtpStep predictor_step(Tensor hidden, Tensor ids, Tensor positions) {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(model.reuse_decode_graphs && model.graph_registry && ids.size(1)>4 && ids.size(1)<=128) {
+        MtpStep last;
+        for(int64_t offset=0;offset<ids.size(1);offset+=4) {
+          const auto rows=std::min<int64_t>(4,ids.size(1)-offset);
+          last=predictor_step(hidden.narrow(1,offset,rows),ids.narrow(1,offset,rows),
+              positions.defined()?positions.narrow(-1,offset,rows):Tensor{});
+        }
+        return last;
+      }
+    }
     auto result=positions.defined()
                ? mtp.step_positioned(target, std::move(hidden), std::move(ids),
                                      std::move(positions))
@@ -196,9 +250,38 @@ template <class Model> struct CudaMtpOps {
       return std::min<int64_t>(1024,requested);
     return std::min<int64_t>(512,requested);
   }
+  double begin_predictor_prefill(int64_t pairs) {
+    const auto started=std::chrono::steady_clock::now();
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(pairs<=128 || !model.reuse_decode_graphs || !model.graph_registry)return 0;
+      prepare_moe_decode_residency(model.execution->moe_expert_cache);
+      const auto rows=std::min<int64_t>(1024,pairs);
+      const auto bytes=(std::size_t(1)<<30)+std::size_t(rows)*model.config.hidden*
+          model.config.streams*sizeof(float)*8+moe_prefill_transfer_bytes(model.execution->moe_expert_cache,true);
+      auto loan=std::make_unique<MoePrefillWorkspaceLoan>(model.execution->moe_expert_cache);
+      if(loan->begin(bytes))predictor_loan=std::move(loan);
+    }
+    return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+  }
+  double end_predictor_prefill() {
+    const auto started=std::chrono::steady_clock::now();
+    if(predictor_loan){predictor_loan->finish();predictor_loan.reset();}
+    return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+  }
   double predictor_prefill(Tensor hidden, Tensor ids, Tensor positions) {
     PrefillCudaTimer timer;
-    (void)predictor_step(std::move(hidden),std::move(ids),std::move(positions));
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(model.reuse_decode_graphs && model.graph_registry && ids.size(1)<=128) {
+        // The short tail uses decode graphs, whose expert addresses must again
+        // contain weights. The final long compute tile has already retired.
+        end_predictor_prefill();
+        for(int64_t offset=0;offset<ids.size(1);offset+=4) {
+          const auto rows=std::min<int64_t>(4,ids.size(1)-offset);
+          (void)predictor_step(hidden.narrow(1,offset,rows),ids.narrow(1,offset,rows),
+              positions.defined()?positions.narrow(-1,offset,rows):Tensor{});
+        }
+      } else (void)predictor_step(std::move(hidden),std::move(ids),std::move(positions));
+    } else (void)predictor_step(std::move(hidden),std::move(ids),std::move(positions));
     MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
     return timer.elapsed_ms();
   }

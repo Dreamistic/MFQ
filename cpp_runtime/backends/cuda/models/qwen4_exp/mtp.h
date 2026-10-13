@@ -23,6 +23,8 @@ struct Qwen4ExpMtp final : MtpModule {
     CudaExecutionContext *execution = nullptr;
     int64_t batch = 0;
     std::unique_ptr<Qwen4MtpGraph> graph_registry;
+    bool reuse_decode_graphs=false;
+    uint64_t graph_captures=0;
     uint64_t graph_replays = 0;
     bool graph_initialized = false;
     bool take_graph_initialization() noexcept override { return std::exchange(graph_initialized,false); }

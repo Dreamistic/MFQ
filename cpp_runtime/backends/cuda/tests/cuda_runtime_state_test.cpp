@@ -10,11 +10,13 @@
 #include "models/minicpmo45/tts.h"
 #include "models/qwen35/linear_attention.h"
 #include "models/qwen35/ops.h"
+#include "models/qwen4_exp/model.h"
 #include "storage/session_state.h"
 #include "moe.h"
 #include "storage/mfe_expert_store.h"
 #include "storage/moe_expert_cache.h"
 #include "storage/weight_loader.h"
+#include "runtime/kv_memory.h"
 
 #include <chrono>
 #include <cstring>
@@ -676,9 +678,96 @@ static void check_batching(const char* model_path, const char* tokenizer) {
     check_media_steps(*engine, model_path);
 }
 
+static void check_retained_recurrent_storage() {
+    namespace tb=mfq_tensor_backend;
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
+    qwen4_exp::GdnWeights weights;
+    weights.norm=tb::ones({32},options);
+    qwen4_exp::Gdn gdn(std::move(weights),1,1,32,4,1e-6,true);
+    auto state=gdn.graph_state();
+    *state[0]=tb::full({1,3,96},2.0,options);
+    *state[1]=tb::full({1,1,32,32},3.0,options);
+    const auto conv=state[0]->clone(),recurrent=state[1]->clone();
+    const auto* conv_address=state[0]->data_ptr();
+    const auto* recurrent_address=state[1]->data_ptr();
+    gdn.reset(true);
+    check(state[0]->sum().item<float>()==0 && state[1]->sum().item<float>()==0,
+        "retained GDN storage leaked the previous request state");
+    gdn.restore_session(conv,recurrent,true);
+    check(state[0]->data_ptr()==conv_address && state[1]->data_ptr()==recurrent_address,
+        "prefix restoration invalidated captured GDN pointers");
+    check(state[0]->sum().item<float>()==576 && state[1]->sum().item<float>()==3072,
+        "prefix restoration lost GDN state values");
+    gdn.reset();
+    check(!state[0]->defined() && !state[1]->defined(),"explicit reset retained GDN storage");
+}
+
+static void check_kv_memory() {
+    namespace tb=mfq_tensor_backend;
+    auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16);
+    KvMemoryOptions config;config.dynamic=true;
+    KvMemoryManager manager(config);
+    auto allocation=manager.add(32768,2,128,128,16,4,options);
+    manager.finalize();
+    const auto bytes=allocation->gpu_bytes();
+    auto* address=allocation->keys.data_ptr();
+    auto prefix=tb::full({1,2,16,128},3.0,options);
+    allocation->keys.narrow(2,0,16).copy_(prefix);
+    manager.ensure(24576);
+    check(allocation->keys.data_ptr()==address,"dynamic KV moved its virtual address");
+    check(allocation->gpu_bytes()>bytes,"dynamic KV failed to map growth pages");
+    auto host=allocation->keys.narrow(2,0,16).to(tb::kCPU,tb::kFloat32).contiguous();
+    for(int i=0;i<host.numel();++i)check(host.data_ptr<float>()[i]==3.0f,"dynamic KV growth corrupted existing values");
+    // Allocation admission must fail before creating any SSD fallback.
+    KvMemoryOptions constrained;constrained.gpu_limit=8192;constrained.ram_limit_set=true;constrained.ram_limit=0;
+    KvMemoryManager rejected(constrained);
+    auto pending=rejected.add(128,1,32,32,32,2,options);
+    bool failed=false;
+    try {rejected.finalize();} catch(const std::runtime_error& e) {
+        failed=std::string(e.what()).find("kv_memory_insufficient:")==0;
+    }
+    check(failed && !pending->ready,"automatic KV silently exceeded RAM/VRAM capacity");
+}
+
+static void check_workspace_loan() {
+    using namespace mfq_tensor_backend;
+    const auto context=mfq::cuda::default_context();
+    const auto stream=mfq_current_cuda_stream();
+    auto arena=full({4096},7,TensorOptions().device(kCUDA).dtype(kUInt8));
+    const auto address=arena.data_ptr();
+    context->begin_workspace_loan({{arena.data_ptr(),arena.nbytes()}},stream);
+    const auto charged=context->memory_stats().allocated;
+    auto a=empty({1024},arena.options()),b=empty({1024},arena.options());
+    check(a.data_ptr()==address && b.data_ptr()==static_cast<uint8_t*>(address)+1024,
+          "prefill did not borrow expert storage");
+    check(context->memory_stats().allocated==charged,"loaned bytes were charged twice");
+    a.zero_();b.zero_();a={};b={};
+    auto whole=empty({4096},arena.options());
+    check(whole.data_ptr()==address,"workspace slices did not coalesce for the next phase");
+    bool rejected=false;
+    try{context->end_workspace_loan();}catch(const std::exception&){rejected=true;}
+    check(rejected,"expert storage was returned with a live workspace tensor");
+    whole={};
+    {
+        mfq::cuda::ResidentAllocationScope resident;
+        auto state=empty({4096},arena.options());
+        check(state.data_ptr()!=address,"persistent request state borrowed expert storage");
+    }
+    context->suspend_workspace_loan();
+    auto detached=empty({4096},arena.options());
+    check(detached.data_ptr()!=address,"escaped prefill output still aliases experts");
+    context->end_workspace_loan();
+    arena.copy_(full({4096},7,arena.options()));
+    check(arena.data_ptr()==address && arena.cpu().data_ptr<uint8_t>()[2048]==7,
+          "restoring expert bytes changed its address or contents");
+}
+
 int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    check_workspace_loan();
+    check_kv_memory();
+    check_retained_recurrent_storage();
     check_sampling_storage();
     check_linear_execution();
     check_graph_warmup_state();

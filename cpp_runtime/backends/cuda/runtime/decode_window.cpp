@@ -310,6 +310,7 @@ void DecodeWindow::run() {
     try {
         WindowSubmission submission;
         using Clock=std::chrono::steady_clock;
+        const auto reset_before=reset_ns_,launch_before=launch_ns_,serve_before=serve_ns_,wait_before=wait_ns_,finish_before=finish_ns_;
         auto previous=Clock::now();const auto started=previous;
         const auto sample=[&](int64_t& total) {
             const auto now=Clock::now();
@@ -341,6 +342,12 @@ void DecodeWindow::run() {
         sample(finish_ns_);
         observe_layers();sample(profile_ns_);
         replay_ns_+=std::chrono::duration_cast<std::chrono::nanoseconds>(previous-started).count();++replays_;
+        const auto elapsed=std::chrono::duration<double,std::milli>(previous-started).count();
+        if(trace && replays_<=64 && elapsed>=45.0)
+            std::cerr<<"runtime_decode_window_slow role="<<profile_role_<<" rows="<<profile_rows_
+                <<" replay="<<replays_<<" ms="<<elapsed<<" reset_ms="<<(reset_ns_-reset_before)/1e6
+                <<" launch_ms="<<(launch_ns_-launch_before)/1e6<<" serve_ms="<<(serve_ns_-serve_before)/1e6
+                <<" wait_ms="<<(wait_ns_-wait_before)/1e6<<" finish_ms="<<(finish_ns_-finish_before)/1e6<<'\n';
         checkpoint("complete");
     } catch(...) {
         report_window_error("replay",phase);

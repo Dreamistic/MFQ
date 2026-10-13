@@ -15,13 +15,13 @@ int main() {
     using namespace mfq::engine::mtp;
     {
         DepthController controller(3);
-        const std::array<int, 6> sweep{3, 2, 1, 0, 0, 0};
+        const std::array<int, 9> sweep{3, 2, 1, 0, 0, 0, 3, 2, 1};
         for (int depth : sweep) {
             require(controller.depth() == depth);
             controller.observe(depth, depth, depth ? 20.0 + depth : 20.0);
         }
         require(!controller.warming_up());
-        require(std::fabs(controller.conditional_acceptance(0)-0.6885248) < 1e-12);
+        require(std::fabs(controller.conditional_acceptance(0)-(1.0-0.4*std::pow(0.92,6))) < 1e-12);
         require(std::fabs(*controller.measured_cycle_ms(3)-23.0) < 1e-12);
         require(std::fabs(*controller.measured_cycle_ms(0)-20.0) < 1e-12);
         const double before = *controller.measured_cycle_ms(3);
@@ -41,6 +41,37 @@ int main() {
         require(!maintenance.measured_cycle_ms(3));
         rejects([&] { controller.conditional_acceptance(-1); });
         rejects([&] { controller.measured_cycle_ms(4); });
+    }
+    {
+        // Reproduce the cold 8K request: 657 ms at depth 3, then progressively
+        // faster lower widths. A short startup resweep must replace that cost
+        // without waiting five seconds for stale-depth exploration.
+        DepthController controller(3);
+        for (const auto [depth, ms] : std::array<std::pair<int,double>,6>{
+                {{3,657.0},{2,189.0},{1,60.0},{0,60.0},{0,30.0},{0,20.0}}}) {
+            require(controller.depth()==depth);
+            controller.observe(depth,depth,ms);
+        }
+        require(controller.warming_up() && controller.depth()==3);
+        controller.observe(3,3,9000.0,false);
+        require(controller.depth()==3 && *controller.measured_cycle_ms(3)==657.0);
+        for (int depth : {3,2,1}) {
+            require(controller.depth()==depth);
+            controller.observe(depth,depth,20.0+5.0*depth);
+        }
+        require(!controller.warming_up() && controller.depth()>1);
+        require(*controller.measured_cycle_ms(3)==35.0);
+        // Consistently slow speculation still loses; calibration must not
+        // force MTP when its actual per-token cost exceeds ordinary decode.
+        DepthController slow(3);
+        while(slow.warming_up()) {
+            const auto depth=slow.depth();
+            slow.observe(depth,depth,depth?200.0:20.0);
+        }
+        require(slow.depth()==0 && slow.speculation_losing());
+        DepthController limited(3);
+        limited.observe(1,1,20.0);
+        require(limited.depth()==3 && limited.warming_up());
     }
     {
         PolicyState state;
@@ -74,6 +105,50 @@ int main() {
         require(!legacy.parked() && legacy.parks() == 0 && legacy.reentries() == 0);
     }
     {
+        DepthController latency(3,nullptr,7.0,1.15,true,60.0);
+        require(latency.depth()==1);
+        latency.observe(1,1,45.0); // Projected three-row window is still cold.
+        require(latency.depth()==1);
+        latency.observe(1,1,35.0,false); // Maintenance cannot permit widening.
+        require(latency.depth()==1);
+        latency.observe(1,1,39.0);
+        require(latency.depth()==2);
+        latency.observe(2,2,51.0);
+        require(latency.depth()==2);
+        latency.observe(2,2,44.0);
+        require(latency.depth()==3);
+        DepthController bounded(3,nullptr,7.0,1.15,true,60.0);
+        for(int i=0;i<48;++i)bounded.observe(bounded.depth(),0,100.0);
+        require(bounded.depth()>1); // Slow devices must still complete calibration.
+        DepthController gradual(3,nullptr,7.0,1.15,true);
+        const std::array<int,12> sweep{1,2,3,0,0,0,3,2,1,3,2,1};
+        int step=0;
+        for(int depth:sweep) {
+            require(gradual.depth()==depth);
+            gradual.observe(depth,depth,1000.0,false);
+            require(gradual.depth()==depth && gradual.warming_up());
+            const double ms=step<3?30.0+40.0*depth:step<9?20.0+20.0*depth:20.0+5.0*depth;
+            gradual.observe(depth,depth,ms);
+            if(++step==9)require(gradual.warming_up());
+        }
+        require(!gradual.warming_up() && gradual.depth()>1);
+        require(*gradual.measured_cycle_ms(3)==35.0);
+        DepthController continuation(3,&gradual,7.0,1.15,true);
+        for(int depth:std::array<int,9>{1,2,3,0,0,0,3,2,1}) {
+            require(continuation.depth()==depth);
+            continuation.observe(depth,depth,20.0+5.0*depth);
+        }
+        require(!continuation.warming_up());
+        PolicyState state;
+        GenerationPolicy<DsparkDepthController> policy(3,false,&state,true);
+        require(policy.depth()==1);
+        for(int cycle=0;cycle<96 && !policy.parked();++cycle)
+            policy.observe(policy.depth(),0,policy.depth()?100.0:20.0);
+        require(policy.parked());
+        for(int i=0;i<128;++i)policy.observe_plain(20.0);
+        require(!policy.parked() && policy.depth()==1);
+    }
+    {
         PolicyState state;
         DepthController controller(2);
         while (controller.warming_up()) controller.observe(controller.depth(), 0, 30.0);
@@ -96,6 +171,7 @@ int main() {
         controller.observe(0, 0, 22.0);
         controller.observe(0, 0, 21.0);
         controller.observe(0, 0, 23.0);
+        for(int depth : {3,2,1})controller.observe(depth,depth,26.0+depth);
         require(controller.depth() == 3);
         require(controller.measured_cycle_ms(3).has_value());
         require(controller.conditional_acceptance(0) > 0.6);
@@ -117,6 +193,7 @@ int main() {
         controller.observe(0, 0, 30.0);
         controller.observe(0, 0, 29.0);
         controller.observe(0, 0, 31.0);
+        for(int depth : {3,2,1})controller.observe(depth,0,60.0+depth);
         require(controller.depth() == 0);
         // Depth zero is a reversible scheduling choice, not a permanent exit
         // from the common MTP state machine. Periodic exploration must remain
@@ -131,6 +208,20 @@ int main() {
             controller.observe(0, 0, 30.0);
         }
         require(probed_speculation);
+    }
+    {
+        DsparkDepthController controller(3);
+        controller.observe(3,3,9000.0,false);
+        require(controller.depth()==3 && !controller.measured_cycle_ms(3));
+        controller.observe(1,1,20.0);
+        require(controller.depth()==3 && !controller.measured_cycle_ms(3));
+        for (const auto [depth,ms] : std::array<std::pair<int,double>,8>{
+                {{3,700.0},{3,657.0},{0,60.0},{0,30.0},{0,20.0},
+                 {3,35.0},{2,30.0},{1,25.0}}}) {
+            require(controller.depth()==depth);
+            controller.observe(depth,depth,ms);
+        }
+        require(controller.depth()==3 && *controller.measured_cycle_ms(3)==35.0);
     }
     {
         const std::array<int32_t, 4> drafts{11, 12, 13, 14};

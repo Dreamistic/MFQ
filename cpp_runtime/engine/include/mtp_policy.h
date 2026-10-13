@@ -71,6 +71,9 @@ public:
           cycle_age_ms_(static_cast<std::size_t>(maximum_depth_ + 1)) {
         warmup_.insert(warmup_.end(), {maximum_depth_, maximum_depth_});
         warmup_.insert(warmup_.end(), {0, 0, 0});
+        if (maximum_depth_ > 1)
+            for (int depth = maximum_depth_; depth > 0; --depth)
+                warmup_.push_back(depth);
     }
 
     int depth() const noexcept { return current_depth_; }
@@ -111,6 +114,9 @@ public:
         milliseconds_since_probe_ += cycle_ms;
         milliseconds_since_explore_ += cycle_ms;
         if (!warmup_.empty()) {
+            // Maintenance and output/context-limited widths cannot satisfy the
+            // requested calibration sample.
+            if (!time_sample || used_depth != warmup_.front()) return;
             warmup_.erase(warmup_.begin());
             if (!warmup_.empty()) {
                 current_depth_ = warmup_.front();
@@ -121,6 +127,7 @@ public:
             return;
         }
         if (probe_left_ > 0) {
+            if (!time_sample || used_depth != current_depth_) return;
             --probe_left_;
             if (probe_left_ == 0) {
                 current_depth_ = best_depth();

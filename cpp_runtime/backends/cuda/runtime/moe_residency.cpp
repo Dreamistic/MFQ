@@ -13,6 +13,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -66,7 +67,7 @@ struct MoeResidencyManager::Impl {
         int incoming_bundle=0,incoming_projection=0;
         MoeHostExpertCache::Lease lease;
         mfq::MoeCacheSlotBook::Replacement replacement;
-        std::vector<int64_t> offsets;
+        std::vector<int64_t> offsets,preserve_offsets;
         std::size_t touched_fields=0;
         std::size_t backed_fields=0;
         MoeGpuArena* cached_arena=nullptr;
@@ -170,13 +171,37 @@ struct MoeResidencyManager::Impl {
     std::atomic<std::uint64_t> cached_copy_dma_bytes{0},cached_copy_dma_fields{0};
     std::atomic<std::uint64_t> direct_exchange_rounds{0},direct_exchange_bytes{0},direct_exchange_ns{0};
     std::atomic<std::uint64_t> cached_copy_descriptors{0},cached_copy_blocks{0};
+    unsigned traced_decode_waits=0;
+    bool last_gpu_preserve=false;
+    int64_t last_preserve_bytes=0;
+    int64_t last_backup_bytes=0,last_small_backup_bytes=0;
+    std::size_t last_backup_fields=0,last_small_backup_fields=0;
+    const int64_t small_backup_limit=[] {
+        const auto* value=std::getenv("MFQ_MOE_RESIDENCY_SMALL_BACKUP_BYTES");
+        return value?std::clamp<int64_t>(std::atoll(value),0,1048576):int64_t(65536);
+    }();
+    std::unique_ptr<mfq::cuda::HostBuffer> backup_descriptors;
+    mfq::MoeCacheMappedCopyDescriptor* backup_descriptors_device=nullptr;
+    uint8_t* backup_ram_device=nullptr;
+    struct PrefillRoutes {int tokens=0,routes=0;};
+    std::vector<PrefillRoutes> prefill_routes;
+    tb::Tensor prefill_route_device;
+    std::unique_ptr<mfq::cuda::HostBuffer> prefill_route_host;
+    int prefill_route_stride=0;
+    cudaEvent_t prefill_done=nullptr;
+    bool prefill_pending=false;
     std::vector<Move> pending;
     std::size_t pending_complete_bundles=0;
     std::vector<Map> maps;
     tb::Tensor upload,backup;
+    std::unique_ptr<mfq::cuda::HostBuffer> map_upload,map_descriptors;
+    uint8_t* map_upload_device=nullptr;
+    mfq::MoeCacheMappedCopyDescriptor* map_descriptors_device=nullptr;
     tb::Tensor device_work,copy_descriptors,device_descriptors;
     int work_tokens=0;
-    cudaStream_t stream=nullptr;
+    cudaStream_t stream=nullptr,backup_stream=nullptr;
+    cudaEvent_t backup_done=nullptr;
+    std::vector<cudaEvent_t> preserve_events;
     cudaEvent_t done=nullptr;
     cudaEvent_t window_done=nullptr;
     std::unique_ptr<mfq::cuda::HostBuffer> expert_done_host;
@@ -196,6 +221,35 @@ struct MoeResidencyManager::Impl {
     explicit Impl(MoeExpertCache* value,Observer observe,MemoryProbe probe)
         :cache(value),observer(std::move(observe)),memory_probe(probe?std::move(probe):process_memory) {}
     void observe(const char* phase,std::size_t index) {if(observer)observer(phase,index);}
+    void upload_maps() {
+        if(maps.empty())return;
+        if(!map_upload) {
+            std::size_t capacity=0,count=0;
+            for(const auto& source:cache->sources_)for(const auto& cohort:source->cohorts_)
+                {capacity+=cohort.host_map.size()*sizeof(int32_t);++count;}
+            map_upload=std::make_unique<mfq::cuda::HostBuffer>(capacity,true);
+            map_descriptors=std::make_unique<mfq::cuda::HostBuffer>(count*sizeof(mfq::MoeCacheMappedCopyDescriptor),true);
+            MFQ_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&map_upload_device),map_upload->data(),0));
+            MFQ_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&map_descriptors_device),map_descriptors->data(),0));
+        }
+        // Publish every small map in one launch after the old graph retires.
+        // One H2D submission per projection otherwise costs more than the
+        // entire map payload, especially during the first routing changes.
+        auto* descriptors=static_cast<mfq::MoeCacheMappedCopyDescriptor*>(map_descriptors->data());
+        std::size_t offset=0;
+        for(std::size_t i=0;i<maps.size();++i) {
+            const auto& map=maps[i];auto& cohort=cache->sources_[map.source]->cohorts_[map.cohort];
+            const auto bytes=map.next.size()*sizeof(int32_t);
+            if(offset+bytes>map_upload->size())throw std::logic_error("residency map staging exceeded topology");
+            auto* source=static_cast<uint8_t*>(map_upload->data())+offset;
+            descriptors[i]={reinterpret_cast<uint64_t>(cohort.active.expert_local.data_ptr<int32_t>()),
+                reinterpret_cast<uint64_t>(map_upload_device+offset),bytes};
+            std::memcpy(source,map.next.data(),bytes);offset+=bytes;
+            observe("map",i);
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        mfq::moe_cache_mapped_gather_cuda(map_descriptors_device,int(maps.size()),1,stream);
+    }
     std::size_t complete_pending_bundles() const {
         std::map<std::pair<int,int>,unsigned> masks;
         for(const auto& move:pending)masks[{move.incoming_bundle,move.incoming}]|=1u<<move.incoming_projection;
@@ -300,6 +354,12 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
             Impl::refill_capacity*sizeof(mfq::MoeCacheMappedCopyDescriptor),true);
         MFQ_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&s.refill_device),s.refill_descriptors->data(),0));
     }
+    if(s.small_backup_limit && cache->pipeline_ram_registered_bytes_ && cache->pipeline_ram_complement_) {
+        s.backup_descriptors=std::make_unique<mfq::cuda::HostBuffer>(
+            Impl::refill_capacity*sizeof(mfq::MoeCacheMappedCopyDescriptor),true);
+        MFQ_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&s.backup_descriptors_device),s.backup_descriptors->data(),0));
+        MFQ_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&s.backup_ram_device),cache->pipeline_ram_complement_->data_ptr(),0));
+    }
     MFQ_CUDA_CHECK(cudaStreamCreateWithFlags(&s.stream,cudaStreamNonBlocking));
     const auto event=cudaEventCreateWithFlags(&s.done,cudaEventDisableTiming);
     if(event!=cudaSuccess){cudaStreamDestroy(s.stream);s.stream=nullptr;MFQ_CUDA_CHECK(event);}
@@ -307,6 +367,10 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
     if(window_event!=cudaSuccess){cudaEventDestroy(s.done);s.done=nullptr;cudaStreamDestroy(s.stream);s.stream=nullptr;MFQ_CUDA_CHECK(window_event);}
 }
 MoeResidencyManager::~MoeResidencyManager() {
+    if(impl_->prefill_done) {
+        (void)cudaEventSynchronize(impl_->prefill_done);
+        (void)cudaEventDestroy(impl_->prefill_done);
+    }
     if(impl_->worker.joinable()) {
         {std::lock_guard<std::mutex> lock(impl_->worker_mutex);impl_->stopping=true;}
         impl_->work_available.notify_one();impl_->work_finished.notify_all();impl_->worker.join();
@@ -319,7 +383,78 @@ MoeResidencyManager::~MoeResidencyManager() {
     if(impl_->stream)(void)cudaStreamSynchronize(impl_->stream);
     if(impl_->done)cudaEventDestroy(impl_->done);
     if(impl_->window_done)cudaEventDestroy(impl_->window_done);
+    if(impl_->backup_stream)(void)cudaStreamSynchronize(impl_->backup_stream);
+    for(auto event:impl_->preserve_events)cudaEventDestroy(event);
+    if(impl_->backup_done)cudaEventDestroy(impl_->backup_done);
+    if(impl_->backup_stream)cudaStreamDestroy(impl_->backup_stream);
     if(impl_->stream)cudaStreamDestroy(impl_->stream);
+}
+void MoeResidencyManager::record_prefill_routes(int layer,const int32_t* ids,int tokens,int routes,void* raw_stream) {
+    auto& s=*impl_;
+    if(layer<0 || !s.cache->config_.moe_residency_adapt || !s.cache->config_.moe_residency_warm)return;
+    const auto* option=std::getenv("MFQ_MOE_PREFILL_RESIDENCY");
+    if(option && option[0]=='0')return;
+    const auto stream=static_cast<cudaStream_t>(raw_stream);
+    if(!s.prefill_done)MFQ_CUDA_CHECK(cudaEventCreateWithFlags(&s.prefill_done,cudaEventDisableTiming));
+    if(s.prefill_routes.empty())s.prefill_routes.resize(s.cache->pipeline_bundles_.size());
+    if(routes>s.prefill_route_stride) {
+        if(s.prefill_pending)MFQ_CUDA_CHECK(cudaEventSynchronize(s.prefill_done));
+        const int64_t elements=int64_t(s.prefill_routes.size())*32*routes;
+        auto next=tb::empty({elements},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt32));
+        // Preserve samples if a model uses different routing widths by layer.
+        if(s.prefill_route_device.defined())for(std::size_t b=0;b<s.prefill_routes.size();++b) {
+            const auto& sample=s.prefill_routes[b];if(!sample.tokens)continue;
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(next.data_ptr<int32_t>()+b*32*routes,
+                s.prefill_route_device.data_ptr<int32_t>()+b*32*s.prefill_route_stride,
+                sample.tokens*sample.routes*sizeof(int32_t),cudaMemcpyDeviceToDevice,stream));
+        }
+        s.prefill_route_device=std::move(next);s.prefill_route_stride=routes;
+        s.prefill_route_host=std::make_unique<mfq::cuda::HostBuffer>(elements*sizeof(int32_t),false);
+    }
+    for(std::size_t b=0;b<s.prefill_routes.size();++b) {
+        if(s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_!=layer)continue;
+        auto& sample=s.prefill_routes[b];
+        const auto tail=std::min(tokens,32),bytes=tail*routes*int(sizeof(int32_t));
+        sample.tokens=tail;sample.routes=routes;
+        // Keep route samples on-device during prefill. Small D2H copies at
+        // every layer interfere with the overlapping expert-weight transfers.
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(s.prefill_route_device.data_ptr<int32_t>()+b*32*s.prefill_route_stride,
+            ids+int64_t(tokens-tail)*routes,bytes,cudaMemcpyDeviceToDevice,stream));
+        MFQ_CUDA_CHECK(cudaEventRecord(s.prefill_done,stream));
+        s.prefill_pending=true;
+    }
+}
+void MoeResidencyManager::prepare_decode() {
+    auto& s=*impl_;
+    if(!s.prefill_pending)return;
+    apply_pending();
+    MFQ_CUDA_CHECK(cudaStreamWaitEvent(s.stream,s.prefill_done,0));
+    MFQ_CUDA_CHECK(cudaMemcpyAsync(s.prefill_route_host->data(),s.prefill_route_device.data_ptr(),
+        s.prefill_route_device.numel()*sizeof(int32_t),cudaMemcpyDeviceToHost,s.stream));
+    MFQ_CUDA_CHECK(cudaStreamSynchronize(s.stream));
+    const auto started=std::chrono::steady_clock::now();
+    for(std::size_t b=0;b<s.prefill_routes.size();++b) {
+        auto& sample=s.prefill_routes[b];if(!sample.tokens)continue;
+        std::fill(s.heat[b].begin(),s.heat[b].end(),0.0f);
+        std::fill(s.observations[b].begin(),s.observations[b].end(),0.0f);
+        const auto* ids=static_cast<const int32_t*>(s.prefill_route_host->data())+b*32*s.prefill_route_stride;
+        for(int t=0;t<sample.tokens;++t) {
+            // About six recent token-equivalents: inform the first decode
+            // without letting a long prompt dominate later routing changes.
+            const float weight=std::exp2(-float(sample.tokens-1-t)/4.0f);
+            for(int r=0;r<sample.routes;++r)s.heat[b].at(ids[t*sample.routes+r])+=weight;
+        }
+        sample.tokens=0;
+    }
+    s.prefill_pending=false;
+    const auto before=s.committed_projections.load();
+    // This boundary is outside the prefill workspace loan. All expert slots
+    // contain weights again and the usual transactional guards still apply.
+    after_layer(s.last,{},32);
+    apply_pending();
+    s.traced_decode_waits=0;
+    std::cerr<<"runtime_moe_prefill_residency projections="<<s.committed_projections.load()-before
+        <<" ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count()<<'\n';
 }
 void MoeResidencyManager::release_transfer_stages() {
     apply_pending();
@@ -602,7 +737,7 @@ void MoeResidencyManager::prepare() {
             !cache.pipeline_shared_cpu_cost_ &&
             std::all_of(cache.pipeline_dispatch_replay_.begin(),cache.pipeline_dispatch_replay_.end(),
                 [](const auto& record){return record.cpu.empty();}) &&
-            std::all_of(s.pending.begin(),s.pending.end(),[](const auto& move){return move.cached_arena!=nullptr;})) {
+            !s.pending.empty()) {
         prepare_direct_exchange();return;
     }
     // The packed path starts with a GPU gather. On the tested WDDM runtime,
@@ -661,6 +796,83 @@ void MoeResidencyManager::prepare() {
 void MoeResidencyManager::prepare_direct_exchange() {
     auto& s=*impl_;auto& cache=*s.cache;
     const PhaseClock direct_clock(s.direct_exchange_ns,nullptr);
+    // Preserve only uncached incoming fields. Cached ones already have an
+    // immutable GPU copy until publication. One cache miss must not force a
+    // backup-to-staging and CPU copy of every victim in this transaction.
+    // The expert fence has retired the wire's previous consumers, and the next
+    // decode joins this exchange before reusing it. Preserve its control header
+    // and borrow only its payload. This avoids a CPU copy without growing VRAM.
+    constexpr int64_t wire_control_bytes=256;
+    int64_t incoming_bytes=0;
+    for(auto& move:s.pending)if(!move.cached_arena) {
+        const auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
+        move.preserve_offsets.clear();
+        for(auto bytes:cohort.bytes_per_expert) {
+            incoming_bytes=(incoming_bytes+15)&~int64_t(15);
+            move.preserve_offsets.push_back(incoming_bytes);
+            if(bytes>INT64_MAX-incoming_bytes)throw std::overflow_error("incoming expert preservation size overflow");
+            incoming_bytes+=bytes;
+        }
+    }
+    const bool gpu_preserve=incoming_bytes>0 && cache.pipeline_wire_gpu_.defined() &&
+        incoming_bytes<=cache.pipeline_wire_gpu_.numel()-wire_control_bytes;
+    s.last_gpu_preserve=gpu_preserve;s.last_preserve_bytes=incoming_bytes;
+    s.last_backup_bytes=0;s.last_small_backup_bytes=0;
+    s.last_backup_fields=0;s.last_small_backup_fields=0;
+    const auto* duplex_option=std::getenv("MFQ_MOE_RESIDENCY_DUPLEX");
+    const bool duplex=gpu_preserve && (!duplex_option || duplex_option[0]!='0');
+    const auto* group_option=std::getenv("MFQ_MOE_RESIDENCY_DUPLEX_CHUNK_BYTES");
+    const int64_t group_limit=group_option?std::clamp<int64_t>(std::atoll(group_option),4096,int64_t(64)<<20):int64_t(8)<<20;
+    std::vector<std::vector<std::size_t>> preserve_groups;
+    if(duplex) {
+        int64_t group_bytes=0;
+        for(std::size_t i=0;i<s.pending.size();++i)if(!s.pending[i].cached_arena) {
+            const auto& cohort=cache.sources_[s.pending[i].incoming_source]->cohorts_[s.pending[i].cohort];
+            int64_t bytes=0;for(auto count:cohort.bytes_per_expert)bytes+=count;
+            if(preserve_groups.empty() || group_bytes+bytes>group_limit) {
+                preserve_groups.emplace_back();group_bytes=0;
+            }
+            preserve_groups.back().push_back(i);group_bytes+=bytes;
+        }
+    }
+    if(duplex) {
+        if(!s.backup_stream)MFQ_CUDA_CHECK(cudaStreamCreateWithFlags(&s.backup_stream,cudaStreamNonBlocking));
+        while(s.preserve_events.size()<preserve_groups.size()) {
+            cudaEvent_t event=nullptr;
+            MFQ_CUDA_CHECK(cudaEventCreateWithFlags(&event,cudaEventDisableTiming));
+            s.preserve_events.push_back(event);
+        }
+        if(!s.backup_done)MFQ_CUDA_CHECK(cudaEventCreateWithFlags(&s.backup_done,cudaEventDisableTiming));
+        if(!s.pending_expert_fence)MFQ_CUDA_CHECK(cudaStreamWaitEvent(s.backup_stream,s.window_done,0));
+    }
+    const auto backup_stream=duplex?s.backup_stream:s.stream;
+    // Also retire backup copies when an observer/CUDA failure occurs before
+    // the cross-stream event is recorded. Normal completion has already waited.
+    struct RetireBackup {
+        cudaStream_t stream;
+        ~RetireBackup(){if(stream)(void)cudaStreamSynchronize(stream);}
+    } retire_backup{duplex?backup_stream:nullptr};
+    const auto incoming_copy=[&](const Impl::Move& move,std::size_t field) {
+        return gpu_preserve?cache.pipeline_wire_gpu_.data_ptr<uint8_t>()+wire_control_bytes+move.preserve_offsets[field]
+            :s.backup.data_ptr<uint8_t>()+move.offsets[field];
+    };
+    {
+        mfq::cpu::HostMemoryCopyBatch copies;
+        const auto preserve=[&](const Impl::Move& move) {
+            const auto fields=moe_cache_fields(move.lease->weights);
+            const auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
+            for(std::size_t f=0;f<fields.size();++f) {
+                const auto bytes=cohort.bytes_per_expert[f];if(!bytes)continue;
+                if(gpu_preserve)MFQ_CUDA_CHECK(cudaMemcpyAsync(incoming_copy(move,f),fields[f].data_ptr(),
+                    std::size_t(bytes),cudaMemcpyHostToDevice,s.stream));
+                else copies.copy(incoming_copy(move,f),fields[f].data_ptr(),std::size_t(bytes));
+            }
+        };
+        if(duplex)for(std::size_t g=0;g<preserve_groups.size();++g) {
+            for(auto i:preserve_groups[g])preserve(s.pending[i]);
+            MFQ_CUDA_CHECK(cudaEventRecord(s.preserve_events[g],s.stream));
+        } else for(const auto& move:s.pending)if(!move.cached_arena)preserve(move);
+    }
     // This callback runs before the cache lock, allowing an arriving reader to
     // retain its lease. exchange_batch must then reject without changing bytes.
     s.observe("before_direct_exchange",0);
@@ -680,6 +892,7 @@ void MoeResidencyManager::prepare_direct_exchange() {
                 auto& item=s.pending[i];
                 const auto& cohort=cache.sources_[item.incoming_source]->cohorts_[item.cohort];
                 const auto fields=moe_cache_fields(reused);
+                MFQ_CUDA_CHECK(cudaStreamSynchronize(backup_stream));
                 MFQ_CUDA_CHECK(cudaStreamSynchronize(s.stream));
                 // RAM now contains the victim. Restore its GPU bytes before
                 // restoring the incoming RAM payload from its retained cache.
@@ -690,8 +903,18 @@ void MoeResidencyManager::prepare_direct_exchange() {
                 }
                 for(std::size_t f=0;f<item.backed_fields;++f) {
                     const auto count=cohort.bytes_per_expert[f];if(!count)continue;
-                    const auto* cached=static_cast<const uint8_t*>(item.cached_arena->fields[f].data_ptr())+int64_t(item.cached_slot)*count;
-                    MFQ_CUDA_CHECK(cudaMemcpyAsync(fields[f].data_ptr(),cached,std::size_t(count),cudaMemcpyDeviceToHost,s.stream));
+                    if(item.cached_arena) {
+                        const auto* cached=static_cast<const uint8_t*>(item.cached_arena->fields[f].data_ptr())+int64_t(item.cached_slot)*count;
+                        MFQ_CUDA_CHECK(cudaMemcpyAsync(fields[f].data_ptr(),cached,std::size_t(count),cudaMemcpyDeviceToHost,s.stream));
+                    } else if(gpu_preserve) {
+                        MFQ_CUDA_CHECK(cudaMemcpyAsync(fields[f].data_ptr(),incoming_copy(item,f),
+                            std::size_t(count),cudaMemcpyDeviceToHost,s.stream));
+                    } else {
+                        // Finish restoring the old GPU owner before replacing
+                        // the RAM source that restoration is reading.
+                        MFQ_CUDA_CHECK(cudaStreamSynchronize(s.stream));
+                        std::memcpy(fields[f].data_ptr(),incoming_copy(item,f),std::size_t(count));
+                    }
                 }
                 MFQ_CUDA_CHECK(cudaStreamSynchronize(s.stream));
                 item.touched_fields=0;item.backed_fields=0;
@@ -715,11 +938,7 @@ void MoeResidencyManager::prepare_direct_exchange() {
             for(const auto& move:s.pending)
                 if(!cache.sources_[move.incoming_source]->cohorts_[move.cohort].arena->book->replacement_valid(move.replacement))
                     throw std::runtime_error("adaptive GPU slot changed before direct publication");
-            for(std::size_t i=0;i<s.maps.size();++i) {
-                const auto& map=s.maps[i];auto& cohort=cache.sources_[map.source]->cohorts_[map.cohort];
-                MFQ_CUDA_CHECK(cudaMemcpyAsync(cohort.active.expert_local.data_ptr<int32_t>(),map.next.data(),
-                    map.next.size()*sizeof(int32_t),cudaMemcpyHostToDevice,s.stream));s.observe("map",i);
-            }
+            s.upload_maps();
             MFQ_CUDA_CHECK(cudaStreamSynchronize(s.stream));
         }
         s.observe("publish",0);
@@ -743,16 +962,52 @@ void MoeResidencyManager::prepare_direct_exchange() {
     },[&] {
         {
             const PhaseClock backup_clock(s.backup_submit_ns,nullptr);
-            for(auto& move:s.pending) {
+            std::size_t small_count=0;
+            const auto ram_begin=reinterpret_cast<uintptr_t>(cache.pipeline_ram_complement_->data_ptr());
+            const auto ram_bytes=uint64_t(cache.pipeline_ram_registered_bytes_);
+            const auto backup=[&](Impl::Move& move) {
                 const auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
                 const auto fields=moe_cache_fields(move.lease->weights);
                 for(std::size_t f=0;f<fields.size();++f) {
                     const auto count=cohort.bytes_per_expert[f];if(!count)continue;
                     const auto* gpu=static_cast<const uint8_t*>(cohort.arena->fields[f].data_ptr())+int64_t(move.slot)*count;
                     move.backed_fields=f+1;
-                    MFQ_CUDA_CHECK(cudaMemcpyAsync(fields[f].data_ptr(),gpu,std::size_t(count),cudaMemcpyDeviceToHost,s.stream));
-                    ++s.backup_copies;s.observe("direct_backup",f);
+                    const auto address=reinterpret_cast<uintptr_t>(fields[f].data_ptr());
+                    if(s.backup_descriptors && count<=s.small_backup_limit && small_count<Impl::refill_capacity &&
+                            address>=ram_begin && address-ram_begin<=ram_bytes && uint64_t(count)<=ram_bytes-(address-ram_begin)) {
+                        auto* descriptors=static_cast<mfq::MoeCacheMappedCopyDescriptor*>(s.backup_descriptors->data());
+                        descriptors[small_count++]={reinterpret_cast<uint64_t>(s.backup_ram_device+(address-ram_begin)),
+                            reinterpret_cast<uint64_t>(gpu),uint64_t(count)};
+                        s.last_small_backup_bytes+=count;++s.last_small_backup_fields;
+                    } else {
+                        MFQ_CUDA_CHECK(cudaMemcpyAsync(fields[f].data_ptr(),gpu,std::size_t(count),cudaMemcpyDeviceToHost,backup_stream));
+                        ++s.backup_copies;
+                    }
+                    s.last_backup_bytes+=count;++s.last_backup_fields;s.observe("direct_backup",f);
                 }
+            };
+            if(duplex) {
+                // Overlap opposite PCIe directions. Each uncached RAM range
+                // becomes writable only after its own preservation group;
+                // later H2D groups can still run while earlier victims drain.
+                for(auto& move:s.pending)if(move.cached_arena)backup(move);
+                for(std::size_t g=0;g<preserve_groups.size();++g) {
+                    MFQ_CUDA_CHECK(cudaStreamWaitEvent(backup_stream,s.preserve_events[g],0));
+                    for(auto i:preserve_groups[g])backup(s.pending[i]);
+                }
+            } else for(auto& move:s.pending)backup(move);
+            // Large victims use the copy engine as soon as their inputs are
+            // preserved. Metadata shares one mapped write kernel after those
+            // transfers, without hundreds of tiny DMA submissions. Waiting on
+            // every preservation group above also protects deferred RAM writes.
+            if(small_count) {
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                mfq::moe_cache_mapped_gather_cuda(s.backup_descriptors_device,int(small_count),1,backup_stream);
+                s.observe("direct_backup_batch",0);
+            }
+            if(duplex) {
+                MFQ_CUDA_CHECK(cudaEventRecord(s.backup_done,backup_stream));
+                MFQ_CUDA_CHECK(cudaStreamWaitEvent(s.stream,s.backup_done,0));
             }
         }
         {
@@ -763,12 +1018,20 @@ void MoeResidencyManager::prepare_direct_exchange() {
                 for(std::size_t f=0;f<cohort.bytes_per_expert.size();++f) {
                     const auto count=cohort.bytes_per_expert[f];if(!count)continue;
                     auto* gpu=static_cast<uint8_t*>(cohort.arena->fields[f].data_ptr())+int64_t(move.slot)*count;
-                    const auto* cached=static_cast<const uint8_t*>(move.cached_arena->fields[f].data_ptr())+int64_t(move.cached_slot)*count;
                     move.touched_fields=f+1;
                     // All victims have already been backed up into final RAM.
                     // Mark queued fields before launch so either submission or
                     // publication failures restore the complete transaction.
-                    refill.copy(gpu,cached,std::uint64_t(count));
+                    if(move.cached_arena) {
+                        const auto* cached=static_cast<const uint8_t*>(move.cached_arena->fields[f].data_ptr())+int64_t(move.cached_slot)*count;
+                        refill.copy(gpu,cached,std::uint64_t(count));
+                    } else if(gpu_preserve) {
+                        refill.copy(gpu,incoming_copy(move,f),std::uint64_t(count));
+                    } else {
+                        MFQ_CUDA_CHECK(cudaMemcpyAsync(gpu,incoming_copy(move,f),
+                            std::size_t(count),cudaMemcpyHostToDevice,s.stream));
+                        ++s.upload_copies;s.direct_upload_bytes+=count;
+                    }
                     s.observe("direct_refill",f);
                 }
                 s.observe("upload",i);
@@ -925,6 +1188,8 @@ void MoeResidencyManager::apply_pending() {
     if(!s.work_pending.load(std::memory_order_acquire) && s.pending.empty() && !s.error)return;
     const bool decode=s.pending_tokens<=8;
     const PhaseClock apply_clock(s.apply_ns,decode?&s.decode_apply_ns:nullptr);
+    const auto started=std::chrono::steady_clock::now();
+    const auto joined=s.join_ns.load(),dma=s.dma_wait_ns.load(),maps=s.map_ns.load();
     {
         const PhaseClock join_clock(s.join_ns,decode?&s.decode_join_ns:nullptr);
         if(s.work_pending.load(std::memory_order_acquire)) {
@@ -935,6 +1200,15 @@ void MoeResidencyManager::apply_pending() {
     }
     if(s.error){auto failure=s.error;s.error=nullptr;std::rethrow_exception(failure);}
     publish_pending();
+    const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+    if(decode && elapsed>=4.0 && s.traced_decode_waits++<32)
+        std::cerr<<"runtime_moe_exchange_wait tokens="<<s.pending_tokens<<" ms="<<elapsed
+            <<" join_ms="<<(s.join_ns.load()-joined)/1e6
+            <<" dma_ms="<<(s.dma_wait_ns.load()-dma)/1e6
+            <<" map_ms="<<(s.map_ns.load()-maps)/1e6
+            <<" gpu_preserve="<<s.last_gpu_preserve<<" preserve_mb="<<s.last_preserve_bytes/1048576.0
+            <<" backup_mb="<<s.last_backup_bytes/1048576.0<<" backup_fields="<<s.last_backup_fields
+            <<" small_backup_mb="<<s.last_small_backup_bytes/1048576.0<<" small_backup_fields="<<s.last_small_backup_fields<<'\n';
 }
 void MoeResidencyManager::publish_pending() {
     auto& s=*impl_;
@@ -954,11 +1228,7 @@ void MoeResidencyManager::publish_pending() {
         const PhaseClock map_clock(s.map_ns,decode?&s.decode_map_ns:nullptr);
         for(const auto& move:s.pending)if(!cache.sources_[move.incoming_source]->cohorts_[move.cohort].arena->book->replacement_valid(move.replacement))
             throw std::runtime_error("adaptive GPU slot changed before publication");
-        for(std::size_t i=0;i<s.maps.size();++i) {
-            const auto& map=s.maps[i];auto& cohort=cache.sources_[map.source]->cohorts_[map.cohort];
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(cohort.active.expert_local.data_ptr<int32_t>(),map.next.data(),
-                map.next.size()*sizeof(int32_t),cudaMemcpyHostToDevice,s.stream));s.observe("map",i);
-        }
+        s.upload_maps();
         MFQ_CUDA_CHECK(cudaStreamSynchronize(s.stream));
         }
         const PhaseClock host_clock(s.host_exchange_ns,decode?&s.decode_host_exchange_ns:nullptr);

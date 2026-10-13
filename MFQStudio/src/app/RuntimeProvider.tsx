@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { runtimeApi, type QsaKvStorageSettings, type KvQuantizationSettings } from '../shared/api/resources/runtime';
+import { runtimeApi, type QsaKvStorageSettings, type KvQuantizationSettings, type KvMemorySettings } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
 import { browserServiceUrl, getApiToken, setApiBaseUrl, setApiToken } from '../shared/api/client';
 import type {
@@ -46,7 +46,7 @@ interface RuntimeContextValue {
   refreshError: string | null;
   jobStreamErrors: Record<string, string>;
   reloadingInstances: Record<string, number>;
-  reloadModelContext: (instanceId: string, contextSize: number | null, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings) => Promise<JobResource>;
+  reloadModelContext: (instanceId: string, contextSize: number | null, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings, kvMemory?: KvMemorySettings) => Promise<JobResource>;
 }
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
@@ -128,13 +128,13 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const reloadModelContext = useCallback(async (instanceId: string, contextSize: number | null, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings) => {
+  const reloadModelContext = useCallback(async (instanceId: string, contextSize: number | null, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings, kvMemory?: KvMemorySettings) => {
     const version = initializationVersion.current;
     if (reloads.current.has(instanceId)) throw new Error('Model reload is already in progress');
     reloads.current.add(instanceId);
     setReloadingInstances((current) => ({ ...current, [instanceId]: contextSize ?? 0 }));
     try {
-      const result = await runtimeApi.configureContext(contextSize, instanceId, yarnEnabled, qsaKvOffload, kvQuantization);
+      const result = await runtimeApi.configureContext(contextSize, instanceId, yarnEnabled, qsaKvOffload, kvQuantization, kvMemory);
       if (mounted.current && version === initializationVersion.current) {
         ++jobRequestVersion.current;
         useJobStore.getState().addJob(result);

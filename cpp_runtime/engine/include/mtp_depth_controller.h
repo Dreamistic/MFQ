@@ -17,7 +17,8 @@ class DepthController {
 public:
     explicit DepthController(int maximum_depth = 3,
             const DepthController* seed = nullptr,
-            double marginal_ms = 7.0, double exit_margin = 1.15)
+            double marginal_ms = 7.0, double exit_margin = 1.15,
+            bool gradual_warmup = false, double cold_window_ms = 0.0)
         : maximum_depth_(std::clamp(maximum_depth, 1, 5)),
           current_depth_(maximum_depth_),
           marginal_ms_(marginal_ms > 0.0 ? marginal_ms : 7.0),
@@ -25,11 +26,30 @@ public:
           acceptance_(static_cast<std::size_t>(maximum_depth_)),
           cycle_ms_(static_cast<std::size_t>(maximum_depth_ + 1)),
           cycle_age_ms_(static_cast<std::size_t>(maximum_depth_ + 1)) {
+        if(gradual_warmup && cold_window_ms>0.0 && (!seed || seed->measurement_order_.empty())) {
+            cold_window_ms_=cold_window_ms;cold_tokens_left_=48;cold_maximum_depth_=1;
+        }
         acceptance_.front() = 0.6;
-        for (int depth = maximum_depth_; depth > 0; --depth)
-            warmup_.push_back(depth);
-        if (maximum_depth_ > 1)
+        for (int index = 1; index <= maximum_depth_; ++index)
+            warmup_.push_back(gradual_warmup?index:maximum_depth_+1-index);
+        current_depth_=warmup_.front();
+        if (maximum_depth_ > 1) {
             warmup_.insert(warmup_.end(), {0, 0, 0});
+            // The initial sweep follows prefill and can include several cold
+            // transfer/cache cycles even when graphs were captured at load.
+            // Revisit every speculative width after the baseline has run;
+            // otherwise a cold first measurement can suppress that width until
+            // the multi-second stale-depth probe. update_time uses the warmup
+            // minimum, so calibration can replace the cold cost immediately.
+            for (int depth = maximum_depth_; depth > 0; --depth)
+                warmup_.push_back(depth);
+            // A fresh CUDA session is still adapting expert residency during
+            // the first revisit. Refresh every width once more before those
+            // transient costs can park MTP for the rest of a short response.
+            // Continuations and re-entry already have an inherited policy.
+            if(gradual_warmup && (!seed || seed->measurement_order_.empty()))
+                for(int depth=maximum_depth_;depth>0;--depth)warmup_.push_back(depth);
+        }
         if (seed && !seed->measurement_order_.empty()) {
             for (int position = 0; position < std::min(maximum_depth_, seed->maximum_depth_); ++position)
                 acceptance_[static_cast<std::size_t>(position)] = seed->acceptance_[static_cast<std::size_t>(position)];
@@ -44,7 +64,7 @@ public:
         }
     }
 
-    int depth() const noexcept { return current_depth_; }
+    int depth() const noexcept { return cold_tokens_left_>0?std::min(current_depth_,cold_maximum_depth_):current_depth_; }
     int maximum_depth() const noexcept { return maximum_depth_; }
     bool warming_up() const noexcept { return !warmup_.empty(); }
     bool should_exit() const noexcept { return exit_streak_ >= 16; }
@@ -62,6 +82,16 @@ public:
             bool time_sample = true) {
         used_depth = std::clamp(used_depth, 0, maximum_depth_);
         accepted_drafts = std::clamp(accepted_drafts, 0, used_depth);
+        if(cold_tokens_left_>0) {
+            cold_tokens_left_=std::max(0,cold_tokens_left_-accepted_drafts-1);
+            // Bound the first widening by recently observed latency. A linear
+            // row-cost estimate is conservative while expert residency adapts;
+            // normal throughput-based selection resumes after 48 output tokens.
+            // Maintenance must not authorize widening from an unmeasured cycle.
+            if(time_sample && used_depth==cold_maximum_depth_ && used_depth<maximum_depth_ &&
+                    cycle_ms*double(used_depth+2)/double(used_depth+1)<=cold_window_ms_)
+                ++cold_maximum_depth_;
+        }
         for (int position = 0; position < used_depth; ++position) {
             const auto index = static_cast<std::size_t>(position);
             if (!acceptance_[index]) acceptance_[index] = conditional_acceptance(position);
@@ -75,9 +105,9 @@ public:
         if (time_sample) cycle_age_ms_[static_cast<std::size_t>(used_depth)] = 0.0;
         milliseconds_since_probe_ += cycle_ms;
         milliseconds_since_explore_ += cycle_ms;
-        exit_streak_ = speculation_losing() ? exit_streak_ + 1 : 0;
+        if (time_sample) exit_streak_ = speculation_losing() ? exit_streak_ + 1 : 0;
         if (!warmup_.empty()) {
-            if (!time_sample) return;
+            if (!time_sample || used_depth != warmup_.front()) return;
             warmup_.erase(warmup_.begin());
             if (!warmup_.empty()) {
                 current_depth_ = warmup_.front();
@@ -88,6 +118,7 @@ public:
             return;
         }
         if (probe_left_ > 0) {
+            if (!time_sample || used_depth != current_depth_) return;
             --probe_left_;
             if (probe_left_ == 0) {
                 current_depth_ = best_depth();
@@ -223,6 +254,8 @@ private:
     int current_depth_;
     int probe_left_ = 0;
     int exit_streak_ = 0;
+    int cold_tokens_left_=0,cold_maximum_depth_=1;
+    double cold_window_ms_=0.0;
     double marginal_ms_;
     double exit_margin_;
     double milliseconds_since_probe_ = 0.0;
@@ -236,13 +269,13 @@ private:
 
 class PolicyState {
 public:
-    DepthController begin(int maximum_depth) const {
+    DepthController begin(int maximum_depth,bool gradual_warmup=false,double cold_window_ms=0.0) const {
         double margin = 1.15;
         if (loop_tax_) {
             const double age = std::chrono::duration<double>(Clock::now()-loop_tax_time_).count();
             margin += (*loop_tax_-margin) * std::exp(-age/600.0);
         }
-        return DepthController(maximum_depth, seed_ ? &*seed_ : nullptr, 7.0, margin);
+        return DepthController(maximum_depth, seed_ ? &*seed_ : nullptr, 7.0, margin,gradual_warmup,cold_window_ms);
     }
     void remember(const DepthController& controller) { seed_ = controller; }
     void record_loop_tax(double baseline_ms, const std::vector<double>& samples) {
@@ -299,10 +332,10 @@ struct ParkState {
 template<class DsparkController>
 class GenerationPolicy {
 public:
-    GenerationPolicy(int maximum_depth, bool dspark, PolicyState* state = nullptr)
-        : state_(state ? *state : local_state_) {
+    GenerationPolicy(int maximum_depth, bool dspark, PolicyState* state = nullptr,bool gradual_warmup=false)
+        : state_(state ? *state : local_state_),gradual_warmup_(gradual_warmup) {
         if (dspark) dspark_.emplace(maximum_depth);
-        else controller_.emplace(state_.begin(maximum_depth));
+        else controller_.emplace(state_.begin(maximum_depth,gradual_warmup_,gradual_warmup_?60.0:0.0));
     }
     ~GenerationPolicy() { if (controller_) state_.remember(*controller_); }
     int depth() const noexcept {
@@ -332,7 +365,7 @@ public:
         park_.observe_plain(elapsed_ms, state_, time_sample);
         if (park_.probe_ready()) {
             park_.begin_probe();
-            controller_.emplace(state_.begin(controller_->maximum_depth()));
+            controller_.emplace(state_.begin(controller_->maximum_depth(),gradual_warmup_));
             ++reentries_;
         }
     }
@@ -341,6 +374,7 @@ public:
 private:
     PolicyState local_state_;
     PolicyState& state_;
+    bool gradual_warmup_=false;
     std::optional<DepthController> controller_;
     std::optional<DsparkController> dspark_;
     ParkState park_;

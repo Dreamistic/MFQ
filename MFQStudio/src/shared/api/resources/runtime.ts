@@ -39,6 +39,12 @@ export interface RuntimeContextPolicy {
   model_yarn_enabled?: Record<string, boolean>;
   model_qsa_kv_offload?: Record<string, QsaKvStorageSettings>;
   model_kv_quantization?: Record<string, KvQuantizationSettings>;
+  model_kv_memory?: Record<string, KvMemorySettings>;
+}
+
+export interface KvMemorySettings {
+  placement: 'auto' | 'auto_ssd' | 'vram' | 'ram';
+  allocation: 'preallocated' | 'dynamic';
 }
 
 export interface KvQuantizationSettings {
@@ -261,9 +267,9 @@ export const runtimeApi = {
     return request(`/api/v1/runtime/yarn/${encodeURIComponent(instanceId)}`);
   },
 
-  configureContext(contextSize: number | null, instanceId: string, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings): Promise<JobResource> {
+  configureContext(contextSize: number | null, instanceId: string, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings, kvMemory?: KvMemorySettings): Promise<JobResource> {
     return request('/api/v1/runtime/context', {
-      method: 'POST', body: JSON.stringify({ context_size: contextSize, instance_id: instanceId, yarn_enabled: yarnEnabled, qsa_kv_offload: qsaKvOffload, kv_quantization: kvQuantization }),
+      method: 'POST', body: JSON.stringify({ context_size: contextSize, instance_id: instanceId, yarn_enabled: yarnEnabled, qsa_kv_offload: qsaKvOffload, kv_quantization: kvQuantization, kv_memory: kvMemory }),
     });
   },
 

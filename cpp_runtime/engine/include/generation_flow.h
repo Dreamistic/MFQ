@@ -103,6 +103,7 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
     std::vector<int64_t> history = prompt;
     Hidden last_target_hidden;
     std::size_t last_snapshot = 0;
+    bool initial_snapshot_attempted = false;
     const auto snapshot = [&] {
         const auto position = model.cache_pos;
         if (!caching || output.result.cancelled || position <= 0 ||
@@ -141,10 +142,19 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
             history.insert(history.end(), delta->token_ids.begin(), delta->token_ids.end());
             // The first MTP token is yielded after predictor prompt priming,
             // while the target still holds the complete prompt boundary.
-            if (use_mtp && caching && !last_snapshot)
+            if (use_mtp && caching && !initial_snapshot_attempted) {
+                initial_snapshot_attempted = true;
                 snapshot();
+            }
         }
         co_yield std::move(step);
+    }
+    // Flush parser-held text before a final session snapshot can copy or evict
+    // a large cache. The executor's terminal finish remains idempotent and
+    // still reports cleanup/cache completion after this final text event.
+    if(caching) {
+        auto tail=output.finish();
+        if(!tail.diffs.empty())co_yield std::move(tail);
     }
     snapshot();
     cleanup.finish();

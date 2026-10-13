@@ -76,11 +76,14 @@ template <typename Model> struct CudaGenerationOps {
         PrefillCudaTimer timer;
         auto ids = full_ids.narrow(1, chunk.offset, chunk.count).contiguous();
         Tensor hidden;
+        bool layer_major=false;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
             if((!prepared || !prepared->transformed()) &&
-                qwen4_layer_major_prefill_eligible(model,chunk.count))
+                qwen4_layer_major_prefill_eligible(model,chunk.count)) {
+                layer_major=true;
                 hidden=qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,true,
                     [&] {return output && output->stopped();});
+            }
         }
         if(output && output->stopped()) {
             MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
@@ -113,7 +116,11 @@ template <typename Model> struct CudaGenerationOps {
             pending = mfq::cuda::sample_logits(sampler, std::move(logits), counts, constraint);
         } else
             MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
-        return timer.elapsed_ms();
+        const auto elapsed=timer.elapsed_ms();
+        if(graph_config.trace)std::cerr<<"runtime_prefill_chunk offset="<<chunk.offset
+            <<" tokens="<<chunk.count<<" layer_major="<<layer_major
+            <<" compute_chunk="<<prefill_compute_chunk<<" elapsed_ms="<<elapsed<<'\n';
+        return elapsed;
     }
     std::int64_t first_token() { return pending.template item<int64_t>(); }
 
@@ -272,6 +279,8 @@ template <class Model> struct CudaGenerationContext {
     void prepare_request(const mfq::engine::InferenceRequest& input) {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            model.decode_reserve_until=std::min<int64_t>(model.max_position_embeddings(),
+                int64_t(input.prompt.size())+std::min<int64_t>(input.sampling.max_tokens,256));
             if(!batching && input.prompt.size()>1024) {
                 finish_moe_expert_exchanges(model.execution->moe_expert_cache);
                 if(model.cache_pos==0 && !model.graph_registry)
@@ -306,9 +315,10 @@ template <class Model> struct CudaGenerationContext {
             // Retire prefill buffers before copying KV/recurrent state. Evict
             // old hot entries before allocating the incoming checkpoint.
             release_moe_prefill_buffers(model.execution->moe_expert_cache);
-            std::size_t incoming=0,hot=0,limit=0;
-            for(const auto& metric:qwen4_cache_memory_metrics(model,mtp))
-                if(metric.first=="kv_cache_bytes")incoming=std::size_t(metric.second);
+            // A prefix stores occupied rows, not the full preallocated context
+            // or graph-owned speculative checkpoints.
+            const auto incoming=qwen4_prefix_snapshot_bytes(model,mtp);
+            std::size_t hot=0,limit=0;
             for(const auto& metric:cache.metrics()) {
                 if(metric.first=="prefix_cache_hot_bytes")hot=std::size_t(metric.second);
                 if(metric.first=="prefix_cache_max_bytes")limit=std::size_t(metric.second);

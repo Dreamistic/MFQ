@@ -504,6 +504,7 @@ void FlashNextBatchOperations::initialize_prefill(
         if(!active) {
             // The preceding exclusive request's global KV/recurrent state is
             // unused while independent batch rows own their own context.
+            qwen4_release_decode_graphs(model_,nullptr);
             model_.reset(1);
             release_moe_decode_buffers(execution_.moe_expert_cache);
             default_context(execution_.layer_placement.primary_device())->reclaim_idle_memory();
@@ -556,6 +557,7 @@ std::vector<mfq::engine::PrefillBatchResult<FlashNextBatchOperations::Sample>>
 FlashNextBatchOperations::prefill_batch(
         const std::vector<std::pair<std::shared_ptr<Request>,mfq::engine::PrefillChunk>>& items) {
     MfqCudaGuard guard(execution_.layer_placement.primary_device());
+    qwen4_release_decode_graphs(model_,nullptr);
     model_.adapter_begin_forward(false);
     release_moe_decode_buffers(execution_.moe_expert_cache);
     std::vector<mfq::engine::PrefillBatchResult<Sample>> result(items.size());

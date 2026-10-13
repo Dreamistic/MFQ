@@ -1,0 +1,196 @@
+# CUDA KV memory policies
+
+The CUDA Flash-Next/QSA worker exposes `kv_memory` in model load requests and
+per-model context settings. It is independent of `kv_quantization`; FP16 remains
+the default. Metal keeps its existing dynamic allocation and storage controls.
+
+```json
+{"kv_memory": {"placement": "auto", "allocation": "preallocated"}}
+```
+
+| Placement | Raw K/V storage |
+| --- | --- |
+| `vram` | Preallocated GPU storage; reject a context that cannot fit. |
+| `ram` | Preallocated mapped host memory, accessible to CUDA kernels. |
+| `auto` (default) | GPU storage first, then a preallocated RAM arena; no SSD fallback. |
+| `auto_ssd` | GPU storage, RAM LRU, then SSD. Disk storage is created on first spill. |
+
+Indexer rows, pooled index keys, recurrent state and compute scratch remain on
+the GPU. Capacity admission accounts for dense weights, the minimum expert
+working set and compute reserve. Expert residency is reduced by the concrete KV
+reservation so prefill transfer buffers retain headroom. Windows additionally
+retains shared-memory budget for mapped plans and pinned transfer buffers.
+
+`allocation: "dynamic"` is experimental. The virtual-memory helper is adapted
+from local Strata under its MIT license. It reserves stable addresses for the
+configured context, initially maps up to 16K tokens of raw KV, and grows in 8K
+steps rounded to the driver's allocation granularity. Existing KV is not copied
+when pages are added. Indexer storage is currently preallocated.
+
+Dynamic allocation currently requires GPU-resident raw KV (`vram` or `auto`).
+Growth headroom is retained in the expert budget; direct physical-page exchange
+with expert arenas is not implemented. Additional concurrent sessions are
+admitted against available GPU memory; explicit RAM placement uses mapped RAM
+for each session. Unsupported model backends do not advertise these controls.
+
+The default CUDA allocation policy is preallocation. Capacity failures without
+SSD use `kv_memory_insufficient`; the Studio message offers enabling SSD KV or
+reducing context length. Settings are persisted per model after a successful
+reload, and a failed reload restores the previous settings.
+
+Local Strata reference `fb58e0dbc8399662c0e47c76578c6e878b14f6cf` defaults to a
+4096-token context. Its context default is fixed; its automatic expert-cache
+budget is computed from remaining memory after model, KV and workspace costs.
+
+Native regression coverage includes four placements, RAM/SSD spill ordering,
+generation parity, reset, prefix restore, MTP, continuous batching and stable
+addresses/data across virtual-memory growth.
+
+The Flash-Next service retains compatible CUDA decode graphs across request
+reset and prefix restoration when KV addresses are stable. GDN/PLE state is
+cleared or restored in place, while QSA pooled keys are refreshed after prefill
+and restoration. Expert-budget changes and switching to independent batch
+execution invalidate graphs before their transfer buffers are released.
+
+Loading prepares ordinary single-token graphs, target verification widths 1–4
+and predictor widths 1–4. Short adaptive catch-up uses the same four-row windows.
+The largest predictor
+is prepared first so smaller shapes share its transfer buffer. Diverse synthetic
+token IDs and two additional replay sweeps exercise the captured widths during
+loading. All synthetic model and predictor state is cleared afterwards. This work adds
+to model loading rather than interrupting the first generated response.
+Long-prompt prefill bounds its compute tile by remaining VRAM while these graphs
+are retained; `runtime_prefill_chunk_budget` reports the requested and selected
+tile sizes. The logical prompt chunk and configured context capacity do not
+change. New, unprepared graph geometries can still incur a first-use capture.
+MTP continuations of up to 128 new tokens reuse the existing target windows;
+short predictor priming uses windows of up to four tokens. Predictor graph
+execution retires prefill expert images before replay. First replay costs after
+each request's prefill are excluded from adaptive draft-depth timing.
+
+CUDA Flash-Next also runs up to 64 synthetic output tokens through the complete
+MTP generation loop after graph capture. This exercises sampling, draft-history
+replay and commit/rollback paths before accepting requests. It clears synthetic
+KV, generation metrics and adaptive-depth policy afterwards. The extra loading
+work is bounded by the model context; `MFQ_QWEN4_WARMUP_MTP=0` disables it.
+
+Whole-layer prefill asynchronously records each target layer's last 32 routed
+tokens into a reusable GPU buffer. One combined D2H copy retrieves the samples
+at the decode boundary, avoiding tiny per-layer transfers that compete with
+prefill expert streaming. Before long MTP predictor priming,
+after the target workspace loan has returned, the residency manager prepares
+experts using this real prompt tail. Earlier prompt chunks replace their samples
+rather than accumulating an entire long prompt's counts. The tail has a four-token
+half-life (about six token-equivalents), so a long prompt does not dominate
+subsequent decode heat. Usual transactional publication,
+rollback and memory limits still apply. This moves an initial exchange into the
+reported prefill time. `MFQ_MOE_PREFILL_RESIDENCY=0` disables the observation, and
+`runtime_moe_prefill_residency` reports its exchanged projections and elapsed time.
+
+Adaptive MTP calibration revisits speculative widths after the ordinary-decode
+baseline. CUDA Flash-Next visits shallow widths before wider verification in its
+initial sweep, including re-entry after ordinary decoding. Other backends retain
+their existing initial order. A fresh CUDA policy repeats the width sweep once
+more after initial residency adaptation; inherited continuation policies keep
+the shorter calibration. Several cold transfer/cache cycles can survive graph warmup; a single
+slow first sample must not suppress a width until the multi-second exploration
+interval. Calibration uses the fastest valid sample for each width, followed by
+the existing steady-state estimator. Maintenance cycles and widths shortened by
+the output/context limit do not consume calibration or probe samples. Acceptance
+measurements still include those cycles, and consistently costly speculation
+can still select ordinary decoding.
+
+A fresh CUDA policy initially caps verification at one draft token. During the
+first 48 emitted tokens, widening requires the observed cycle time, scaled by
+the next verification width, to fit a 60 ms budget. This is a startup estimate,
+not a hard inter-token latency guarantee: actual expert routes and transfers
+can change between windows. Inherited continuation policies keep throughput
+selection without this cold-start cap. Maintenance samples cannot authorize
+widening, and the bounded startup period prevents permanent under-calibration.
+
+During active ordinary-decode calibration, predictor history is replayed every
+four tokens through the already captured four-row graph. Parked speculation
+retains the larger history batch. Re-entry combines at most 128 pending history
+rows with the current row, avoiding a separate one-row predictor launch while
+preserving token positions and committed KV history.
+`MFQ_MTP_HISTORY_EARLY_FLUSH=0` restores the previous 512-row flush threshold.
+
+Fresh single-device, layer-major Flash-Next prefill can borrow expert-cache tails
+while retaining decode graphs. This follows local Strata's `plan_lend` / `lend`
+design: count compute workspace and the layer transfer ring together, then
+temporarily stream the experts whose GPU storage is borrowed. MFQ preserves the
+original allocations and slot books. It saves one compressed RAM copy of the
+borrowed tails and builds temporary cold expert maps; two reusable host staging
+buffers upload their weights with each layer. RAM prefix storage yields capacity
+before these backups are allocated.
+
+Temporary CUDA allocations reuse free slices of the borrowed regions on the
+prefill compute stream. Releasing a tensor returns its slice for later phases,
+so sequential scratch does not accumulate. Persistent state and graph allocations
+bypass the loan. On completion, the final residual is detached, transfer readers
+are synchronized, all borrowed tensors are released, and original weights are
+restored at the same addresses. Cancellation and exceptions use the same cleanup.
+Decode rejects an outstanding loan if cleanup cannot complete.
+
+`runtime_prefill_loan` reports borrowing and return. `MFQ_PREFILL_BORROW=0`
+disables this path; `force` is a diagnostic override used by small native tests.
+The current compute estimate remains conservative rather than Strata's exact
+`Prefill::bytes_needed` formula. Free memory, transfer growth, fragmented expert
+fields and the minimum resident expert set can still require a smaller compute
+tile. Cached long continuations and other model/prefill paths retain their
+existing allocation policy. Ordinary expert-cache resizing remains a separate
+operation that invalidates graphs and the contiguous layer-prefill layout.
+
+MTP teacher-forced prompt priming also borrows workspace when its predictor
+expert image and compute tiles exceed available memory. A single predictor layer
+uses one transfer slot; multiple layers may overlap two slots.
+Gate/Up and Down transfer images are allocated separately during a single-layer
+loan so they can use separate expert regions rather than requiring one oversized
+contiguous allocation. Persistent
+predictor positions bypass the loan. A short priming tail returns the loan before
+using decode graphs, and cancellation releases it with the speculative session.
+Borrowing and restoration time is included in prefill timing.
+
+Speculative generation publishes each committed token batch before computing
+the next draft chain. Consumer/network delay is excluded from the next MTP cost
+sample. Cancellation between batches updates committed predictor history without
+running another speculative chain. The CUDA worker reports early cycles above
+55 ms as `runtime_mtp_slow_cycle`, separating draft, verification and commit time
+and reporting target expert transfer bytes. `MFQ_TRACE_MOE_SERVE` additionally
+reports decode-window reset, graph launch, service and final wait times.
+
+Expert residency exchanges retain their full adaptation rate. Transactions may
+mix incoming weights already held in the GPU transfer cache with uncached RAM
+weights: only uncached incoming fields need to be preserved before victims are
+copied directly into their final RAM locations. When the existing GPU transfer
+wire has sufficient payload space, it holds those incoming fields instead,
+eliminating the CPU backup copy without allocating more VRAM. Only uncached
+fields occupy this compact payload; cached fields leave no unused gaps. Its control header
+is preserved; the expert fence retires previous consumers and the next decode
+waits for the transaction before reusing it. Insufficient wire space uses pinned
+RAM backups. Cached incoming fields refill
+from GPU storage. Publication and rollback preserve both kinds of original
+weights. GPU-wire exchanges pipeline H2D preservation and D2H victim backups
+on separate streams in groups of up to 8 MiB. A group fence protects each RAM
+source until its original weights have been preserved; cached incoming fields
+can begin their victim backups immediately. Refill and publication wait for all
+backups, and rollback drains both streams before restoring bytes.
+Large victim fields retain direct D2H DMA. Fields up to 64 KiB inside the
+registered RAM arena share one mapped-write kernel after the preservation
+fences. This removes small per-field DMA submissions while large transfers
+can still overlap the graph tail. Fields outside that arena or beyond descriptor
+capacity keep their individual DMA path. `MFQ_MOE_RESIDENCY_SMALL_BACKUP_BYTES=0`
+disables this batching; its default limit is 65536 bytes. The exchange-wait log
+includes total and batched backup bytes/field counts.
+`MFQ_MOE_RESIDENCY_DUPLEX=0` retains the serial transfer path. One reusable pinned
+image also supplies expert-map uploads. One mapped-copy kernel publishes all
+maps after the previous window retires, avoiding a separate DMA submission for
+each small map. Both its descriptors and payload remain alive through completion
+and rollback.
+
+Prefix snapshot admission counts occupied KV rows and recurrent state, excluding
+unused KV capacity and speculative graph checkpoints. An unsuccessful initial
+MTP snapshot is retried at request completion, rather than after every token.
+Parser-held trailing text is flushed before the final prefix snapshot. Cache
+storage and cleanup still finish before the terminal event; they no longer hold
+back the last visible characters of an otherwise completed response.
