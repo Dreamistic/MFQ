@@ -558,6 +558,22 @@ def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, r
         assert int(metrics["packed_prefills"]) > 0
 
 
+async def _fresh_idle_status(client):
+    # Status uses the scheduler's nonblocking 250 ms snapshot. Require a
+    # snapshot captured after this call before asserting final counters.
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    while loop.time() - started < 5:
+        requested = loop.time()
+        status = await client.status()
+        if (status["runtime_metrics_age_ms"] <= (requested - started) * 1000
+                and status.get("active_requests", 0) == 0
+                and status.get("continuous_batching_active", 0) == 0):
+            return status
+        await asyncio.sleep(0.02)
+    raise AssertionError("runtime metrics did not publish an idle snapshot")
+
+
 @pytest.mark.parametrize("requests", [2, 32])
 def test_cuda_flash_next_stdio_batches_normal_chat_requests(tmp_path, requests):
     from mfq.server.runtime.client import StdioRuntimeClient
@@ -599,7 +615,7 @@ def test_cuda_flash_next_stdio_batches_normal_chat_requests(tmp_path, requests):
                         for event in events for choice in event.get("choices",[]))
                 assert list(map(text,parallel)) == list(map(text,reference))
                 assert list(map(text,parallel)) == ["ab"*32] + ["a"*32] * (requests-1)
-                status = await client.status()
+                status = await _fresh_idle_status(client)
                 (tmp_path / "worker-status.json").write_text(json.dumps(status,indent=2),encoding="utf-8")
                 assert status["continuous_batching_admissions"] == 2 * requests
                 assert status["continuous_batching_cuda_graph_replays"] > 0
@@ -648,7 +664,7 @@ def test_cuda_flash_next_stdio_mtp_avoids_ordinary_batch_path(tmp_path):
                         "stream":True,"stream_options":{"include_usage":True},
                         "mfq_prefix_cache_enabled":False}) as events:
                         chunks=[event async for event in events if event is not None]
-                    after=await client.status()
+                    after=await _fresh_idle_status(client)
                     text="".join(choice.get("delta",{}).get("content","")
                         for event in chunks for choice in event.get("choices",[]))
                     assert text=="a"*16
