@@ -14,13 +14,6 @@ from pathlib import Path
 
 _DIR = os.path.dirname(__file__)
 _REPOSITORY_ROOT = str(Path(_DIR).resolve().parents[2])
-_HIP_RUNTIME_INCLUDE = str(Path(_REPOSITORY_ROOT) / "cpp_runtime" / "backends" / "hip" / "include")
-_CORE_INCLUDE = str(Path(_REPOSITORY_ROOT) / "cpp_runtime" / "core" / "include")
-_GGML_ROOT = Path(_REPOSITORY_ROOT) / "cpp_runtime" / "components" / "ggml"
-_GGML_INCLUDE = str(_GGML_ROOT / "include")
-_GGML_SOURCE_INCLUDE = str(_GGML_ROOT / "src")
-_GGML_HIP_INCLUDE = str(_GGML_ROOT / "src" / "ggml-hip")
-_GGML_VENDORS_INCLUDE = str(_GGML_ROOT / "src" / "ggml-hip" / "vendors")
 _SOURCES = [
     os.path.join(_DIR, "norm.hip"),
     os.path.join(_DIR, "acc.hip"),
@@ -52,22 +45,29 @@ def ext():
     global _module
     if _module is None:
         import torch
-        from torch.utils.cpp_extension import load
+        from torch.utils.cpp_extension import _get_build_directory, load
+
+        from ._build import stage_sources
 
         if not torch.version.hip:
             raise RuntimeError("the HIP kernel extension requires a ROCm build of torch")
+        build_directory = Path(_get_build_directory("mfq_hip", verbose=False))
+        root = stage_sources(Path(_REPOSITORY_ROOT), build_directory)
+        kernel = root / "mfq/kernels/hip"
+        ggml = root / "cpp_runtime/components/ggml"
         _module = load(
             name="mfq_hip",
-            sources=_SOURCES,
+            sources=[str(kernel / Path(source).name) for source in _SOURCES],
+            build_directory=str(build_directory),
             extra_include_paths=[
-                _DIR,
-                _REPOSITORY_ROOT,
-                _HIP_RUNTIME_INCLUDE,
-                _CORE_INCLUDE,
-                _GGML_INCLUDE,
-                _GGML_SOURCE_INCLUDE,
-                _GGML_HIP_INCLUDE,
-                _GGML_VENDORS_INCLUDE,
+                str(kernel),
+                str(root),
+                str(root / "cpp_runtime/backends/hip/include"),
+                str(root / "cpp_runtime/core/include"),
+                str(ggml / "include"),
+                str(ggml / "src"),
+                str(ggml / "src/ggml-hip"),
+                str(ggml / "src/ggml-hip/vendors"),
             ],
             extra_cflags=["-std=c++20"],
             # The CUDA build undefines __CUDA_NO_HALF_OPERATORS__ and friends

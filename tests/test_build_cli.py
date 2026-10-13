@@ -146,6 +146,19 @@ def test_cuda_build_plan_is_native_and_does_not_import_or_configure_torch(
     assert "from torch" not in source
 
 
+@pytest.mark.parametrize("backend", ["cuda", "hip", "metal"])
+def test_build_plan_disables_unselected_accelerators(tmp_path, monkeypatch, backend):
+    monkeypatch.setattr(build, "detect_backend", lambda _: backend)
+    monkeypatch.setattr(build, "_mlx_root", lambda: tmp_path / "mlx")
+    monkeypatch.setattr(build.shutil, "which", lambda name: "/usr/bin/cmake" if name == "cmake" else None)
+    monkeypatch.delenv("ROCM_PATH", raising=False)
+    monkeypatch.delenv("ROCM_HOME", raising=False)
+    plan = build.create_build_plan(backend=backend, build_dir=tmp_path)
+    for name in ("CUDA", "HIP", "METAL"):
+        expected = "ON" if name.lower() == backend else "OFF"
+        assert f"-DMFQ_BUILD_{name}_RUNTIME={expected}" in plan.configure_command
+
+
 def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> None:
     cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"

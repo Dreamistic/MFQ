@@ -293,6 +293,8 @@ def create_build_plan(
         configure.extend(
             [
                 "-DMFQ_BUILD_METAL_RUNTIME=ON",
+                "-DMFQ_BUILD_CUDA_RUNTIME=OFF",
+                "-DMFQ_BUILD_HIP_RUNTIME=OFF",
                 f"-DMFQ_MLX_ROOT={_mlx_root()}",
             ]
         )
@@ -323,7 +325,7 @@ def create_build_plan(
         if rocm:
             configure.append(f"-DROCM_PATH={rocm}")
     elif selected == "cuda":
-        configure.extend(["-DMFQ_BUILD_CUDA_RUNTIME=ON"])
+        configure.extend(["-DMFQ_BUILD_CUDA_RUNTIME=ON", "-DMFQ_BUILD_HIP_RUNTIME=OFF"])
     configure.extend(str(value) for value in cmake_args)
     parallelism = jobs if jobs is not None else max(1, os.cpu_count() or 1)
     if parallelism < 1:
