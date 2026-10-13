@@ -15,6 +15,7 @@
 struct MoeFfnPrefillHostWorkspace;
 class MoeExpertCache {
 public:
+    bool layer_prefill_ready() const { return pipeline_prefill_layer_layout_ && pipeline_ram_registered_bytes_>0; }
     MoeExpertCache(
             int64_t budget_bytes,
             const CudaExecutionConfig& config)
@@ -220,6 +221,12 @@ public:
     }
 
     void finalize();
+    void resize(std::size_t bytes);
+    std::size_t minimum_bytes() const {
+        std::size_t result=0;
+        for(const auto& [signature,arena]:arenas_)result+=std::size_t(arena->minimum_slots)*arena->slot_bytes;
+        return result;
+    }
 
     void set_profile(mfq::MoeCacheProfile profile) {
         if (finalized_ || !sources_.empty()) {

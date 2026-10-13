@@ -15,7 +15,7 @@ class WeightMemoryLedger {
 public:
     void observe(const std::shared_ptr<TensorStorage>& storage);
     void observe_ple(const std::shared_ptr<void>& owner,std::size_t bytes);
-    std::size_t resident_bytes() const;
+    std::size_t resident_bytes(int device = -1) const;
     std::size_t ple_bytes() const;
 };
 

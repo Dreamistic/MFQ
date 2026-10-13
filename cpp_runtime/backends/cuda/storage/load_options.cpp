@@ -373,6 +373,7 @@ void setup_cuda_load(
     if (options.cpu_threads > 0) {
         mfq_set_num_threads(options.cpu_threads);
     }
+    execution.yarn_context_extension=options.yarn_context_extension;
     configure_model_parallel(
         execution, options.tensor_parallel_arg, options.tensor_split_arg,
         options.expert_parallel_arg, options.expert_split_arg,

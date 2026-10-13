@@ -53,7 +53,7 @@ export function QsaKvOffloadPanel({ model, context, enabled, budget, separateVra
     <div id={contentId} className="qsa-kv-body" hidden={!expanded}>
       <p className="qsa-kv-description">{supported
         ? separateVram
-          ? tr('KV Cache 保存在显存热层，淘汰后进入内存流式层；内存层按 LRU 淘汰到 SSD。前缀缓存单独使用显存热层与 SSD 冷层。', 'Active KV uses a VRAM hot tier, a RAM LRU tier and SSD overflow. Prefix cache separately uses VRAM and SSD.')
+          ? tr('KV Cache 保存在显存热层，淘汰后进入内存流式层；内存层按 LRU 淘汰到 SSD。RAM 前缀缓存优先给活跃 KV 让出内存。', 'Active KV uses a VRAM hot tier, a RAM LRU tier and SSD overflow. RAM prefix caches yield memory to active KV first.')
           : tr('KV Cache 使用内存热层与 SSD 流式层，常驻预算限制内存占用。', 'KV cache uses a RAM hot tier and SSD streaming tier, with residency bounded by the memory budget.')
         : tr('仅支持具备此后端能力的 QSA 模型，其它模型不能启用。', 'Requires a QSA model and a backend with streaming sparse attention support.')}</p>
       <div className="qsa-kv-fields qsa-kv-model-settings-fields">

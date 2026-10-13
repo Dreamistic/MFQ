@@ -39,6 +39,10 @@ class SessionSnapshotCache {
     };
 
 public:
+    template <class Visitor> void visit_states(Visitor&& visitor) const {
+        for (const auto& [id, history] : states_)
+            for (const auto& entry : history) visitor(entry.state);
+    }
     struct Match {
         State* state = nullptr;
         std::string session_id;

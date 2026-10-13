@@ -299,11 +299,13 @@ describe('useModelCatalog', () => {
     act(() => {
       result.current.setLoadPinned(true);
       result.current.setLoadIdleTtl(300);
+      result.current.setLoadDeviceIds(['2']);
     });
     await act(async () => result.current.loadArtifact(artifact.name));
     expect(load).toHaveBeenCalledWith('Local Model', 8192, 2048, {
       pin: true,
       idle_ttl_seconds: 300,
+      device_ids: ['2'],
     });
     expect(state.refreshRuntime).toHaveBeenCalledWith(false);
     expect(state.setSelectedModel).toHaveBeenCalledWith('Local Model');

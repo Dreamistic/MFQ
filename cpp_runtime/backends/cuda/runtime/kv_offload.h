@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <functional>
 
 namespace mfq::cuda {
 struct KvOffloadConfig {
@@ -28,6 +29,7 @@ public:
     const KvOffloadConfig& config() const;
     std::vector<std::pair<std::string, double>> metrics() const;
     void flush();
+    void set_ram_reservation(std::function<void(std::size_t)> reserve);
 private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
@@ -35,7 +37,8 @@ private:
 
 class KvOffloadSequence {
 public:
-    KvOffloadSequence(std::shared_ptr<KvOffloadStore> store, int64_t width, int64_t block_rows);
+    KvOffloadSequence(std::shared_ptr<KvOffloadStore> store, int64_t width, int64_t block_rows,
+        mfq_tensor_backend::ScalarType dtype = mfq_tensor_backend::kFloat16);
     int64_t position() const { return position_; }
     void reset();
     void truncate(int64_t position);
@@ -45,6 +48,7 @@ public:
 private:
     std::shared_ptr<KvOffloadStore> store_;
     int64_t width_, block_rows_, position_ = 0;
+    mfq_tensor_backend::ScalarType dtype_;
     std::vector<KvOffloadStore::BlockPtr> blocks_;
 };
 }

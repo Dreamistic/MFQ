@@ -1,5 +1,6 @@
 #include "mfq_cuda_context.h"
 #include "mfq_cuda_resident_allocations.h"
+#include "mfq/runtime.h"
 
 #include <algorithm>
 #include <atomic>
@@ -57,7 +58,7 @@ struct AllocationBudget {
         do {
             if(bytes>std::numeric_limits<std::size_t>::max()-before ||
                 (limit && (before>limit || bytes>limit-before)))
-                throw Error("CUDA VRAM limit exceeded: requested="+std::to_string(bytes)+
+                throw MfqResourceExhausted("CUDA VRAM limit exceeded: requested="+std::to_string(bytes)+
                     " allocated="+std::to_string(before)+" limit="+std::to_string(limit));
         } while(!allocated.compare_exchange_weak(before,before+bytes,std::memory_order_relaxed));
         auto maximum=peak.load(std::memory_order_relaxed);
@@ -733,6 +734,14 @@ void Context::reclaim_idle_memory() {
     trim_pool_pages();
 }
 
+void Context::set_memory_limit(std::size_t bytes) {
+    // Called by the engine only while no requests or expert transfers are active.
+    reclaim_idle_memory();
+    if(bytes && bytes < std::max(memory_stats().allocated,local_memory_usage()))
+        throw Error("resident memory budget is below live CUDA allocations");
+    allocation_budget_->limit=bytes;
+}
+
 void Context::check_memory_limit(std::size_t additional) const {
     if(!allocation_budget_->limit)return;
     auto usage=local_memory_usage();
@@ -744,8 +753,15 @@ void Context::check_memory_limit(std::size_t additional) const {
         usage=local_memory_usage();
     }
     if(usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage) {
+        // A layer transition may still have frees pending on transfer/compute
+        // streams. Retire them before rejecting a request against physical use.
+        MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
+        trim_pool_pages();
+        usage=local_memory_usage();
+    }
+    if(usage>allocation_budget_->limit || additional>allocation_budget_->limit-usage) {
         const auto [pool_used,pool_reserved]=pool_memory_stats();
-        throw Error("CUDA process VRAM limit exceeded: local_usage="+std::to_string(usage)+
+        throw MfqResourceExhausted("CUDA process VRAM limit exceeded: local_usage="+std::to_string(usage)+
             " requested="+std::to_string(additional)+" limit="+std::to_string(allocation_budget_->limit)+
             " owned="+std::to_string(memory_stats().allocated)+" pool_used="+std::to_string(pool_used)+
             " pool_reserved="+std::to_string(pool_reserved));
@@ -834,7 +850,7 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
                 : cudaMalloc(&pointer,bytes);
         }
         if(result==cudaErrorMemoryAllocation)
-            throw Error("CUDA allocation failed: requested="+std::to_string(bytes)+
+            throw MfqResourceExhausted("CUDA allocation failed: requested="+std::to_string(bytes)+
                 " allocated="+std::to_string(memory_stats().allocated));
         MFQ_NATIVE_CUDA_CHECK(result);
         if(verify_pool_reuse)check_memory_limit();
@@ -1062,7 +1078,7 @@ HostBuffer::HostBuffer(std::size_t bytes, bool mapped) : bytes_(bytes) {
     const auto allocation=cudaHostAlloc(&data_,bytes_,flags);
     if(allocation==cudaErrorMemoryAllocation) {
         (void)cudaGetLastError();
-        throw Error("CUDA pinned allocation failed: requested="+std::to_string(bytes_));
+        throw MfqResourceExhausted("CUDA pinned allocation failed: requested="+std::to_string(bytes_));
     }
     MFQ_NATIVE_CUDA_CHECK(allocation);
 }

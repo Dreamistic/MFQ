@@ -454,6 +454,11 @@ public:
                         if (disk < 0) throw ApiError(400, "invalid_request_error", "disk_target_bytes must be non-negative");
                         command.disk_bytes = static_cast<uint64_t>(disk);
                     }
+                    if (op == "cache.budget" && params.contains("ram_target_bytes")) {
+                        const auto ram = integer_field(params, "ram_target_bytes", 0);
+                        if (ram < 0) throw ApiError(400, "invalid_request_error", "ram_target_bytes must be non-negative");
+                        command.ram_bytes = static_cast<uint64_t>(ram);
+                    }
                     json result = {
                         {"status", "ok"},
                         {"released_bytes", scheduler.session(command).count},

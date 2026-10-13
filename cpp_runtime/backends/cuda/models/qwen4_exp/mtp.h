@@ -47,6 +47,7 @@ struct Qwen4ExpMtp final : MtpModule {
     Tensor forward(const MtpTarget &target, Tensor hidden, Tensor ids) override;
 
     MtpStep step(const MtpTarget &target, Tensor hidden, Tensor ids) override;
+    MtpStep step_positioned(const MtpTarget &target, Tensor hidden, Tensor ids, Tensor positions) override;
 
     int64_t cache_position() const noexcept override;
 

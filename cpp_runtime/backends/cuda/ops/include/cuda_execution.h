@@ -3,6 +3,7 @@ namespace mfq::cuda { class KvOffloadStore; }
 
 #include "mfq_tensor_backend.h"
 #include "tensor_parallel.h"
+#include "mfq/yarn.h"
 
 #include <cuda_runtime_api.h>
 #ifdef MFQ_HAVE_NCCL
@@ -315,6 +316,8 @@ struct MoeRouteLayerStats {
 
 struct CudaExecutionContext {
     CudaExecutionContext();
+    bool yarn_context_extension=false;
+    mfq::models::YarnScaling yarn;
 
     CudaProfiler profiler;
     CudaExecutionConfig config;

@@ -155,6 +155,14 @@ template <typename Model> struct CudaCausalOps : Model {
         return value.narrow(0, start, count);
     }
     static Tensor concat_positions(Tensor first, Tensor second) {
+        // Generated text advances all semantic axes equally after an image.
+        if (first.dim() > 1 && second.dim() == 1) {
+            auto shape = first.sizes().vec();
+            shape.back() = second.size(0);
+            std::vector<int64_t> view(shape.size(),1);
+            view.back() = second.size(0);
+            second = second.reshape(view).expand(shape);
+        }
         return mfq_tensor_backend::cat({first, second}, -1);
     }
     static int64_t rank(const Tensor &value) { return value.dim(); }

@@ -553,6 +553,7 @@ class RuntimeMemoryPolicy(ProtocolModel):
     model_limit_bytes: int | None = Field(default=None, ge=1)
     prefix_limit_bytes: int | None = Field(default=None, ge=0)
     prefix_disk_limit_bytes: int | None = Field(default=None, ge=0)
+    prefix_ram_limit_bytes: int | None = Field(default=None, ge=0)
     prefix_directory: str | None = Field(default=None, min_length=1, max_length=4096)
 
 
@@ -594,6 +595,7 @@ class ModelLoadRequest(ProtocolModel):
     prefix_cache_enabled: bool = True
     prefix_cache_disk_bytes: int | None = Field(default=None, ge=0)
     prefix_cache_hot_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_ram_bytes: int | None = Field(default=None, ge=0)
     prefix_cache_block_tokens: int | None = Field(default=None, ge=1, le=65536)
     prefix_cache_pending_bytes: int | None = Field(default=None, ge=0)
     sampling_defaults: SamplingParams | None = None
@@ -711,6 +713,7 @@ class ModelUnloadRequest(ProtocolModel):
 
 
 class RuntimeGpuUtilization(ProtocolModel):
+    id: str | None = None
     name: str
     core_count: int | None = Field(default=None, ge=1)
     utilization_percent: float | None = Field(default=None, ge=0, le=100)
@@ -754,6 +757,17 @@ class RuntimeResourceSnapshot(ProtocolModel):
     weights: list[RuntimeWeightTraffic]
 
 
+class RuntimeDeviceMemory(ProtocolModel):
+    device_id: str
+    resident_bytes: int | None = Field(default=None, ge=0)
+    resident_weight_bytes: int | None = Field(default=None, ge=0)
+    resident_buffer_bytes: int | None = Field(default=None, ge=0)
+    kv_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_bytes: int | None = Field(default=None, ge=0)
+    memory_total_bytes: int | None = Field(default=None, ge=0)
+    memory_available_bytes: int | None = Field(default=None, ge=0)
+
+
 class RuntimeMemoryResources(ProtocolModel):
     """Physical residency and file payloads are separate, never added together.
 
@@ -763,6 +777,7 @@ class RuntimeMemoryResources(ProtocolModel):
     """
 
     resident_weight_bytes: int | None = Field(default=None, ge=0)
+    devices: list[RuntimeDeviceMemory] = Field(default_factory=list)
     resident_buffer_bytes: int | None = Field(default=None, ge=0)
     wired_bytes: int | None = Field(default=None, ge=0)
     wired_limit_bytes: int | None = Field(default=None, ge=0)
@@ -772,6 +787,9 @@ class RuntimeMemoryResources(ProtocolModel):
     prefix_cache_blocks: int | None = Field(default=None, ge=0)
     prefix_cache_bytes: int | None = Field(default=None, ge=0)
     prefix_cache_limit_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_ram_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_ram_limit_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_ram_blocks: int | None = Field(default=None, ge=0)
     ram_experts: bool | None = None
     ram_expert_bytes: int | None = Field(default=None, ge=0)
     ram_kv: bool | None = None

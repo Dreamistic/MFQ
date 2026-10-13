@@ -284,7 +284,7 @@ QwenBatchState Qwen35BatchStateAdapter::take(int64_t batch) {
             } else {
                 MFQ_RUNTIME_CHECK(full->cache.k.defined() && full->cache.v.defined() &&
                                       full->cache.k.dim() == 4 && full->cache.k.size(0) == batch &&
-                                      full->cache.v.sizes() == full->cache.k.sizes(),
+                                      session_kv_geometry_matches(full->cache.k,full->cache.v),
                                   "continuous batching full-attention state is unavailable");
                 layer.first = full->cache.k;
                 layer.second = full->cache.v;
@@ -330,10 +330,11 @@ void Qwen35BatchStateAdapter::restore(const QwenBatchState &state, int64_t cache
             if (!saved.paged) {
                 MFQ_RUNTIME_CHECK(!saved.ring && saved.first.dim() == 4 &&
                                       saved.first.size(0) == state.batch &&
-                                      saved.second.sizes() == saved.first.sizes(),
+                                      session_kv_geometry_matches(saved.first,saved.second),
                                   "continuous batching KV cache geometry changed");
                 full->cache.k = saved.first;
                 full->cache.v = saved.second;
+                full->cache.quantization = full->kv_quantization;
             }
             clear_full_attention_decode_workspaces(*full);
         } else if (auto *linear = dynamic_cast<LinearBlock *>(block.get())) {

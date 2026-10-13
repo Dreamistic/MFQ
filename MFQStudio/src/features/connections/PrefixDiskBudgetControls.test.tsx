@@ -2,18 +2,33 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { PrefixCacheControls } from './PrefixCacheControls';
 
-const api = vi.hoisted(() => ({ policy: vi.fn(), configure: vi.fn(), getJob: vi.fn(), addJob: vi.fn() }));
+const api = vi.hoisted(() => ({ policy: vi.fn(), configure: vi.fn(), getJob: vi.fn(), addJob: vi.fn(), discrete: false }));
 vi.mock('../../shared/api/resources/runtime', () => ({ runtimeApi: { memoryPolicy: api.policy, configureMemoryPolicy: api.configure } }));
 vi.mock('../../shared/api/resources/jobs', () => ({ jobsApi: { getJob: api.getJob } }));
-vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ addJob: api.addJob }) }));
+vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ addJob: api.addJob,
+  runtime: { memory_architecture: api.discrete ? 'discrete' : 'unified' } }) }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
 vi.mock('../../stores/jobStore', () => ({ useJobStore: (selector: (state: { jobs: [] }) => unknown) => selector({ jobs: [] }) }));
 
 beforeEach(() => {
   vi.clearAllMocks();
+  api.discrete = false;
   api.policy.mockResolvedValue({ prefix_disk_limit_bytes: null });
   api.configure.mockResolvedValue({ operation_id: 'job' });
   api.getJob.mockResolvedValue({ id: 'job' });
+});
+
+it('sets RAM independently and disables SSD through its switch', async () => {
+  api.discrete = true;
+  render(<PrefixCacheControls budget={100 * 2 ** 30} />);
+  const mode = screen.getByLabelText('RAM prefix cache budget mode');
+  await waitFor(() => expect(mode).toBeEnabled());
+  fireEvent.change(mode, { target: { value: 'manual' } });
+  fireEvent.change(screen.getByLabelText('RAM prefix cache limit'), { target: { value: '3' } });
+  fireEvent.click(screen.getByLabelText('Enable SSD tier'));
+  fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+  await waitFor(() => expect(api.configure).toHaveBeenCalledWith({ prefix_ram_limit_bytes: 3 * 2 ** 30,
+    prefix_disk_limit_bytes: 0 }));
 });
 
 it('submits an SSD-only limit, including zero, without changing RAM or weights', async () => {

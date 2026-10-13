@@ -17,6 +17,18 @@ export function ModelLoadPolicy({ catalog }: { catalog: ReturnType<typeof useMod
         </div>
       </div>
       <div className="setting-list model-policy-panel">
+        {!!catalog.runtime?.gpu_devices?.length && <SettingRow
+          title={tr('计算设备', 'Compute device')}
+          detail={tr('选择加载此模型的 GPU。', 'Choose the GPU for this model.')}
+          trailing={<select aria-label={tr('计算设备', 'Compute device')}
+            value={catalog.loadDeviceIds[0] ?? ''}
+            onChange={event => catalog.setLoadDeviceIds(event.target.value ? [event.target.value] : [])}>
+            <option value="">{tr('默认 GPU', 'Default GPU')}</option>
+            {catalog.runtime.gpu_devices.map(device => <option key={device.id} value={device.id}>
+              {`GPU ${device.id} · ${device.name}`}
+            </option>)}
+          </select>}
+        />}
         <SettingRow
           title={tr('固定到内存', 'Pin in memory')}
           detail={tr('跳过 LRU 与空闲卸载', 'Skip LRU and idle eviction')}

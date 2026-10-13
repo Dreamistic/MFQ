@@ -23,10 +23,14 @@ bool moe_expert_cache_has_sources(
     const std::shared_ptr<MoeExpertCache>& cache);
 bool moe_expert_cache_finalized(
     const std::shared_ptr<MoeExpertCache>& cache);
+bool moe_expert_cache_layer_prefill_ready(const std::shared_ptr<MoeExpertCache>& cache);
 std::vector<std::pair<std::string, double>> moe_expert_memory_metrics(
     const std::shared_ptr<MoeExpertCache>& cache);
 void finalize_moe_expert_cache(
     const std::shared_ptr<MoeExpertCache>& cache);
+std::size_t moe_expert_cache_minimum_bytes(const std::shared_ptr<MoeExpertCache>& cache);
+std::size_t moe_expert_cache_budget_bytes(const std::shared_ptr<MoeExpertCache>& cache);
+void resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache, std::size_t bytes);
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);
 // Finish the adaptive transaction before a session reset or a prefill loan.
 void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache);

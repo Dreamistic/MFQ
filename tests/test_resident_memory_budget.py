@@ -109,6 +109,28 @@ def test_busy_worker_capacity_is_reserved_and_not_mutated(tmp_path):
     asyncio.run(run())
 
 
+def test_cuda_global_budget_cannot_be_given_to_one_physical_gpu(tmp_path, monkeypatch):
+    monkeypatch.setattr('mfq.server.runtime.runtime_pool.gpu_memory_status', lambda: [
+        {'id': '0', 'memory_available_bytes': 2 * GIB},
+        {'id': '2', 'memory_available_bytes': 10 * GIB}])
+
+    async def run():
+        pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime', backend='cuda',
+            max_runtime_memory_bytes=60 * GIB, automatic_memory_budget=False)
+        first, second = instance(tmp_path, 'first'), instance(tmp_path, 'second')
+        first.device_ids, second.device_ids = ['0'], ['2']
+        first.started_at -= timedelta(days=1)
+        pool._instances = {first.id: first, second.id: second}
+        await pool._rebalance_resident_budget(second.id)
+        assert 0 < first.backend.limit <= 8 * GIB
+        assert 0 < second.backend.limit <= 16 * GIB
+        assert first.backend.kv == second.backend.kv == GIB
+        pool._instances.clear()
+        await pool.aclose()
+
+    asyncio.run(run())
+
+
 def test_irreducible_budget_failure_does_not_modify_workers(tmp_path):
     async def run():
         pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime', max_runtime_memory_bytes=20 * GIB)

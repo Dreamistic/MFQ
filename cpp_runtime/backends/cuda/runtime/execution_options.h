@@ -41,6 +41,7 @@ bool nint_compressed_large_batch(bool vocabulary=false);
 bool nint_large_output_tiling();
 int continuous_batch_kv_initial_capacity();
 std::size_t workspace_reserve_bytes();
+std::size_t resident_budget_bytes();
 bool phased_transfer();
 bool mapped_copy_overlap();
 bool background_calibration();

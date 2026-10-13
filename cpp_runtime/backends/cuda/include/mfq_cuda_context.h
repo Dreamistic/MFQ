@@ -197,6 +197,7 @@ public:
     std::size_t available_memory() const;
     void reclaim_idle_memory();
     void check_memory_limit(std::size_t additional = 0) const;
+    void set_memory_limit(std::size_t bytes);
 
     void* allocate(std::size_t bytes, cudaStream_t stream = nullptr);
     void release(

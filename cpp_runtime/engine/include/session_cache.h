@@ -21,6 +21,9 @@ template <class Backend> class SessionCache {
     using StateError = typename Backend::StateError;
 
   public:
+    template <class Visitor> void visit_snapshots(Visitor&& visitor) const {
+        snapshots_.visit_states(std::forward<Visitor>(visitor));
+    }
     template <class SessionConfig, class PrefixConfig>
     explicit SessionCache(const SessionConfig &session_config, const PrefixConfig &prefix_config,
         std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache = {}, bool supported = true,
@@ -33,6 +36,7 @@ template <class Backend> class SessionCache {
           paged_bindings_(paged_cache_, snapshots_.max_sessions()),
           paged_disk_budget_(paged_cache_ ? prefix_config.disk_bytes : 0),
           paged_hot_budget_(paged_cache_ ? prefix_config.hot_bytes : 0),
+          paged_ram_budget_(paged_cache_ && native_hot_snapshots ? prefix_config.ram_bytes : 0),
           trace_(session_config.trace), supported_(supported), disabled_reason_(disabled_reason),
           native_hot_snapshots_(native_hot_snapshots) {}
 
@@ -155,7 +159,7 @@ template <class Backend> class SessionCache {
                 {"prefix_cache_hits", static_cast<double>(value.hits)},
                 {"prefix_cache_hit_tokens", static_cast<double>(value.hit_tokens)},
                 {"prefix_cache_sessions", static_cast<double>(paged_bindings_.sessions())},
-                {"prefix_cache_snapshots", static_cast<double>(value.disk_blocks)},
+                {"prefix_cache_snapshots", static_cast<double>(value.blocks ? value.blocks : native.snapshots)},
                 {"prefix_cache_tokens", static_cast<double>(paged_bindings_.tokens())},
                 {"prefix_cache_bytes", static_cast<double>(native_hot_snapshots_ ? native.bytes : value.hot_bytes)},
                 {"prefix_cache_max_sessions", static_cast<double>(snapshots_.max_sessions())},
@@ -167,8 +171,12 @@ template <class Backend> class SessionCache {
                 {"prefix_cache_hot_blocks", static_cast<double>(native_hot_snapshots_ ? native.snapshots : value.hot_blocks)},
                 {"prefix_cache_hot_bytes", static_cast<double>(native_hot_snapshots_ ? native.bytes : value.hot_bytes)},
                 {"prefix_cache_native_hot", native_hot_snapshots_ ? 1.0 : 0.0},
-                {"prefix_cache_ram_bytes", static_cast<double>(value.hot_bytes)},
-                {"prefix_cache_hot_pressure_bytes", static_cast<double>(value.hot_pressure_bytes)},
+                {"prefix_cache_ram_bytes", static_cast<double>(native_hot_snapshots_ ? value.resident_bytes : value.hot_bytes)},
+                {"prefix_cache_ram_max_bytes", static_cast<double>(paged_ram_budget_)},
+                {"prefix_cache_ram_blocks", static_cast<double>(native_hot_snapshots_ ? value.hot_blocks : 0)},
+                {"prefix_cache_ram_hits", static_cast<double>(native_hot_snapshots_ ? value.hot_hits : 0)},
+                {"prefix_cache_hot_pressure_bytes", static_cast<double>(native_hot_snapshots_ ? 0 : value.hot_pressure_bytes)},
+                {"prefix_cache_ram_pressure_bytes", static_cast<double>(native_hot_snapshots_ ? value.hot_pressure_bytes : 0)},
                 {"prefix_cache_dynamic_budget", 1.0},
                 {"prefix_cache_pending_writes", static_cast<double>(value.pending_writes)},
                 {"prefix_cache_pending_bytes", static_cast<double>(value.pending_bytes)},
@@ -177,7 +185,7 @@ template <class Backend> class SessionCache {
                 {"prefix_cache_deduplicated_writes",
                     static_cast<double>(value.deduplicated_writes)},
                 {"prefix_cache_disk_hits", static_cast<double>(value.disk_hits)},
-                {"prefix_cache_hot_hits", static_cast<double>(value.hot_hits + (native_hot_snapshots_ ? native.hits : 0))},
+                {"prefix_cache_hot_hits", static_cast<double>(native_hot_snapshots_ ? native.hits : value.hot_hits)},
                 {"prefix_cache_evictions", static_cast<double>(value.evictions)},
                 {"prefix_cache_corrupt_blocks", static_cast<double>(value.corrupt_blocks)},
                 {"prefix_cache_low_disk_space_skips", static_cast<double>(value.low_disk_space_skips)},
@@ -247,6 +255,19 @@ template <class Backend> class SessionCache {
         if (!paged_cache_) return 0;
         paged_disk_budget_ = max_bytes;
         return paged_cache_->set_disk_limit(max_bytes);
+    }
+
+    uint64_t set_ram_limit(uint64_t max_bytes) {
+        if (!paged_cache_ || !native_hot_snapshots_) return 0;
+        paged_ram_budget_ = max_bytes;
+        const auto released = paged_cache_->set_hot_limit(max_bytes);
+        if (released) Backend::release_host_cache();
+        return released;
+    }
+
+    void reserve_ram(uint64_t bytes) {
+        if (paged_cache_ && native_hot_snapshots_ && paged_cache_->reserve_ram(bytes))
+            Backend::release_host_cache();
     }
 
     uint64_t refresh_disk_index() {
@@ -394,6 +415,7 @@ template <class Backend> class SessionCache {
     mfq::engine::PagedSessionBindings paged_bindings_;
     uint64_t paged_disk_budget_ = 0;
     uint64_t paged_hot_budget_ = 0;
+    uint64_t paged_ram_budget_ = 0;
     bool trace_ = false;
     bool supported_ = true;
     int disabled_reason_ = 0;

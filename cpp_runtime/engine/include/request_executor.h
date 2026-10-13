@@ -19,8 +19,11 @@ template <class Cache> SessionResult control_session(Cache &cache, const Session
         return {cache.trim_hot(command.bytes), {}};
     case SessionCommand::Kind::budget:
         if constexpr (requires { cache.set_hot_limit(command.bytes); cache.set_disk_limit(command.bytes); }) {
-            const auto released = cache.set_hot_limit(command.bytes);
             if (command.disk_bytes) cache.set_disk_limit(*command.disk_bytes);
+            auto released = cache.set_hot_limit(command.bytes);
+            if constexpr (requires { cache.set_ram_limit(command.bytes); }) {
+                if (command.ram_bytes) released += cache.set_ram_limit(*command.ram_bytes);
+            }
             return {released, {}};
         }
         else throw std::invalid_argument("prefix cache budgets are unavailable");
@@ -195,7 +198,12 @@ template <class Backend> class EngineInstance final : public Engine {
         return backend.visit([&](auto& ops) { return requests_.step(eligible, ops); });
     }
     SessionResult session(const SessionCommand& command) override {
-        return backend.visit([&](auto& ops) { return control_session(ops.cache, command); });
+        if(command.kind == SessionCommand::Kind::memory_budget && !requests_.empty())
+            throw std::runtime_error("memory budgeting requires a quiescent engine");
+        return backend.visit([&](auto& ops) {
+            if constexpr(requires { ops.session(command); })return ops.session(command);
+            else return control_session(ops.cache, command);
+        });
     }
     ControlResult control(ControlRequest request) override {
         if (!loaded_) throw std::runtime_error("engine is unloaded");

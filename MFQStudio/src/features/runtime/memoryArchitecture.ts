@@ -1,4 +1,31 @@
-import type { RuntimeStatus, RuntimeMemoryResources } from '../../shared/api/types';
+import type { RuntimeStatus, RuntimeMemoryResources, RuntimeInstance } from '../../shared/api/types';
+
+export function gpuMemoryGroups(runtime: RuntimeStatus | null | undefined, instances: RuntimeInstance[]) {
+  const devices = new Map((runtime?.gpu_devices ?? []).filter(device => !device.unified_memory).map(device => [device.id, device]));
+  for (const item of instances) for (const memory of item.memory?.devices ?? []) {
+    const previous = devices.get(memory.device_id);
+    devices.set(memory.device_id, { ...previous, id: memory.device_id, name: previous?.name ?? '',
+      memory_total_bytes: memory.memory_total_bytes ?? previous?.memory_total_bytes,
+      memory_available_bytes: previous?.memory_available_bytes ?? memory.memory_available_bytes });
+  }
+  if (!devices.size) devices.set('0', { id: '0', name: '',
+    memory_total_bytes: runtime?.device_memory_total_bytes ?? runtime?.device_total_bytes,
+    memory_available_bytes: runtime?.device_free_bytes });
+  return [...devices.values()].map(device => ({ ...device, instances: instances.flatMap(item => {
+    const memory = item.memory?.devices?.find(value => value.device_id === device.id);
+    if (memory) return [{ ...item, memory: { ...item.memory!, ...memory,
+      resident_weight_bytes: memory.resident_weight_bytes ?? null,
+      resident_buffer_bytes: memory.resident_buffer_bytes ?? null,
+      prefix_cache_bytes: memory.prefix_cache_bytes ?? null,
+      kv_bytes: memory.kv_bytes ?? null } }];
+    const assigned = item.devices.filter(value => value.startsWith('cuda:')).map(value => value.slice(5));
+    if (item.memory?.devices?.length || assigned.length && !assigned.includes(device.id)) return [];
+    if (!assigned.length && device.id !== '0') return [];
+    // A legacy worker's aggregate is only attributable when it runs on one GPU.
+    return [{ ...item, memory: assigned.length > 1 && item.memory ? { ...item.memory,
+      resident_weight_bytes: null, resident_buffer_bytes: null, kv_bytes: null, prefix_cache_bytes: null } : item.memory }];
+  }) }));
+}
 
 export function residentWeightsAndBuffers(memory: RuntimeMemoryResources | null | undefined,
   separate: boolean): number | null {

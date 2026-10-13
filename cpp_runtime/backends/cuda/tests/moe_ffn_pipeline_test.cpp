@@ -10,7 +10,9 @@
 #include "storage/moe_expert_cache.h"
 #include "storage/weight_loader.h"
 #include "moe.h"
+#include "core/rope.h"
 #include "mfq/moe_dispatch_plan.h"
+#include "mfq/runtime.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -589,8 +591,11 @@ int verify_warm_residency(const std::filesystem::path& root, bool shared_cases=t
             if(std::getenv("MFQ_TEST_RESIDENCY_TRACE"))std::cerr<<"fence_shared before_forward"<<std::endl;
             std::vector<float> values(2560);for(int j=0;j<2560;++j)values[j]=std::sin(float(j)*.013f);
             auto x=tb::tensor(values).reshape({1,2560}).to(tb::kFloat16).to(tb::kCUDA);
-            auto ids=tb::zeros({1,1},x.options().dtype(tb::kInt32));
-            auto route_weights=tb::ones({1,1},x.options());
+            // The shared-backup case exchanges `count` expert bundles. Size
+            // the decode staging packet for that many routes; a one-route
+            // packet now intentionally reserves only one bundle's storage.
+            auto ids=tb::zeros({1,count},x.options().dtype(tb::kInt32));
+            auto route_weights=tb::ones({1,count},x.options())/count;
             auto reference=forwards[0](execution,x,ids,route_weights).cpu().contiguous();
             if(std::getenv("MFQ_TEST_RESIDENCY_TRACE"))std::cerr<<"fence_shared after_forward"<<std::endl;
             MoeResidencyManager failed(cache.get(),[](const char* phase,std::size_t) {
@@ -682,7 +687,9 @@ int verify_warm_residency(const std::filesystem::path& root, bool shared_cases=t
             }
             ++async_cases;
         }
-        manager.apply_pending();const auto stats=manager.stats();
+        // A predictor may run before the next backbone layer zero. Its entry
+        // must finish the pending ownership transaction and release staging.
+        manager.before_layer(-1);const auto stats=manager.stats();
         if(stats.batched && !limited && !tail && (stats.backup_copies!=1 || stats.batch_descriptor_copies!=1 ||
                 !stats.batch_device_bytes || !stats.upload_copies))
             throw std::runtime_error("warm residency did not batch the complete backup and field descriptors");
@@ -1776,6 +1783,99 @@ void verify_router_lookahead_inputs() {
 #include "compact_prefill_mma_test.h"
 #include "nvq_prefill_k_tile_test.h"
 #include "mfe_token_group_test.h"
+void verify_yarn() {
+    // Independent values for dim=64, theta=10000, original context=4096,
+    // factor=4. The ramp spans pairs 10..23 (32 and 1 full rotations).
+    mfq::models::YarnScaling scaling;
+    scaling.factor=4;scaling.original_context=4096;
+    const int64_t positions[]={0,63,4095,8191};
+    auto opts=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
+    auto x=tb::ones({1,1,4,68},opts);
+    auto pos=tb::tensor(std::vector<int64_t>(positions,positions+4)).to(tb::kCUDA);
+    mfq::cuda::RotaryEmbedding rotary(64,16384,10000,{},false,std::nullopt,scaling);
+    auto output=rotary.forward(x,pos).cpu().contiguous();
+    RopeCache cache(16384,64,10000,0,-1,tb::Device(tb::kCUDA),false,scaling);
+    const auto cosine=cache.cos.cpu().contiguous(),sine=cache.sin.cpu().contiguous();
+    const double amplitude=1+.1*std::log(4.0);
+    for(int t=0;t<4;++t)for(int p=0;p<32;++p) {
+        const double ramp=std::clamp((p-10.0)/13.0,0.0,1.0);
+        const float frequency=float(std::pow(10000.,-2.*p/64)*(1-.75*ramp));
+        const float angle=float(positions[t])*frequency;
+        const auto c=std::cos(angle)*amplitude,s=std::sin(angle)*amplitude;
+        if(std::abs(output.data_ptr<float>()[t*68+p]-(c-s))>2e-5 ||
+            std::abs(output.data_ptr<float>()[t*68+32+p]-(s+c))>2e-5 ||
+            std::abs(cosine.data_ptr<float>()[positions[t]*32+p]-c)>2e-5 ||
+            std::abs(sine.data_ptr<float>()[positions[t]*32+p]-s)>2e-5)
+            throw std::runtime_error("CUDA YaRN differs from interpolated frequencies and attention scaling");
+    }
+    for(int t=0;t<4;++t)for(int p=64;p<68;++p)
+        if(output.data_ptr<float>()[t*68+p]!=1)throw std::runtime_error("YaRN changed non-rotary dimensions");
+    std::cout<<"cuda_yarn_tables_dynamic_partial_rotary PASS\n";
+}
+
+void verify_online_expert_budget(const std::filesystem::path& root) {
+    for(const std::string format:{"nint5","nvq3j-512"}) {
+        CudaExecutionContext execution;
+        execution.config.moe_pipeline=true;execution.config.moe_preload_all=true;
+        execution.config.moe_ram_pcie=true;execution.config.moe_ram_pcie_fraction=1;
+        execution.config.moe_residency_adapt=false;execution.config.moe_assert_resident=true;
+        std::array<std::shared_ptr<MoeQuantRangeSource>,3> sources={
+            source(root/(format+"-640-2560.mfq")),source(root/(format+"-640-2560.mfq")),
+            source(root/(format+"-2560-640.mfq"))};
+        std::size_t bundle=0;for(const auto& s:sources)bundle+=bytes(s->metadata()->pools[0]);
+        execution.config.moe_host_cache_bytes=16*bundle;
+        auto cache=make_moe_expert_cache(4*bundle,execution.config);
+        std::vector<std::shared_ptr<MfeWeight>> gu,down;
+        const std::array<std::string,3> roles={"gate","up","down"};
+        for(int p=0;p<3;++p) {
+            auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(cache,roles[p],sources[p],1,0,roles[p]));
+            (p==2?down:gu).push_back(std::move(weight));
+        }
+        auto ffn=make_moe_ffn_pipeline(gu,down,{});
+        finalize_moe_expert_cache(cache);
+        auto x=tb::full({2,2560},.001,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+        auto ids=tb::arange(3,x.options().dtype(tb::kInt32)).unsqueeze(0).expand({2,3}).contiguous();
+        auto weights=tb::ones({2,3},x.options().dtype(tb::kFloat32));
+        auto expected=ffn(execution,x,ids,weights).to(tb::kFloat32).cpu().contiguous();
+        auto prompt=tb::full({32,2560},.001,x.options());
+        auto prompt_ids=ids.narrow(0,0,1).expand({32,3}).contiguous();
+        auto prompt_weights=tb::ones({32,3},weights.options());
+        auto expected_prompt=ffn(execution,prompt,prompt_ids,prompt_weights).to(tb::kFloat32).cpu().contiguous();
+        const auto compare=[&](tb::Tensor result,const tb::Tensor& reference) {
+            auto actual=result.to(tb::kFloat32).cpu().contiguous();
+            if(actual.sizes()!=reference.sizes())throw std::runtime_error("online expert resize changed output shape");
+            for(int64_t i=0;i<actual.numel();++i)
+                if(!std::isfinite(actual.data_ptr<float>()[i]) ||
+                    std::abs(actual.data_ptr<float>()[i]-reference.data_ptr<float>()[i])>
+                        0.002f+0.001f*std::abs(reference.data_ptr<float>()[i]))
+                    throw std::runtime_error("online expert resize changed FFN output at "+std::to_string(i)+
+                        " rows="+std::to_string(actual.size(0))+" actual="+std::to_string(actual.data_ptr<float>()[i])+
+                        " expected="+std::to_string(reference.data_ptr<float>()[i]));
+        };
+        for(const auto target:{2*bundle,4*bundle}) {
+            resize_moe_expert_cache(cache,target);
+            compare(ffn(execution,x,ids,weights),expected);
+            compare(ffn(execution,prompt,prompt_ids,prompt_weights),expected_prompt);
+            release_moe_decode_buffers(cache);
+            tb::Tensor output;
+            {
+                mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+                window.capture([&]{output=ffn(execution,x,ids,weights);},[]{},[&]{output={};});
+                window.run();compare(output,expected);
+            }
+            if(moe_expert_cache_budget_bytes(cache)!=target)throw std::runtime_error("expert budget was not applied");
+            for(const auto& source:sources)if(source->expert_disk_reads_after_preload())
+                throw std::runtime_error("online expert budget reread sealed SSD weights");
+        }
+        bool rejected=false;
+        try {resize_moe_expert_cache(cache,1);}catch(const std::exception&){rejected=true;}
+        if(!rejected || moe_expert_cache_budget_bytes(cache)!=4*bundle)
+            throw std::runtime_error("invalid expert budget changed active cache");
+        (void)ffn(execution,x,ids,weights).cpu();
+        std::cout<<"online_expert_budget format="<<format<<" shrink_grow_reject prefill graph sealed_RAM PASS\n";
+    }
+}
+
 void verify_prefill_quota_recovery(const std::filesystem::path& root) {
     struct Setting {
         std::string previous;
@@ -1813,7 +1913,10 @@ void verify_prefill_quota_recovery(const std::filesystem::path& root) {
         bool inject=true,fatal=false;int shared_calls=0;
         auto ffn=make_moe_ffn_pipeline(gu,down,[&](CudaExecutionContext&,const tb::Tensor&) {
             ++shared_calls;
-            if(inject)throw mfq::cuda::Error(failure+" injected after prefill transfer submission");
+            if(inject) {
+                if(failure=="CUDA VRAM limit exceeded:")throw MfqResourceExhausted(failure+" injected after prefill transfer submission");
+                throw mfq::cuda::Error(failure+" injected after prefill transfer submission");
+            }
             if(fatal)throw std::runtime_error("injected non-quota prefill failure");
             return tb::Tensor{};
         });
@@ -1823,7 +1926,7 @@ void verify_prefill_quota_recovery(const std::filesystem::path& root) {
         auto weights=tb::ones({16,3},x.options().dtype(tb::kFloat32));
         bool rejected=false;
         try {(void)ffn(execution,x,ids,weights);}
-        catch(const mfq::cuda::Error& error) {rejected=std::string(error.what()).starts_with(failure);}
+        catch(const std::exception& error) {rejected=std::string(error.what()).starts_with(failure);}
         if(!rejected || shared_calls!=1)throw std::runtime_error("prefill quota fixture did not reach the eager transfer path");
         inject=false;
         auto first=ffn(execution,x,ids,weights).to(tb::kCPU).contiguous();
@@ -1900,6 +2003,8 @@ int main(int argc,char** argv)try {
     const std::filesystem::path root(argv[1]);
     auto cuda_context=mfq::cuda::default_context(mfq_current_cuda_device());
     if(argc==3) {
+        if(std::string(argv[2])=="--online-budget-check") {verify_online_expert_budget(root);return 0;}
+        if(std::string(argv[2])=="--yarn-check") {verify_yarn();return 0;}
         if(std::string(argv[2])=="--nvq-bank-map-check") {verify_nvq_bank_map(root);return 0;}
         if(std::string(argv[2])=="--memory-phase-check") {verify_memory_phase_reuse(root);return 0;}
         if(std::string(argv[2])=="--prefill-quota-recovery-check") {verify_prefill_quota_recovery(root);return 0;}

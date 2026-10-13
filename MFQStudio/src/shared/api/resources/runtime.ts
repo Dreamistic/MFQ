@@ -21,6 +21,8 @@ export interface RuntimeMemoryPolicy {
   model_limit_bytes: number | null;
   prefix_limit_bytes: number | null;
   prefix_disk_limit_bytes?: number | null;
+  prefix_ram_limit_bytes?: number | null;
+  effective_prefix_ram_limit_bytes?: number;
   prefix_directory: string | null;
   actual_prefix_directory: string;
 }
@@ -168,7 +170,7 @@ export const runtimeApi = {
   memoryPolicy(): Promise<RuntimeMemoryPolicy> {
     return request('/api/v1/runtime/memory-policy');
   },
-  configureMemoryPolicy(policy: Partial<Pick<RuntimeMemoryPolicy, 'total_limit_bytes' | 'model_limit_bytes' | 'prefix_limit_bytes' | 'prefix_disk_limit_bytes' | 'prefix_directory'>>): Promise<{ operation_id: string }> {
+  configureMemoryPolicy(policy: Partial<Pick<RuntimeMemoryPolicy, 'total_limit_bytes' | 'model_limit_bytes' | 'prefix_limit_bytes' | 'prefix_disk_limit_bytes' | 'prefix_ram_limit_bytes' | 'prefix_directory'>>): Promise<{ operation_id: string }> {
     return request('/api/v1/runtime/memory-policy', { method: 'PUT', body: JSON.stringify(policy) });
   },
   runtimeListener(): Promise<RuntimeListener> {

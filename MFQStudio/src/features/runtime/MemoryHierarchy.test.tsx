@@ -10,14 +10,14 @@ beforeEach(() => {
 
 function render(ui: ReactElement) { return baseRender(ui, { wrapper: TooltipProvider }); }
 
-it('shows seven separate VRAM, RAM and SSD tiers without treating unknown RAM telemetry as zero', () => {
+it('shows eight separate VRAM, RAM and SSD tiers without treating unknown RAM telemetry as zero', () => {
   const item = model('1', 1024);
   Object.assign(item.memory!, { ram_experts: true, ram_expert_bytes: 4096,
     ram_kv: true, ram_kv_bytes: 2048, ram_kv_limit_bytes: 8192, prefix_cache_bytes: 256, ssd_experts: false });
   const { container, rerender } = render(<MemoryHierarchy instances={[item]} runtime={{ memory_architecture: 'discrete' }} memoryCapacityBytes={32768} detailed />);
-  expect(container.querySelectorAll('[data-tier]')).toHaveLength(7);
+  expect(container.querySelectorAll('[data-tier]')).toHaveLength(8);
   expect([...container.querySelectorAll('[data-storage]')].map(group => group.getAttribute('data-storage'))).toEqual(['vram', 'ram', 'ssd']);
-  expect(screen.getByRole('heading', { level: 3, name: 'VRAM' })).toBeInTheDocument();
+  expect(screen.getByRole('heading', { level: 3, name: 'VRAM · GPU 0' })).toBeInTheDocument();
   expect(screen.getByRole('heading', { level: 3, name: 'RAM' })).toBeInTheDocument();
   expect(container.querySelector('[data-storage="vram"] [data-tier="weights"]')).toBeInTheDocument();
   expect(container.querySelector('[data-storage="ram"] [data-tier="ram-experts"]')).toBeInTheDocument();
@@ -37,6 +37,29 @@ it('shows seven separate VRAM, RAM and SSD tiers without treating unknown RAM te
   expect(screen.queryByText('RAM-streamed experts')).not.toBeInTheDocument();
 });
 import type { RuntimeInstance } from '../../shared/api/types';
+
+it('shows independent GPU capacities, model allocations and an idle third GPU', () => {
+  const item = model('split', 8192);
+  item.devices = ['cuda:0', 'cuda:2'];
+  item.memory!.devices = [
+    { device_id: '0', resident_weight_bytes: 1024, resident_buffer_bytes: 512, kv_bytes: 512, prefix_cache_bytes: 0 },
+    { device_id: '2', resident_weight_bytes: 7168, resident_buffer_bytes: 1024, kv_bytes: 1024, prefix_cache_bytes: 256 },
+  ];
+  const { container } = render(<MemoryHierarchy instances={[item]} detailed runtime={{ memory_architecture: 'discrete',
+    gpu_devices: [
+      { id: '0', name: 'GPU A', memory_total_bytes: 8192, memory_available_bytes: 2048 },
+      { id: '2', name: 'GPU B', memory_total_bytes: 16384, memory_available_bytes: 1024 },
+      { id: '3', name: 'GPU C', memory_total_bytes: 8192, memory_available_bytes: 4096 },
+    ] }} />);
+  expect(screen.getByRole('heading', { name: 'VRAM · GPU 2' })).toBeInTheDocument();
+  const first = container.querySelector('[data-gpu-id="0"]')!;
+  const second = container.querySelector('[data-gpu-id="2"]')!;
+  expect(first.querySelector('[data-tier="weights"] .memory-tier-heading')).toHaveTextContent('2 KiB / 4 KiB');
+  expect(first.querySelector('[data-tier="weights"] .memory-tier-track [data-model-id="split"]')).toHaveStyle({ width: '37.5%' });
+  expect(second.querySelector('[data-tier="weights"] .memory-tier-heading')).toHaveTextContent('8 KiB / 10 KiB');
+  expect(container.querySelector('[data-gpu-id="3"] [data-model-id]')).toBeNull();
+  expect(container.querySelectorAll('[data-storage="ram"]')).toHaveLength(1);
+});
 
 it('includes per-model buffers in VRAM usage and subtracts them from the KV capacity', () => {
   const first = model('1', 1024), second = model('2', 2048);
@@ -90,6 +113,19 @@ vi.mock('../settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (_zh: string, en: string) => en }),
 }));
 
+it('counts disposable RAM prefixes in available RAM without adding them to VRAM', () => {
+  const item = model('1', 1024);
+  item.memory = { ...item.memory!, ram_experts: true, ram_expert_bytes: 4096,
+    ram_kv: true, ram_kv_bytes: 2048, prefix_cache_ram_bytes: 1024,
+    prefix_cache_ram_limit_bytes: 4096, prefix_cache_ram_blocks: 4 };
+  const { container } = render(<MemoryHierarchy instances={[item]} memoryCapacityBytes={32768}
+    runtime={{ memory_architecture: 'discrete', device_free_bytes: 32768,
+      host_memory_total_bytes: 65536, host_memory_available_bytes: 8192 }} />);
+  expect(container.querySelector('[data-tier="ram-experts"] .memory-tier-heading')).toHaveTextContent('4 KiB / 15 KiB');
+  expect(container.querySelector('[data-tier="ram-prefix"] .memory-tier-heading')).toHaveTextContent('1 KiB / 9 KiB');
+  expect(container.querySelector('[data-tier="kv"] .memory-tier-heading')).toHaveTextContent('1 KiB / 31 KiB');
+});
+
 function model(id: string, bytes: number): RuntimeInstance {
   return { id, model: `Model ${id}`, state: 'ready', devices: ['metal'], active_sessions: 0,
     queued_requests: 0, started_at: `2026-01-01T00:00:0${id}Z`, memory: {
@@ -117,14 +153,14 @@ it.each([false, true])('groups the same resource tiers into RAM and SSD on unifi
   fireEvent.focus(helpButton);
   const help = await screen.findByRole('tooltip');
   expect(help).toHaveTextContent('unified-memory devices share it between CPU and GPU');
-  expect(help).toHaveTextContent('excludes persistent prefix caches');
+  expect(help).toHaveTextContent('excludes prefix caches');
 });
 
 it('keeps separate VRAM, RAM and SSD categories and their device-specific explanations', async () => {
   const { container } = render(<MemoryHierarchy instances={[model('1', 1024)]} runtime={{ memory_architecture: 'discrete' }} />);
   expect([...container.querySelectorAll('[data-memory-group]')].map(group => group.getAttribute('data-memory-group'))).toEqual(['VRAM', 'RAM', 'SSD']);
   expect(container.querySelector('[data-memory-group="VRAM"]')?.querySelectorAll('[data-tier]')).toHaveLength(2);
-  expect(container.querySelector('[data-memory-group="RAM"]')?.querySelectorAll('[data-tier]')).toHaveLength(2);
+  expect(container.querySelector('[data-memory-group="RAM"]')?.querySelectorAll('[data-tier]')).toHaveLength(3);
   fireEvent.focus(screen.getByRole('button', { name: 'Memory tier details' }));
   expect(await screen.findByRole('tooltip')).toHaveTextContent('transferred to VRAM on demand');
   expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('Memory and VRAM limits below');

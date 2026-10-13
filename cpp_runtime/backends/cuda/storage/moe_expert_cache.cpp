@@ -338,6 +338,117 @@ void MoeExpertCache::finalize() {
     if (config_.moe_preload_all) preload_complete_residency();
 }
 
+void MoeExpertCache::resize(std::size_t bytes) {
+    if (!finalized_ || bytes == std::size_t(budget_bytes_)) return;
+    std::vector<mfq::MoeArenaDemand> demands;
+    for (const auto& [signature, arena] : arenas_)
+        demands.push_back({signature, arena->slot_bytes, arena->minimum_slots, arena->registered_experts});
+    const auto plan=mfq::plan_moe_arena_slots(static_cast<int64_t>(bytes),demands);
+    for(const auto& [signature,arena]:arenas_)arena->book->prepare_resize(plan.at(signature));
+    std::size_t demoted=0;
+    for(const auto& [signature,arena]:arenas_)
+        for(int slot=plan.at(signature);slot<arena->slots;++slot)
+            if(const auto& key=arena->book->key_for(slot); key && sources_[key->source]->quant_source_)
+                demoted+=arena->slot_bytes;
+    const auto host=host_experts_->stats();
+    if(complete_residency_ && demoted>host.budget_bytes-std::min(host.budget_bytes,host.managed_bytes))
+        throw std::runtime_error("expert budget reduction exceeds available RAM expert storage");
+    // Each field remains compressed. Temporary host copies permit replacing the
+    // arenas without needing both old and new GPU allocations at once.
+    struct SavedArena { MoeGpuArena* arena; int slots; std::vector<mfq_tensor_backend::Tensor> fields; };
+    std::vector<SavedArena> saved;
+    for(auto& [signature,arena]:arenas_)if(plan.at(signature)!=arena->slots) {
+        SavedArena entry{arena.get(),arena->slots,{}};
+        for(const auto& field:arena->fields)entry.fields.push_back(field.to(mfq_tensor_backend::kCPU));
+        saved.push_back(std::move(entry));
+    }
+    if(saved.empty()) { budget_bytes_=static_cast<int64_t>(bytes); return; }
+    std::vector<mfq::MoeCacheKey> demotions;
+    try {
+        for(auto& entry:saved)for(int slot=plan.at(entry.arena->signature);slot<entry.slots;++slot)
+            if(const auto& key=entry.arena->book->key_for(slot);key && sources_[key->source]->quant_source_) {
+                auto& source=*sources_[key->source];
+                auto pool=*source.cohorts_.at(key->cohort).cpu;
+                pool.local_experts=1;pool.expert_local={};
+                const auto retain=[&] {
+                    std::vector<mfq_tensor_backend::Tensor> fields;
+                    for(std::size_t i=0;i<entry.fields.size();++i) {
+                        auto rows=entry.arena->layouts[i].slot_shape[0];
+                        fields.push_back(entry.fields[i].narrow(0,slot*rows,rows).clone());
+                    }
+                    return moe_replace_quant_fields(pool,fields);
+                };
+                if(!host_experts_->demote(*key,entry.arena->slot_bytes,retain))
+                    throw std::runtime_error("cannot retain an evicted expert in RAM");
+                demotions.push_back(*key);
+            }
+    } catch(...) {
+        for(const auto& key:demotions)host_experts_->promote(key);
+        throw;
+    }
+    const auto context=mfq::cuda::default_context();
+    const auto rebuild_sources=[&] {
+        for(auto& source:sources_) {
+            auto previous=std::move(source->active_);
+            source->finalize();
+            if(previous) { *previous=std::move(*source->active_); source->active_=std::move(previous); }
+            for(auto& cohort:source->cohorts_) {
+                auto map=mfq_tensor_backend::tensor(cohort.host_map).to(mfq_tensor_backend::kCUDA);
+                cohort.active.expert_local.copy_(map);
+                cohort.map_dirty=false;
+            }
+            initialize_mixed_nvq_dispatch(*source->active_,config_);
+        }
+    };
+    // Retire all derived views before returning old arenas to the allocator.
+    moe_residency_.reset();
+    for(auto& source:sources_) {
+        source->active_->pools.clear();
+        for(auto& cohort:source->cohorts_)cohort.active={};
+    }
+    try {
+        for(auto& entry:saved) {
+            auto& arena=*entry.arena;
+            const auto slots=plan.at(arena.signature);
+            arena.fields.clear();context->reclaim_idle_memory();
+            for(std::size_t i=0;i<entry.fields.size();++i) {
+                auto shape=arena.layouts[i].slot_shape;shape[0]*=slots;
+                auto field=mfq_tensor_backend::empty(shape,entry.fields[i].options().device(mfq_tensor_backend::kCUDA));
+                const auto rows=arena.layouts[i].slot_shape[0]*std::min(slots,entry.slots);
+                field.narrow(0,0,rows).copy_(entry.fields[i].narrow(0,0,rows));
+                arena.fields.push_back(std::move(field));
+            }
+        }
+    } catch(...) {
+        for(auto& entry:saved) {
+            entry.arena->fields.clear();context->reclaim_idle_memory();
+            for(const auto& field:entry.fields)entry.arena->fields.push_back(field.to(mfq_tensor_backend::kCUDA));
+        }
+        rebuild_sources();
+        for(const auto& key:demotions)host_experts_->promote(key);
+        throw;
+    }
+    // Publish demotions from the retained CPU image, then change slot books.
+    for(auto& entry:saved) {
+        auto& arena=*entry.arena;
+        const int slots=plan.at(arena.signature);
+        for(int slot=slots;slot<entry.slots;++slot)if(const auto& key=arena.book->key_for(slot);key) {
+            auto& source=*sources_.at(key->source);
+            if(source.quant_source_)source.quant_source_->publish_gpu_resident(key->expert,false);
+            source.invalidate(key->cohort,key->expert,slot);
+        }
+        arena.slots=slots;arena.book->resize(slots);
+    }
+    allocated_bytes_=0;
+    for(const auto& [signature,arena]:arenas_)allocated_bytes_+=int64_t(arena->slots)*arena->slot_bytes;
+    budget_bytes_=static_cast<int64_t>(bytes);
+    // An online repartition invalidates the old contiguous cold-expert image.
+    // Subsequent prefill uses the existing per-expert DMA path until reloaded.
+    pipeline_prefill_layer_layout_=false;
+    rebuild_sources();
+    context->reclaim_idle_memory();
+}
+
 void MoeExpertCache::preload_complete_residency() {
     if (!finalized_) throw std::logic_error("expert residency requires finalized GPU arenas");
     const auto started=std::chrono::steady_clock::now();
@@ -374,11 +485,11 @@ void MoeExpertCache::preload_complete_residency() {
     std::vector<std::vector<int64_t>> ram_offsets(sources_.size());
     std::map<int,std::vector<MoeCachedSource*>> layer_sources;
     // Only registered FFN bundles consume the direct-RAM transfer arena.
-    // Packed predictor projections use the ordinary cache uploader; keeping
-    // their CPU fields pageable avoids locking several extra GiB on Windows.
+    // Target and predictor bundles share compact fields; partial host pinning
+    // prioritizes target layers and permits pageable predictor tails.
     std::vector<bool> pipeline_sources(sources_.size(),!config_.moe_pipeline);
     for(const auto& bundle:pipeline_bundles_)
-        if(bundle[0]!=bundle[1])for(const auto id:bundle)pipeline_sources.at(id)=true;
+        for(const auto id:bundle)pipeline_sources.at(id)=true;
     for(const auto& source:sources_) {
         ram_offsets[source->id_].assign(source->n_experts(),-1);
         if(pipeline_sources[source->id_])layer_sources[source->layer_id_].push_back(source.get());
@@ -394,7 +505,13 @@ void MoeExpertCache::preload_complete_residency() {
         // FFN bundle defines Down independently of those strings and load order.
         std::vector<bool> down_sources(sources_.size(),false);
         for(const auto& bundle:pipeline_bundles_)down_sources.at(bundle[2])=true;
-        for(auto& layer:layer_sources) {
+        // Keep predictor images after backbone images so a partial Windows
+        // host registration continues to favor ordinary target decoding.
+        std::vector<int> layer_order;
+        for(const auto& [id,sources]:layer_sources)if(id>=0)layer_order.push_back(id);
+        for(const auto& [id,sources]:layer_sources)if(id<0)layer_order.push_back(id);
+        for(const auto id:layer_order) {
+            auto& layer=*layer_sources.find(id);
             ram_allocated=(ram_allocated+255)&~int64_t(255);
             const auto begin=ram_allocated;
             const auto down=[&](const MoeCachedSource* source) {
@@ -511,6 +628,13 @@ void MoeExpertCache::preload_complete_residency() {
         registered_host_fields_.reserve(registered_host_fields_.size()+1);
         auto* address=pipeline_ram_complement_->data_ptr();
         int64_t registered=ram_allocated;
+#ifdef _WIN32
+        // Leave predictor images pageable, as before the prefill layout was
+        // enabled for them. WDDM's shared-memory charge must leave room for
+        // mapped decode plans and transfer buffers allocated after loading.
+        for(const auto& [layer,span]:pipeline_prefill_layers_)
+            if(layer<0 && span.first>0)registered=std::min(registered,span.first);
+#endif
         if(const auto limit=mfq::cuda::runtime_options::moe_ram_pin_bytes()) {
             if(*limit>0)registered=std::min(registered,*limit);
         }
@@ -1309,6 +1433,21 @@ std::vector<std::pair<std::string, double>> moe_expert_memory_metrics(
 bool moe_expert_cache_finalized(
         const std::shared_ptr<MoeExpertCache>& cache) {
     return cache && cache->finalized();
+}
+
+std::size_t moe_expert_cache_minimum_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
+    return cache ? cache->minimum_bytes() : 0;
+}
+bool moe_expert_cache_layer_prefill_ready(const std::shared_ptr<MoeExpertCache>& cache) {
+    return cache && cache->layer_prefill_ready();
+}
+std::size_t moe_expert_cache_budget_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
+    return cache ? std::size_t(cache->budget_bytes()) : 0;
+}
+void resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
+    if(!cache)return;
+    release_moe_decode_buffers(cache);
+    cache->resize(bytes);
 }
 
 void finalize_moe_expert_cache(

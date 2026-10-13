@@ -37,6 +37,7 @@ export function useModelCatalog() {
   };
   const [modelFilter, setModelFilter] = useState('');
   const [loadPinned, setLoadPinned] = useState(false);
+  const [loadDeviceIds, setLoadDeviceIds] = useState<string[]>([]);
   const [loadIdleTtl, setLoadIdleTtl] = useState<number | null>(null);
   const [modelBrowser, setModelBrowser] = useState<ModelDirectoryList | null>(null);
   const [modelBrowserOpen, updateModelBrowserOpen] = useState(false);
@@ -74,6 +75,7 @@ export function useModelCatalog() {
     setArtifacts([]);
     updateModelBrowserOpen(false);
     setBusy(false);
+    setLoadDeviceIds([]);
   }, [connectionRevision]);
   useEffect(() => {
     if (!ready) return;
@@ -140,6 +142,7 @@ export function useModelCatalog() {
     try {
       await modelsApi.loadModel(name, contextSize, 2048, {
         pin: loadPinned,
+        device_ids: loadDeviceIds,
         idle_ttl_seconds: loadIdleTtl,
       });
       if (!current()) return;
@@ -185,6 +188,7 @@ export function useModelCatalog() {
       if (!loaded) {
         await modelsApi.loadModel(artifact.name, contextSize, 2048, {
           pin: loadPinned,
+          device_ids: loadDeviceIds,
           idle_ttl_seconds: loadIdleTtl,
         });
         if (!current()) return;
@@ -334,6 +338,8 @@ export function useModelCatalog() {
     filteredInstances,
     filteredArtifacts,
     loadPinned,
+    loadDeviceIds,
+    setLoadDeviceIds,
     setLoadPinned,
     loadIdleTtl,
     setLoadIdleTtl,

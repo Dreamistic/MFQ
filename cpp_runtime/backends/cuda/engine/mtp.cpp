@@ -190,6 +190,18 @@ template <class Model> struct CudaMtpOps {
         ? result.sample_hidden.narrow(1, result.sample_hidden.size(1)-1, 1).contiguous() : Tensor{};
     return result;
   }
+  int64_t predictor_prefill_chunk_size(int64_t requested) const {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+      // The predictor retains its expert image across these compute tiles.
+      return std::min<int64_t>(1024,requested);
+    return std::min<int64_t>(512,requested);
+  }
+  double predictor_prefill(Tensor hidden, Tensor ids, Tensor positions) {
+    PrefillCudaTimer timer;
+    (void)predictor_step(std::move(hidden),std::move(ids),std::move(positions));
+    MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+    return timer.elapsed_ms();
+  }
   int32_t sample_normal(Tensor logits, Tensor token_counts) {
     if(sampler().greedy() && !penalties) {
       if(projected_predictor_greedy>=0 && projected_predictor_logits.defined() &&

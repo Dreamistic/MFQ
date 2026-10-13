@@ -108,6 +108,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
 add_library(mfq-cuda-native-kernels STATIC
     ${MFQ_CUDA_KERNEL_SOURCES}
     ${MFQ_CUDA_ROOT}/kernels/float_projection.cu
+    ${MFQ_CUDA_ROOT}/kernels/kv_quantization.cu
     ${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu
     ${MFQ_CUDA_ROOT}/kernels/shared_gate_fused.cu
     ${MFQ_CUDA_ROOT}/runtime/moe_pipeline.cu
@@ -605,6 +606,9 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
     add_test(NAME mfq-cuda-qsa-kv-offload-test COMMAND mfq-window-attention-test --qsa-kv-offload-check)
+    add_test(NAME mfq-cuda-turboquant-kv-test COMMAND mfq-window-attention-test --turboquant-kv-check)
+    add_test(NAME mfq-cuda-turboquant-qsa-test COMMAND mfq-window-attention-test --turboquant-qsa-check)
+    set_tests_properties(mfq-cuda-turboquant-qsa-test PROPERTIES ENVIRONMENT "MFQ_KV_TURBOQUANT_BITS=3.5")
     mfq_configure_cuda_runtime_target(mfq-nint-row-pipeline-test)
     target_link_libraries(mfq-nint-row-pipeline-test PRIVATE mfq-cuda-runtime)
 

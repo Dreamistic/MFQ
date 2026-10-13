@@ -93,7 +93,7 @@ inline CudaModelPlan cuda_model_plan(
     CudaModelPlan result;
     result.backbone = cuda_backbone(graph.backbone);
     const auto* vision = graph.component("vision");
-    if (graph.backbone == "qwen3_5" && vision != nullptr &&
+    if ((graph.backbone == "qwen3_5" || graph.backbone == "qwen4_exp") && vision != nullptr &&
         vision->tensor_root == "vision" &&
         vision->implementation == "grid_vit" &&
         vision->input_contract == kMfqGridVisionInputContract &&

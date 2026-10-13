@@ -116,14 +116,14 @@ export function MemoryBudgetControls({ residency, children }: { residency: strin
   }
   return <>
     <SettingRow title={totalLabel}
-      detail={separate ? tr('显存权重、活跃 KV 与显存热前缀共用此预算；前缀冷层在 SSD，流式专家与 KV 的 RAM 占用单独统计。', 'VRAM weights, live KV and hot prefixes share this budget. Cold prefixes reside on SSD; RAM-streamed experts and KV are accounted separately.') : tr('权重、活跃 KV 和前缀 RAM 共用此预算；接近上限时，先将前缀缓存移至 SSD，再减少常驻专家。', 'Weights, live KV and prefix RAM share this budget; near the limit, move prefix caches to SSD before reducing resident experts.')}
+      detail={separate ? tr('显存权重、活跃 KV 与显存热前缀共用此预算；RAM 专家、KV 和前缀缓存单独统计。', 'VRAM weights, live KV and hot prefixes share this budget. RAM experts, KV and prefix caches are accounted separately.') : tr('权重、活跃 KV 和前缀 RAM 共用此预算；接近上限时，先将前缀缓存移至 SSD，再减少常驻专家。', 'Weights, live KV and prefix RAM share this budget; near the limit, move prefix caches to SSD before reducing resident experts.')}
       trailing={<>{!totalManual && effectiveTotal != null && <small className="memory-budget-available">{(effectiveTotal / 2 ** 30).toFixed(1)} GiB</small>}
         {control(totalLabel, totalManual, changeTotalMode, totalDraft, setTotalDraft, 0.1)}</>} />
     <SettingRow title={modelLabel}
       detail={separate ? tr('所有模型权重的显存上限；放不下的 MoE 专家在 RAM 中按需传入显存，SSD 专家流式加载尚未支持。', 'VRAM ceiling across model weights; overflowing MoE experts stream from RAM to VRAM. SSD expert streaming is not yet supported.') : tr('所有模型权重的总上限；放不下的 MoE 专家自动转为 SSD 缓存。', 'Total weight ceiling across models; overflowing MoE experts use SSD-backed caching.')}
       trailing={control(modelLabel, modelManual, setModelManual, modelDraft, setModelDraft, 0.1)} />
     <SettingRow title={prefixLabel}
-      detail={separate ? tr('所有模型可复用前缀的显存上限，不含活跃 KV；冷前缀直接存入 SSD，不保留 RAM 缓存层。', 'VRAM limit for reusable prefixes, excluding live KV. Cold prefixes go directly to SSD without a RAM cache tier.') : tr('所有模型可复用前缀的 RAM 上限，不含活跃 KV。', 'RAM limit for reusable prefixes across models; excludes active KV.')}
+      detail={separate ? tr('所有模型可复用前缀的显存上限，不含活跃 KV；RAM 与 SSD 前缀缓存配额单独设置。', 'VRAM limit for reusable prefixes, excluding live KV. RAM and SSD prefix allowances are configured separately.') : tr('所有模型可复用前缀的 RAM 上限，不含活跃 KV。', 'RAM limit for reusable prefixes across models; excludes active KV.')}
       trailing={control(prefixLabel, prefixManual, setPrefixManual, prefixDraft, setPrefixDraft, 0)} />
     {children}
     <div className="memory-budget-actions"><small>{tr('当前模型驻留', 'Current weight residency')}: {residency}</small>

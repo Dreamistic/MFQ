@@ -24,6 +24,15 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <fstream>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__linux__)
+#include <sys/sysinfo.h>
+#endif
 
 namespace mfq::cuda::internal {
 
@@ -40,6 +49,8 @@ static std::string cuda_prefix_cache_compatibility_key(
         << "codec=" << (source.architecture()=="qwen4_exp" ? "cuda-qwen4-session-v1" : "cuda-full-attention-kv-v1") << '\n'
         << "context=" << max_position_embeddings << '\n'
         << "architecture=" << source.architecture() << '\n';
+    const auto quantization=mfq::cuda::cuda_kv_quantization_tag();
+    if(!quantization.empty())key<<"kv="<<quantization<<'\n';
     for (std::size_t index = 0; index < source.source_paths().size(); ++index) {
         const auto &path = source.source_paths()[index];
         std::error_code error;
@@ -80,9 +91,22 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
     cache.compatibility_key = cuda_prefix_cache_compatibility_key(source, max_position_embeddings);
     cache.block_size_tokens = static_cast<size_t>(config.block_tokens);
     cache.max_disk_bytes = config.disk_bytes;
-    // Discrete devices keep native GPU snapshots as the hot tier. Serialized
-    // blocks are staging buffers for SSD I/O, never a retained RAM cache.
-    cache.max_hot_bytes = cuda_has_separate_memory() ? 0 : config.hot_bytes;
+    const bool separate = cuda_has_separate_memory();
+    cache.max_hot_bytes = separate ? config.ram_bytes : config.hot_bytes;
+    cache.spill_hot_on_eviction = separate;
+    if (separate) cache.available_ram_bytes = []() -> std::uint64_t {
+#ifdef _WIN32
+        MEMORYSTATUSEX state{};
+        state.dwLength = sizeof(state);
+        if (GlobalMemoryStatusEx(&state)) return state.ullAvailPhys;
+#elif defined(__linux__)
+        std::ifstream input("/proc/meminfo");
+        std::string name, unit;
+        std::uint64_t kib = 0;
+        while (input >> name >> kib >> unit) if (name == "MemAvailable:") return kib * 1024;
+#endif
+        return UINT64_MAX;
+    };
     cache.max_pending_writes = config.pending_writes;
     cache.max_pending_bytes = config.pending_bytes;
     return std::make_shared<mfq::cache::PagedPrefixCache>(std::move(cache));
@@ -138,6 +162,7 @@ TextSessionRestore TextSessionCache::restore_best(Model &model, MtpModule *mtp,
 }
 
 void TextSessionCache::store(const std::string &session_id, TextSessionState state) {
+    impl_->reserve_ram(state.bytes);
     impl_->store(session_id, std::move(state));
 }
 
@@ -154,12 +179,57 @@ std::vector<std::pair<std::string, double>> TextSessionCache::metrics() const {
     return impl_->metrics();
 }
 
+std::map<int, std::size_t> TextSessionCache::device_hot_bytes() const {
+    std::map<std::pair<int, std::uintptr_t>, std::size_t> allocations;
+    const auto tensor = [&](const mfq_tensor_backend::Tensor& value) {
+        if (!value.defined() || !value.is_cuda()) return;
+        auto& bytes = allocations[{value.get_device(), reinterpret_cast<std::uintptr_t>(value.data_ptr())}];
+        bytes = std::max(bytes, std::size_t(value.numel()) * value.element_size());
+    };
+    const auto full = [&](const FullBlockSessionState& block) { tensor(block.k); tensor(block.v); };
+    const auto qwen = [&](const Qwen4BlockSessionState& block) {
+        tensor(block.keys); tensor(block.values); tensor(block.index); tensor(block.convolution);
+        tensor(block.recurrent); tensor(block.ple_convolution);
+    };
+    const auto pool = [&](const Dsv4PoolSessionState& value) {
+        tensor(value.state_kv); tensor(value.state_gate); tensor(value.previous_kv);
+        tensor(value.previous_gate); tensor(value.pool);
+    };
+    impl_->visit_snapshots([&](const TextSessionState& state) {
+        tensor(state.qwen4_positions);
+        std::visit([&](const auto& blocks) {
+            if constexpr (!std::is_same_v<std::decay_t<decltype(blocks)>, std::monostate>)
+                for (const auto& block : blocks) {
+                    using Block = std::decay_t<decltype(block)>;
+                    if constexpr (std::is_same_v<Block, FullBlockSessionState>) full(block);
+                    else if constexpr (std::is_same_v<Block, Qwen4BlockSessionState>) qwen(block);
+                    else if constexpr (std::is_same_v<Block, HybridBlockSessionState>) {
+                        full(block.full_attention); tensor(block.convolution_state); tensor(block.recurrent_state);
+                    } else if constexpr (std::is_same_v<Block, Dsv4BlockSessionState>) {
+                        tensor(block.local_cache); pool(block.compressor); pool(block.indexer_compressor);
+                    } else { tensor(block.kv_cache); tensor(block.index_cache); }
+                }
+        }, state.payload);
+        if (state.mtp) {
+            tensor(state.mtp->last_target_hidden);
+            for (const auto& block : state.mtp->blocks) full(block);
+            for (const auto& block : state.mtp->qwen4_blocks) qwen(block);
+            for (const auto& value : state.mtp->qwen4_positions) tensor(value);
+        }
+    });
+    std::map<int, std::size_t> result;
+    for (const auto& [address, bytes] : allocations) result[address.first] += bytes;
+    return result;
+}
+
 size_t TextSessionCache::clear_live_sessions() noexcept { return impl_->clear_live_sessions(); }
 
 size_t TextSessionCache::clear() { return impl_->clear(); }
 
 uint64_t TextSessionCache::trim_hot(uint64_t target_bytes) { return impl_->trim_hot(target_bytes); }
 uint64_t TextSessionCache::set_hot_limit(uint64_t max_bytes) { return impl_->set_hot_limit(max_bytes); }
+uint64_t TextSessionCache::set_ram_limit(uint64_t max_bytes) { return impl_->set_ram_limit(max_bytes); }
+void TextSessionCache::reserve_ram(uint64_t bytes) { impl_->reserve_ram(bytes); }
 uint64_t TextSessionCache::set_disk_limit(uint64_t max_bytes) { return impl_->set_disk_limit(max_bytes); }
 uint64_t TextSessionCache::refresh_disk_index() { return impl_->refresh_disk_index(); }
 
@@ -199,7 +269,7 @@ void CudaPagedWriter::tensor(const mfq_tensor_backend::Tensor &source) {
         dtype != mfq_tensor_backend::kFloat32 && dtype != mfq_tensor_backend::kInt32 && dtype != mfq_tensor_backend::kInt64) {
         throw std::runtime_error("unsupported CUDA paged cache tensor dtype");
     }
-    const auto cpu = source.to(mfq_tensor_backend::kCPU).contiguous();
+    const auto cpu = source.contiguous().to(mfq_tensor_backend::kCPU);
     scalar<int32_t>(static_cast<int32_t>(dtype));
     scalar<int32_t>(source.get_device());
     scalar<uint32_t>(static_cast<uint32_t>(cpu.dim()));
@@ -452,7 +522,7 @@ std::vector<CudaPagedPayload> encode_cuda_paged_session(const TextSessionState &
         writer.scalar<uint32_t>(static_cast<uint32_t>(layers->size()));
         for (const auto &layer : *layers) {
             if (layer.ring || layer.capacity <= 0 || !layer.k.defined() || !layer.v.defined() ||
-                layer.k.dim() != 4 || layer.v.sizes() != layer.k.sizes() ||
+                !session_kv_geometry_matches(layer.k,layer.v) ||
                 layer.k.size(2) < start + static_cast<int64_t>(block_size)) {
                 throw std::runtime_error("CUDA session layer cannot be block-sliced");
             }
@@ -495,8 +565,7 @@ CudaDecodedPagedBlock decode_cuda_paged_block(const std::vector<uint8_t> &payloa
         layer.capacity = reader.scalar<int64_t>("capacity");
         auto key = reader.tensor();
         auto value = reader.tensor();
-        if (key.second != value.second || key.first.dim() != 4 ||
-            value.first.sizes() != key.first.sizes() ||
+        if (key.second != value.second || !session_kv_geometry_matches(key.first,value.first) ||
             key.first.size(2) != static_cast<int64_t>(block.count)) {
             throw CudaSessionStateError("invalid CUDA paged cache layer");
         }
@@ -548,7 +617,7 @@ TextSessionState decode_cuda_paged_session(const std::vector<CudaPagedPayload> &
             if (layer.capacity != final.capacity || layer.device != final.device ||
                 layer.k.scalar_type() != final.k.scalar_type() ||
                 layer.k.size(0) != final.k.size(0) || layer.k.size(1) != final.k.size(1) ||
-                layer.k.size(3) != final.k.size(3)) {
+                layer.k.size(3) != final.k.size(3) || layer.v.size(3)!=final.v.size(3)) {
                 throw CudaSessionStateError("inconsistent CUDA paged cache topology");
             }
             keys.push_back(layer.k);
@@ -620,7 +689,7 @@ void restore_session_prefix_tensor(mfq_tensor_backend::Tensor &target,
 FullBlockSessionState capture_full_attention_session_state(const FullBlock &block,
                                                            int64_t cache_pos, size_t &bytes) {
     if (!block.cache.k.defined() || !block.cache.v.defined() || block.cache.k.dim() != 4 ||
-        block.cache.v.sizes() != block.cache.k.sizes() || block.cache.k.size(0) != 1) {
+        !session_kv_geometry_matches(block.cache.k,block.cache.v) || block.cache.k.size(0) != 1) {
         throw std::runtime_error("full-attention KV cache is unavailable");
     }
     FullBlockSessionState state;
@@ -637,11 +706,12 @@ FullBlockSessionState capture_full_attention_session_state(const FullBlock &bloc
 
 void restore_full_attention_session_state(FullBlock &block, const FullBlockSessionState &state) {
     if (!state.k.defined() || !state.v.defined() || state.capacity <= 0 || state.k.dim() != 4 ||
-        state.v.sizes() != state.k.sizes() || state.k.size(0) != 1 ||
+        !session_kv_geometry_matches(state.k,state.v) || state.k.size(0) != 1 ||
         state.k.size(2) > state.capacity) {
         throw CudaSessionStateError("full-attention session KV layout is invalid");
     }
     restore_session_prefix_tensor(block.cache.k, state.k, 2, state.capacity);
     restore_session_prefix_tensor(block.cache.v, state.v, 2, state.capacity);
     block.cache.ring = state.ring;
+    block.cache.quantization = block.kv_quantization;
 }
