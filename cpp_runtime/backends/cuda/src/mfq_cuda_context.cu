@@ -683,6 +683,18 @@ std::size_t Context::resident_memory_usage() const {
     return std::max(bytes,local_memory_usage());
 }
 
+std::optional<std::size_t> shared_memory_available(int device) {
+#ifdef _WIN32
+    const auto budget=device_allocation_budget(device);
+    if(budget->adapter) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+        if(SUCCEEDED(budget->adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,&memory)))
+            return memory.Budget>memory.CurrentUsage?std::size_t(memory.Budget-memory.CurrentUsage):0;
+    }
+#endif
+    return std::nullopt;
+}
+
 std::pair<std::uint64_t,std::uint64_t> Context::pool_memory_stats() const {
     DeviceGuard guard(device_);
     std::uint64_t used=0,reserved=0;
@@ -768,6 +780,50 @@ void Context::check_memory_limit(std::size_t additional) const {
     }
 }
 
+void Context::begin_workspace_loan(const std::vector<std::pair<void*,std::size_t>>& regions,
+                                  cudaStream_t stream) {
+    std::lock_guard lock(graph_pool_mutex_);
+    if(workspace_loan_)throw Error("CUDA workspace loan is already active");
+    auto loan=std::make_unique<WorkspaceLoan>();
+    loan->stream=stream;loan->thread=std::this_thread::get_id();
+    for(const auto& [pointer,bytes]:regions) {
+        const auto raw=reinterpret_cast<std::uintptr_t>(pointer);
+        const auto begin=(raw+255)&~std::uintptr_t(255);
+        if(begin-raw>=bytes)continue;
+        const auto size=(bytes-(begin-raw))&~std::size_t(255);
+        if(size && !loan->free.emplace(begin,size).second)throw Error("duplicate CUDA workspace loan region");
+    }
+    for(auto it=loan->free.begin();it!=loan->free.end();++it) {
+        const auto next=std::next(it);
+        if(next==loan->free.end())break;
+        if(it->first+it->second>next->first)throw Error("overlapping CUDA workspace loan regions");
+        // Keep a gap between distinct allocations even when the allocator
+        // happened to place them adjacently. Never coalesce across their bounds.
+        if(it->first+it->second==next->first)it->second-=256;
+    }
+    workspace_loan_=std::move(loan);
+}
+void Context::suspend_workspace_loan() {
+    std::lock_guard lock(graph_pool_mutex_);
+    if(workspace_loan_)workspace_loan_->enabled=false;
+}
+void Context::end_workspace_loan() {
+    std::lock_guard lock(graph_pool_mutex_);
+    if(workspace_loan_ && !workspace_loan_->live.empty()) {
+        std::size_t bytes=0;for(const auto& [p,n]:workspace_loan_->live)bytes+=n;
+        throw Error("CUDA workspace loan still has live tensors: count="+
+            std::to_string(workspace_loan_->live.size())+" bytes="+std::to_string(bytes));
+    }
+    workspace_loan_.reset();
+}
+std::size_t Context::workspace_available() const {
+    std::lock_guard lock(graph_pool_mutex_);
+    std::size_t bytes=0;
+    if(workspace_loan_ && workspace_loan_->enabled && workspace_loan_->thread==std::this_thread::get_id())
+        for(const auto& [p,n]:workspace_loan_->free)bytes+=n;
+    return bytes;
+}
+
 void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     if (bytes == 0) {
         return nullptr;
@@ -791,6 +847,24 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
                 return pointer;
             }
             capture_pool_miss = pool->second.capturing;
+        }
+        if(!pooled_allocation && !resident_allocations && workspace_loan_ &&
+                workspace_loan_->enabled && workspace_loan_->stream==allocation_stream &&
+                workspace_loan_->thread==std::this_thread::get_id() && bytes<=SIZE_MAX-255) {
+            auto& loan=*workspace_loan_;
+            const auto aligned=(bytes+255)&~std::size_t(255);
+            // Best fit keeps the large regions available for transfer images.
+            auto best=loan.free.end();
+            for(auto it=loan.free.begin();it!=loan.free.end();++it)
+                if(it->second>=aligned && (best==loan.free.end() || it->second<best->second))best=it;
+            if(best!=loan.free.end()) {
+                const auto base=best->first,size=best->second;
+                auto* result=reinterpret_cast<void*>(base);
+                loan.live.emplace(result,aligned);
+                loan.free.erase(best);
+                if(size>aligned)loan.free.emplace(base+aligned,size-aligned);
+                return result;
+            }
         }
     }
     if (capture_pool_miss) {
@@ -875,6 +949,25 @@ void Context::release(
         stream != nullptr ? stream : stream_.get();
     try {
         std::lock_guard lock(graph_pool_mutex_);
+        if(workspace_loan_) {
+            auto& loan=*workspace_loan_;
+            if(auto it=loan.live.find(pointer);it!=loan.live.end()) {
+                const auto base=reinterpret_cast<std::uintptr_t>(pointer),size=it->second;
+                auto entry=loan.free.emplace(base,size).first;
+                loan.live.erase(it);
+                if(entry!=loan.free.begin()) {
+                    auto before=std::prev(entry);
+                    if(before->first+before->second==entry->first) {
+                        before->second+=entry->second;loan.free.erase(entry);entry=before;
+                    }
+                }
+                auto after=std::next(entry);
+                if(after!=loan.free.end() && entry->first+entry->second==after->first) {
+                    entry->second+=after->second;loan.free.erase(after);
+                }
+                return;
+            }
+        }
         if (auto pool = graph_pools_.find(allocation_stream);
             pool != graph_pools_.end() && pool->second.owned.count(pointer)) {
             pool->second.available[bytes].push_back(pointer);
@@ -886,6 +979,9 @@ void Context::release(
         // leaking it. During capture the size bucket already exists and the
         // preceding pop leaves enough vector capacity for this push.
         std::lock_guard lock(graph_pool_mutex_);
+        // A host bookkeeping failure must never cudaFree an expert-cache
+        // suballocation. Keeping the live record makes return fail safely.
+        if(workspace_loan_ && workspace_loan_->live.count(pointer))return;
         if (auto pool = graph_pools_.find(allocation_stream); pool != graph_pools_.end())
             pool->second.owned.erase(pointer);
     }

@@ -34,6 +34,17 @@ def test_memory_resources_use_worker_measurements_not_allocator_or_io_totals():
     assert memory.ssd_ple is False
 
 
+def test_ram_kv_preallocation_and_ram_only_streaming_do_not_enable_ssd():
+    memory = RuntimePool._memory_resources({
+        'kv_memory_ram_bytes': 4096, 'qsa_kv_ram_bytes': 2048,
+        'qsa_kv_offload_enabled': 1, 'qsa_kv_ssd_enabled': 0,
+    })
+    assert memory.ram_kv_bytes == 6144
+    assert memory.ram_kv_limit_bytes == 6144
+    assert memory.ram_kv is True
+    assert memory.ssd_kv is False
+
+
 def test_busy_worker_retains_last_breakdown_instead_of_resetting_to_zero():
     previous = RuntimePool._memory_resources({"resident_weight_bytes": 1024, "ssd_ple_enabled": 1})
     assert RuntimePool._memory_resources({"mlx_active_bytes": 2048}, previous) == previous

@@ -44,7 +44,8 @@ def test_cuda_online_budget_yarn_and_device_telemetry(tmp_path, kv_bits):
                 assert status["resident_memory_budget_bytes"] == 2 << 30
                 assert status["gpu_0_resident_weight_bytes"] == status["resident_weight_bytes"] > 0
                 assert status["gpu_0_memory_total_bytes"] > status["gpu_0_memory_available_bytes"] >= 0
-                assert status["gpu_0_kv_bytes"] == 0
+                assert status["kv_memory_preallocated"] == 1
+                assert status["gpu_0_kv_bytes"] == status["kv_memory_gpu_bytes"] > 0
 
                 async def generate(tokens=50):
                     # This prompt exceeds the fixture's native 32-token context.

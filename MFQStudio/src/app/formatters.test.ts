@@ -24,3 +24,8 @@ it('preserves diagnostic codes for unexpected failures', () => {
   expect(errorMessage(apiError('unexpected_kernel_error', 'allocation failed'), (_zh, en) => en)).toBe('unexpected_kernel_error: allocation failed');
   expect(errorMessage(new Error('unexpected problem'))).toBe('unexpected problem');
 });
+
+it('explains automatic KV capacity failure with the requested SSD alternative', () => {
+  expect(errorMessage(apiError('kv_memory_insufficient'), (zh) => zh)).toBe(
+    '可用显存和内存不足，请选择自动（启用SSD KV），这可能会拖慢长上下文时的速度并造成磁盘占用，或者降低上下文长度。');
+});

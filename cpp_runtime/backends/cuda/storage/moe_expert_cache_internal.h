@@ -15,7 +15,17 @@
 struct MoeFfnPrefillHostWorkspace;
 class MoeExpertCache {
 public:
+    std::size_t begin_prefill_loan(std::size_t workspace_bytes);
+    void suspend_prefill_loan();
+    void end_prefill_loan();
+    bool prefill_loan_active() const {return bool(prefill_loan_);}
+    std::size_t prefill_transfer_bytes(bool predictor=false) const;
+    void set_workspace_reservation(std::function<void(std::size_t)> reserve,
+                                   std::function<void(std::size_t)> reserve_ram={}) {
+        reserve_workspace_=std::move(reserve);reserve_ram_workspace_=std::move(reserve_ram);
+    }
     bool layer_prefill_ready() const { return pipeline_prefill_layer_layout_ && pipeline_ram_registered_bytes_>0; }
+    std::uint64_t streamed_bytes() const {return stats_.ram_pcie_bytes;}
     MoeExpertCache(
             int64_t budget_bytes,
             const CudaExecutionConfig& config)
@@ -75,6 +85,9 @@ public:
     }
 
     ~MoeExpertCache() {
+        if(prefill_loan_)try{end_prefill_loan();}catch(const std::exception& e) {
+            std::cerr<<"runtime_prefill_loan destructor_error="<<e.what()<<'\n';
+        }
         pipeline_cpu_calibration_.wait();
         if(pipeline_prefill_layer_buffer_.defined() && weight_stream_)
             (void)cudaStreamSynchronize(weight_stream_);
@@ -220,7 +233,7 @@ public:
         return arena;
     }
 
-    void finalize();
+    void finalize(std::size_t kv_growth_reserve = 0, std::size_t kv_budget_charge = 0);
     void resize(std::size_t bytes);
     std::size_t minimum_bytes() const {
         std::size_t result=0;
@@ -322,6 +335,7 @@ public:
     bool complete_residency() const noexcept { return complete_residency_; }
     double ram_pcie_fraction() const noexcept { return ram_pcie_fraction_; }
     void finish_pipeline_exchanges() { if(moe_residency_)moe_residency_->apply_pending(); }
+    void prepare_decode_residency() { if(moe_residency_)moe_residency_->prepare_decode(); }
 
     void begin_route_experts(
             const MoeRoutePlan & route,
@@ -667,6 +681,21 @@ public:
     }
 
 private:
+    struct PrefillLoan {
+        struct Arena {MoeGpuArena* arena;int first;std::vector<mfq_tensor_backend::Tensor> saved;};
+        struct Cohort {std::vector<int32_t> experts;std::vector<int64_t> fields;};
+        struct Copy {const uint8_t* source;std::size_t offset,bytes;};
+        struct Layer {std::size_t bytes=0;std::vector<Copy> copies;};
+        struct Stage {mfq_tensor_backend::Tensor host;bool pinned=false;};
+        std::vector<Arena> arenas;
+        std::map<std::pair<int,int>,Cohort> cohorts;
+        std::map<int,Layer> layers;
+        std::array<Stage,2> stages;
+        std::size_t bytes=0;
+        ~PrefillLoan() {for(auto& stage:stages)if(stage.pinned)(void)cudaHostUnregister(stage.host.data_ptr());}
+    };
+    std::unique_ptr<PrefillLoan> prefill_loan_;
+    std::function<void(std::size_t)> reserve_ram_workspace_;
     struct DmaCallSample {
         int layer=0,tokens=0,entries=0;
         bool window=false;
@@ -790,7 +819,10 @@ private:
     std::map<int,std::pair<int64_t,int64_t>> pipeline_prefill_layers_;
     std::map<int,int64_t> pipeline_prefill_layer_gate_up_bytes_;
     mfq_tensor_backend::Tensor pipeline_prefill_layer_buffer_;
+    mfq_tensor_backend::Tensor pipeline_prefill_layer_down_buffer_;
+    int64_t pipeline_prefill_layer_split_=0;
     int64_t pipeline_prefill_layer_stride_=0;
+    std::function<void(std::size_t)> reserve_workspace_;
     bool pipeline_prefill_layer_overlap_=false;
     std::array<cudaEvent_t,2> pipeline_prefill_layer_ready_{};
     std::array<cudaEvent_t,2> pipeline_prefill_layer_gate_up_ready_{};

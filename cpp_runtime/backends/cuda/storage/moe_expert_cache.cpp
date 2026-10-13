@@ -1,5 +1,6 @@
 #include "../runtime/execution_options.h"
 #include "moe_cached_source_internal.h"
+#include "mfq_cuda_resident_allocations.h"
 #include <map>
 #include <cmath>
 
@@ -47,7 +48,7 @@ std::shared_ptr<MoeCachedSource> MoeExpertCache::register_quant_range_source(
     return source;
 }
 
-void MoeExpertCache::finalize() {
+void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budget_charge) {
     if (finalized_) return;
     if (sources_.empty()) {
         throw std::runtime_error(
@@ -60,10 +61,15 @@ void MoeExpertCache::finalize() {
     // those weights, retaining room for prefill, graph warmup and growing KV.
     size_t device_free=0,device_total=0;
     MFQ_CUDA_CHECK(cudaMemGetInfo(&device_free,&device_total));
-    const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes();
+    const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes()+kv_growth_reserve;
     if(device_free<=reserve)
         throw std::runtime_error("CUDA VRAM leaves no workspace for expert streaming");
     const auto requested_physical=budget_bytes_;
+    // The requested expert budget predates the concrete KV layout. Charge
+    // its reserved capacity here so prefill transfer/compute overlap keeps
+    // the same headroom when switching from growing to preallocated KV.
+    budget_bytes_=int64_t(std::max(minimum_bytes(),std::size_t(budget_bytes_)>
+        kv_budget_charge?std::size_t(budget_bytes_)-kv_budget_charge:0));
     budget_bytes_=static_cast<int64_t>(std::min<std::size_t>(
         static_cast<std::size_t>(budget_bytes_),device_free-reserve));
     std::cerr<<"moe_cache_physical_budget free_bytes="<<device_free
@@ -338,7 +344,156 @@ void MoeExpertCache::finalize() {
     if (config_.moe_preload_all) preload_complete_residency();
 }
 
+std::size_t MoeExpertCache::prefill_transfer_bytes(bool predictor) const {
+    std::size_t maximum=0;
+    std::size_t layers=0;
+    for(const auto& [id,span]:pipeline_prefill_layers_)if((id<0)==predictor) {
+        ++layers;
+        std::size_t bytes=std::size_t(span.second);
+        if(prefill_loan_)if(auto it=prefill_loan_->layers.find(id);it!=prefill_loan_->layers.end())
+            bytes=((bytes+255)&~std::size_t(255))+it->second.bytes;
+        maximum=std::max(maximum,bytes);
+    }
+    return maximum*std::min<std::size_t>(2,layers);
+}
+
+std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    if(prefill_loan_)throw std::logic_error("prefill workspace loan is already active");
+    const auto* option=std::getenv("MFQ_PREFILL_BORROW");
+    const bool force=option && std::string_view(option)=="force";
+    if((option && option[0]=='0') || !complete_residency_ || !layer_prefill_ready())return 0;
+    const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    if(!force && context->available_memory()>=workspace_bytes)return 0;
+    finish_pipeline_exchanges();
+    release_moe_prefill_buffers(this);
+    MFQ_CUDA_CHECK(cudaDeviceSynchronize());
+    context->reclaim_idle_memory();
+    const auto available=context->available_memory();
+    if(!force && available>=workspace_bytes)return 0;
+    // Cover the extra streamed expert rows as well as allocator alignment.
+    const auto needed=workspace_bytes>available?workspace_bytes-available:std::size_t(1);
+    const auto desired=force?std::size_t(allocated_bytes_)/3:needed+needed/8+(std::size_t(64)<<20);
+    if(reserve_ram_workspace_)reserve_ram_workspace_(desired);
+    auto loan=std::make_unique<PrefillLoan>();
+    std::vector<MoeGpuArena*> candidates;
+    for(auto& [key,arena]:arenas_)if(arena->slots>arena->minimum_slots)candidates.push_back(arena.get());
+    std::sort(candidates.begin(),candidates.end(),[](auto* a,auto* b) {
+        return (a->slots-a->minimum_slots)*a->slot_bytes>(b->slots-b->minimum_slots)*b->slot_bytes;
+    });
+    std::vector<std::pair<void*,std::size_t>> regions;
+    for(auto* arena:candidates) {
+        if(loan->bytes>=desired)break;
+        const auto slots=std::min<std::size_t>(arena->slots-arena->minimum_slots,
+            (desired-loan->bytes+arena->slot_bytes-1)/arena->slot_bytes);
+        if(!slots)continue;
+        PrefillLoan::Arena saved{arena,arena->slots-int(slots),{}};
+        for(std::size_t f=0;f<arena->fields.size();++f) {
+            const auto rows=arena->layouts[f].slot_shape[0];
+            auto tail=arena->fields[f].narrow(0,saved.first*rows,int64_t(slots)*rows);
+            saved.saved.push_back(tail.to(mfq_tensor_backend::kCPU));
+            regions.emplace_back(tail.data_ptr(),tail.nbytes());
+        }
+        loan->bytes+=slots*arena->slot_bytes;
+        loan->arenas.push_back(std::move(saved));
+    }
+    if(loan->bytes<needed)return 0;
+    // Append temporary cold pools to each immutable layer image. Original
+    // books, GPU pointers and the fixed RAM layer layout stay unchanged.
+    std::map<int,std::size_t> sizes;
+    for(const auto& source:sources_)for(const auto& cohort:source->cohorts_) {
+        const auto saved=std::find_if(loan->arenas.begin(),loan->arenas.end(),
+            [&](const auto& a){return a.arena==cohort.arena;});
+        if(saved==loan->arenas.end())continue;
+        auto& cold=loan->cohorts[{source->id_,cohort.index}];
+        for(int e=0;e<source->n_experts();++e)if(source->expert_to_cohort_[e]==cohort.index &&
+                cohort.arena->book->slot_for({source->id_,cohort.index,e})>=saved->first)cold.experts.push_back(e);
+        if(cold.experts.empty())continue;
+        auto& bytes=sizes[source->layer_id_];
+        for(const auto field:cohort.bytes_per_expert) {
+            bytes=(bytes+255)&~std::size_t(255);cold.fields.push_back(int64_t(bytes));
+            bytes+=cold.experts.size()*field;
+        }
+    }
+    std::size_t largest=0;
+    for(const auto& [id,bytes]:sizes){loan->layers[id].bytes=bytes;largest=std::max(largest,bytes);}
+    if(reserve_ram_workspace_)reserve_ram_workspace_(largest*2);
+    for(auto& stage:loan->stages)stage.host=mfq_tensor_backend::empty(
+        {int64_t(largest)},mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kUInt8));
+    for(const auto& source:sources_)for(const auto& cohort:source->cohorts_) {
+        const auto found=loan->cohorts.find({source->id_,cohort.index});
+        if(found==loan->cohorts.end() || found->second.experts.empty())continue;
+        const auto& cold=found->second;
+        const auto saved=std::find_if(loan->arenas.begin(),loan->arenas.end(),
+            [&](const auto& a){return a.arena==cohort.arena;});
+        auto& copies=loan->layers.at(source->layer_id_).copies;
+        for(std::size_t slot=0;slot<cold.experts.size();++slot) {
+            const auto original=cohort.arena->book->slot_for({source->id_,cohort.index,cold.experts[slot]})-saved->first;
+            for(std::size_t f=0;f<cold.fields.size();++f) {
+                const auto bytes=cohort.bytes_per_expert[f];
+                copies.push_back({static_cast<const uint8_t*>(saved->saved[f].data_ptr())+original*bytes,
+                    std::size_t(cold.fields[f]+slot*bytes),std::size_t(bytes)});
+            }
+        }
+    }
+    // Pin only within the current host-registration budget, retaining room
+    // for graph plans and concurrent host activity. Pageable copies remain valid.
+    auto pin_budget=mfq::cuda::shared_memory_available(mfq_current_cuda_device()).value_or(loan->bytes);
+    pin_budget=pin_budget> (std::size_t(512)<<20)?pin_budget-(std::size_t(512)<<20):0;
+    for(auto& stage:loan->stages)if(stage.host.nbytes() && stage.host.nbytes()<=pin_budget) {
+        if(cudaHostRegister(stage.host.data_ptr(),stage.host.nbytes(),cudaHostRegisterDefault)==cudaSuccess) {
+            stage.pinned=true;pin_budget-=stage.host.nbytes();
+        } else (void)cudaGetLastError();
+    }
+    context->begin_workspace_loan(regions,mfq_current_cuda_stream());
+    prefill_loan_=std::move(loan);
+    std::cerr<<"runtime_prefill_loan action=borrow requested_bytes="<<workspace_bytes
+        <<" available_bytes="<<available<<" borrowed_bytes="<<prefill_loan_->bytes
+        <<" transfer_bytes="<<prefill_transfer_bytes()<<'\n';
+    return prefill_loan_->bytes;
+#else
+    return 0;
+#endif
+}
+
+void MoeExpertCache::suspend_prefill_loan() {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    if(prefill_loan_)mfq::cuda::default_context(mfq_current_cuda_device())->suspend_workspace_loan();
+#endif
+}
+void MoeExpertCache::end_prefill_loan() {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    if(!prefill_loan_)return;
+    suspend_prefill_loan();
+    release_moe_prefill_buffers(this);
+    MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
+    mfq::cuda::default_context(mfq_current_cuda_device())->end_workspace_loan();
+    for(const auto& saved:prefill_loan_->arenas)for(std::size_t f=0;f<saved.saved.size();++f) {
+        const auto rows=saved.arena->layouts[f].slot_shape[0];
+        saved.arena->fields[f].narrow(0,saved.first*rows,saved.saved[f].size(0)).copy_(saved.saved[f]);
+    }
+    MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
+    std::cerr<<"runtime_prefill_loan action=return restored_bytes="<<prefill_loan_->bytes<<'\n';
+    prefill_loan_.reset();
+#endif
+}
+
+MoePrefillWorkspaceLoan::~MoePrefillWorkspaceLoan() {
+    if(active_)try{finish();}catch(const std::exception& e) {
+        std::cerr<<"runtime_prefill_loan cleanup_error="<<e.what()<<'\n';
+    }
+}
+std::size_t MoePrefillWorkspaceLoan::begin(std::size_t bytes) {
+    const auto borrowed=cache_?cache_->begin_prefill_loan(bytes):0;active_=borrowed>0;return borrowed;
+}
+void MoePrefillWorkspaceLoan::suspend(){if(active_)cache_->suspend_prefill_loan();}
+void MoePrefillWorkspaceLoan::finish(){if(active_){cache_->end_prefill_loan();active_=false;}}
+std::size_t moe_prefill_transfer_bytes(const std::shared_ptr<MoeExpertCache>& cache,bool predictor) {
+    return cache?cache->prefill_transfer_bytes(predictor):0;
+}
+
 void MoeExpertCache::resize(std::size_t bytes) {
+    if(prefill_loan_)throw std::logic_error("cannot resize expert arenas during prefill workspace loan");
     if (!finalized_ || bytes == std::size_t(budget_bytes_)) return;
     std::vector<mfq::MoeArenaDemand> demands;
     for (const auto& [signature, arena] : arenas_)
@@ -634,11 +789,15 @@ void MoeExpertCache::preload_complete_residency() {
         // mapped decode plans and transfer buffers allocated after loading.
         for(const auto& [layer,span]:pipeline_prefill_layers_)
             if(layer<0 && span.first>0)registered=std::min(registered,span.first);
+        if(const auto available=mfq::cuda::shared_memory_available(mfq_current_cuda_device())) {
+            constexpr std::size_t scratch=3ULL<<30;
+            registered=std::min<int64_t>(registered,*available>scratch?*available-scratch:0);
+        }
 #endif
         if(const auto limit=mfq::cuda::runtime_options::moe_ram_pin_bytes()) {
             if(*limit>0)registered=std::min(registered,*limit);
         }
-        for(;;) {
+        while(registered>0) {
             const auto result=cudaHostRegister(address,static_cast<std::size_t>(registered),cudaHostRegisterMapped);
             if(result==cudaSuccess)break;
 #ifdef _WIN32
@@ -651,7 +810,7 @@ void MoeExpertCache::preload_complete_residency() {
 #endif
             MFQ_CUDA_CHECK(result);
         }
-        registered_host_fields_.push_back({address,registered,true});
+        if(registered>0)registered_host_fields_.push_back({address,registered,true});
         pipeline_ram_registered_bytes_=registered;
         if(registered<ram_allocated)
             std::cerr<<"moe_ram_registration pinned_bytes="<<registered<<" pageable_bytes="<<ram_allocated-registered<<std::endl;
@@ -1449,10 +1608,14 @@ void resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache,std::s
     release_moe_decode_buffers(cache);
     cache->resize(bytes);
 }
+void set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCache>& cache,
+        std::function<void(std::size_t)> reserve,std::function<void(std::size_t)> reserve_ram) {
+    if(cache)cache->set_workspace_reservation(std::move(reserve),std::move(reserve_ram));
+}
 
 void finalize_moe_expert_cache(
-        const std::shared_ptr<MoeExpertCache>& cache) {
-    if (cache && !cache->finalized()) cache->finalize();
+        const std::shared_ptr<MoeExpertCache>& cache, std::size_t kv_growth_reserve, std::size_t kv_budget_charge) {
+    if (cache && !cache->finalized()) cache->finalize(kv_growth_reserve,kv_budget_charge);
 }
 
 void print_moe_expert_cache_stats(
@@ -1465,6 +1628,13 @@ void print_moe_expert_cache_stats(
 }
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache) {
     return cache ? cache->ram_pcie_fraction() : 0;
+}
+void release_moe_prefill_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
+    // Public request/decode boundary: borrowed weights must have been restored.
+    // Internal prefill cleanup uses the raw overload while retiring loan views.
+    if(cache && cache->prefill_loan_active())
+        throw std::runtime_error("expert workspace loan must be returned before decode");
+    release_moe_prefill_buffers(cache.get());
 }
 void release_moe_prefill_buffers(MoeExpertCache* cache) {
     if(!cache || (cache->pipeline_prefill_release_.empty() &&
@@ -1483,6 +1653,7 @@ void release_moe_prefill_buffers(MoeExpertCache* cache) {
     cache->pipeline_prefill_activations_.reset();
     cache->pipeline_prefill_ring_={};
     cache->pipeline_prefill_layer_buffer_={};
+    cache->pipeline_prefill_layer_down_buffer_={};cache->pipeline_prefill_layer_split_=0;
     cache->pipeline_prefill_layer_stride_=0;
     cache->pipeline_prefill_layer_loaded_={};
     cache->pipeline_prefill_layer_last_served_=-1;
@@ -1498,6 +1669,14 @@ void release_moe_prefill_buffers(MoeExpertCache* cache) {
     cache->transfer_ready_recorded_=false;
 }
 
+std::uint64_t moe_expert_streamed_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
+    return cache?cache->streamed_bytes():0;
+}
+void prepare_moe_decode_residency(const std::shared_ptr<MoeExpertCache>& cache) {
+    if(!cache)return;
+    release_moe_prefill_buffers(cache);
+    cache->prepare_decode_residency();
+}
 void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache) {
     if(cache)cache->finish_pipeline_exchanges();
 }

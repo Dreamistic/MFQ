@@ -38,6 +38,8 @@ public:
     void finish_window(int layer);
     void record_window_expert_fence(int layer,void* stream);
     void apply_pending();
+    void record_prefill_routes(int layer,const int32_t* ids,int tokens,int routes,void* stream);
+    void prepare_decode();
     void release_transfer_stages();
     Stats stats() const noexcept;
 private:

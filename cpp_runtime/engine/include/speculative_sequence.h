@@ -99,7 +99,10 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             ? 1
             : std::clamp<int>(sampling.mtp_max_draft_tokens, 1, policy::kMaximumDraftDepth));
     policy::GenerationPolicy<policy::DsparkDepthController> depth_controller(
-        maximum_depth, mtp.dspark_policy(), &mtp.policy_state);
+        maximum_depth, mtp.dspark_policy(), &mtp.policy_state,[&] {
+            if constexpr(requires {ops.gradual_mtp_warmup();})return ops.gradual_mtp_warmup();
+            return false;
+        }());
 
     {
         Tensor raw, hidden;
@@ -172,6 +175,8 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             } else if (pairs > 0) {
                 prime_hidden = ops.slice(raw, 1, 0, pairs);
             }
+            if constexpr (requires { ops.begin_predictor_prefill(pairs); })
+                prefill_ms += ops.begin_predictor_prefill(pairs);
             for (int64_t offset = 0; offset < pairs;) {
                 if (output.result.cancelled)
                     co_return;
@@ -188,6 +193,8 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 if (output.result.cancelled)
                     co_return;
                 offset += chunk.count;
+                if constexpr (requires { ops.end_predictor_prefill(); })
+                    if(offset == pairs)prefill_ms += ops.end_predictor_prefill();
                 co_yield PrefillProgress{
                     {prompt.size() - reused_tokens, prefill_ms, 0.0, prefill_ms}};
             }
@@ -195,6 +202,13 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
 
         if (output.result.cancelled)
             co_return;
+        // Only one boundary row is needed after prompt priming. A contiguous
+        // slice can still own the entire prompt allocation; detach it before
+        // the first decode replay and release the large prefill tensors.
+        committed_last_hidden = ops.clone(committed_last_hidden);
+        raw = Tensor{};
+        hidden = Tensor{};
+        logits = Tensor{};
         auto first = output.append(std::vector<int64_t>{pending});
         accept(first);
         finish();
@@ -314,17 +328,32 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             if (!depth_controller.dspark() && requested_depth == 0) {
                 pending_hidden.push_back(hidden_rows);
                 pending_ids.insert(pending_ids.end(), next_ids.begin(), next_ids.end());
-                if (pending_ids.size() >= 512) { maintenance = true; flush_history(); }
+                std::size_t threshold=512;
+                if constexpr(requires { ops.predictor_history_flush_threshold(); })
+                    if(!depth_controller.parked())threshold=ops.predictor_history_flush_threshold();
+                if (pending_ids.size() >= threshold) { maintenance = true; flush_history(); }
                 return result;
             }
-            if (!pending_ids.empty()) { maintenance = true; flush_history(); }
             std::vector<int64_t> shifted(next_ids.begin(), next_ids.end());
+            if (!pending_ids.empty()) {
+                maintenance = true;
+                std::size_t merge_limit=0;
+                if constexpr(requires { ops.predictor_history_merge_limit(); })
+                    merge_limit=ops.predictor_history_merge_limit();
+                if(pending_ids.size()+shifted.size()<=merge_limit) {
+                    pending_hidden.push_back(hidden_rows);
+                    hidden_rows=ops.concatenate(pending_hidden,1);
+                    pending_ids.insert(pending_ids.end(),shifted.begin(),shifted.end());
+                    shifted=std::move(pending_ids);pending_ids.clear();pending_hidden.clear();
+                } else flush_history();
+            }
+            const auto history_rows=static_cast<int64_t>(shifted.size());
             auto head = ops.predictor_step(std::move(hidden_rows),
                 ops.ids_for(std::move(shifted)),
                 transformed_prompt ? ops.decode_positions(predictor_history_position + 1,
-                                         static_cast<int64_t>(next_ids.size()))
+                                         history_rows)
                                    : Tensor{});
-            predictor_history_position += static_cast<int64_t>(next_ids.size());
+            predictor_history_position += history_rows;
             require_execution(mtp.cache_position() == predictor_history_position,
                 "MTP predictor cache did not advance");
             auto sample_hidden =
@@ -350,6 +379,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         auto cycle_started = Clock::now();
         auto draft =
             prepare_draft(initial_hidden, {pending}, bounded_depth(depth_controller.depth()), true);
+        double draft_ms=std::chrono::duration<double,std::milli>(Clock::now()-cycle_started).count();
         while (generated < limit) {
             if (output.stopped()) {
                 finish();
@@ -373,16 +403,19 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 mtp.last_stats.selected_depth = depth_controller.depth();
                 mtp.last_stats.reentry_probes = depth_controller.reentries();
                 pending = next;
+                finish();
+                co_yield std::move(delta);
                 cycle_started = Clock::now();
                 maintenance = false;
                 draft = prepare_draft(committed_last_hidden, {pending},
-                    bounded_depth(depth_controller.depth()), false);
-                finish();
-                co_yield std::move(delta);
+                    output.stopped()?0:bounded_depth(depth_controller.depth()), false);
+                draft_ms=std::chrono::duration<double,std::milli>(Clock::now()-cycle_started).count();
+                if(output.stopped()){finish();co_return;}
                 continue;
             }
             const int draft_count = static_cast<int>(draft.tokens.size());
             if (depth_controller.dspark()) cycle_started = Clock::now();
+            const auto verify_started=Clock::now();
             Tensor verified_raw;
             std::vector<int64_t> verify_ids{pending};
             verify_ids.insert(verify_ids.end(), draft.tokens.begin(), draft.tokens.end());
@@ -408,6 +441,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             }
             auto targets =
                 ops.reshape(ops.logits_for(verified), {draft_count + 1, model.vocab_size()});
+            const auto verify_finished=Clock::now();
 
             ++mtp.last_stats.cycles;
             mtp.last_stats.drafted_tokens += static_cast<uint64_t>(draft_count);
@@ -563,6 +597,10 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
 
             const double cycle_ms =
                 std::chrono::duration<double, std::milli>(Clock::now() - cycle_started).count();
+            if constexpr(requires { ops.trace_cycle(uint64_t{},int{},int{},double{},double{},double{}); })
+                ops.trace_cycle(mtp.last_stats.cycles,draft_count,accepted,draft_ms,
+                    std::chrono::duration<double,std::milli>(verify_finished-verify_started).count(),
+                    std::chrono::duration<double,std::milli>(Clock::now()-verify_finished).count());
             bool time_sample=!maintenance;
             if constexpr(requires { ops.take_target_maintenance(); }) {
                 const bool initialized=ops.take_target_maintenance();time_sample=time_sample && !initialized;
@@ -590,14 +628,21 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             next_ids.reserve(static_cast<size_t>(accepted + 1));
             next_ids.insert(next_ids.end(), draft.tokens.begin(), draft.tokens.begin() + accepted);
             next_ids.push_back(pending);
+            // Publish committed tokens before computing the next draft. A
+            // cold next-width replay must not hold this completed batch back.
+            // Resume timing after the consumer returns, excluding its delay.
+            finish();
+            co_yield std::move(delta);
             cycle_started = Clock::now();
             maintenance = false;
             draft = prepare_draft(ops.slice(verified_raw, 1, 0, accepted + 1),
                 next_ids,
-                bounded_depth(depth_controller.depth()),
+                output.stopped()?0:bounded_depth(depth_controller.depth()),
                 false);
-            finish();
-            co_yield std::move(delta);
+            draft_ms=std::chrono::duration<double,std::milli>(Clock::now()-cycle_started).count();
+            // Cancellation between yields still commits predictor history for
+            // prefix restoration, without running another speculative chain.
+            if(output.stopped()){finish();co_return;}
         }
         finish();
     }

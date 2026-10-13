@@ -694,24 +694,38 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         const auto layout=cache_->pipeline_prefill_layers_.at(sources_[0]->layer_id_);
         // The predictor's combined NINT image can exceed the target's image.
         // Retire all views before replacing the shared staging allocation.
-        if(cache_->pipeline_prefill_layer_buffer_.defined() && cache_->pipeline_prefill_layer_stride_<layout.second)
+        const auto layer_bytes=[&](int id) {
+            auto bytes=cache_->pipeline_prefill_layers_.at(id).second;
+            if(cache_->prefill_loan_)if(auto it=cache_->prefill_loan_->layers.find(id);it!=cache_->prefill_loan_->layers.end())
+                bytes=((bytes+255)&~int64_t(255))+int64_t(it->second.bytes);
+            return bytes;
+        };
+        if(cache_->pipeline_prefill_layer_buffer_.defined() && cache_->pipeline_prefill_layer_stride_<layer_bytes(sources_[0]->layer_id_))
             release_moe_prefill_buffers(cache_);
         if(!cache_->pipeline_prefill_layer_buffer_.defined()) {
             int64_t maximum=0;
             // Predictor images are separate from backbone prefill. Their
             // packed projections can be much larger than a backbone layer.
-            maximum=layout.second;
+            maximum=layer_bytes(sources_[0]->layer_id_);
+            int layer_count=0;
             for(const auto& layer:cache_->pipeline_prefill_layers_)
-                if((layer.first<0)==(sources_[0]->layer_id_<0))
-                    maximum=std::max(maximum,layer.second.second);
+                if((layer.first<0)==(sources_[0]->layer_id_<0)) {
+                    ++layer_count;
+                    maximum=std::max(maximum,layer_bytes(layer.first));
+                }
             const auto overlap=mfq::cuda::runtime_options::moe_prefill_layer_overlap();
-            cache_->pipeline_prefill_layer_overlap_=!overlap || *overlap!=0;
+            cache_->pipeline_prefill_layer_overlap_=layer_count>1 && (!overlap || *overlap!=0);
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
             // Strata sizes its transfer ring together with the compute
             // workspace. A second layer image is optional under pressure.
             const auto context=mfq::cuda::default_context(ids.get_device());
             const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes()/2;
-            const auto available=context->available_memory();
+            auto available=context->available_memory()+context->workspace_available();
+            const auto requested=std::size_t(maximum)*2+reserve;
+            if(cache_->pipeline_prefill_layer_overlap_ && available<requested && cache_->reserve_workspace_) {
+                cache_->reserve_workspace_(requested);
+                available=context->available_memory()+context->workspace_available();
+            }
             if(cache_->pipeline_prefill_layer_overlap_ &&
                 (available<=reserve || std::size_t(maximum)>((available-reserve)/2))) {
                 cache_->pipeline_prefill_layer_overlap_=false;
@@ -720,8 +734,18 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             }
 #endif
             cache_->pipeline_prefill_layer_stride_=maximum;
+            // The single predictor image is larger than any one expert arena.
+            // Allocate Gate/Up and Down separately so the loan can actually
+            // host its transfer buffers without another multi-GiB allocation.
+            const auto cut=cache_->pipeline_prefill_layer_gate_up_bytes_.at(sources_[0]->layer_id_);
+            const bool split=cache_->prefill_loan_ && layer_count==1 && cut>0 && cut<maximum;
+            cache_->pipeline_prefill_layer_split_=split?cut:0;
             cache_->pipeline_prefill_layer_buffer_=tb::empty(
-                {maximum*(cache_->pipeline_prefill_layer_overlap_?2:1)},ids.options().dtype(tb::kUInt8));
+                {split?cut:maximum*(cache_->pipeline_prefill_layer_overlap_?2:1)},ids.options().dtype(tb::kUInt8));
+            if(split) {
+                cache_->pipeline_prefill_layer_down_buffer_=tb::empty({maximum-cut},ids.options().dtype(tb::kUInt8));
+                std::cerr<<"runtime_prefill_ring split=1 gate_up_bytes="<<cut<<" down_bytes="<<maximum-cut<<'\n';
+            }
             if(cache_->pipeline_prefill_layer_overlap_) {
                 for(auto& event:cache_->pipeline_prefill_layer_ready_)
                     if(!event)MFQ_CUDA_CHECK(cudaEventCreateWithFlags(&event,cudaEventDisableTiming));
@@ -740,8 +764,6 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             int(std::distance(cache_->pipeline_prefill_layers_.begin(),
                 cache_->pipeline_prefill_layers_.find(prepared->layer_id)))%2:0;
         prepared->ram_begin=layout.first;prepared->bytes=layout.second;
-        auto* device=cache_->pipeline_prefill_layer_buffer_.data_ptr<uint8_t>()+
-            prepared->slot*cache_->pipeline_prefill_layer_stride_;
         for(int p=0;p<3;++p) {
             const auto& source=*sources_[p];auto& runtime=prepared->projections[p];
             std::vector<std::vector<int32_t>> host_maps;
@@ -752,6 +774,25 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 std::vector<int32_t> hot_map(experts_,-1),cold_map(experts_,-1);
                 for(int e=0;e<experts_;++e)if(source.expert_to_cohort_[e]==cohort.index)
                     hot_map[e]=cohort.arena->book->slot_for({source.id_,cohort.index,e});
+                if(cache_->prefill_loan_) {
+                    const auto borrowed=cache_->prefill_loan_->cohorts.find({source.id_,cohort.index});
+                    if(borrowed!=cache_->prefill_loan_->cohorts.end() && !borrowed->second.experts.empty()) {
+                        const auto& loan=borrowed->second;
+                        const auto count=int(loan.experts.size());
+                        std::vector<int32_t> loan_map(experts_,-1);
+                        for(int i=0;i<count;++i) {hot_map[loan.experts[i]]=-1;loan_map[loan.experts[i]]=i;}
+                        std::vector<tb::Tensor> fields;
+                        for(std::size_t f=0;f<loan.fields.size();++f) {
+                            auto shape=cohort.arena->layouts[f].slot_shape;shape[0]*=count;
+                            fields.push_back(tb::from_blob(prefill_layer_pointer(prepared->slot,
+                                ((layout.second+255)&~int64_t(255))+loan.fields[f],count*cohort.bytes_per_expert[f]),
+                                shape,tb::TensorOptions().device(tb::kCUDA).dtype(cohort.arena->layouts[f].scalar_type)));
+                        }
+                        auto cold=fields_pool(cohort.active,fields,count,runtime.out_per_expert);
+                        cold.expert_local=tb::tensor(loan_map).to(tb::kCUDA);
+                        runtime.pools.push_back(std::move(cold));host_maps.push_back(std::move(loan_map));
+                    }
+                }
                 auto hot=cohort.active;hot.expert_local=tb::tensor(hot_map).to(tb::kCUDA);
                 runtime.pools.push_back(std::move(hot));
                 host_maps.push_back(std::move(hot_map));
@@ -764,7 +805,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     const auto bytes=slots*cohort.bytes_per_expert[f];
                     if(offset<0 || offset>layout.second || bytes>layout.second-offset)
                         throw std::logic_error("prefill field exceeds its layer image");
-                    fields.push_back(tb::from_blob(device+offset,shape,
+                    fields.push_back(tb::from_blob(prefill_layer_pointer(prepared->slot,offset,bytes),shape,
                         tb::TensorOptions().device(tb::kCUDA).dtype(field.scalar_type)));
                 }
                 for(int slot=0;slot<slots;++slot)cold_map[cohort.prefill_ram_experts[slot]]=slot;
@@ -785,17 +826,29 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         });
     }
 
+    uint8_t* prefill_layer_pointer(int slot,int64_t offset,int64_t bytes) {
+        const auto split=cache_->pipeline_prefill_layer_split_;
+        if(split) {
+            if(slot || offset<0 || bytes<0 || offset>cache_->pipeline_prefill_layer_stride_-bytes ||
+                    (offset<split && bytes>split-offset))
+                throw std::logic_error("prefill field crosses split transfer image");
+            if(offset>=split)return cache_->pipeline_prefill_layer_down_buffer_.data_ptr<uint8_t>()+offset-split;
+        }
+        return cache_->pipeline_prefill_layer_buffer_.data_ptr<uint8_t>()+
+            slot*cache_->pipeline_prefill_layer_stride_+offset;
+    }
     void submit_prefill_layer_copy(CudaExecutionContext& execution,int layer_id,int slot) {
         if(cache_->pipeline_prefill_layer_loaded_[slot]==layer_id)return;
         const auto layout=cache_->pipeline_prefill_layers_.at(layer_id);
         const auto copy_stream=cache_->pipeline_prefill_layer_overlap_?cache_->weight_stream_:stream_;
-        const auto gate_up_bytes=cache_->pipeline_prefill_layer_overlap_ && prefill_layer_phased()?
-            cache_->pipeline_prefill_layer_gate_up_bytes_.at(layer_id):layout.second;
+        const auto gate_up_bytes=cache_->pipeline_prefill_layer_split_?cache_->pipeline_prefill_layer_split_:
+            cache_->pipeline_prefill_layer_overlap_ && prefill_layer_phased()?
+                cache_->pipeline_prefill_layer_gate_up_bytes_.at(layer_id):layout.second;
         if(gate_up_bytes<0 || gate_up_bytes>layout.second)
             throw std::logic_error("prefill Gate/Up copy exceeds layer image");
         if(cache_->pipeline_prefill_layer_overlap_ && cache_->pipeline_prefill_layer_read_recorded_[slot])
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(copy_stream,cache_->pipeline_prefill_layer_read_done_[slot],0));
-        int copies=0,direct_copies=0;int64_t direct_bytes=0;
+        int copies=0,direct_copies=0;int64_t direct_bytes=0,loan_bytes=0;
         {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         MfqCudaStreamGuard guard(MfqCudaStream(mfq_current_cuda_device(),copy_stream));
@@ -803,19 +856,34 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         MfqCudaStreamGuard guard(at::cuda::getStreamFromExternal(copy_stream,mfq_current_cuda_device()));
 #endif
         execution.profiler.measure("prefill.expert_h2d",[&] {
-            auto* destination=cache_->pipeline_prefill_layer_buffer_.data_ptr<uint8_t>()+
-                slot*cache_->pipeline_prefill_layer_stride_;
             const auto* source=cache_->pipeline_ram_complement_->data_ptr<uint8_t>()+layout.first;
             const auto copy=[&](int64_t begin,int64_t bytes) {
+                auto* destination=prefill_layer_pointer(slot,begin,bytes);
                 // CUDA forbids a single host copy spanning registered and
                 // pageable ranges. Split at the registration boundary.
                 const auto pinned=std::clamp<int64_t>(cache_->pipeline_ram_registered_bytes_-layout.first-begin,0,bytes);
-                if(pinned) {MFQ_CUDA_CHECK(cudaMemcpyAsync(destination+begin,source+begin,std::size_t(pinned),
+                if(pinned) {MFQ_CUDA_CHECK(cudaMemcpyAsync(destination,source+begin,std::size_t(pinned),
                     cudaMemcpyHostToDevice,copy_stream));++copies;++direct_copies;direct_bytes+=pinned;}
-                if(bytes>pinned) {MFQ_CUDA_CHECK(cudaMemcpyAsync(destination+begin+pinned,source+begin+pinned,
+                if(bytes>pinned) {MFQ_CUDA_CHECK(cudaMemcpyAsync(destination+pinned,source+begin+pinned,
                     std::size_t(bytes-pinned),cudaMemcpyHostToDevice,copy_stream));++copies;}
             };
             copy(0,gate_up_bytes);
+            // Loaned experts are a temporary third pool. Publish their rows
+            // before Gate/Up readiness; the original cold image remains intact.
+            if(cache_->prefill_loan_)if(auto it=cache_->prefill_loan_->layers.find(layer_id);it!=cache_->prefill_loan_->layers.end()) {
+                auto& host=cache_->prefill_loan_->stages[slot];
+                // This host slot must outlive its preceding DMA. Its GPU slot
+                // separately waits for read_done before any overwrite.
+                if(cache_->pipeline_prefill_layer_overlap_ && cache_->pipeline_prefill_layer_loaded_[slot])
+                    MFQ_CUDA_CHECK(cudaEventSynchronize(cache_->pipeline_prefill_layer_ready_[slot]));
+                for(const auto& range:it->second.copies)
+                    std::memcpy(host.host.data_ptr<uint8_t>()+range.offset,range.source,range.bytes);
+                const auto bytes=it->second.bytes;
+                loan_bytes=int64_t(bytes);
+                MFQ_CUDA_CHECK(cudaMemcpyAsync(prefill_layer_pointer(slot,((layout.second+255)&~int64_t(255)),bytes),
+                    host.host.data_ptr(),bytes,cudaMemcpyHostToDevice,copy_stream));
+                ++copies;if(host.pinned){++direct_copies;direct_bytes+=bytes;}
+            }
             if(cache_->pipeline_prefill_layer_overlap_)
                 MFQ_CUDA_CHECK(cudaEventRecord(cache_->pipeline_prefill_layer_gate_up_ready_[slot],copy_stream));
             copy(gate_up_bytes,layout.second-gate_up_bytes);
@@ -829,11 +897,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             mfq::cuda::check_stream_progress(copy_stream);
         auto& stats=cache_->stats_;
         stats.pipeline_direct_ram_copies+=direct_copies;stats.pipeline_dma_copies+=copies;
-        stats.pipeline_direct_ram_bytes+=direct_bytes;stats.pipeline_staged_ram_bytes+=layout.second-direct_bytes;
-        stats.ram_pcie_bytes+=layout.second;
+        stats.pipeline_direct_ram_bytes+=direct_bytes;stats.pipeline_staged_ram_bytes+=layout.second+loan_bytes-direct_bytes;
+        stats.ram_pcie_bytes+=layout.second+loan_bytes;
         if(gate_up_bytes<layout.second) {
             ++stats.pipeline_phased_transfer_serves;
-            stats.pipeline_gate_up_dma_bytes+=gate_up_bytes;
+            stats.pipeline_gate_up_dma_bytes+=gate_up_bytes+loan_bytes;
             stats.pipeline_down_dma_bytes+=layout.second-gate_up_bytes;
         }
     }
@@ -851,6 +919,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(prefill_stream_)return streamed_prefill(execution,input,ids,weights);
         try { initialize_prefill_layer(execution,ids); }
         catch(const MfqResourceExhausted& error) {
+            // Grouped/decode dispatch sees the normal resident-slot books.
+            // It cannot run while those slots hold a prefill workspace.
+            if(cache_->prefill_loan_)throw;
             // Retire an oversized whole-layer image before switching to the
             // bounded expert-group ring. Keep that ring for subsequent chunks.
             release_moe_prefill_buffers(cache_);
@@ -913,6 +984,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(cache_->pipeline_prefill_layer_overlap_ && prefill_layer_flush())
             mfq::cuda::check_stream_progress(stream_);
         cache_->pipeline_prefill_layer_last_served_=layer.layer_id;
+        cache_->moe_residency_->record_prefill_routes(sources_[0]->layer_id_,
+            ids.contiguous().data_ptr<int32_t>(),int(ids.size(0)),int(ids.size(1)),stream_);
         return output;
     }
 
@@ -2648,7 +2721,8 @@ public:
         const auto layer_prefill=mfq::cuda::runtime_options::moe_prefill_layer();
         if(!window && !batch_decode && layer_prefill && *layer_prefill!=0 && cache_->pipeline_prefill_layer_layout_ &&
                 cache_->pipeline_ram_registered_bytes_>0 && execution.kl_mmq.mode==KlMmqMode::Default) {
-            if(cache_->moe_residency_)cache_->moe_residency_->before_layer(sources_[0]->layer_id_);
+            if(!cache_->moe_residency_)cache_->moe_residency_=std::make_unique<MoeResidencyManager>(cache_);
+            cache_->moe_residency_->before_layer(sources_[0]->layer_id_);
             try {return whole_layer_prefill(execution,input,ids,weights);}
             catch(...) {handle_prefill_failure();throw;}
         }

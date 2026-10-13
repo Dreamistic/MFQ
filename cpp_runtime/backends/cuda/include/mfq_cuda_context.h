@@ -6,10 +6,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -196,6 +198,13 @@ public:
     std::size_t resident_memory_usage() const;
     std::size_t available_memory() const;
     void reclaim_idle_memory();
+    // Temporarily reuse already charged expert-cache storage on one ordered
+    // compute stream. Graph/resident allocations never enter this workspace.
+    void begin_workspace_loan(const std::vector<std::pair<void*,std::size_t>>& regions,
+                              cudaStream_t stream);
+    void suspend_workspace_loan();
+    void end_workspace_loan();
+    std::size_t workspace_available() const;
     void check_memory_limit(std::size_t additional = 0) const;
     void set_memory_limit(std::size_t bytes);
 
@@ -228,7 +237,15 @@ private:
     bool async_allocations_ = false;
     std::shared_ptr<AllocationBudget> allocation_budget_;
     void trim_pool_pages() const;
-    std::mutex graph_pool_mutex_;
+    mutable std::mutex graph_pool_mutex_;
+    struct WorkspaceLoan {
+        cudaStream_t stream=nullptr;
+        std::thread::id thread;
+        bool enabled=true;
+        std::map<std::uintptr_t,std::size_t> free;
+        std::unordered_map<void*,std::size_t> live;
+    };
+    std::unique_ptr<WorkspaceLoan> workspace_loan_;
     std::unordered_map<cudaStream_t, GraphPool> graph_pools_;
 };
 

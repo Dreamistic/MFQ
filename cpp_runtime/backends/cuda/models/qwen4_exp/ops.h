@@ -69,6 +69,9 @@ std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
     bool* initialized=nullptr,const mfq_tensor_backend::Tensor& host_ids={},
     mfq_tensor_backend::Tensor* logits=nullptr,std::vector<int32_t>* greedy_tokens=nullptr);
 void qwen4_report_decode_graph(const Qwen4CausalLm&,std::ostream&);
+void qwen4_release_decode_graphs(Qwen4CausalLm&,MtpModule*);
+void qwen4_warmup_decode_graphs(Qwen4CausalLm&,MtpModule*);
+std::size_t qwen4_prefix_snapshot_bytes(const Qwen4CausalLm&,const MtpModule*);
 std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(const Qwen4CausalLm&,const MtpModule*);
 bool qwen4_layer_major_prefill_eligible(const Qwen4CausalLm&, int64_t tokens);
 mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
@@ -88,6 +91,10 @@ struct Qwen4Model : CausalResources {
     int64_t batch = 0;
     std::optional<bool> router_lookahead;
     std::unique_ptr<Qwen4DecodeGraph> graph_registry;
+    bool reuse_decode_graphs=false;
+    uint64_t decode_graph_captures=0;
+    // Bounded request lookahead, independent of the configured context ceiling.
+    int64_t decode_reserve_until=0;
     std::function<void(std::size_t)> reserve_kv_workspace;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model& model,mfq_tensor_backend::Tensor ids,int kind) {

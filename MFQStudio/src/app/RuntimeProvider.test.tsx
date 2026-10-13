@@ -74,7 +74,7 @@ describe('RuntimeProvider 故障状态', () => {
     render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
     await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
     fireEvent.click(screen.getByRole('button', { name: 'Reload model' }));
-    expect(reload).toHaveBeenCalledExactlyOnceWith(8192, 'instance-a', undefined, undefined, undefined);
+    expect(reload).toHaveBeenCalledExactlyOnceWith(8192, 'instance-a', undefined, undefined, undefined, undefined);
     expect(screen.getByTestId('reloading')).toHaveTextContent('"instance-a":8192');
     await act(async () => { finish({ ...activeJob, id: 'context-reload', kind: 'runtime.context' }); });
     await waitFor(() => expect(screen.getByTestId('reloading')).toHaveTextContent('{}'));

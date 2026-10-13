@@ -533,6 +533,11 @@ class QsaKvStorageSettings(ProtocolModel):
     ram_budget_bytes: int | None = Field(default=None, ge=0, le=1 << 50)
 
 
+class KvMemorySettings(ProtocolModel):
+    placement: Literal["auto", "auto_ssd", "vram", "ram"] = "auto"
+    allocation: Literal["preallocated", "dynamic"] = "preallocated"
+
+
 class KvQuantizationSettings(ProtocolModel):
     enabled: bool = Field(default=False, strict=True)
     bits: Literal[2, 2.5, 3, 3.5, 4, 6, 8] = 4
@@ -546,6 +551,7 @@ class RuntimeContextPolicy(ProtocolModel):
     model_yarn_enabled: dict[str, bool] = Field(default_factory=dict)
     model_qsa_kv_offload: dict[str, QsaKvStorageSettings] = Field(default_factory=dict)
     model_kv_quantization: dict[str, KvQuantizationSettings] = Field(default_factory=dict)
+    model_kv_memory: dict[str, KvMemorySettings] = Field(default_factory=dict)
 
 
 class RuntimeMemoryPolicy(ProtocolModel):
@@ -602,6 +608,7 @@ class ModelLoadRequest(ProtocolModel):
 
     qsa_kv_offload: QsaKvOffloadPolicy = Field(default_factory=QsaKvOffloadPolicy)
     kv_quantization: KvQuantizationSettings = Field(default_factory=KvQuantizationSettings)
+    kv_memory: KvMemorySettings = Field(default_factory=KvMemorySettings)
 
 class CreateRuntimeProfileRequest(ProtocolModel):
     name: str = Field(min_length=1, max_length=64)
@@ -831,6 +838,8 @@ class RuntimeInstanceResource(ProtocolModel):
     mtp_available: bool = False
     qsa_kv_offload_supported: bool = False
     kv_quantization_supported: bool = False
+    kv_memory_supported: bool = False
+    kv_memory: KvMemorySettings = Field(default_factory=KvMemorySettings)
     kv_quantization: KvQuantizationSettings = Field(default_factory=KvQuantizationSettings)
     qsa_kv_offload: QsaKvOffloadPolicy = Field(default_factory=QsaKvOffloadPolicy)
     identity: RuntimeIdentity | None = None
@@ -1376,6 +1385,7 @@ class RuntimeReloadRequest(ProtocolModel):
     yarn_enabled: bool | None = Field(default=None, strict=True)
     qsa_kv_offload: QsaKvStorageSettings | None = None
     kv_quantization: KvQuantizationSettings | None = None
+    kv_memory: KvMemorySettings | None = None
 
 
 class RuntimeCacheClearRequest(ProtocolModel):

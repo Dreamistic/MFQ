@@ -257,6 +257,8 @@ export interface RuntimeInstance {
   mtp_available?: boolean;
   qsa_kv_offload_supported?: boolean;
   kv_quantization_supported?: boolean;
+  kv_memory_supported?: boolean;
+  kv_memory?: { placement: 'auto' | 'auto_ssd' | 'vram' | 'ram'; allocation: 'preallocated' | 'dynamic' };
   kv_quantization?: { enabled: boolean; bits: 2 | 2.5 | 3 | 3.5 | 4 | 6 | 8; algorithm: 'turboquant' };
   qsa_kv_offload?: { enabled: boolean; budget_bytes: number; ram_budget_bytes?: number | null; target_context: number };
   error?: ApiErrorBody['error'] | null;

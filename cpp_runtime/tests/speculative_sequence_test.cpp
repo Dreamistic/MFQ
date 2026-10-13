@@ -182,6 +182,74 @@ void run_target_initialization() {
         throw std::runtime_error("target initialization entered steady MTP timing");
 }
 
+void run_streaming_publication(bool accepted) {
+    struct StreamingOps : Ops {
+        int* predictor_calls;
+        bool accepted;
+        Head predictor_step(Tensor hidden,Tensor ids,Tensor positions) {
+            ++*predictor_calls;return Ops::predictor_step(hidden,ids,positions);
+        }
+        std::vector<int32_t> greedy_tokens(Tensor logits) {
+            return std::vector<int32_t>(size(logits,0),accepted?1:0);
+        }
+    };
+    Model model;Predictor mtp;int calls=0;
+    InferenceRequest request;request.chat=false;request.prompt={0,0,0};
+    request.sampling.max_tokens=32;request.sampling.mtp_max_draft_tokens=3;
+    InferenceOutput output(request,nullptr,"mtp-publication-test");
+    Tensor last_hidden;
+    auto generation=speculative_sequence(StreamingOps{{model,mtp},&calls,accepted},
+        request,output,512,0,Tensor{},&last_hidden);
+    int deltas=0;
+    while(auto step=generation.next())if(step.value)
+        if(const auto* delta=std::get_if<TokenOutput>(&*step.value);delta && !delta->token_ids.empty()) {
+            if(++deltas==2)break;
+        }
+    // One prompt-priming call and three calls for the first draft. Computing
+    // any part of the next speculative chain would delay this publication.
+    if(deltas!=2 || calls!=4)
+        throw std::runtime_error("completed MTP tokens waited for the next draft");
+    output.result.cancelled=true;
+    while(auto step=generation.next())if(step.value && std::holds_alternative<TokenOutput>(*step.value))
+        throw std::runtime_error("cancelled MTP stream emitted another token batch");
+    if(calls!=5 || mtp.cache_position()!=model.cache_pos || !Ops::defined(last_hidden))
+        throw std::runtime_error("MTP cancellation failed to commit predictor history");
+}
+
+void run_history_batching() {
+    struct HistoryOps : Ops {
+        std::vector<int64_t>* widths;
+        bool gradual_mtp_warmup() const {return true;}
+        std::size_t predictor_history_merge_limit() const {return 128;}
+        std::size_t predictor_history_flush_threshold() const {return 4;}
+        Head predictor_step(Tensor hidden,Tensor ids,Tensor positions) {
+            if(size(hidden,1)!=size(ids,1))throw std::runtime_error("merged MTP history lost token alignment");
+            // A parked predictor intentionally defers long history until
+            // request completion; only active calibration has the short bound.
+            if(!mtp.last_stats.standard_tokens)widths->push_back(size(ids,1));
+            return Ops::predictor_step(hidden,ids,positions);
+        }
+        std::vector<int32_t> greedy_tokens(Tensor logits) {return std::vector<int32_t>(size(logits,0),1);}
+    };
+    Model model;Predictor mtp;std::vector<int64_t> widths;
+    InferenceRequest request;request.chat=false;request.prompt={0,0,0};
+    request.sampling.max_tokens=96;request.sampling.mtp_max_draft_tokens=3;
+    InferenceOutput output(request,nullptr,"mtp-history-test");
+    auto generation=speculative_sequence(HistoryOps{{model,mtp},&widths},request,output,512,0,Tensor{},nullptr);
+    std::vector<int64_t> tokens;
+    while(auto step=generation.next())if(step.value)
+        if(const auto* delta=std::get_if<TokenOutput>(&*step.value))
+            tokens.insert(tokens.end(),delta->token_ids.begin(),delta->token_ids.end());
+    if(tokens.size()!=96 || tokens.front()!=0 || model.cache_pos!=98 || mtp.cache_position()!=98 ||
+            output.metrics.mtp.depth_cycles[0]<3 || std::find(widths.begin(),widths.end(),4)==widths.end() ||
+            std::any_of(widths.begin(),widths.end(),[](auto n){return n>4;})) {
+        std::cerr<<"history tokens="<<tokens.size()<<" model="<<model.cache_pos<<" predictor="<<mtp.cache_position()
+            <<" baseline="<<output.metrics.mtp.depth_cycles[0]<<" widths=";
+        for(auto n:widths)std::cerr<<n<<',';std::cerr<<std::endl;
+        throw std::runtime_error("MTP history batching changed output/cache boundaries or left a re-entry burst");
+    }
+}
+
 void run_batched_greedy(bool penalties) {
     struct BatchedOps : Ops {
         int* batches;
@@ -270,6 +338,9 @@ int main() {
     run(false);
     run(true);
     run_target_initialization();
+    run_streaming_publication(false);
+    run_streaming_publication(true);
+    run_history_batching();
     run_batched_greedy(false);
     run_batched_greedy(true);
     batch_policy();

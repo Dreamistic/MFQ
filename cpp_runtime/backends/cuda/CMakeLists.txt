@@ -328,6 +328,8 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
     ${MFQ_CUDA_ROOT}/models/qwen4_exp/ops.cpp
     ${MFQ_CUDA_ROOT}/runtime/kv_offload.cpp
+    ${MFQ_CUDA_ROOT}/runtime/kv_memory.cpp
+    ${MFQ_CUDA_ROOT}/runtime/kv_vmm.cpp
     ${MFQ_CUDA_ROOT}/models/glm5_next/ops.cpp
     ${MFQ_CUDA_ROOT}/models/gemma4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/glm_dsa/ops.cpp

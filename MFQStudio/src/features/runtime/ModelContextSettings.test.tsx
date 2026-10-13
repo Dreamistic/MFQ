@@ -72,6 +72,24 @@ it('does not enable KV quantization on an unsupported backend', async () => {
   expect(await screen.findByRole('checkbox', { name: 'Enable KV quantization' })).toBeDisabled();
 });
 
+it('defaults CUDA KV to preallocated automatic without SSD and saves placement independently of quantization', async () => {
+  state.instances[0].kv_memory_supported = true;
+  state.instances[0].kv_quantization_supported = true;
+  const { save } = await controls();
+  const placement = screen.getByRole('combobox', { name: 'KV placement' });
+  const allocation = screen.getByRole('combobox', { name: 'KV allocation' });
+  expect(placement).toHaveValue('auto');
+  expect(allocation).toHaveValue('preallocated');
+  expect(placement.querySelectorAll('option')).toHaveLength(4);
+  fireEvent.change(allocation, { target: { value: 'dynamic' } });
+  fireEvent.change(placement, { target: { value: 'auto_ssd' } });
+  expect(allocation).toHaveValue('preallocated');
+  expect(screen.getByRole('option', { name: 'Dynamic (experimental)' })).toBeDisabled();
+  fireEvent.click(save);
+  await waitFor(() => expect(mocks.reload).toHaveBeenCalledWith('a', null, false, undefined,
+    { enabled: false, bits: 4, algorithm: 'turboquant' }, { placement: 'auto_ssd', allocation: 'preallocated' }));
+});
+
 it('keeps independent KV quantization drafts while switching models', async () => {
   state.instances[0].kv_quantization_supported = true;
   state.instances.push({ ...state.instances[0], id: 'b', model: 'Model B' });

@@ -38,6 +38,7 @@ from mfq.server.protocol.models import (
     ConfigureQsaKvOffloadRequest,
     QsaKvOffloadPolicy,
     QsaKvStorageSettings,
+    KvMemorySettings,
     KvQuantizationSettings,
     ResponseFormat,
     RuntimeCapabilitiesResource,
@@ -149,6 +150,7 @@ class _Runtime(BaseModel):
     mtp_available: bool = False
     qsa_kv_offload_supported: bool = False
     kv_quantization_supported: bool = False
+    kv_memory_supported: bool = False
     error: ErrorDetail | None = None
     output_task: asyncio.Task[None] | None = None
     log_to_load_job: bool = False
@@ -559,6 +561,15 @@ class RuntimePool:
             saved_storage = self.context_policy.model_qsa_kv_offload.get(artifact.resource.name)
             if saved_storage is not None:
                 request = request.model_copy(update={"qsa_kv_offload": QsaKvOffloadPolicy(**saved_storage.model_dump())})
+        if 'kv_memory' not in request.model_fields_set:
+            saved_memory = self.context_policy.model_kv_memory.get(artifact.resource.name)
+            if saved_memory is not None:
+                request = request.model_copy(update={"kv_memory": saved_memory})
+        if request.kv_memory.allocation == "dynamic" and request.kv_memory.placement in {"ram", "auto_ssd"}:
+            raise _job_error("kv_dynamic_unavailable", "Experimental dynamic KV requires VRAM or automatic without SSD")
+        if request.kv_memory != KvMemorySettings() and (self.backend != "cuda" or
+                not artifact.resource.architecture.casefold().startswith("qwen4_exp")):
+            raise _job_error("kv_memory_unsupported", "Configurable KV placement currently requires the CUDA QSA backend")
         if 'kv_quantization' not in request.model_fields_set:
             saved_quantization = self.context_policy.model_kv_quantization.get(artifact.resource.name)
             if saved_quantization is not None:
@@ -954,6 +965,10 @@ class RuntimePool:
             context.raise_if_cancelled()
             status = process.returncode
             if status is not None:
+                if instance.output_task is not None:
+                    await instance.output_task
+                if instance.error is not None and instance.error.code.startswith("kv_"):
+                    raise _job_error(instance.error.code, instance.error.message)
                 raise _job_error(
                     "runtime_start_failed",
                     f"runtime exited during startup with status {status}",
@@ -1074,6 +1089,10 @@ class RuntimePool:
     def _kv_quantization_policy(self, model: str) -> KvQuantizationSettings:
         request = self._load_requests.get(model)
         return request.kv_quantization if request is not None else KvQuantizationSettings()
+
+    def _kv_memory_policy(self, model: str) -> KvMemorySettings:
+        request = self._load_requests.get(model)
+        return request.kv_memory if request is not None else KvMemorySettings()
 
     async def configure_qsa_kv_offload(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         settings = ConfigureQsaKvOffloadRequest.model_validate(payload)
@@ -1673,6 +1692,8 @@ class RuntimePool:
                     mtp_available=item.mtp_available,
                     qsa_kv_offload_supported=item.qsa_kv_offload_supported,
                     kv_quantization_supported=item.kv_quantization_supported,
+                    kv_memory_supported=item.kv_memory_supported,
+                    kv_memory=self._kv_memory_policy(item.artifact.resource.name),
                     kv_quantization=self._kv_quantization_policy(item.artifact.resource.name),
                     qsa_kv_offload=self._qsa_kv_policy(item.artifact.resource.name),
                     error=item.error,
@@ -1741,6 +1762,8 @@ class RuntimePool:
                 mtp_available=instance.mtp_available,
                 qsa_kv_offload_supported=instance.qsa_kv_offload_supported,
                 kv_quantization_supported=instance.kv_quantization_supported,
+                kv_memory_supported=instance.kv_memory_supported,
+                kv_memory=self._kv_memory_policy(instance.artifact.resource.name),
                 kv_quantization=self._kv_quantization_policy(instance.artifact.resource.name),
                 qsa_kv_offload=self._qsa_kv_policy(instance.artifact.resource.name),
                 error=instance.error,
@@ -2358,7 +2381,7 @@ class RuntimePool:
         try:
             if request.apply_global_cap:
                 return await self._reload_global_context_cap(context)
-            if request.qsa_kv_offload is not None or request.kv_quantization is not None:
+            if request.qsa_kv_offload is not None or request.kv_quantization is not None or request.kv_memory is not None:
                 return await self._configure_model_context(context, request)
             return await self.reload_runtime(request.context_size, request.instance_id, context=context, yarn_enabled=request.yarn_enabled)
         except BackendError as error:
@@ -2397,6 +2420,13 @@ class RuntimePool:
         storage = settings.qsa_kv_offload or QsaKvStorageSettings(enabled=previous.qsa_kv_offload.enabled,
             budget_bytes=previous.qsa_kv_offload.budget_bytes, ram_budget_bytes=previous.qsa_kv_offload.ram_budget_bytes)
         quantization = settings.kv_quantization or previous.kv_quantization
+        kv_memory = settings.kv_memory or previous.kv_memory
+        if kv_memory.allocation == "dynamic" and kv_memory.placement in {"ram", "auto_ssd"}:
+            raise _job_error("kv_dynamic_unavailable", "Experimental dynamic KV requires VRAM or automatic without SSD")
+        if settings.kv_memory is not None:
+            if not getattr(instance, "kv_memory_supported", False):
+                raise _job_error("kv_memory_unsupported", "This runtime does not support configurable KV placement")
+            storage = storage.model_copy(update={"enabled": False})
         if quantization.enabled and not getattr(instance, "kv_quantization_supported", False):
             raise _job_error("kv_quantization_unsupported", "the model or backend does not support TurboQuant KV")
         policy = QsaKvOffloadPolicy(**storage.model_dump(), target_context=target)
@@ -2405,7 +2435,7 @@ class RuntimePool:
                 raise _job_error("qsa_kv_offload_unsupported", "the model or backend does not support QSA KV offload")
             await self._validate_qsa_kv_policy(instance.artifact, policy, yarn_enabled=enabled)
         updated = previous.model_copy(update={"context_size": target, "yarn_enabled": enabled,
-            "qsa_kv_offload": policy, "kv_quantization": quantization,
+            "qsa_kv_offload": policy, "kv_quantization": quantization, "kv_memory": kv_memory,
             "pin": instance.pinned, "idle_ttl_seconds": instance.idle_ttl_seconds})
         async with self._lock:
             if self._instances.get(instance.id) is not instance or instance.state != RuntimeInstanceState.READY or \
@@ -2433,14 +2463,17 @@ class RuntimePool:
                 offload[name] = storage
                 quantization_map = dict(self.context_policy.model_kv_quantization)
                 quantization_map[name] = quantization
+                memory_map = dict(self.context_policy.model_kv_memory)
+                memory_map[name] = kv_memory
                 saved = self.context_policy.model_copy(update={"model_overrides": overrides,
-                    "model_yarn_enabled": yarn, "model_qsa_kv_offload": offload, "model_kv_quantization": quantization_map})
+                    "model_yarn_enabled": yarn, "model_qsa_kv_offload": offload, "model_kv_quantization": quantization_map,
+                    "model_kv_memory": memory_map})
                 if self.store is not None:
                     await asyncio.to_thread(self.store.save_runtime_context_policy, saved.model_dump())
                 self.context_policy = saved
             return {**result, "max_context": target, "context_override": target if settings.context_size is not None else None,
                 "yarn_enabled": enabled, "qsa_kv_offload": policy.model_dump(),
-                "kv_quantization": quantization.model_dump(), "warning": warning}
+                "kv_quantization": quantization.model_dump(), "kv_memory": kv_memory.model_dump(), "warning": warning}
         except BaseException:
             for item in list(self._instances.values()):
                 if item.artifact.resource.name == name:
@@ -3844,6 +3877,10 @@ class RuntimePool:
             job_context = instance.context_job if isinstance(instance.context_job, JobContext) else context
             message = line.decode("utf-8", errors="replace").rstrip()
             normalized = message.casefold()
+            for code in ("kv_memory_insufficient", "kv_vram_insufficient", "kv_dynamic_unavailable"):
+                if code + ":" in message:
+                    instance.error = ErrorDetail(code=code, message=message, retryable=False)
+                    break
             if message.startswith("mfq-decode-metal:"):
                 level = RuntimeLogLevel.ERROR
             elif re.search(r"(?:^|:\s+)warning:", normalized):
@@ -4011,6 +4048,8 @@ class RuntimePool:
                     instance.qsa_kv_offload_supported = self.backend in {"metal", "cuda"} and status["qsa_kv_offload_supported"] == 1
                 if "kv_quantization_supported" in status:
                     instance.kv_quantization_supported = self.backend in {"cuda", "metal"} and status["kv_quantization_supported"] == 1
+                if "kv_memory_supported" in status:
+                    instance.kv_memory_supported = self.backend == "cuda" and status["kv_memory_supported"] == 1
                 for field, metric in (("resident_budget_limit", "resident_memory_budget_bytes"),
                     ("resident_weight_budget_limit", "resident_weight_budget_bytes"),
                     ("resident_memory_used", "resident_memory_used_bytes"), ("reclaimable_weight_bytes", "resident_reclaimable_weight_bytes")):
@@ -4073,6 +4112,14 @@ class RuntimePool:
             value = status.get(source)
             if isinstance(value, (bool, int, float)) and value in (0, 1):
                 values[target] = bool(value)
+        if status.get("kv_memory_ram_bytes", 0) > 0:
+            values["ram_kv_bytes"] = values.get("ram_kv_bytes", 0) + int(status["kv_memory_ram_bytes"])
+            values["ram_kv_limit_bytes"] = values["ram_kv_bytes"]
+            values["ram_kv"] = True
+        if "qsa_kv_ssd_enabled" in status:
+            values["ssd_kv"] = status["qsa_kv_ssd_enabled"] == 1
+        if "kv_memory_ssd_enabled" in status:
+            values["ssd_kv"] = status["kv_memory_ssd_enabled"] == 1
         hot = status.get("prefix_cache_hot_bytes", status.get("prefix_cache_bytes"))
         live = status.get("kv_cache_bytes")
         groups = status.get("kv_cache_contexts")
@@ -4341,6 +4388,14 @@ class RuntimePool:
                 # by the same bounded GPU cache; they must not read SSD per step.
                 process_environment.setdefault("MFQ_DISABLE_MOE_SSD_RANGES", "1")
         process_environment["MFQ_KV_TURBOQUANT_BITS"] = str(request.kv_quantization.bits if request.kv_quantization.enabled else 0)
+        if self.backend == "cuda":
+            process_environment["MFQ_KV_PLACEMENT"] = request.kv_memory.placement
+            process_environment["MFQ_KV_ALLOCATION"] = request.kv_memory.allocation
+            _, host_available = host_memory_capacity()
+            if host_available is not None:
+                # Reserve RAM for experts before allocating KV arenas.
+                cold_experts = max(0, artifact.routed_expert_bytes - int((request.moe_gpu_cache_gb or 0) * (1 << 30)))
+                process_environment["MFQ_KV_RAM_LIMIT_BYTES"] = str(max(0, host_available - cold_experts - (2 << 30)))
         process_environment.pop("MFQ_QSA_KV_BUDGET_BYTES", None)
         process_environment.pop("MFQ_QSA_KV_TARGET_CONTEXT", None)
         process_environment.pop("MFQ_QSA_KV_RAM_BUDGET_BYTES", None)

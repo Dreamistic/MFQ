@@ -3,6 +3,7 @@
 #include "moe_cache_profile.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -10,6 +11,21 @@
 #include <utility>
 
 class MoeExpertCache;
+
+// The owner outlives every temporary tensor allocated from the borrowed tails.
+// Destruction restores experts on cancellation/exception as well as success.
+class MoePrefillWorkspaceLoan {
+public:
+    explicit MoePrefillWorkspaceLoan(std::shared_ptr<MoeExpertCache> cache):cache_(std::move(cache)){}
+    ~MoePrefillWorkspaceLoan();
+    std::size_t begin(std::size_t bytes);
+    void suspend();
+    void finish();
+private:
+    std::shared_ptr<MoeExpertCache> cache_;
+    bool active_=false;
+};
+std::size_t moe_prefill_transfer_bytes(const std::shared_ptr<MoeExpertCache>& cache,bool predictor=false);
 class MoeQuantRangeSource;
 struct CudaExecutionConfig;
 
@@ -27,13 +43,18 @@ bool moe_expert_cache_layer_prefill_ready(const std::shared_ptr<MoeExpertCache>&
 std::vector<std::pair<std::string, double>> moe_expert_memory_metrics(
     const std::shared_ptr<MoeExpertCache>& cache);
 void finalize_moe_expert_cache(
-    const std::shared_ptr<MoeExpertCache>& cache);
+    const std::shared_ptr<MoeExpertCache>& cache, std::size_t kv_growth_reserve = 0, std::size_t kv_budget_charge = 0);
 std::size_t moe_expert_cache_minimum_bytes(const std::shared_ptr<MoeExpertCache>& cache);
 std::size_t moe_expert_cache_budget_bytes(const std::shared_ptr<MoeExpertCache>& cache);
 void resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache, std::size_t bytes);
+// Reclaim lower-priority cache storage before reducing prefill transfer overlap.
+void set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCache>& cache,
+    std::function<void(std::size_t)> reserve,std::function<void(std::size_t)> reserve_ram={});
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);
+std::uint64_t moe_expert_streamed_bytes(const std::shared_ptr<MoeExpertCache>& cache);
 // Finish the adaptive transaction before a session reset or a prefill loan.
 void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache);
+void prepare_moe_decode_residency(const std::shared_ptr<MoeExpertCache>& cache);
 // Target, predictor and request batches share the MFE pool on their compute stream.
 bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
 // Request boundary only, after target/predictor graphs have been destroyed.
@@ -41,9 +62,7 @@ bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
 void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);
 // Return prompt-only ring and workspace storage before preparing decode graphs.
 void release_moe_prefill_buffers(MoeExpertCache* cache);
-inline void release_moe_prefill_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
-    release_moe_prefill_buffers(cache.get());
-}
+void release_moe_prefill_buffers(const std::shared_ptr<MoeExpertCache>& cache);
 // Idle diagnostic passes retain primary weights, clear transfer-cache entries,
 // and replay the CPU assignments captured by the first pass.
 void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cache, bool replay);

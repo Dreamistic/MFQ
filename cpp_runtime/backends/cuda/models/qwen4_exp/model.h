@@ -12,6 +12,7 @@
 #include "mfq/kernels/cuda/ple_fused.h"
 #include "runtime/nint_row_pipeline.h"
 #include "runtime/kv_offload.h"
+#include "runtime/kv_memory.h"
 #include "mfq_cuda_kv_quantization.h"
 #include "storage/session_state.h"
 #include <array>
@@ -55,10 +56,16 @@ class Gdn {
         MFQ_RUNTIME_CHECK(nk_ > 0 && nv_ > 0 && nv_ % nk_ == 0 && d_ > 0 && kernel_ > 1 && eps_ > 0,
                           "invalid Qwen4 GDN head/convolution geometry");
     }
-    void reset() {
-        conv_ = Tensor();
-        state_ = Tensor();
-        core_workspace_ = Tensor();
+    void reset(bool retain_storage=false) {
+        if(retain_storage) {
+            if(conv_.defined())conv_.zero_();
+            if(state_.defined())state_.zero_();
+            if(core_workspace_.defined())core_workspace_.zero_();
+        } else {
+            conv_ = Tensor();
+            state_ = Tensor();
+            core_workspace_ = Tensor();
+        }
         commit();
     }
     void commit() {
@@ -93,9 +100,13 @@ class Gdn {
             fused_output_ && transposed_state_ && !core_workspace_.defined()
             ? std::size_t(nv_)*(d_+1)*sizeof(float) : 0);
     }
-    void restore_session(const Tensor& convolution,const Tensor& recurrent) {
+    void restore_session(const Tensor& convolution,const Tensor& recurrent,bool retain_storage=false) {
         MFQ_RUNTIME_CHECK(convolution.defined() && recurrent.defined(),"missing Qwen4 GDN session state");
-        reset();conv_=convolution.clone();state_=recurrent.clone();
+        if(retain_storage) {
+            MFQ_RUNTIME_CHECK(conv_.defined() && state_.defined() && conv_.sizes()==convolution.sizes() &&
+                state_.sizes()==recurrent.sizes(),"Qwen4 GDN graph session geometry changed");
+            commit();conv_.copy_(convolution);state_.copy_(recurrent);
+        } else {reset();conv_=convolution.clone();state_=recurrent.clone();}
     }
     Tensor recurrent_state() const {
         return state_.defined() && transposed_state_ ? state_.transpose(-1,-2) : state_;
@@ -566,9 +577,9 @@ class Ple {
         int64_t dilation, double eps)
         : embedding_(std::move(embedding)), w_(std::move(weights)), hidden_(hidden),
           streams_(streams), dilation_(dilation), eps_(eps) {}
-    void reset() {
+    void reset(bool retain_storage=false) {
         embedding_.reset();
-        conv_ = Tensor();
+        if(retain_storage && conv_.defined())conv_.zero_();else conv_ = Tensor();
         commit();
     }
     void commit() {
@@ -587,9 +598,14 @@ class Ple {
     bool graph_supported() const { return embedding_.graph_supported(); }
     const NgramEmbedding::Context& session_context() const { return embedding_.context(); }
     void restore_graph_context(NgramEmbedding::Context context) { embedding_.restore(std::move(context)); }
-    void restore_session(const Tensor& convolution,NgramEmbedding::Context context) {
+    void restore_session(const Tensor& convolution,NgramEmbedding::Context context,bool retain_storage=false) {
         MFQ_RUNTIME_CHECK(convolution.defined(),"missing Qwen4 PLE session state");
-        reset();conv_=convolution.clone();embedding_.restore(std::move(context));
+        if(retain_storage) {
+            MFQ_RUNTIME_CHECK(conv_.defined() && conv_.sizes()==convolution.sizes(),
+                "Qwen4 PLE graph session geometry changed");
+            commit();conv_.copy_(convolution);
+        } else {reset();conv_=convolution.clone();}
+        embedding_.restore(std::move(context));
     }
     std::shared_ptr<NintRowStage> graph_stage(int64_t tokens,const tb::Device& device) {
         return embedding_.graph_stage(1,tokens,device);
@@ -720,7 +736,7 @@ class Qsa {
   public:
     Qsa(QsaWeights weights, QsaConfig config, std::shared_ptr<RotaryEmbedding> rotary,
         bool fused_projection = true, bool grouped_projection = true,
-        std::shared_ptr<KvOffloadStore> offload = {})
+        std::shared_ptr<KvOffloadStore> offload = {}, std::shared_ptr<KvMemoryManager> memory = {})
         : w_(std::move(weights)), c_(config), rotary_(std::move(rotary)), fused_projection_(fused_projection), grouped_projection_(grouped_projection),
           keys_(config.maximum, config.kv_heads * key_width(), cache_dtype()),
           values_(config.maximum, config.kv_heads * value_width(), cache_dtype()),
@@ -733,16 +749,31 @@ class Qsa {
         // BF16 sources otherwise record repeated casts in each row's graph.
         for(auto* weight:{&w_.query_norm,&w_.key_norm,&w_.index_query_norm,&w_.index_key_norm})
             if(weight->defined())*weight=weight->to(tb::kFloat32).contiguous();
+        memory_manager_=memory;
         offload_ = std::move(offload);
+        if(memory && !offload_)memory_=memory->add(c_.maximum,c_.kv_heads,key_width(),value_width(),
+            c_.index_width,c_.pool,w_.query_norm.options().dtype(cache_dtype()));
         if (offload_) {
             offloaded_kv_ = std::make_unique<KvOffloadSequence>(offload_, c_.kv_heads * (key_width()+value_width()), c_.pool, cache_dtype());
             offloaded_index_ = std::make_unique<KvOffloadSequence>(offload_, c_.index_width, c_.pool);
             offloaded_pooled_ = std::make_unique<KvOffloadSequence>(offload_, c_.index_width, 16);
         }
     }
-    int64_t position() const { return offload_ ? offloaded_kv_->position() : keys_.position(); }
+    int64_t position() const { return offload_ && offloaded_kv_ ? offloaded_kv_->position() : keys_.position(); }
+    bool managed_memory() const {return memory_ && memory_->ready;}
+    int64_t graph_capacity() const {return managed_memory()?c_.maximum:0;}
+    void activate_memory() {
+        if(!managed_memory())return;
+        if(!index_.storage().defined())index_.replace_storage(memory_->index);
+        graph_pooled_=memory_->pooled;
+        if(memory_->offload) {
+            offload_=memory_->offload;
+            if(!offloaded_kv_)offloaded_kv_=std::make_unique<KvOffloadSequence>(offload_,
+                c_.kv_heads*(key_width()+value_width()),c_.pool,cache_dtype());
+        } else {graph_keys_=memory_->keys;graph_values_=memory_->values;}
+    }
     std::unique_ptr<Qsa> fork_empty() const {
-        return std::make_unique<Qsa>(w_, c_, rotary_, fused_projection_, grouped_projection_, offload_);
+        return std::make_unique<Qsa>(w_, c_, rotary_, fused_projection_, grouped_projection_, offload_,memory_manager_);
     }
     std::vector<Tensor> project_inputs(CudaExecutionContext& execution,const Tensor& x) const {
         if(grouped_projection_ && w_.input_projection)return w_.input_projection(execution,x);
@@ -752,6 +783,7 @@ class Qsa {
         return w_.output(execution,x);
     }
     std::size_t growth_bytes(int64_t tokens) const {
+        if(managed_memory())return memory_->growth_bytes(position()+tokens);
         if (offload_) return 0;
         const auto required = position() + tokens;
         MFQ_RUNTIME_CHECK(tokens > 0 && required <= c_.maximum, "QSA growth exceeds max_context");
@@ -770,6 +802,7 @@ class Qsa {
         return bytes;
     }
     std::size_t graph_growth_bytes(int64_t capacity) const {
+        if(managed_memory())return memory_->growth_bytes(capacity);
         if (graph_keys_.defined()) return 0;
         auto bytes = std::size_t(capacity) * c_.kv_heads * (key_width()+value_width()) * (quantization_.enabled()?4:2);
         if (!index_.storage().defined() || index_.storage().size(1) != capacity)
@@ -777,7 +810,12 @@ class Qsa {
         bytes += std::size_t((capacity+c_.pool-1)/c_.pool) * c_.index_width * 2;
         return bytes;
     }
-    bool supports_session() const { return !offload_; }
+    bool supports_session() const { return !offload_ && !(memory_ && memory_->offload); }
+    std::size_t session_bytes(int64_t count) const {
+        if(count<=0)return 0;
+        return std::size_t(count)*(c_.kv_heads*(key_width()+value_width())*(quantization_.enabled()?4:2)+
+            c_.index_width*index_.storage().element_size());
+    }
     void capture_session(Qwen4BlockSessionState& state,int64_t count,std::size_t& bytes) const {
         MFQ_RUNTIME_CHECK(!offload_ && count>0 && count<=position(),"invalid Qwen4 QSA session boundary");
         const auto save=[&](const Tensor& tensor) {
@@ -800,9 +838,16 @@ class Qsa {
             state.values.size(2)==c_.kv_heads*value_width() && state.values.scalar_type()==cache_dtype() &&
             state.index.dim()==3 && state.index.size(0)==1 && state.index.size(1)==count && state.index.size(2)==c_.index_width,
             "incompatible Qwen4 QSA session state");
-        reset();keys_.append(state.keys);values_.append(state.values);index_.append(state.index);
+        reset();activate_memory();
+        if(managed_memory()) {
+            memory_->ensure(count);
+            graph_keys_.narrow(2,0,count).copy_(state.keys.reshape({1,count,c_.kv_heads,key_width()}).permute({0,2,1,3}));
+            graph_values_.narrow(2,0,count).copy_(state.values.reshape({1,count,c_.kv_heads,value_width()}).permute({0,2,1,3}));
+            keys_.advance_fixed(count);values_.advance_fixed(count);index_.append(state.index);graph_prepared_=false;
+        } else {keys_.append(state.keys);values_.append(state.values);index_.append(state.index);}
     }
     std::vector<Tensor> resident_cache_tensors() const {
+        if(managed_memory())return {}; // Count physical GPU/RAM tiers through KvMemoryManager.
         return {keys_.storage(),values_.storage(),index_.storage(),graph_keys_,graph_values_,graph_pooled_};
     }
     void set_grouped_projection(bool enabled) {
@@ -815,6 +860,7 @@ class Qsa {
         rotary_->set_fused(enabled);
     }
     void leave_graph() {
+        if(managed_memory()){graph_prepared_=false;return;}
         if(!graph_keys_.defined())return;
         const auto n=position();
         keys_.replace_storage(graph_keys_.narrow(2,0,n).permute({0,2,1,3}).contiguous().reshape({1,n,c_.kv_heads*key_width()}));
@@ -822,14 +868,33 @@ class Qsa {
         graph_keys_={};graph_values_={};graph_pooled_={};
     }
     void reset() {
-        if (offload_) { offloaded_kv_->reset(); offloaded_index_->reset(); offloaded_pooled_->reset(); }
+        if (offload_) {
+            if(offloaded_kv_)offloaded_kv_->reset();
+            if(offloaded_index_)offloaded_index_->reset();
+            if(offloaded_pooled_)offloaded_pooled_->reset();
+        }
         keys_.reset();
         values_.reset();
         index_.reset();
+        graph_prepared_=false;
+        if(managed_memory()){activate_memory();return;}
         graph_keys_={};graph_values_={};graph_pooled_={};
     }
     void prepare_graph(const Tensor& full_positions, int64_t capacity) {
+        activate_memory();
         MFQ_RUNTIME_CHECK(!offload_, "streamed QSA KV requires host-controlled block transfers");
+        if(managed_memory()) {
+            if(graph_prepared_)return;
+            const auto n=position(),pools=n/c_.pool;
+            memory_->ensure(n);
+            if(pools) {
+                auto pooled=index_.storage().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
+                pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
+                auto starts=tb::arange(pools,full_positions.options().dtype(tb::kInt64))*c_.pool;
+                graph_pooled_.narrow(1,0,pools).copy_(rotary_->forward(pooled.unsqueeze(1),full_positions.index_select(-1,starts)).squeeze(1));
+            }
+            graph_prepared_=true;return;
+        }
         if(graph_keys_.defined())return;
         MFQ_RUNTIME_CHECK(position()>0 && keys_.storage().size(0)==1,
             "QSA graph requires a prefilled single sequence");
@@ -952,7 +1017,9 @@ class Qsa {
     void truncate(int64_t keep) {
         if (offload_) {
             MFQ_RUNTIME_CHECK(keep >= 0 && keep <= position(), "invalid offloaded QSA truncation");
-            offloaded_kv_->truncate(keep); offloaded_index_->truncate(keep); offloaded_pooled_->truncate(keep / c_.pool);
+            offloaded_kv_->truncate(keep);
+            if(managed_memory())index_.truncate(keep);
+            else {offloaded_index_->truncate(keep);offloaded_pooled_->truncate(keep/c_.pool);}
             return;
         }
         MFQ_RUNTIME_CHECK(keep >= 0 && keep <= keys_.position() && keep <= values_.position() &&
@@ -969,6 +1036,7 @@ class Qsa {
         MFQ_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0 &&
                               hidden.size(1) > 0,
                           "Qwen4 QSA requires nonempty [B,T,H] input");
+        activate_memory();
         if (offload_ && use_cache)
             return forward_offloaded(execution, hidden, current_positions, full_positions, selection_trace,
                                      std::move(projections),project_output);
@@ -1006,10 +1074,20 @@ class Qsa {
                 return Projection{gate, query, key, value, iq, raw};
             },
             [&](Projection &p) {
-                p.key = keys_.append(encode_key(p.key).reshape({b, t, -1}))
-                            .reshape({b, offset + t, c_.kv_heads, key_width()});
-                p.value = values_.append(encode_value(p.value).reshape({b, t, -1}))
-                              .reshape({b, offset + t, c_.kv_heads, value_width()});
+                if(managed_memory()) {
+                    MFQ_RUNTIME_CHECK(b==1,"preallocated QSA expects one sequence per cache");
+                    memory_->ensure(offset+t);
+                    graph_keys_.narrow(2,offset,t).copy_(encode_key(p.key).permute({0,2,1,3}));
+                    graph_values_.narrow(2,offset,t).copy_(encode_value(p.value).permute({0,2,1,3}));
+                    p.key=graph_keys_.narrow(2,0,offset+t).permute({0,2,1,3});
+                    p.value=graph_values_.narrow(2,0,offset+t).permute({0,2,1,3});
+                    keys_.advance_fixed(t);values_.advance_fixed(t);graph_prepared_=false;
+                } else {
+                    p.key = keys_.append(encode_key(p.key).reshape({b, t, -1}))
+                                .reshape({b, offset + t, c_.kv_heads, key_width()});
+                    p.value = values_.append(encode_value(p.value).reshape({b, t, -1}))
+                                  .reshape({b, offset + t, c_.kv_heads, value_width()});
+                }
                 p.raw = index_.append(p.raw);
             },
             [&](const Projection &p) {
@@ -1076,6 +1154,9 @@ class Qsa {
         const Tensor& positions, const Tensor& full_positions, std::vector<Tensor>* trace,
         std::vector<Tensor> projections={},bool project_output=true) {
         const auto offset = position(), tokens = hidden.size(1), length = offset + tokens;
+        const auto pool_position=[&]{return managed_memory()?index_.position()/c_.pool:offloaded_pooled_->position();};
+        const auto pool_range=[&](int64_t start,int64_t count){return managed_memory()
+            ? graph_pooled_.narrow(1,start,count).reshape({count,c_.index_width}) : offloaded_pooled_->range(start,count);};
         MFQ_RUNTIME_CHECK(hidden.size(0) == 1 && length <= c_.maximum && full_positions.size(-1) == length,
             "streamed QSA requires one sequence within its configured context");
         const auto key_row = c_.kv_heads * key_width(), value_row = c_.kv_heads * value_width();
@@ -1086,15 +1167,19 @@ class Qsa {
         auto p = project(execution, hidden, positions, length > c_.budget,{},{},{},std::move(projections));
         try {
             offloaded_kv_->append(tb::cat({encode_key(p.key).reshape({tokens,key_row}), encode_value(p.value).reshape({tokens,value_row})}, 1));
-            offloaded_index_->append(p.raw.reshape({tokens, c_.index_width}));
-            const auto first_pool = offloaded_pooled_->position(), new_pools = length / c_.pool - first_pool;
+            const auto first_pool = pool_position();
+            if(managed_memory())index_.append(p.raw);
+            else offloaded_index_->append(p.raw.reshape({tokens,c_.index_width}));
+            const auto new_pools = length / c_.pool - first_pool;
             if (new_pools) {
-                auto raw = offloaded_index_->range(first_pool * c_.pool, new_pools * c_.pool);
+                auto raw = managed_memory()?index_.storage().narrow(1,first_pool*c_.pool,new_pools*c_.pool).reshape({new_pools*c_.pool,c_.index_width})
+                    : offloaded_index_->range(first_pool * c_.pool, new_pools * c_.pool);
                 auto pooled = raw.reshape({1, new_pools, c_.pool, c_.index_width}).to(tb::kFloat32).mean(2).to(tb::kFloat16);
                 pooled = rms_norm(pooled, w_.index_key_norm.to(tb::kFloat32) + 1, c_.eps);
                 auto starts = (tb::arange(new_pools, positions.options().dtype(tb::kInt64)) + first_pool) * c_.pool;
                 pooled = rotary_->forward(pooled.unsqueeze(1), full_positions.index_select(-1, starts)).squeeze(1);
-                offloaded_pooled_->append(pooled.reshape({new_pools, c_.index_width}));
+                if(managed_memory())graph_pooled_.narrow(1,first_pool,new_pools).copy_(pooled);
+                else offloaded_pooled_->append(pooled.reshape({new_pools, c_.index_width}));
             }
             // When one layer fits in staging, reuse that layer across the
             // entire prefill tile instead of gathering the same rows per token.
@@ -1106,7 +1191,7 @@ class Qsa {
                 auto value = packed.narrow(1,key_row,value_row).reshape({1,length,c_.kv_heads,value_width()}).permute({0,2,1,3});
                 Tensor ids;
                 if (length > c_.budget) {
-                    auto pooled = offloaded_pooled_->range(0,length / c_.pool).reshape({1,length / c_.pool,c_.index_width});
+                    auto pooled = pool_range(0,length / c_.pool).reshape({1,length / c_.pool,c_.index_width});
                     auto scores = mfq_qwen4_exp::block_scores(p.iq, pooled);
                     ids = select_pooled_blocks(scores, offset, length, c_.pool, c_.budget, true);
                     if (trace) *trace = {scores,ids,p.iq,pooled};
@@ -1127,14 +1212,14 @@ class Qsa {
                     auto ids = tb::arange(max_keys, cache_positions.options()).reshape({1, 1, max_keys}).expand({1, count, max_keys});
                     selected = tb::where(ids <= cache_positions.reshape({1, count, 1}), ids, tb::full_like(ids, -1)).to(tb::kInt32).contiguous();
                 } else {
-                    const auto pools = offloaded_pooled_->position(), keep = std::min(c_.budget / c_.pool, pools);
+                    const auto pools = pool_position(), keep = std::min(c_.budget / c_.pool, pools);
                     Tensor best_scores, best_ids;
                     std::vector<Tensor> traced_scores, traced_pools;
                     const auto pool_chunk = std::max<int64_t>(16, std::min<int64_t>(1024,
                         offload_->config().buffer_bytes / 8 / (c_.index_width * 2 + count * 4)));
                     for (int64_t start = 0; start < pools; start += pool_chunk) {
                         const auto n = std::min(pool_chunk, pools - start);
-                        auto pooled = offloaded_pooled_->range(start, n).reshape({1, n, c_.index_width});
+                        auto pooled = pool_range(start, n).reshape({1, n, c_.index_width});
                         auto scores = mfq_qwen4_exp::block_scores(p.iq.narrow(1, begin, count), pooled);
                         auto ids = tb::arange(start, start + n, cache_positions.options());
                         auto visible = (ids * c_.pool + c_.pool - 1).reshape({1, 1, n}) <= cache_positions.reshape({1, count, 1});
@@ -1236,5 +1321,8 @@ class Qsa {
     std::shared_ptr<KvOffloadStore> offload_;
     std::unique_ptr<KvOffloadSequence> offloaded_kv_, offloaded_index_, offloaded_pooled_;
     Tensor graph_keys_,graph_values_,graph_pooled_;
+    std::shared_ptr<KvMemoryAllocation> memory_;
+    std::shared_ptr<KvMemoryManager> memory_manager_;
+    bool graph_prepared_=false;
 };
 } // namespace mfq::cuda::qwen4_exp
