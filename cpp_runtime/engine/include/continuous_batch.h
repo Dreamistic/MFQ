@@ -221,10 +221,13 @@ template <class Ops> class ContinuousBatch {
                 prefilling_operation = true;
                 std::vector<PrefillBatchResult<Sample>> samples;
                 if constexpr (requires { operations.prefill_batch(items); }) {
-                    auto results = operations.prefill_batch(items);
-                    for (auto& result : results) {
-                        if constexpr (requires { result.failure; result.sample; }) samples.push_back(std::move(result));
-                        else samples.push_back({std::move(result), {}});
+                    const bool use_batch = items.size() > 1 || !requires { operations.prefill_batch_limit(); };
+                    if (use_batch) {
+                        auto results = operations.prefill_batch(items);
+                        for (auto& result : results) {
+                            if constexpr (requires { result.failure; result.sample; }) samples.push_back(std::move(result));
+                            else samples.push_back({std::move(result), {}});
+                        }
                     }
                 }
                 if (samples.empty()) {

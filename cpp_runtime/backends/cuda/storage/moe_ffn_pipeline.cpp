@@ -753,9 +753,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 host_maps.push_back(std::move(cold_map));
             }
             const auto compact=mfq::cuda::runtime_options::moe_prefill_compact_mma();
-            const auto* host_maps_option=std::getenv("MFQ_MOE_PREFILL_HOST_MAPS");
+            const auto host_maps_option=mfq::cuda::runtime_options::moe_prefill_host_maps();
             initialize_mixed_nvq_dispatch(runtime,execution.config,!compact || *compact!=0,
-                !host_maps_option || host_maps_option[0]!='0'?&host_maps:nullptr);
+                !host_maps_option || *host_maps_option?&host_maps:nullptr);
         }
         if(execution.config.moe_ffn_fused_activation && !cache_->pipeline_sigmoid_table_.defined())
             cache_->pipeline_sigmoid_table_=moe_swiglu_sigmoid_table_cuda();
@@ -1127,8 +1127,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         const auto host_routes=std::min(experts_,cell.batch_decode?cell.entries:std::max(cell.entries,8*cell.routes));
         const auto host_header=(32+24*host_routes*route_fields+15)&~int64_t(15);
         int64_t host_payload=host_routes*route_bytes;
-        const auto* compact_host=std::getenv("MFQ_MOE_COMPACT_HOST_STAGE");
-        if(cell.transfer_cache && cache_->pipeline_prefill_layer_layout_ && compact_host && compact_host[0]=='1') {
+        const auto compact_host=mfq::cuda::runtime_options::moe_compact_host_stage();
+        if(cell.transfer_cache && cache_->pipeline_prefill_layer_layout_ && compact_host && *compact_host) {
             // RAM expert leases are stable after full preload. Inspect their
             // actual fields once: retained warm copies may live outside the
             // registered cold arena. Only pageable fields and packed metadata
@@ -1831,8 +1831,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             std::array<std::vector<Interval>,2> intervals;
             std::array<std::vector<mfq::cuda::DmaCopy>,2> cache_copies;
             std::vector<bool> direct_to_cache(fields.size(),false);
-            const auto* direct_option=std::getenv("MFQ_MOE_DIRECT_CACHE_DMA");
-            const bool direct_cache=cell.transfer_cache && direct_option && direct_option[0]=='1';
+            const auto direct_option=mfq::cuda::runtime_options::moe_direct_cache_dma();
+            const bool direct_cache=cell.transfer_cache && direct_option && *direct_option;
             std::array<int64_t,2> staged_begin{},staged_end{},staged_host_begin{};
             int64_t offset=cell.wire_header_bytes,direct_bytes=0,staged_bytes=0,gate_up_end=0;
             int64_t host_offset=cell.wire_header_bytes;

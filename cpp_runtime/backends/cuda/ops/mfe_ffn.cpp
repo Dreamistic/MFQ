@@ -42,8 +42,8 @@ View pool_view(const MixedMoePool& pool,int rows,std::vector<tb::Tensor>& owners
             result.format==12 || result.format==15 || result.format==17;
         result.e8_dense_groups=w.dense_groups && !d4;
         result.d4_dense_groups=w.dense_groups && d4;
-        const auto* bank_map_option=std::getenv("MFQ_MFE_NVQ_BANK_MAP");
-        result.nvq_bank_map=bank_map_option && bank_map_option[0]=='0'?0:w.bank_map;
+        const auto bank_map_option=mfq::cuda::runtime_options::mfe_nvq_bank_map();
+        result.nvq_bank_map=bank_map_option && !*bank_map_option?0:w.bank_map;
         result.nvec=(result.input_width+(d4?3:7))/(d4?4:8);result.nsign=(result.input_width+7)/8;
         const std::array<tb::Tensor,5> fields={w.indices_packed,w.aux_packed,w.sub_scale_packed,w.neuron_scale,w.codebook};
         for(int i=0;i<5;++i){result.fields[i]=fields[i].data_ptr();owners.push_back(fields[i]);}
@@ -163,9 +163,9 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
             shared[2]->out<batch_.output_width)throw std::invalid_argument("two-stage MFE shared geometry invalid");
         for(int p=0;p<3;++p) {
             auto d=nint_view(*shared[p],int(shared[p]->out),1,owners_);d.expert_local=nullptr;
-            const auto* small_whole=std::getenv("MFQ_MFE_SHARED_SMALL_WHOLE");
+            const auto small_whole=mfq::cuda::runtime_options::mfe_shared_small_whole();
             const bool small_down=p==2 && d.group_size==24 && d.groups<=32 &&
-                (small_whole?small_whole[0]!='0':(batch_.tokens==1 || batch_.tokens==5 || batch_.tokens==6));
+                (small_whole?*small_whole:(batch_.tokens==1 || batch_.tokens==5 || batch_.tokens==6));
             d.nint_whole=nint_whole && (d.group_size==28 || (p<2 && d.group_size==24) || small_down);
             const auto grouped=mfq::cuda::runtime_options::nint_group_dot();
             if(batch_.shared_dense_math && shared[p]->aligned_q8)
@@ -253,18 +253,10 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         batch_.token_group_capacity=batch_.tokens<=8?2:8;
         if(token_group_capacity_hint==4 || token_group_capacity_hint==8)
             batch_.token_group_capacity=token_group_capacity_hint;
-        if(const auto* capacity=std::getenv("MFQ_MFE_TOKEN_GROUP_CAPACITY")) {
-            if(std::strcmp(capacity,"2")==0)batch_.token_group_capacity=2;
-            else if(std::strcmp(capacity,"4")==0)batch_.token_group_capacity=4;
-            else if(std::strcmp(capacity,"8")==0)batch_.token_group_capacity=8;
-            else if(std::strcmp(capacity,"auto")==0 && batch_.tokens>=3 && batch_.tokens<=6)
+        if(const auto capacity=mfq::cuda::runtime_options::mfe_token_group_capacity()) {
+            if(*capacity>0)batch_.token_group_capacity=*capacity;
+            else if(batch_.tokens>=3 && batch_.tokens<=6)
                 batch_.token_group_capacity=batch_.tokens<=4?4:8;
-            else if(shared[0] && batch_.tokens>=3 && batch_.tokens<=6) {
-                if(std::strcmp(capacity,"shared4")==0)
-                    batch_.token_group_capacity=mfq::cuda::kMfeSharedGroupEncoding+4;
-                else if(std::strcmp(capacity,"shared8")==0)
-                    batch_.token_group_capacity=mfq::cuda::kMfeSharedGroupEncoding+8;
-            }
         }
         const int plan_capacity=batch_.token_group_capacity>mfq::cuda::kMfeSharedGroupEncoding?
             2:batch_.token_group_capacity;
@@ -274,19 +266,19 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         token_group_slots_=tb::empty({batch_.token_groups,8},input.options().dtype(tb::kInt32));
         batch_.token_group_counts=token_group_counts_.data_ptr<int32_t>();
         batch_.token_group_slots=token_group_slots_.data_ptr<int32_t>();
-        const auto* aligned_gu=std::getenv("MFQ_MFE_TOKEN_ALIGNED_GU");
+        const auto aligned_gu=mfq::cuda::runtime_options::mfe_token_aligned_gu();
         // The aligned CTA saves work at four rows. Other short shapes retain
         // the more parallel Gate/Up split; an explicit setting can compare it.
         batch_.token_group_aligned_gu=batch_.tokens<=8 &&
-            (aligned_gu?aligned_gu[0]!='0':batch_.tokens==4);
+            (aligned_gu?*aligned_gu:batch_.tokens==4);
         const auto aligned_down=[](const View& d) {
             return d.group_size>=2 && d.group_size<=32 && d.group_size%2==0;
         };
         for(int i=0;i<batch_.projection_counts[2];++i)
             batch_.token_group_aligned_gu &= aligned_down(views[batch_.projection_offsets[2]+i]);
         if(shared[0])batch_.token_group_aligned_gu &= aligned_down(views.back());
-        const auto* compact_plan=std::getenv("MFQ_MFE_TOKEN_COMPACT_PLAN");
-        if(!compact_plan || compact_plan[0]!='0') {
+        const auto compact_plan=mfq::cuda::runtime_options::mfe_token_compact_plan();
+        if(!compact_plan || *compact_plan) {
             token_group_buckets_=tb::empty({4,batch_.token_groups+1},input.options().dtype(tb::kInt32));
             batch_.token_group_buckets=token_group_buckets_.data_ptr<int32_t>();
         }
@@ -427,8 +419,8 @@ void MfeFfnRuntime::prepare(){
     auto prepared=batch_;
     const bool shared_plan=batch_.token_group_capacity>mfq::cuda::kMfeSharedGroupEncoding;
     if(shared_plan)prepared.token_group_capacity=2;
-    if(const auto* setting=std::getenv("MFQ_MFE_TOKEN_GROUPS"))
-        if(setting[0]=='0')prepared.token_group_counts=nullptr;
+    if(const auto setting=mfq::cuda::runtime_options::mfe_token_groups())
+        if(!*setting)prepared.token_group_counts=nullptr;
     mfq::cuda::mfe_ffn_prepare(prepared,reinterpret_cast<const mfq::cuda::MfeInputQuantization*>(quantization_.data_ptr()),
         quantization_count_,quantization_groups_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     if(shared_plan && prepared.token_group_counts) {

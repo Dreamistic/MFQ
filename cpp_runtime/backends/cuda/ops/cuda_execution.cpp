@@ -1108,3 +1108,162 @@ void report_cuda_memory(
 #endif
 #endif
 }
+
+namespace mfq::cuda::runtime_options {
+std::optional<bool> mfe_token_groups() {
+    if (const auto* value = std::getenv("MFQ_MFE_TOKEN_GROUPS")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> mfe_token_compact_plan() {
+    if (const auto* value = std::getenv("MFQ_MFE_TOKEN_COMPACT_PLAN")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> mfe_token_aligned_gu() {
+    if (const auto* value = std::getenv("MFQ_MFE_TOKEN_ALIGNED_GU")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> mfe_shared_small_whole() {
+    if (const auto* value = std::getenv("MFQ_MFE_SHARED_SMALL_WHOLE")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> mfe_nvq_bank_map() {
+    if (const auto* value = std::getenv("MFQ_MFE_NVQ_BANK_MAP")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> nint_fused_fixed_bits() {
+    if (const auto* value = std::getenv("MFQ_NINT_FUSED_FIXED_BITS")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> nint_group_quantize() {
+    if (const auto* value = std::getenv("MFQ_NINT_GROUP_QUANTIZE")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> ple_native_fusion() {
+    if (const auto* value = std::getenv("MFQ_PLE_NATIVE_FUSION")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> gdn_strided_projections() {
+    if (const auto* value = std::getenv("MFQ_GDN_STRIDED_PROJECTIONS")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gdn_short_inplace() {
+    if (const auto* value = std::getenv("MFQ_GDN_SHORT_INPLACE")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gdn_short_fusion() {
+    if (const auto* value = std::getenv("MFQ_GDN_SHORT_FUSION")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gdn_batch_projection() {
+    if (const auto* value = std::getenv("MFQ_GDN_BATCH_PROJECTION")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> nint_prefill_decode_reuse() {
+    if (const auto* value = std::getenv("MFQ_NINT_PREFILL_DECODE_REUSE")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> moe_prefill_append_tail() {
+    if (const auto* value = std::getenv("MFQ_MOE_PREFILL_APPEND_TAIL")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> gdn_prefill_layer_batch() {
+    if (const auto* value = std::getenv("MFQ_GDN_PREFILL_LAYER_BATCH")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> gr_prefill_layer_batch() {
+    if (const auto* value = std::getenv("MFQ_GR_PREFILL_LAYER_BATCH")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gr_chain_ffn_post() {
+    if (const auto* value = std::getenv("MFQ_GR_CHAIN_FFN_POST")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> mtp_predictor_graph() {
+    if (const auto* value = std::getenv("MFQ_MTP_PREDICTOR_GRAPH")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<std::int64_t> continuous_ffn_tile() {
+    if (const auto* value = std::getenv("MFQ_CONTINUOUS_FFN_TILE")) return std::atoll(value);
+    return std::nullopt;
+}
+std::optional<bool> gdn_packed_qkv() {
+    if (const auto* value = std::getenv("MFQ_GDN_PACKED_QKV")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<int> moe_prefill_shared_chain_streams() {
+    if (const auto* value = std::getenv("MFQ_MOE_PREFILL_SHARED_CHAIN_STREAMS")) return std::atoi(value);
+    return std::nullopt;
+}
+std::optional<int> moe_prefill_shared_streams() {
+    if (const auto* value = std::getenv("MFQ_MOE_PREFILL_SHARED_STREAMS")) return std::atoi(value);
+    return std::nullopt;
+}
+std::optional<int> gdn_prefill_projection_streams() {
+    if (const auto* value = std::getenv("MFQ_GDN_PREFILL_PROJECTION_STREAMS")) return std::atoi(value);
+    return std::nullopt;
+}
+std::optional<bool> trace_gr_dispatch() {
+    if (const auto* value = std::getenv("MFQ_TRACE_GR_DISPATCH")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gr_batch_two_stage() {
+    if (const auto* value = std::getenv("MFQ_GR_BATCH_TWO_STAGE")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> gr_continuous_two_stage() {
+    if (const auto* value = std::getenv("MFQ_GR_CONTINUOUS_TWO_STAGE")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<std::int64_t> gr_prefill_work_chunk() {
+    if (const auto* value = std::getenv("MFQ_GR_PREFILL_WORK_CHUNK")) return std::atoll(value);
+    return std::nullopt;
+}
+std::optional<bool> position_buffer(const char* name) {
+    if (const auto* value = std::getenv(name)) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> single_output_view() {
+    if (const auto* value = std::getenv("MFQ_SINGLE_OUTPUT_VIEW")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<bool> moe_direct_cache_dma() {
+    if (const auto* value = std::getenv("MFQ_MOE_DIRECT_CACHE_DMA")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> moe_compact_host_stage() {
+    if (const auto* value = std::getenv("MFQ_MOE_COMPACT_HOST_STAGE")) return value[0] == '1';
+    return std::nullopt;
+}
+std::optional<bool> moe_prefill_host_maps() {
+    if (const auto* value = std::getenv("MFQ_MOE_PREFILL_HOST_MAPS")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<char> gr_up_group_coefficients() {
+    if (const auto* value = std::getenv("MFQ_GR_UP_GROUP_COEFFICIENTS")) return value[0];
+    return std::nullopt;
+}
+std::optional<bool> gr_dense_bf16_direct() {
+    if (const auto* value = std::getenv("MFQ_GR_DENSE_BF16_DIRECT")) return value[0] != '0';
+    return std::nullopt;
+}
+std::optional<int> mfe_token_group_capacity() {
+    if (const auto* value = std::getenv("MFQ_MFE_TOKEN_GROUP_CAPACITY")) {
+        const std::string_view mode(value);
+        if (mode == "2") return 2;
+        if (mode == "4") return 4;
+        if (mode == "8") return 8;
+        if (mode == "auto") return 0;
+    }
+    return std::nullopt;
+}
+std::optional<std::int64_t> moe_ram_pin_bytes() {
+    if (const auto* value = std::getenv("MFQ_MOE_RAM_PIN_GIB")) {
+        char* end=nullptr;
+        const double gib=std::strtod(value,&end);
+        if(end==value || *end || !std::isfinite(gib) || gib<0 || gib>double(INT64_MAX)/(1ull<<30))
+            throw std::invalid_argument("MFQ_MOE_RAM_PIN_GIB must be finite and non-negative");
+        return gib>0?std::max<std::int64_t>(1,std::int64_t(gib*(1ull<<30))):0;
+    }
+    return std::nullopt;
+}
+} // namespace mfq::cuda::runtime_options

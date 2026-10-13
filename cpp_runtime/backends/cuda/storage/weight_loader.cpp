@@ -297,8 +297,8 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
         if(weight->dense.scalar_type()==tb::kBFloat16 && weight->dense.is_contiguous() &&
                 (name=="model.mhc.pre.down.weight" || name=="predictor.mhc.pre.down.weight"))
             activated=[weight,forward](CudaExecutionContext& execution,const Tensor& input,int64_t streams,bool injection) {
-                const auto* option=std::getenv("MFQ_GR_DENSE_BF16_DIRECT");
-                if(!injection && (!option || option[0]!='0'))
+                const auto option=mfq::cuda::runtime_options::gr_dense_bf16_direct();
+                if(!injection && (!option || *option))
                     if(auto output=try_gr_bf16_down_cuda(input,weight->dense,streams);output.defined())return output;
                 auto projected=forward(execution,input);
                 return injection?mfq_qwen4_exp::gated_residual_injection(projected,streams):
@@ -307,8 +307,8 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
         if(weight->dense.scalar_type()==tb::kBFloat16 && weight->dense.is_contiguous() &&
                 (name=="model.mhc.pre.up.weight" || name=="predictor.mhc.pre.up.weight"))
             mixed=[weight,forward](CudaExecutionContext& execution,const Tensor& input,const Tensor& normalized,int64_t streams) {
-                const auto* option=std::getenv("MFQ_GR_DENSE_BF16_DIRECT");
-                if(!option || option[0]!='0')
+                const auto option=mfq::cuda::runtime_options::gr_dense_bf16_direct();
+                if(!option || *option)
                     if(auto output=try_gr_bf16_up_mix_cuda(input,normalized,weight->dense,streams);output.defined())return output;
                 return mfq_qwen4_exp::gated_residual_mix(forward(execution,input),normalized,streams);
             };
@@ -339,10 +339,10 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
         });
     };
     Tensor group_coefficients;
-    const auto* group_option=std::getenv("MFQ_GR_UP_GROUP_COEFFICIENTS");
-    if(group_option && group_option[0]!='0' && weight->nint.aligned_q8 && !weight->nint.q8_zero &&
+    const auto group_option=mfq::cuda::runtime_options::gr_up_group_coefficients();
+    if(group_option && *group_option!='0' && weight->nint.aligned_q8 && !weight->nint.q8_zero &&
             weight->nint.gs==48 && weight->nint.out==10240 && weight->nint.neuron_len==320)
-        group_coefficients=group_option[0]=='2'?prepare_gr_up_packed_metadata(weight->nint):
+        group_coefficients=*group_option=='2'?prepare_gr_up_packed_metadata(weight->nint):
             prepare_gr_up_group_coefficients(weight->nint);
     return {std::move(forward),std::move(mixed),std::move(activated),std::move(weight),Tensor{},std::move(group_coefficients)};
 }

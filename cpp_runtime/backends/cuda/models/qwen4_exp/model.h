@@ -163,8 +163,8 @@ class Gdn {
         auto weight=w_.conv.to(tb::kFloat32).contiguous();
         if(weight.dim()==2 && weight.size(0)==(2*nk_+nv_)*d_ && weight.size(1)==kernel_)
             weight=weight.reshape({(2*nk_+nv_)*d_,1,kernel_});
-        const auto* stride_setting=std::getenv("MFQ_GDN_STRIDED_PROJECTIONS");
-        const auto direct=[&](const Tensor& value){return !stride_setting || stride_setting[0]!='0'?value:value.contiguous();};
+        const auto stride_setting=mfq::cuda::runtime_options::gdn_strided_projections();
+        const auto direct=[&](const Tensor& value){return !stride_setting || *stride_setting?value:value.contiguous();};
         auto result=gdn_decode_core_cuda(direct(projections[0]),direct(projections[1]),
             projections[2].reshape({x.size(0),1,nv_}),projections[3].reshape({x.size(0),1,nv_}),
             conv_,state_,weight,w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
@@ -175,8 +175,8 @@ class Gdn {
     Tensor forward_graph(CudaExecutionContext& execution,const Tensor& x,int64_t confirmed,
                          Tensor& checkpoint_conv,Tensor& checkpoint_state) {
         if(!confirmed)return forward_chunk(execution,x,true);
-        const auto* batch=std::getenv("MFQ_GDN_BATCH_PROJECTION");
-        const bool grouped=grouped_projection_ && w_.input_projection && x.size(1)<=8 && (!batch || batch[0]!='0');
+        const auto batch=mfq::cuda::runtime_options::gdn_batch_projection();
+        const bool grouped=grouped_projection_ && w_.input_projection && x.size(1)<=8 && (!batch || *batch);
         // Only recurrence is split at the confirmation boundary. Both parts
         // share the input projections and one output projection.
         std::vector<Tensor> projected;if(grouped)projected=w_.input_projection(execution,x);
@@ -246,8 +246,8 @@ class Gdn {
                 if(weight.dim()==2 && weight.size(0)==channels && weight.size(1)==kernel_)
                     weight=weight.reshape({channels,1,kernel_});
                 if(!core_workspace_.defined())core_workspace_=tb::zeros({b,nv_,d_+1},options);
-                const auto* stride_setting=std::getenv("MFQ_GDN_STRIDED_PROJECTIONS");
-                const auto direct=[&](const Tensor& value){return !stride_setting || stride_setting[0]!='0'?value:value.contiguous();};
+                const auto stride_setting=mfq::cuda::runtime_options::gdn_strided_projections();
+                const auto direct=[&](const Tensor& value){return !stride_setting || *stride_setting?value:value.contiguous();};
                 auto decoded=gdn_decode_core_cuda(direct(projections[0]),direct(projections[1]),
                     projections[2].reshape({b,t,nv_}),projections[3].reshape({b,t,nv_}),previous,state_,
                     weight,w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
@@ -280,12 +280,12 @@ class Gdn {
                         auto weight=w_.conv.to(tb::kFloat32).contiguous();
                         if(weight.dim()==2 && weight.size(0)==channels && weight.size(1)==kernel_)
                             weight=weight.reshape({channels,1,kernel_});
-                        const auto* short_option=std::getenv("MFQ_GDN_SHORT_FUSION");
-                        if(t<=8 && (!short_option || short_option[0]!='0') && projections.size()==4 &&
+                        const auto short_option=mfq::cuda::runtime_options::gdn_short_fusion();
+                        if(t<=8 && (!short_option || *short_option) && projections.size()==4 &&
                             projections[2].scalar_type()==projections[3].scalar_type() &&
                             (projections[2].scalar_type()==tb::kFloat16 || projections[2].scalar_type()==tb::kFloat32)) {
-                            const auto* stride_setting=std::getenv("MFQ_GDN_STRIDED_PROJECTIONS");
-                            const auto direct=[&](const Tensor& value){return !stride_setting || stride_setting[0]!='0'?value:value.contiguous();};
+                            const auto stride_setting=mfq::cuda::runtime_options::gdn_strided_projections();
+                            const auto direct=[&](const Tensor& value){return !stride_setting || *stride_setting?value:value.contiguous();};
                             auto qkv=linear_conv_qkv_gate_short_cuda(previous,direct(projected),weight,
                                 direct(projections[2].reshape({b,t,nv_})),direct(projections[3].reshape({b,t,nv_})),
                                 w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6);
@@ -370,9 +370,9 @@ class Gdn {
                 Tensor attended, next_state;
                 if (d_ == 32 || d_ == 64 || d_ == 128) {
                     auto result = execution.profiler.measure("prefill.gdn_recurrence",[&] {
-                        const auto* short_option=std::getenv("MFQ_GDN_SHORT_INPLACE");
+                        const auto short_option=mfq::cuda::runtime_options::gdn_short_inplace();
                         const auto inplace=mfq::cuda::runtime_options::gdn_inplace_state();
-                        if(cache && initial.defined() && t<=8 && (!short_option || short_option[0]!='0') && (!inplace || *inplace))
+                        if(cache && initial.defined() && t<=8 && (!short_option || *short_option) && (!inplace || *inplace))
                             return (transposed_state_?gdn_inplace_transposed_cuda:gdn_inplace_cuda)(q,k,v,decay,beta,initial);
                         return (transposed_state_ ? gdn_transposed_cuda : gdn_cuda)(
                             q, k, v, decay, beta,initial.defined() ? MfqOptional<Tensor>(initial) : mfq_nullopt);
@@ -401,8 +401,8 @@ class Gdn {
                 return std::array<Tensor, 2>{attended, next_state};
             },
             [&](Tensor attended) {
-                const auto* stride_setting=std::getenv("MFQ_GDN_STRIDED_PROJECTIONS");
-                const bool strided=!stride_setting || stride_setting[0]!='0';
+                const auto stride_setting=mfq::cuda::runtime_options::gdn_strided_projections();
+                const bool strided=!stride_setting || *stride_setting;
                 auto projected_gate=projections.empty()?w_.gate(execution,x):
                     strided?projections[1]:projections[1].contiguous();
                 if(fused_decode_ && fused_output_ && attended.is_contiguous() &&
@@ -638,8 +638,8 @@ class Ple {
         auto context = embedding_.context();
         const auto b = x.size(0), t = x.size(1);
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        const auto* native=std::getenv("MFQ_PLE_NATIVE_FUSION");
-        if((!native || native[0]=='1') && x.is_contiguous() && t<=32 && hidden_>128 && hidden_<=8192 &&
+        const auto native=mfq::cuda::runtime_options::ple_native_fusion();
+        if((!native || *native) && x.is_contiguous() && t<=32 && hidden_>128 && hidden_<=8192 &&
             (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32)) {
             try {
                 auto embeddings=graph_embeddings.defined()?graph_embeddings:

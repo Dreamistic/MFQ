@@ -662,8 +662,8 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(
                     w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
                     x, gate, mode, w.gs, ws.qx, ws.xscale);
             }
-            const auto* fixed_setting=std::getenv("MFQ_NINT_FUSED_FIXED_BITS");
-            if((!fixed_setting || fixed_setting[0]!='0') &&
+            const auto fixed_setting=mfq::cuda::runtime_options::nint_fused_fixed_bits();
+            if((!fixed_setting || *fixed_setting) &&
                     ((w.uniform_qbits==5 && w.gs==28) || (w.uniform_qbits==6 && (w.gs==24 || w.gs==28)))) {
                 return nint_matmul_input_mul_fixed_bits_ws_cuda(
                     w.q_packed,w.row_q_bits,w.row_q_bit_offsets,

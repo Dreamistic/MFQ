@@ -1,7 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import type { ReactElement } from 'react';
+import { TooltipProvider } from '../../shared/ui/Tooltip';
+import { act, fireEvent, render as baseRender, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { CachePage } from './CachePage';
 import type { RuntimeStatus } from '../../shared/api/contracts/runtime';
+
+function render(ui: ReactElement) { return baseRender(ui, { wrapper: TooltipProvider }); }
 
 const state = vi.hoisted(() => ({ runtime: null as RuntimeStatus | null, connectionRevision: 0,
   refreshRuntime: vi.fn().mockResolvedValue(true), clearRuntimeCache: vi.fn().mockResolvedValue({}), confirm: vi.fn(),

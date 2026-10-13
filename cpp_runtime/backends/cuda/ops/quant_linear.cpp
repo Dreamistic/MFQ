@@ -2244,8 +2244,8 @@ std::vector<mfq_tensor_backend::Tensor> NintLinearGroup::forward(
     } else if (!split_w.empty()) {
         parts.reserve(outs.size());
         std::vector<int> shared_groups;
-        const auto* quant_group_setting=std::getenv("MFQ_NINT_GROUP_QUANTIZE");
-        if((!quant_group_setting || quant_group_setting[0]!='0') && serial_branches &&
+        const auto quant_group_setting=mfq::cuda::runtime_options::nint_group_quantize();
+        if((!quant_group_setting || *quant_group_setting) && serial_branches &&
                 kl_mmq.mode==KlMmqMode::Default && xf.is_contiguous() &&
                 xf.size(0)>=1 && xf.size(0)<=6 &&
                 (xf.scalar_type()==mfq_tensor_backend::kFloat16 || xf.scalar_type()==mfq_tensor_backend::kFloat32)) {

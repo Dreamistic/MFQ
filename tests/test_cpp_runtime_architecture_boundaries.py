@@ -592,7 +592,7 @@ def test_cuda_model_finalizers_live_with_their_models() -> None:
         assert f"{namespace}::finalize_hidden" not in CUDA_CAUSAL_LM_SOURCE
         if name == "qwen4_exp":
             assert "Qwen4Model::adapter_finalize_hidden(" in source
-            assert "return final_mixer->pre(*execution, hidden)[0];" in source
+            assert "return final_mixer->pre(*execution, hidden,marker)[0];" in source
         else:
             shared = (ROOT / "cpp_runtime/models" / name / "causal_lm.h").read_text(encoding="utf-8")
             assert shared.index("this->collapse_hidden(") < shared.index("this->normalize_hidden(")
@@ -1074,7 +1074,7 @@ def test_every_mtp_architecture_is_a_thin_client_of_one_engine() -> None:
     for source in clients:
         assert source.count("run_mlx_mtp_generation(") == 1
         assert source.count("mlx_mtp_verification_ids(") == 1
-        assert source.count("mlx_mtp_committed_hidden(") == 1
+        assert source.count("mlx_mtp_committed_hidden(") == (2 if source == QWEN4 else 1)
 
     all_sources = model_sources()
     assert all_sources.count("run_mlx_mtp_generation(") == len(clients)

@@ -511,11 +511,8 @@ void MoeExpertCache::preload_complete_residency() {
         registered_host_fields_.reserve(registered_host_fields_.size()+1);
         auto* address=pipeline_ram_complement_->data_ptr();
         int64_t registered=ram_allocated;
-        if(const auto* value=std::getenv("MFQ_MOE_RAM_PIN_GIB")) {
-            char* end=nullptr;const double gib=std::strtod(value,&end);
-            if(end==value || *end || !std::isfinite(gib) || gib<0 || gib>double(INT64_MAX)/(1ull<<30))
-                throw std::invalid_argument("MFQ_MOE_RAM_PIN_GIB must be finite and non-negative");
-            if(gib>0)registered=std::min(registered,std::max<int64_t>(1,int64_t(gib*(1ull<<30))));
+        if(const auto limit=mfq::cuda::runtime_options::moe_ram_pin_bytes()) {
+            if(*limit>0)registered=std::min(registered,*limit);
         }
         for(;;) {
             const auto result=cudaHostRegister(address,static_cast<std::size_t>(registered),cudaHostRegisterMapped);

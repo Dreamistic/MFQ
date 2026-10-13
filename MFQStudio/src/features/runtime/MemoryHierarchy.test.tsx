@@ -1,8 +1,12 @@
 import { fireEvent, render as baseRender, screen } from '@testing-library/react';
 import type { ReactElement } from 'react';
-import { expect, it, vi } from 'vitest';
+import { beforeEach, expect, it, vi } from 'vitest';
 import { MemoryHierarchy } from './MemoryHierarchy';
 import { TooltipProvider } from '../../shared/ui/Tooltip';
+
+beforeEach(() => {
+  vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
+});
 
 function render(ui: ReactElement) { return baseRender(ui, { wrapper: TooltipProvider }); }
 

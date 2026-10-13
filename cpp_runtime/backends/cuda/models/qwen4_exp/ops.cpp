@@ -32,8 +32,8 @@
 namespace mfq::cuda {
 static mfq_tensor_backend::Tensor join_request_outputs(
         const std::vector<mfq_tensor_backend::Tensor>& outputs,int64_t axis) {
-    const auto* option=std::getenv("MFQ_SINGLE_OUTPUT_VIEW");
-    if(outputs.size()==1 && outputs.front().is_contiguous() && (!option || option[0]!='0'))
+    const auto option=mfq::cuda::runtime_options::single_output_view();
+    if(outputs.size()==1 && outputs.front().is_contiguous() && (!option || *option))
         return outputs.front();
     return mfq_tensor_backend::cat(outputs,axis);
 }
@@ -42,7 +42,7 @@ static mfq_tensor_backend::Tensor append_decode_positions(
         mfq_tensor_backend::Tensor& storage,int64_t maximum,
         const char* option_name="MFQ_QWEN4_POSITION_BUFFER") {
     namespace tb=mfq_tensor_backend;
-    if(const auto* option=std::getenv(option_name))if(option[0]=='0')
+    if(const auto option=mfq::cuda::runtime_options::position_buffer(option_name))if(!*option)
         return previous.defined()?tb::cat({previous,current},-1):current.clone();
     MFQ_RUNTIME_CHECK(current.dim()>=1 && (!previous.defined() || (previous.dim()==current.dim() &&
         previous.scalar_type()==current.scalar_type() && previous.device()==current.device())),
@@ -78,14 +78,14 @@ struct Gr {
     double eps;
     int64_t prefill_work_chunk(const Tensor& input)const {
         if(input.dim()!=3 || input.size(0)!=1)return 0;
-        const auto* option=std::getenv("MFQ_GR_PREFILL_WORK_CHUNK");
+        const auto option=mfq::cuda::runtime_options::gr_prefill_work_chunk();
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        const int64_t chunk=option?std::atoll(option):8192;
+        const int64_t chunk=option?*option:8192;
         // Chat framing just beyond 8k needs no large temporary-memory cut.
         // Avoid extra concatenation there; longer inputs use 8k work tiles.
         if(!option && input.size(1)<=9216)return 0;
 #else
-        const int64_t chunk=option?std::atoll(option):0;
+        const int64_t chunk=option?*option:0;
 #endif
         return chunk>=256 && input.size(1)>chunk?chunk:0;
     }
@@ -126,14 +126,14 @@ struct Gr {
             injection.weight->dense.scalar_type()==tb::kBFloat16))return false;
         const auto& w=up.weight->nint;
         const auto rows=x.numel()/(hidden*streams);
-        const auto* continuous=std::getenv("MFQ_GR_CONTINUOUS_TWO_STAGE");
-        if(rows>8 && (!execution.continuous_batch_cache_serial || (continuous && continuous[0]=='0')))
+        const auto continuous=mfq::cuda::runtime_options::gr_continuous_two_stage();
+        if(rows>8 && (!execution.continuous_batch_cache_serial || (continuous && !*continuous)))
             return false;
-        const auto* batch=std::getenv("MFQ_GR_BATCH_TWO_STAGE");
-        if(rows>1 && batch && batch[0]=='0')return false;
+        const auto batch=mfq::cuda::runtime_options::gr_batch_two_stage();
+        if(rows>1 && batch && !*batch)return false;
         const bool selected=w.ng==1 || ((w.out+3)/4)*rows>=nint_float_projection_resident_blocks(x.get_device());
-        const auto* trace=std::getenv("MFQ_TRACE_GR_DISPATCH");
-        if(selected && trace && trace[0]!='0') {
+        const auto trace=mfq::cuda::runtime_options::trace_gr_dispatch();
+        if(selected && trace && *trace) {
             static thread_local uint64_t seen[2]{};
             const int kind=x.scalar_type()==tb::kFloat16?0:1;
             if(!(seen[kind]&(uint64_t(1)<<rows))) {
@@ -223,8 +223,8 @@ static Linear qwen_gdn_preserve_projection_rows(Linear project) {
         if(rows<=0 || source.dim()!=3 || source.size(0)!=1 || source.size(1)<=rows)
             return project(execution,source);
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        const auto* parallel_option=std::getenv("MFQ_GDN_PREFILL_PROJECTION_STREAMS");
-        const int streams=parallel_option?std::atoi(parallel_option):2;
+        const auto parallel_option=mfq::cuda::runtime_options::gdn_prefill_projection_streams();
+        const int streams=parallel_option?*parallel_option:2;
         const auto tail=source.size(1)%rows;
         if(streams>0 && (tail==0 || tail>8)) {
             const mfq::cuda::MatmulRowsScope gemm_rows(rows,streams);
@@ -251,8 +251,8 @@ static LinearGroup qwen_gdn_preserve_projection_rows(LinearGroup project) {
         if(rows<=0 || source.dim()!=3 || source.size(0)!=1 || source.size(1)<=rows)
             return project(execution,source);
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        const auto* parallel_option=std::getenv("MFQ_GDN_PREFILL_PROJECTION_STREAMS");
-        const int streams=parallel_option?std::atoi(parallel_option):2;
+        const auto parallel_option=mfq::cuda::runtime_options::gdn_prefill_projection_streams();
+        const int streams=parallel_option?*parallel_option:2;
         const auto tail=source.size(1)%rows;
         if(streams>0 && (tail==0 || tail>8)) {
             const mfq::cuda::MatmulRowsScope gemm_rows(rows,streams);
@@ -306,10 +306,10 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
     auto shared=[shared_raw,shared_projections,shared_gate,shared_row_parallel](CudaExecutionContext& execution,const Tensor& source) {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         const auto rows=qwen_prefill_reference_rows;
-        const auto* parallel_option=std::getenv("MFQ_MOE_PREFILL_SHARED_STREAMS");
-        const int streams=parallel_option?std::atoi(parallel_option):0;
-        const auto* chain_option=std::getenv("MFQ_MOE_PREFILL_SHARED_CHAIN_STREAMS");
-        const int chain_streams=chain_option?std::atoi(chain_option):4;
+        const auto parallel_option=mfq::cuda::runtime_options::moe_prefill_shared_streams();
+        const int streams=parallel_option?*parallel_option:0;
+        const auto chain_option=mfq::cuda::runtime_options::moe_prefill_shared_chain_streams();
+        const int chain_streams=chain_option?*chain_option:4;
         const auto tail=rows>0?source.size(0)%rows:0;
         if(chain_streams>0 && shared_row_parallel && rows>8 && source.size(0)>=8192 &&
                 source.size(0)>rows && (tail==0 || tail>8)) {
@@ -443,8 +443,8 @@ struct BlockLoader : weight_loader::Loader {
             ? std::vector<Linear>{weights.qkv} : weights.split_qkv;
         const bool independent = !weights.split_qkv.empty();
         projections.insert(projections.end(), {weights.gate,weights.alpha,weights.beta});
-        const auto* packed_qkv_option=std::getenv("MFQ_GDN_PACKED_QKV");
-        const bool packed_qkv=independent && (!packed_qkv_option || packed_qkv_option[0]!='0');
+        const auto packed_qkv_option=mfq::cuda::runtime_options::gdn_packed_qkv();
+        const bool packed_qkv=independent && (!packed_qkv_option || *packed_qkv_option);
         auto group = weight_loader::grouped_linear(execution,projections,packed_qkv?3:1);
         if (independent) {
             if(group && packed_qkv)weights.input_projection=std::move(group);
@@ -564,8 +564,8 @@ struct Qwen4Block final : Block {
     std::unique_ptr<Ple> ple;
     Tensor batch_ffn(CudaExecutionContext& execution,const Tensor& input) {
         if(input.size(0)<=8)return ffn(execution,input);
-        const auto* option=std::getenv("MFQ_CONTINUOUS_FFN_TILE");
-        const int64_t rows=option?std::atoll(option):8;
+        const auto option=mfq::cuda::runtime_options::continuous_ffn_tile();
+        const int64_t rows=option?*option:8;
         MFQ_RUNTIME_CHECK(rows==8 || rows==16,"continuous FFN tile must be 8 or 16 rows");
         auto* window=DecodeWindow::recording();
         const int previous_profile_tile=window ? window->set_profile_tile(-1) : -1;
@@ -900,8 +900,8 @@ Tensor Qwen4ExpMtp::forward(const MtpTarget &target, Tensor hidden, Tensor ids) 
 }
 
 MtpStep Qwen4ExpMtp::step(const MtpTarget &target, Tensor hidden, Tensor ids) {
-    const auto* graph=std::getenv("MFQ_MTP_PREDICTOR_GRAPH");
-    if((!graph || graph[0]!='0') && execution->config.moe_pipeline && execution->config.moe_two_stage_ffn &&
+    const auto graph=mfq::cuda::runtime_options::mtp_predictor_graph();
+    if((!graph || *graph) && execution->config.moe_pipeline && execution->config.moe_two_stage_ffn &&
         execution->kl_mmq.mode==KlMmqMode::Default && execution->moe_expert_cache &&
         !execution->qsa_kv_store && batch==1 && ids.dim()==2 && ids.size(0)==1 && ids.size(1)>0 && ids.size(1)<=8 &&
         hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)==ids.size(1) && hidden.size(2)==hidden_norm.numel() &&
@@ -1133,8 +1133,8 @@ struct Qwen4DecodeGraph {
                     auto hidden=model.adapter_prepare_hidden(model.embed_tokens(cell.ids),1,tokens);
                     std::size_t ple_index=0;int layer=0;
                     std::vector<tb::Tensor> prior_mix;
-                    const auto* chain_setting=std::getenv("MFQ_GR_CHAIN_FFN_POST");
-                    const bool chain_post=(!chain_setting || chain_setting[0]=='1') && tokens<=8;
+                    const auto chain_setting=mfq::cuda::runtime_options::gr_chain_ffn_post();
+                    const bool chain_post=(!chain_setting || *chain_setting) && tokens<=8;
                     for(const auto& block:model.blocks) {
                         cell.window.mark(layer,"block_begin");
                         auto& b=static_cast<qwen4_exp::Qwen4Block&>(*block);tb::Tensor rows;
@@ -1612,8 +1612,8 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
             graph.window->mark(-1,"window_begin");
             auto hidden = model.adapter_prepare_hidden(model.embed_tokens(graph.ids),batch,1);
             std::vector<tb::Tensor> prior_mix;
-            const auto* chain_setting=std::getenv("MFQ_GR_CHAIN_FFN_POST");
-            const bool chain_post=(!chain_setting || chain_setting[0]=='1') && batch<=8;
+            const auto chain_setting=mfq::cuda::runtime_options::gr_chain_ffn_post();
+            const bool chain_post=(!chain_setting || *chain_setting) && batch<=8;
             for (std::size_t i = 0; i < model.blocks.size(); ++i) {
                 graph.window->mark(static_cast<int>(i),"block_begin");
                 auto& block = static_cast<qwen4_exp::Qwen4Block&>(*model.blocks[i]);
@@ -1922,23 +1922,23 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     const bool trace=trace_option && *trace_option!=0;
     const auto batch_option=mfq::cuda::runtime_options::moe_prefill_expert_batch();
     const bool batch_experts=!batch_option || *batch_option!=0;
-    const auto* bulk_gr_option=std::getenv("MFQ_GR_PREFILL_LAYER_BATCH");
+    const auto bulk_gr_option=mfq::cuda::runtime_options::gr_prefill_layer_batch();
     // Long prompts retain the established memory footprint unless explicitly
     // requested; the combined residual tensors have been verified to 16k.
-    const bool bulk_gr=batch_experts && (bulk_gr_option?bulk_gr_option[0]!='0':tokens<=16384);
-    const auto* bulk_gdn_option=std::getenv("MFQ_GDN_PREFILL_LAYER_BATCH");
+    const bool bulk_gr=batch_experts && (bulk_gr_option?*bulk_gr_option:tokens<=16384);
+    const auto bulk_gdn_option=mfq::cuda::runtime_options::gdn_prefill_layer_batch();
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
     // Allow 8k chat framing while keeping the extra whole-sequence QKV and
     // gate tensors out of the 16k service path, which also retains MTP weights.
-    const bool bulk_gdn=bulk_gr && (bulk_gdn_option?bulk_gdn_option[0]=='1':tokens<=9216);
+    const bool bulk_gdn=bulk_gr && (bulk_gdn_option?*bulk_gdn_option:tokens<=9216);
 #else
-    const bool bulk_gdn=bulk_gr && bulk_gdn_option && bulk_gdn_option[0]=='1';
+    const bool bulk_gdn=bulk_gr && bulk_gdn_option && *bulk_gdn_option;
 #endif
     const qwen4_exp::QwenPrefillReferenceRowsScope reference_rows(batch_experts?std::min<int64_t>(1024,compute_chunk):0);
     const auto batch_tokens_option=mfq::cuda::runtime_options::moe_prefill_expert_batch_tokens();
     const int64_t batch_tokens=batch_tokens_option?*batch_tokens_option:8192;
-    const auto* append_tail_option=std::getenv("MFQ_MOE_PREFILL_APPEND_TAIL");
-    const bool append_tail=append_tail_option && append_tail_option[0]=='1';
+    const auto append_tail_option=mfq::cuda::runtime_options::moe_prefill_append_tail();
+    const bool append_tail=append_tail_option && *append_tail_option;
     const auto expert_batch_count=[&](int64_t remaining) {
         // Chat framing can leave a few tokens beyond the batch boundary.
         // Absorb at most one reference chunk instead of running a second
@@ -1951,8 +1951,8 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     const auto started=std::chrono::steady_clock::now();
     int layer=0;
     for(auto& block:model.blocks) {
-        const auto* decode_reuse_option=std::getenv("MFQ_NINT_PREFILL_DECODE_REUSE");
-        NintPrefillDecodeCacheScope decode_reuse(!decode_reuse_option || decode_reuse_option[0]=='1');
+        const auto decode_reuse_option=mfq::cuda::runtime_options::nint_prefill_decode_reuse();
+        NintPrefillDecodeCacheScope decode_reuse(!decode_reuse_option || *decode_reuse_option);
         Tensor next_hidden=hidden;
         Tensor ffn_inputs,ffn_injection;
         std::vector<Tensor> full_mix;
