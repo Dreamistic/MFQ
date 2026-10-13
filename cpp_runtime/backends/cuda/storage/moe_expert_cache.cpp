@@ -511,11 +511,8 @@ void MoeExpertCache::preload_complete_residency() {
         registered_host_fields_.reserve(registered_host_fields_.size()+1);
         auto* address=pipeline_ram_complement_->data_ptr();
         int64_t registered=ram_allocated;
-        if(const auto* value=std::getenv("MFQ_MOE_RAM_PIN_GIB")) {
-            char* end=nullptr;const double gib=std::strtod(value,&end);
-            if(end==value || *end || !std::isfinite(gib) || gib<0 || gib>double(INT64_MAX)/(1ull<<30))
-                throw std::invalid_argument("MFQ_MOE_RAM_PIN_GIB must be finite and non-negative");
-            if(gib>0)registered=std::min(registered,std::max<int64_t>(1,int64_t(gib*(1ull<<30))));
+        if(const auto limit=mfq::cuda::runtime_options::moe_ram_pin_bytes()) {
+            if(*limit>0)registered=std::min(registered,*limit);
         }
         for(;;) {
             const auto result=cudaHostRegister(address,static_cast<std::size_t>(registered),cudaHostRegisterMapped);
@@ -1364,6 +1361,42 @@ void release_moe_prefill_buffers(MoeExpertCache* cache) {
 
 void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache) {
     if(cache)cache->finish_pipeline_exchanges();
+}
+
+void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache) {
+    if(!cache)return;
+    cache->finish_pipeline_exchanges();
+    MFQ_CUDA_CHECK(cudaDeviceSynchronize());
+    release_moe_prefill_buffers(cache);
+    for(const auto& held:cache->pipeline_transfer_slots_)
+        if(held.book->slot_for(held.key)==held.slot)held.book->clear_inflight(held.slot);
+    cache->pipeline_transfer_slots_.clear();cache->pipeline_dma_leases_.clear();
+    // Destroy captured DMA/FFN consumers before returning their storage.
+    for(auto& batch:cache->pipeline_dma_batches_)batch.reset();
+    for(auto& release:cache->pipeline_decode_release_)release();
+    if(cache->pipeline_pool_context_) {
+        cache->pipeline_pool_context_->end_graph_pool(cache->pipeline_pool_stream_);
+        cache->pipeline_pool_context_.reset();cache->pipeline_pool_stream_=nullptr;
+    }
+    // Adaptation caches arena pointers independently of captured FFN cells.
+    // Keep its heat history, but retire those pointers before freeing arenas.
+    if(cache->moe_residency_)cache->moe_residency_->release_transfer_stages();
+    cache->pipeline_stages_.clear();
+    cache->pipeline_wire_gpu_={};cache->pipeline_prefetch_wire_gpu_={};
+    cache->pipeline_prefetch_host_stage_={};
+    cache->pipeline_prefetched_keys_.clear();cache->transfer_ready_recorded_=false;
+}
+
+bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache) {
+    if (!cache || !moe_expert_cache_has_sources(cache)) return false;
+    const auto stream = mfq_current_cuda_stream();
+    if (!cache->pipeline_pool_context_) {
+        cache->pipeline_pool_context_ = mfq::cuda::default_context(mfq_current_cuda_device());
+        cache->pipeline_pool_stream_ = stream;
+        cache->pipeline_pool_context_->begin_graph_pool(stream);
+    } else if (cache->pipeline_pool_stream_ != stream)
+        throw std::runtime_error("MFE graph memory pool changed its CUDA stream");
+    return true;
 }
 
 

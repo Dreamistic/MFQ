@@ -232,7 +232,34 @@ Tensor Tensor::reshape(std::span<const std::int64_t> shape) const {
     if (!defined()) {
         throw std::invalid_argument("cannot reshape an undefined tensor");
     }
-    if (!is_contiguous()) return contiguous().reshape(shape);
+    if (!is_contiguous()) {
+        const auto* option=std::getenv("MFQ_TENSOR_VIEW_RESHAPE");
+        if(option && option[0]=='0')return contiguous().reshape(shape);
+        // Validate/infer the requested dimensions without copying storage.
+        auto packed=view_;packed.rank=1;packed.sizes[0]=numel();packed.strides[0]=1;
+        auto result=reshape_view(packed,shape);
+        if(numel()==0)return Tensor(storage_,result,byte_offset_);
+        // Each contiguous source chunk can be split or joined independently.
+        // A row gap (grouped projection), transpose or broadcast stays a gap;
+        // a reshape crossing it still requires the original copy.
+        int output_axis=int(result.rank)-1;
+        int64_t source_count=1,output_count=1,chunk_stride=view_.strides[view_.rank-1];
+        bool compatible=true;
+        for(int axis=int(view_.rank)-1;axis>=0;--axis) {
+            source_count*=view_.sizes[axis];
+            const bool boundary=axis==0 || (view_.sizes[axis-1]!=1 &&
+                view_.strides[axis-1]!=source_count*chunk_stride);
+            if(!boundary)continue;
+            while(output_axis>=0 && (output_count<source_count || result.sizes[output_axis]==1)) {
+                result.strides[output_axis]=output_count*chunk_stride;
+                output_count*=result.sizes[output_axis];--output_axis;
+            }
+            if(output_count!=source_count){compatible=false;break;}
+            if(axis>0){chunk_stride=view_.strides[axis-1];source_count=output_count=1;}
+        }
+        if(compatible && output_axis==-1)return Tensor(storage_,result,byte_offset_);
+        return contiguous().reshape(shape);
+    }
     return Tensor(storage_, reshape_view(view_, shape), byte_offset_);
 }
 

@@ -11,6 +11,7 @@
 #include "mtp_metrics.h"
 #include "request_executor.h"
 #include "generation_flow.h"
+#include "mfq_weight_memory.h"
 
 #include <cuda_runtime_api.h>
 #include <algorithm>
@@ -23,6 +24,7 @@ using namespace mfq::cuda::internal;
 namespace {
 template <typename Model>
 struct CudaEngineState {
+    std::shared_ptr<WeightMemoryLedger> weight_memory;
     std::shared_ptr<CudaExecutionContext> execution;
     CudaRuntimeConfig config;
     Model model;
@@ -30,12 +32,13 @@ struct CudaEngineState {
     Model& language;
     DecodeGraphCache graph;
     TextSessionCache cache;
-    std::unique_ptr<ContinuousBatch<QwenBatchOperations>> batching;
+    std::unique_ptr<ContinuousBatch<CudaBatchOperations<Model>>> batching;
     bool duplex_active = false;
 
     CudaEngineState(std::shared_ptr<CudaExecutionContext> owner, Model loaded,
-            RuntimeComponents<Model> optional, CudaRuntimeConfig runtime_config)
-        : execution(std::move(owner)), config(std::move(runtime_config)),
+            RuntimeComponents<Model> optional, CudaRuntimeConfig runtime_config,
+            std::shared_ptr<WeightMemoryLedger> weights)
+        : weight_memory(std::move(weights)), execution(std::move(owner)), config(std::move(runtime_config)),
           model(std::move(loaded)), components(std::move(optional)),
           language(components.language(model)), graph(language.max_position_embeddings()),
           cache(config.session_cache, config.prefix_cache,
@@ -44,14 +47,35 @@ struct CudaEngineState {
                 language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1,
                 cuda_has_separate_memory()) {
         if (config.continuous_batch.max_sequences) {
-            if constexpr (std::is_same_v<Model, Qwen35CausalLm>)
-                batching = std::make_unique<ContinuousBatch<QwenBatchOperations>>(
+            if constexpr (std::is_same_v<Model, Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)
+                batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
                     config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
                     language, *execution, config.continuous_batch);
             else throw std::invalid_argument("continuous batching is unavailable for this model");
         }
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
+            language.reserve_kv_workspace = [this](std::size_t bytes) {
+                const auto device = execution->layer_placement.primary_device();
+                auto context = mfq::cuda::default_context(device);
+                if (context->available_memory() >= bytes) return;
+                std::size_t hot = 0;
+                for (const auto& [name,value] : cache.metrics())
+                    if (name == "prefix_cache_hot_bytes") hot = std::size_t(value);
+                const auto shortage = bytes - context->available_memory();
+                cache.trim_hot(hot > shortage ? hot - shortage : 0);
+                context->reclaim_idle_memory();
+                if (context->available_memory() < bytes)
+                    throw InferenceInputError(InferenceInputErrorCode::ContextLength,
+                        "insufficient VRAM for context growth; reduce concurrent requests or prompt length");
+            };
+        }
+#endif
     }
     bool can_batch(const EngineRequest& request) const {
+        if constexpr (std::is_same_v<Model,Qwen4CausalLm>)
+            return batching && !request.input.media && request.input.cache_plan.session_id.empty() &&
+                !(request.input.sampling.enable_mtp && components.mtp);
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
     }
     bool exclusive() const { return duplex_active; }
@@ -78,7 +102,14 @@ struct CudaEngineState {
                                   batched ? batching.get() : nullptr, id);
     }
     Generation generate(const RequestId& id, ExecutionRequest& request) {
-        if (request.batched) graph.invalidate();
+        if (request.batched) {
+            graph.invalidate();
+            if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
+                // Exclusive MTP generation has ended before a batch starts.
+                // Its graph consumers must retire before idle batch buffers.
+                if (components.mtp) components.mtp->reset(1);
+            }
+        }
         return generate_prepared(*this, request.input, request.output, id, request.batched);
     }
     template <class T> ControlResult control(T value) {
@@ -86,6 +117,7 @@ struct CudaEngineState {
             size_t free = 0, total = 0;
             MFQ_CUDA_CHECK(cudaMemGetInfo(&free, &total));
             auto memory = mfq_cuda_memory_stats(mfq_current_cuda_device());
+            const auto batch_metrics = batching ? batching->metrics() : Metrics{};
             const auto capabilities = components.state();
             Metrics metrics{{"device_free_bytes", double(free)}, {"device_total_bytes", double(total)},
                 {"cuda_allocated_bytes", double(memory.allocated_bytes)}, {"cuda_reserved_bytes", double(memory.reserved_bytes)},
@@ -94,14 +126,36 @@ struct CudaEngineState {
                 {"mtp_supported", double(capabilities.mtp_supported)}, {"mtp_available", double(capabilities.mtp_available)}};
             auto experts = moe_expert_memory_metrics(execution->moe_expert_cache);
             metrics.insert(metrics.end(), experts.begin(), experts.end());
+            std::size_t resident_weights=weight_memory->resident_bytes();
+            for(const auto& metric:experts)
+                if(metric.first=="resident_expert_cache_bytes")resident_weights+=std::size_t(metric.second);
+            const auto ple=weight_memory->ple_bytes();
+            metrics.insert(metrics.end(),{{"resident_weight_bytes",double(resident_weights)},
+                {"ssd_ple_enabled",ple>0?1.0:0.0},{"ssd_ple_payload_bytes",double(ple)}});
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                auto cache_memory=qwen4_cache_memory_metrics(language,components.mtp.get());
+                for (auto& [name,value] : cache_memory)
+                    for (const auto& [batch_name,batch_value] : batch_metrics) {
+                        if (name == "kv_cache_bytes" && batch_name == "continuous_batching_request_kv_bytes")
+                            value += batch_value;
+                        if (name == "kv_cache_contexts" && batch_name == "continuous_batching_request_contexts")
+                            value += batch_value;
+                    }
+                metrics.insert(metrics.end(),cache_memory.begin(),cache_memory.end());
+                std::size_t kv_bytes=0,hot_bytes=0;
+                for(const auto& metric:cache_memory)
+                    if(metric.first=="kv_cache_bytes")kv_bytes=std::size_t(metric.second);
+                for(const auto& metric:cache.metrics())
+                    if(metric.first=="prefix_cache_hot_bytes")hot_bytes=std::size_t(metric.second);
+                const auto categorized=resident_weights+kv_bytes+hot_bytes;
+                const auto resident=std::max(memory.reserved_bytes,memory.allocated_bytes);
+                metrics.emplace_back("resident_buffer_bytes",double(resident>categorized?resident-categorized:0));
+            }
             metrics.insert(metrics.end(), {{"ssd_expert_enabled", 0.0}, {"ssd_expert_payload_bytes", 0.0},
                 {"qsa_kv_offload_supported", std::is_same_v<Model, Qwen4CausalLm> ? 1.0 : 0.0}});
             if (execution->qsa_kv_store) {
                 auto kv = execution->qsa_kv_store->metrics();
                 metrics.insert(metrics.end(), kv.begin(), kv.end());
-                for (const auto& value : kv)
-                    if (value.first == "qsa_kv_resident_bytes") metrics.emplace_back("kv_cache_bytes", value.second);
-                metrics.emplace_back("kv_cache_contexts", language.cache_pos > 0 ? 1.0 : 0.0);
             } else metrics.insert(metrics.end(), {{"qsa_kv_offload_enabled", 0.0},
                 {"qsa_kv_ram_enabled", 0.0}, {"qsa_kv_ram_bytes", 0.0}, {"qsa_kv_ssd_bytes", 0.0}});
             if (components.mtp) {
@@ -109,7 +163,7 @@ struct CudaEngineState {
                 metrics.emplace_back("mtp_predictor_graph_replays",double(components.mtp->graph_replay_count()));
             }
             if (batching) {
-                auto batch = batching->metrics(); metrics.insert(metrics.end(), batch.begin(), batch.end());
+                metrics.insert(metrics.end(), batch_metrics.begin(), batch_metrics.end());
             }
             return metrics;
         } else {
@@ -152,6 +206,8 @@ struct CudaBackend {
         auto execution = std::make_shared<CudaExecutionContext>();
         setup_cuda_load(options, *execution);
         execution->profiler.enabled = false;
+        auto weight_memory=std::make_shared<WeightMemoryLedger>();
+        const WeightMemoryLoadScope memory_load(*weight_memory);
         mfq_tensor_backend::NoGradGuard no_grad;
         auto config = resolve_cuda_runtime_config(options);
         const auto kv_options = runtime_options::qsa_kv_offload();
@@ -168,7 +224,7 @@ struct CudaBackend {
                 using Model = std::decay_t<decltype(model)>;
                 if constexpr (!std::is_same_v<Model, Qwen4CausalLm>)
                     if (execution->qsa_kv_store) throw std::invalid_argument("CUDA streamed KV requires a QSA model");
-                return std::make_unique<CudaEngineState<Model>>(execution, std::move(model), std::move(components), config);
+                return std::make_unique<CudaEngineState<Model>>(execution, std::move(model), std::move(components), config,weight_memory);
             });
         return visit([&](auto& state) {
             EngineInfo info;

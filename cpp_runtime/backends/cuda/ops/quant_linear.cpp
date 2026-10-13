@@ -1,7 +1,10 @@
+#include "../runtime/execution_options.h"
 #include "mfq_cuda_activation_ops.h"
 #include "mfq_cuda_quant_ops.h"
+#include "mfq_cuda_nint_route_hint.h"
 #include "storage/weight_loader.h"
 #include "quant_linear.h"
+#include "mfq_weight_memory.h"
 
 #include "format.h"
 #include "fp8_sq.h"
@@ -152,6 +155,7 @@ mfq_tensor_backend::Tensor load_dense_gpu(
         CudaExecutionContext& execution,
         const mfq::ModelSource& mfq,
         const std::string& name) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     const bool cpu_layer = execution.loading_cpu_layer;
     MfqCudaGuard guard(active_weight_load_device(execution));
     const auto & rec = require_tensor(mfq, name);
@@ -195,7 +199,9 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     int64_t out = 0;
     int64_t q_bit_base = 0;
     bool aligned_q8 = !a.q8_zero;
+    int uniform_qbits=a.uniform_qbits;
     for (const auto & w : ws) {
+        if(w.uniform_qbits!=uniform_qbits)uniform_qbits=0;
         if (w.ng != a.ng || w.gs != a.gs ||
             w.neuron_len != a.neuron_len || w.q8_zero != a.q8_zero) {
             throw std::runtime_error("cannot group NINT tensors with different input layout");
@@ -226,6 +232,7 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     g.neuron_len = a.neuron_len;
     g.q8_zero = a.q8_zero;
     g.aligned_q8 = aligned_q8;
+    g.uniform_qbits=uniform_qbits;
     g.shape = a.shape;
     g.shape[0] = out;
     g.q_packed = mfq_tensor_backend::cat(qp, 0).contiguous();
@@ -1016,6 +1023,7 @@ QuantLinear load_quant_linear(
         std::optional<TensorParallelAxis> axis_override,
         const std::vector<mfq::TensorParallelSlice> *
             slices_override) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     const bool cpu_layer = execution.loading_cpu_layer;
     const auto & dtype = require_tensor(mfq, name).dtype;
     QuantLinear result;
@@ -1422,6 +1430,7 @@ QuantLinearGroup make_quant_group(
         CudaExecutionContext& execution,
         std::vector<QuantLinear> layers,
         bool preserve_projection_boundaries) {
+    const mfq::cuda::WeightAllocationScope weight_memory;
     if (layers.empty()) throw std::runtime_error("empty quantized linear group");
     QuantLinearGroup result;
     result.decode_branch_parallel = !preserve_projection_boundaries;
@@ -2235,6 +2244,22 @@ std::vector<mfq_tensor_backend::Tensor> NintLinearGroup::forward(
         }
     } else if (!split_w.empty()) {
         parts.reserve(outs.size());
+        std::vector<int> shared_groups;
+        const auto quant_group_setting=mfq::cuda::runtime_options::nint_group_quantize();
+        if((!quant_group_setting || *quant_group_setting) && serial_branches &&
+                kl_mmq.mode==KlMmqMode::Default && xf.is_contiguous() &&
+                xf.size(0)>=1 && xf.size(0)<=6 &&
+                (xf.scalar_type()==mfq_tensor_backend::kFloat16 || xf.scalar_type()==mfq_tensor_backend::kFloat32)) {
+            bool compatible=true;
+            for(const auto& weight:split_w) {
+                compatible=compatible && !weight.q8_zero && weight.neuron_len==xf.size(1) &&
+                    (weight.gs==24 || weight.gs==28 || weight.gs==48);
+                if(std::find(shared_groups.begin(),shared_groups.end(),weight.gs)==shared_groups.end())
+                    shared_groups.push_back(weight.gs);
+            }
+            if(!compatible || shared_groups.size()<2)shared_groups.clear();
+        }
+        NintInputQuantizationScope prepared(xf,shared_groups);
         std::vector<mfq_tensor_backend::Tensor> grouped_outputs;
         const bool parallel =
             decode_branch_parallel_enabled(

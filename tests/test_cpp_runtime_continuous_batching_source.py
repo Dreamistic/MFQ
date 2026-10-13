@@ -62,7 +62,7 @@ CAUSAL_LM += SHARED_MODELS
 def test_continuous_batching_is_an_explicit_server_mode():
     assert '"--continuous-batching"' in DECODE
     assert '"--check-continuous-batching"' in DECODE
-    assert "ContinuousBatch<QwenBatchOperations>" in BATCHING_CHECK
+    assert "ContinuousBatch<CudaBatchOperations<Model>>" in BATCHING_CHECK
     assert "QwenBatchExecutor" not in BATCHING
     assert "ContinuousBatchingController" not in BATCHING
     assert "ContinuousBatchQueue" not in BATCHING
@@ -82,7 +82,7 @@ def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
     assert "prefill_chunk_size" in SHARED_ENGINE
     assert "std::min(chunk_size, token_budget)" in SHARED_ENGINE
     assert "std::optional<QwenBatchState> prefill_" in BATCH_STATE
-    assert "operations.prefill(chunks.front().first, chunks.front().second)" in BATCHING
+    assert "operations.prefill(request, chunk)" in BATCHING
     assert "schedule_prefill(PrefillChunk chunk)" in BATCHING
     assert "request->prefill_offset = chunk.offset + chunk.count" in SHARED_ENGINE
     assert "request->prefill_offset =" not in (CUDA_ROOT / "engine/cuda_batching.cpp").read_text()
@@ -176,10 +176,10 @@ def test_generic_qwen_loader_constructs_moe_ffns():
 def test_step_alternates_bounded_prefill_and_decode():
     assert "has_decode && (prefill == requests.end() || decode_next)" in BATCHING
     assert "decode_next = !decode_next" in BATCHING
-    assert "operations.prefill_batch(chunks)" in BATCHING
-    assert "int64_t remaining = prefill_chunk_size" in BATCHING
-    assert "it->second->prefill->count > remaining" in BATCHING
-    assert "remaining -= work->prefill->count" in BATCHING
+    assert "operations.prefill_batch(items)" in BATCHING
+    assert "auto budget=prefill_chunk_size" in BATCHING
+    assert "chunk.count > remaining" in BATCHING
+    assert "remaining -= chunk.count" in BATCHING
     assert "release(*work);" in BATCHING
 
 

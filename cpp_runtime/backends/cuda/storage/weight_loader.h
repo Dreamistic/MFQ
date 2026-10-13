@@ -106,6 +106,8 @@ struct ResidualLinear {
     std::shared_ptr<const QuantLinear> weight;
     // F32 [column, stream], or same-size vector layout [column/4, stream, 4].
     Tensor prepared_right;
+    // Optional immutable GR Up metadata: FP32 coefficients or packed row/group records.
+    Tensor up_group_coefficients;
     Tensor operator()(CudaExecutionContext& execution,const Tensor& input)const {
         return forward(execution,input);
     }
@@ -128,7 +130,8 @@ Linear linear(CudaExecutionContext& execution, const mfq::ModelSource& file, con
 std::shared_ptr<const QuantLinear> linear_weight(const Linear& function);
 using LinearGroup = std::function<std::vector<Tensor>(CudaExecutionContext&, const Tensor&)>;
 // Share packed storage while retaining individual projection boundaries for GEMM.
-LinearGroup grouped_linear(CudaExecutionContext&, std::vector<Linear>& functions);
+LinearGroup grouped_linear(CudaExecutionContext&, std::vector<Linear>& functions,
+                           std::size_t joined_prefix=1);
 
 // GR projections use floating activation math for both dense and packed NINT.
 ResidualLinear residual_linear(CudaExecutionContext&, const mfq::ModelSource&, const std::string& name);

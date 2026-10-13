@@ -33,11 +33,12 @@ public:
     explicit MoeResidencyManager(MoeExpertCache*,Observer observer={},MemoryProbe memory_probe={});
     ~MoeResidencyManager();
     void before_layer(int layer);
-    void after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight=false);
+    void after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight=false,bool independent_sequences=false);
     bool prepare_during_window() const noexcept;
     void finish_window(int layer);
     void record_window_expert_fence(int layer,void* stream);
     void apply_pending();
+    void release_transfer_stages();
     Stats stats() const noexcept;
 private:
     struct Impl;

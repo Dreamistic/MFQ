@@ -1,6 +1,14 @@
-import { fireEvent, render, screen } from '@testing-library/react';
-import { expect, it, vi } from 'vitest';
+import { fireEvent, render as baseRender, screen } from '@testing-library/react';
+import type { ReactElement } from 'react';
+import { beforeEach, expect, it, vi } from 'vitest';
 import { MemoryHierarchy } from './MemoryHierarchy';
+import { TooltipProvider } from '../../shared/ui/Tooltip';
+
+beforeEach(() => {
+  vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
+});
+
+function render(ui: ReactElement) { return baseRender(ui, { wrapper: TooltipProvider }); }
 
 it('shows seven separate VRAM, RAM and SSD tiers without treating unknown RAM telemetry as zero', () => {
   const item = model('1', 1024);
@@ -8,7 +16,13 @@ it('shows seven separate VRAM, RAM and SSD tiers without treating unknown RAM te
     ram_kv: true, ram_kv_bytes: 2048, ram_kv_limit_bytes: 8192, prefix_cache_bytes: 256, ssd_experts: false });
   const { container, rerender } = render(<MemoryHierarchy instances={[item]} runtime={{ memory_architecture: 'discrete' }} memoryCapacityBytes={32768} detailed />);
   expect(container.querySelectorAll('[data-tier]')).toHaveLength(7);
-  expect(screen.getByText('VRAM-resident experts and dense weights')).toBeInTheDocument();
+  expect([...container.querySelectorAll('[data-storage]')].map(group => group.getAttribute('data-storage'))).toEqual(['vram', 'ram', 'ssd']);
+  expect(screen.getByRole('heading', { level: 3, name: 'VRAM' })).toBeInTheDocument();
+  expect(screen.getByRole('heading', { level: 3, name: 'RAM' })).toBeInTheDocument();
+  expect(container.querySelector('[data-storage="vram"] [data-tier="weights"]')).toBeInTheDocument();
+  expect(container.querySelector('[data-storage="ram"] [data-tier="ram-experts"]')).toBeInTheDocument();
+  expect(container.querySelector('[data-storage="ssd"] [data-tier="ple"]')).toBeInTheDocument();
+  expect(screen.getByText('VRAM-resident weights and buffers')).toBeInTheDocument();
   expect(screen.getByText('RAM-streamed experts')).toBeInTheDocument();
   expect(screen.getByText('RAM-streamed KV')).toBeInTheDocument();
   expect(screen.getByText('Not yet supported on this device')).toBeInTheDocument();
@@ -19,9 +33,58 @@ it('shows seven separate VRAM, RAM and SSD tiers without treating unknown RAM te
   expect(container.querySelector('[data-tier="ram-experts"]')).toHaveTextContent('Breakdown not reported');
   rerender(<MemoryHierarchy instances={[item]} runtime={{ memory_architecture: 'unified', backend: 'cuda' }} />);
   expect(container.querySelectorAll('[data-tier]')).toHaveLength(5);
+  expect(container.querySelector('[data-storage="vram"]')).not.toBeInTheDocument();
   expect(screen.queryByText('RAM-streamed experts')).not.toBeInTheDocument();
 });
 import type { RuntimeInstance } from '../../shared/api/types';
+
+it('includes per-model buffers in VRAM usage and subtracts them from the KV capacity', () => {
+  const first = model('1', 1024), second = model('2', 2048);
+  first.memory!.resident_buffer_bytes = 2048;
+  second.memory!.resident_buffer_bytes = 1024;
+  const { container, rerender } = render(<MemoryHierarchy instances={[first, second]} detailed
+    runtime={{ memory_architecture: 'discrete' }} memoryCapacityBytes={16384} />);
+  expect(container.querySelector('[data-tier="weights"] .memory-tier-heading')).toHaveTextContent('6 KiB / 16 KiB');
+  expect(container.querySelector('[data-tier="kv"] .memory-tier-heading')).toHaveTextContent('3 KiB / 10 KiB');
+  expect(container.querySelector('[data-tier="weights"] .memory-tier-track [data-model-id="1"]')).toHaveStyle({ width: '18.75%' });
+  expect(container.querySelector('[data-tier="weights"] .resource-tier-model small')).toHaveTextContent('Weights 1 KiB · Buffers 2 KiB');
+  rerender(<MemoryHierarchy instances={[first, second]} runtime={{ memory_architecture: 'unified' }} memoryCapacityBytes={16384} />);
+  expect(container.querySelector('[data-tier="weights"]')).toHaveTextContent('3 KiB / 16 KiB');
+});
+
+it('scales RAM weights and KV against the shared RAM capacity', () => {
+  const item = model('1', 1024);
+  Object.assign(item.memory!, { ram_experts: true, ram_expert_bytes: 4096, ram_kv: true, ram_kv_bytes: 2048 });
+  const { container, rerender } = render(<MemoryHierarchy instances={[item]} memoryCapacityBytes={32768}
+    runtime={{ memory_architecture: 'discrete', host_memory_total_bytes: 16384, host_memory_available_bytes: 8192 }} />);
+  expect(container.querySelector('[data-tier="ram-experts"]')).toHaveTextContent('4 KiB / 14 KiB');
+  expect(container.querySelector('[data-tier="ram-kv"]')).toHaveTextContent('2 KiB / 10 KiB');
+  expect(parseFloat((container.querySelector('[data-tier="ram-experts"] .memory-tier-track > span') as HTMLElement).style.width)).toBeCloseTo(400 / 14);
+  rerender(<MemoryHierarchy instances={[{ ...item, memory: { ...item.memory!, ram_expert_bytes: null } }]}
+    runtime={{ memory_architecture: 'discrete', host_memory_total_bytes: 16384 }} />);
+  expect(container.querySelector('[data-tier="ram-kv"]')).toHaveTextContent('2 KiB / --');
+});
+
+it('uses current free space for both pools and returns capacity when other applications release it', () => {
+  const first = model('1', 4096), second = model('2', 2048);
+  first.memory!.resident_buffer_bytes = 2048;
+  second.memory!.resident_buffer_bytes = 1024;
+  for (const item of [first, second]) Object.assign(item.memory!, {
+    ram_experts: true, ram_expert_bytes: 4096, ram_kv: true, ram_kv_bytes: 1024,
+  });
+  const { container, rerender } = render(<MemoryHierarchy instances={[first, second]} memoryCapacityBytes={32768}
+    runtime={{ memory_architecture: 'discrete', device_free_bytes: 2048,
+      host_memory_total_bytes: 65536, host_memory_available_bytes: 4096 }} />);
+  expect(container.querySelector('[data-tier="weights"] .memory-tier-heading')).toHaveTextContent('9 KiB / 17 KiB');
+  expect(container.querySelector('[data-tier="kv"] .memory-tier-heading')).toHaveTextContent('6 KiB / 8 KiB');
+  expect(container.querySelector('[data-tier="ram-experts"] .memory-tier-heading')).toHaveTextContent('8 KiB / 14 KiB');
+  expect(container.querySelector('[data-tier="ram-kv"] .memory-tier-heading')).toHaveTextContent('2 KiB / 6 KiB');
+  rerender(<MemoryHierarchy instances={[first, second]} memoryCapacityBytes={32768}
+    runtime={{ memory_architecture: 'discrete', device_free_bytes: 65536,
+      host_memory_total_bytes: 65536, host_memory_available_bytes: 65536 }} />);
+  expect(container.querySelector('[data-tier="weights"] .memory-tier-heading')).toHaveTextContent('9 KiB / 32 KiB');
+  expect(container.querySelector('[data-tier="ram-experts"] .memory-tier-heading')).toHaveTextContent('8 KiB / 64 KiB');
+});
 
 vi.mock('../settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (_zh: string, en: string) => en }),
@@ -36,35 +99,36 @@ function model(id: string, bytes: number): RuntimeInstance {
     } };
 }
 
-it.each([false, true])('groups the same resource tiers into RAM and SSD on unified memory: detailed=%s', (detailed) => {
+it.each([false, true])('groups the same resource tiers into RAM and SSD on unified memory: detailed=%s', async (detailed) => {
   const { container } = render(<MemoryHierarchy instances={[model('1', 1024)]} runtime={{ memory_architecture: 'unified' }} detailed={detailed} />);
   expect([...container.querySelectorAll('[data-memory-group]')].map(group => group.getAttribute('data-memory-group'))).toEqual(['RAM', 'SSD']);
   expect(container.querySelector('[data-memory-group="RAM"]')?.querySelectorAll('[data-tier]')).toHaveLength(2);
   expect(container.querySelector('[data-memory-group="SSD"]')?.querySelectorAll('[data-tier]')).toHaveLength(3);
-  expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('usable inference memory after system reservations and budget limits, not total hardware capacity');
-  expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('remainder after resident weights');
+  expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('capacity available to MFQ after system and other process usage');
   expect(container.querySelector('.overview-memory-heading > div > p')).not.toHaveTextContent('RAM holds');
   for (const heading of container.querySelectorAll('.memory-tier-group-heading')) {
     expect(heading.children[0].tagName).toBe('H3');
     expect(heading.children[1].tagName).toBe('I');
     expect(heading.children[1]).toHaveAttribute('aria-hidden', 'true');
   }
-  const help = container.querySelector('.resource-memory-help')!;
-  expect(help).not.toHaveAttribute('open');
-  fireEvent.click(screen.getByLabelText('Resource tier details'));
-  expect(help).toHaveAttribute('open');
+  const helpButton = screen.getByRole('button', { name: 'Memory tier details' });
+  expect(helpButton.closest('.memory-heading-title')).toContainElement(screen.getByRole('heading', { level: 2 }));
+  expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+  fireEvent.focus(helpButton);
+  const help = await screen.findByRole('tooltip');
   expect(help).toHaveTextContent('unified-memory devices share it between CPU and GPU');
   expect(help).toHaveTextContent('excludes persistent prefix caches');
 });
 
-it('keeps separate VRAM, RAM and SSD categories and their device-specific explanations', () => {
+it('keeps separate VRAM, RAM and SSD categories and their device-specific explanations', async () => {
   const { container } = render(<MemoryHierarchy instances={[model('1', 1024)]} runtime={{ memory_architecture: 'discrete' }} />);
   expect([...container.querySelectorAll('[data-memory-group]')].map(group => group.getAttribute('data-memory-group'))).toEqual(['VRAM', 'RAM', 'SSD']);
   expect(container.querySelector('[data-memory-group="VRAM"]')?.querySelectorAll('[data-tier]')).toHaveLength(2);
   expect(container.querySelector('[data-memory-group="RAM"]')?.querySelectorAll('[data-tier]')).toHaveLength(2);
-  expect(container.querySelector('.resource-memory-help')).toHaveTextContent('transferred to VRAM on demand');
-  expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('usable inference VRAM');
-  expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('not total GPU capacity');
+  fireEvent.focus(screen.getByRole('button', { name: 'Memory tier details' }));
+  expect(await screen.findByRole('tooltip')).toHaveTextContent('transferred to VRAM on demand');
+  expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('Memory and VRAM limits below');
+  expect(container.querySelector('.overview-memory-heading > div > p')).toHaveTextContent('including MFQ allocations and remaining free space');
 });
 
 it('shows prefix usage against the combined quota without adding it to KV twice', () => {
@@ -148,7 +212,7 @@ it('excludes failed/loading models and distinguishes unavailable telemetry from 
   ]} memoryCapacityBytes={4096} />);
   expect(screen.queryByText('Model 2')).not.toBeInTheDocument();
   expect(screen.queryByText('Model 3')).not.toBeInTheDocument();
-  expect(screen.getAllByText('0 B')).toHaveLength(3);
+  expect([...container.querySelectorAll('.memory-tier-heading > span')].filter(item => item.textContent === '0 B')).toHaveLength(3);
   expect(screen.getAllByText('0 B / 4 KiB')).toHaveLength(2);
   rerender(<MemoryHierarchy instances={[{ ...zero, memory: null }]} memoryCapacityBytes={4096} />);
   expect(screen.getAllByText('Model 1: breakdown not reported')).toHaveLength(5);

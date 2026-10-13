@@ -31,7 +31,7 @@ vi.mock('../src/features/settings/SettingsProvider', () => ({
 }));
 
 it('概览预填充卡片展示运行时速度与耗时，而非 TTFT 或媒体准备总时间', () => {
-  render(<MemoryRouter><OverviewPage /></MemoryRouter>);
+  render(<TooltipProvider><MemoryRouter><OverviewPage /></MemoryRouter></TooltipProvider>);
   const prefill = screen.getByText('Prefill').closest('.metric-tile');
   expect(prefill?.querySelector('strong')).toHaveTextContent(/^999 tok\/s$/);
   expect(screen.getByText('50 ms · Prompt processing')).toBeInTheDocument();

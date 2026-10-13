@@ -11,9 +11,53 @@
 #include <iosfwd>
 
 namespace mfq::cuda::qwen4_exp { struct Gr; }
+struct MtpModule;
 
 namespace mfq::cuda {
 struct Qwen4DecodeGraph;
+class Qwen4BatchDecodeGraph;
+// A request owns recurrent, positional and attention state; weights stay shared.
+class Qwen4BatchRequestState {
+  public:
+    explicit Qwen4BatchRequestState(Qwen4CausalLm&);
+    ~Qwen4BatchRequestState();
+    Qwen4BatchRequestState(const Qwen4BatchRequestState&) = delete;
+    Qwen4BatchRequestState& operator=(const Qwen4BatchRequestState&) = delete;
+    mfq_tensor_backend::Tensor prefill(Qwen4CausalLm&, mfq_tensor_backend::Tensor);
+    int64_t position() const;
+    std::size_t resident_bytes() const;
+    std::size_t prefill_growth_bytes(int64_t tokens) const;
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> state_;
+    friend class Qwen4BatchDecodeGraph;
+    friend std::vector<mfq_tensor_backend::Tensor> qwen4_batch_prefill(
+        Qwen4CausalLm&,const std::vector<Qwen4BatchRequestState*>&,
+        const std::vector<mfq_tensor_backend::Tensor>&);
+    friend mfq_tensor_backend::Tensor qwen4_batch_decode(
+        Qwen4CausalLm&, const std::vector<Qwen4BatchRequestState*>&,
+        mfq_tensor_backend::Tensor, const mfq_tensor_backend::Tensor&);
+};
+std::vector<mfq_tensor_backend::Tensor> qwen4_batch_prefill(
+    Qwen4CausalLm&,const std::vector<Qwen4BatchRequestState*>&,
+    const std::vector<mfq_tensor_backend::Tensor>&);
+mfq_tensor_backend::Tensor qwen4_batch_decode(
+    Qwen4CausalLm&, const std::vector<Qwen4BatchRequestState*>&,
+    mfq_tensor_backend::Tensor ids, const mfq_tensor_backend::Tensor& host_ids);
+class Qwen4BatchDecodeGraph {
+  public:
+    explicit Qwen4BatchDecodeGraph(Qwen4CausalLm&);
+    ~Qwen4BatchDecodeGraph();
+    std::optional<mfq_tensor_backend::Tensor> run(
+        const std::vector<Qwen4BatchRequestState*>&,
+        const mfq_tensor_backend::Tensor&,const mfq_tensor_backend::Tensor&,bool greedy=false);
+    void clear();
+    int64_t captures() const;
+    int64_t replays() const;
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> graph_;
+};
 void qwen4_begin_router_lookahead_audit(Qwen4CausalLm&,int samples);
 void qwen4_finish_router_lookahead_audit(Qwen4CausalLm&,const std::string& prefix);
 void qwen4_set_rotary_fusion(Qwen4CausalLm&, bool enabled);
@@ -25,6 +69,7 @@ std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
     bool* initialized=nullptr,const mfq_tensor_backend::Tensor& host_ids={},
     mfq_tensor_backend::Tensor* logits=nullptr,std::vector<int32_t>* greedy_tokens=nullptr);
 void qwen4_report_decode_graph(const Qwen4CausalLm&,std::ostream&);
+std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(const Qwen4CausalLm&,const MtpModule*);
 bool qwen4_layer_major_prefill_eligible(const Qwen4CausalLm&, int64_t tokens);
 mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     Qwen4CausalLm&, mfq_tensor_backend::Tensor ids, int64_t compute_chunk = 1024,
@@ -43,6 +88,7 @@ struct Qwen4Model : CausalResources {
     int64_t batch = 0;
     std::optional<bool> router_lookahead;
     std::unique_ptr<Qwen4DecodeGraph> graph_registry;
+    std::function<void(std::size_t)> reserve_kv_workspace;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model& model,mfq_tensor_backend::Tensor ids,int kind) {
         if (ids.dim()==2 && ids.size(0)==1 &&
@@ -81,7 +127,12 @@ struct Qwen4Model : CausalResources {
     void adapter_rollback_speculative(int64_t keep);
 };
 
-extern template struct CudaSessionCodec<Qwen4Model>;
+template <> struct CudaSessionCodec<Qwen4Model> {
+    static TextSessionStateKind kind(const Qwen4CausalLm&);
+    static bool supports_paged(const Qwen4CausalLm&);
+    static TextSessionState capture(const Qwen4CausalLm&,const std::vector<int64_t>&);
+    static void restore(Qwen4CausalLm&,const TextSessionState&);
+};
 
 } // namespace mfq::cuda
 

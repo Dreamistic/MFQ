@@ -77,6 +77,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/embedding.cu
     ${MFQ_CUDA_KERNEL_ROOT}/selected_attention.cu
     ${MFQ_CUDA_KERNEL_ROOT}/qwen4_exp.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/ple_fused.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm5_next.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gated_delta_net.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
@@ -93,6 +94,8 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/nepq.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nepq_residual.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nint_short_decode.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nint_q8_decode.cu
     ${MFQ_CUDA_KERNEL_ROOT}/norm.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq_routed_reuse.cu
@@ -117,9 +120,9 @@ add_library(mfq::cuda-native-kernels ALIAS mfq-cuda-native-kernels)
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu PROPERTIES
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.h;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_nvq_compact_dot.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.h")
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_nvq_compact_dot.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_jsc_bank_map.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.h")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.cu PROPERTIES
-    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.h;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_e8_dense_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_d4_dense_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_nint_whole.cuh")
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.h;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_e8_dense_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_d4_dense_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_jsc_bank_map.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_nint_whole.cuh")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu PROPERTIES
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul.cu PROPERTIES
@@ -442,6 +445,11 @@ if(BUILD_TESTING)
     mfq_configure_cuda_runtime_target(mfq-cuda-real-mfe-bench)
     target_compile_definitions(mfq-cuda-real-mfe-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-cuda-real-mfe-bench PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-mfe-nvq-bank-map-probe
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfe_nvq_bank_map_probe.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-mfe-nvq-bank-map-probe)
+    target_compile_definitions(mfq-cuda-mfe-nvq-bank-map-probe PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-mfe-nvq-bank-map-probe PRIVATE mfq-cuda-runtime)
     # Generated device snapshot keeps occupancy experiments out of the runtime.
     # Refresh with bench/cuda_format_comparison/generate_mfe_gu_register_probe.py.
     if(EXISTS "${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfe_gu_register_probe_body.inc")
@@ -469,6 +477,17 @@ if(BUILD_TESTING)
     mfq_configure_cuda_runtime_target(mfq-cuda-real-gr-bench)
     target_compile_definitions(mfq-cuda-real-gr-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-cuda-real-gr-bench PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-gr-batch-probe
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_gr_batch_probe.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-gr-batch-probe)
+    target_compile_definitions(mfq-cuda-gr-batch-probe PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-gr-batch-probe PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-nint-dense-decode-probe
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/nint_dense_decode_probe.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-nint-dense-decode-probe)
+    target_include_directories(mfq-cuda-nint-dense-decode-probe PRIVATE ${MFQ_REPOSITORY_ROOT}/bench)
+    target_compile_definitions(mfq-cuda-nint-dense-decode-probe PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-nint-dense-decode-probe PRIVATE mfq-cuda-runtime)
     add_executable(mfq-cuda-shared-gate-bench
         ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_shared_gate_bench.cu)
     mfq_configure_cuda_runtime_target(mfq-cuda-shared-gate-bench)
