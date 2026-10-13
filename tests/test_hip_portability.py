@@ -124,6 +124,25 @@ int main() {
     subprocess.run([str(executable)], check=True)
 
 
+def test_host_translation_units_do_not_require_device_builtins(tmp_path):
+    compiler = shutil.which("c++") or shutil.which("clang++")
+    if not compiler:
+        pytest.skip("C++ compiler is unavailable")
+    include = tmp_path / "hip"
+    include.mkdir()
+    (include / "hip_bf16.h").write_text("")
+    (include / "hip_runtime.h").write_text("#define __device__\n#define __forceinline__ inline\n")
+    source = tmp_path / "host.cpp"
+    source.write_text('#define __HIP_PLATFORM_AMD__ 1\n#include "mfq_hip_compat.h"\n'
+                      'int main() { return 0; }\n')
+    executable = tmp_path / "host"
+    result = subprocess.run([compiler, "-std=c++17", "-I", str(tmp_path),
+                             "-I", str(ROOT / "mfq/kernels/hip"), str(source), "-o", str(executable)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    subprocess.run([str(executable)], check=True)
+
+
 def hashes(root):
     return {p.relative_to(root): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in root.rglob("*") if p.is_file()}

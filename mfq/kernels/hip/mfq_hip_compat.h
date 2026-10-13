@@ -50,13 +50,13 @@ __device__ __forceinline__ T shuffle_xor(T value, int lane, int width = 32) {
 #if !defined(MFQ_HIP_COMPAT_BALLOT)
 #define MFQ_HIP_COMPAT_BALLOT
 namespace mfq::hip_compat {
-__device__ __forceinline__ unsigned ballot(unsigned mask, bool predicate) {
-    const unsigned thread = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
-    const auto votes = static_cast<unsigned long long>(__ballot(predicate));
-    return static_cast<unsigned>(votes >> ((thread % warpSize) & 32u)) & mask;
+__device__ __forceinline__ unsigned ballot(unsigned mask, unsigned long long votes,
+        unsigned thread, unsigned wave_width) {
+    return static_cast<unsigned>(votes >> ((thread % wave_width) & 32u)) & mask;
 }
 }
-#define __ballot_sync(mask, predicate) ::mfq::hip_compat::ballot(mask, predicate)
+#define __ballot_sync(mask, predicate) ::mfq::hip_compat::ballot(mask, __ballot(predicate), \
+    threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z), warpSize)
 #endif
 
 // cuBLAS enum names left behind by partial hipify passes map onto the
