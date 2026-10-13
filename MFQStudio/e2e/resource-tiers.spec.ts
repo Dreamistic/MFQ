@@ -11,7 +11,8 @@ for (const language of ['zh-CN', 'en'] as const) {
       await expect(page.locator('[data-memory-group]')).toHaveCount(2);
       await expect(page.locator('[data-memory-group="RAM"] [data-tier]')).toHaveCount(2);
       await expect(page.locator('[data-memory-group="SSD"] [data-tier]')).toHaveCount(3);
-      await expect(page.locator('.overview-memory-heading > div > p')).toContainText(language === 'zh-CN' ? '不是硬件总容量' : 'not total hardware capacity');
+      await expect(page.locator('.memory-capacity-note')).toContainText(language === 'zh-CN' ? '扣除系统和其他进程占用' : 'after system and other process usage');
+      await expect(page.locator('[data-memory-group="RAM"] h3')).toHaveText(language === 'zh-CN' ? '内存' : 'RAM');
       for (const group of ['RAM', 'SSD']) {
         const heading = page.locator(`[data-memory-group="${group}"] .memory-tier-group-heading`);
         await expect(heading).toHaveCSS('border-bottom-width', '0px');
@@ -22,17 +23,19 @@ for (const language of ['zh-CN', 'en'] as const) {
         expect(rule.height).toBe(1);
         expect(Math.abs(rule.y + rule.height / 2 - title.y - title.height / 2)).toBeLessThanOrEqual(1);
       }
-      const help = page.locator('.resource-memory-help');
-      await expect(help).not.toHaveAttribute('open');
-      await help.locator('summary').click();
-      await expect(help).toHaveAttribute('open');
-      await expect(help.locator('div')).toBeVisible();
+      const trigger = page.locator('.memory-heading-title').getByRole('button', { name: language === 'zh-CN' ? '资源分层说明' : 'Memory tier details' });
+      const help = page.locator('.studio-tooltip');
+      await expect(help).not.toBeVisible();
+      await trigger.scrollIntoViewIfNeeded();
+      await trigger.hover();
+      await expect(help).toBeVisible();
       await expect(help).toContainText(language === 'zh-CN' ? '持久化前缀缓存' : 'persistent prefix caches');
-      const bounds = await help.locator('div').boundingBox();
+      const bounds = await help.boundingBox();
       expect(bounds!.x).toBeGreaterThanOrEqual(0);
       expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
       await page.screenshot({ path: testInfo.outputPath(`${path.slice(1) || 'overview'}-help-${language}.png`), fullPage: true });
-      await help.locator('summary').click();
+      await page.keyboard.press('Escape');
+      await expect(help).not.toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     }
     const reference = await page.locator('.memory-tier-heading > span').first().evaluate(element => {

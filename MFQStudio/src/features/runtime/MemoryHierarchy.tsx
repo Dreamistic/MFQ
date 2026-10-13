@@ -137,7 +137,7 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
       </p>}
       <div className="overview-memory-tiers">
         {groups.map((group) => <section className="memory-tier-group" key={group.name} data-memory-group={group.name} data-storage={group.name.toLowerCase()}>
-          <div className="memory-tier-group-heading"><h3>{group.name === 'VRAM' ? tr('??', 'VRAM') : group.name === 'RAM' ? tr('??', 'RAM') : group.name}</h3><i aria-hidden="true" /><span>{group.detail}</span></div>
+          <div className="memory-tier-group-heading"><h3>{group.name === 'VRAM' ? tr('显存', 'VRAM') : group.name === 'RAM' ? tr('内存', 'RAM') : group.name}</h3><i aria-hidden="true" /><span>{group.detail}</span></div>
           {tiers.filter((tier) => group.ids.includes(tier.id)).map((tier) => {
           const amounts = loaded.map((item) => ({ item, bytes: value(item, tier.id) }));
           const missing = amounts.filter(({ bytes }) => bytes == null);
