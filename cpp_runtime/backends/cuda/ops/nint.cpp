@@ -1,5 +1,6 @@
 #include "mfq_cuda_activation_ops.h"
 #include "mfq_cuda_quant_ops.h"
+#include "mfq_cuda_nint_route_hint.h"
 #include "mfq_cuda_resident_allocations.h"
 #include "nint.h"
 #include "nint_prefill_cache.h"
@@ -496,6 +497,12 @@ mfq_tensor_backend::Tensor nint_matmul(
                         w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
                         x, w.gs, ws.qx, ws.xscale);
                 }
+                if((w.uniform_qbits==5 && w.gs==28) || (w.uniform_qbits==6 && (w.gs==24 || w.gs==28))) {
+                    return nint_matmul_fixed_bits_ws_cuda(
+                        w.q_packed,w.row_q_bits,w.row_q_bit_offsets,
+                        w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,
+                        x,w.gs,ws.qx,ws.xscale,w.uniform_qbits);
+                }
                 return nint_matmul_ws_cuda(
                     w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                     w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
@@ -654,6 +661,14 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(
                     w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                     w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
                     x, gate, mode, w.gs, ws.qx, ws.xscale);
+            }
+            const auto* fixed_setting=std::getenv("MFQ_NINT_FUSED_FIXED_BITS");
+            if((!fixed_setting || fixed_setting[0]!='0') &&
+                    ((w.uniform_qbits==5 && w.gs==28) || (w.uniform_qbits==6 && (w.gs==24 || w.gs==28)))) {
+                return nint_matmul_input_mul_fixed_bits_ws_cuda(
+                    w.q_packed,w.row_q_bits,w.row_q_bit_offsets,
+                    w.sub_scale,w.sub_min,w.neuron_scale,w.neuron_min,
+                    x,gate,mode,w.gs,ws.qx,ws.xscale,w.uniform_qbits);
             }
             return nint_matmul_input_mul_ws_cuda(
                 w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
@@ -1324,7 +1339,9 @@ NintWeight to_device_nint(const NintCpu & c, bool cuda) {
     w.distribution_entropy = c.distribution_entropy;
     w.shape = c.shape;
     w.aligned_q8 = c.gs % 4 == 0;
+    w.uniform_qbits=c.row_q_bits.empty()?0:c.row_q_bits.front();
     for (size_t row = 0; row < c.row_q_bits.size(); ++row) {
+        if(c.row_q_bits[row]!=w.uniform_qbits)w.uniform_qbits=0;
         w.aligned_q8 = w.aligned_q8 && c.row_q_bits[row] == 8 &&
             (c.row_q_bit_offsets[row] & 31) == 0;
     }

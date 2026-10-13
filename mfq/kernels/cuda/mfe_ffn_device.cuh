@@ -1025,9 +1025,10 @@ __global__ void __launch_bounds__(128) mfe_ffn_gate_up_kernel(MfeFfnBatch b,int 
             b.hidden[int64_t(slot)*b.hidden_stride+first+row]=
                 __float2half_rn(__half2float(activated)*__half2float(up[row]));
         }
-        __threadfence();
+        if(b.completion)__threadfence();
     }
     __syncwarp();
+    if(!b.completion)return;
     if(!down || d_local<0 || d_local>=down->local_experts)return;
     const int gs=down->group_size;
     for(int row=0;row<2;++row)if(first+row<width) {
@@ -1110,9 +1111,10 @@ __global__ void __launch_bounds__(512,MinimumBlocks) mfe_ffn_parallel_gate_up_ke
         const auto activated=__float2half_rn(__half2float(gate)*__half2float(sigmoid));
         b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=
             __float2half_rn(__half2float(activated)*__half2float(up));
-        __threadfence();
+        if(b.completion)__threadfence();
     }
     __syncwarp();
+    if(!b.completion)return;
     const int d_local=block_locals[2];
     const auto* down=block_present[2]?block_descriptors+2:nullptr;
     if(!down || (!block_early && (d_local<0 || d_local>=down->local_experts)))return;

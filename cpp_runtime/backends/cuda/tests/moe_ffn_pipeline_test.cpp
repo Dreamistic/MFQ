@@ -466,6 +466,35 @@ void verify_mapped_refill_descriptors() {
     }
     std::cout<<"mapped_refill_descriptor_cases="<<cases<<" changing pointers/counts/unaligned tails/guards exact PASS\n";
 }
+void verify_short_decode_residency_interval(const std::filesystem::path& root) {
+    int checks=0;
+    for(bool independent:{false,true})for(int tokens:{1,2,3,4,5,6,8,31}) {
+        CudaExecutionContext execution;auto& config=execution.config;config.moe_residency_warm=true;
+        config.moe_pipeline=true;config.moe_ram_pcie=true;
+        config.moe_preload_all=true;config.moe_assert_resident=true;config.moe_residency_projection_heat=false;
+        std::array<std::shared_ptr<MoeQuantRangeSource>,3> sources={source(root/"nint5-640-2560.mfq"),
+            source(root/"nint5-640-2560.mfq"),source(root/"nint5-2560-640.mfq")};
+        std::size_t bundle=0;for(const auto& item:sources)bundle+=bytes(item->metadata()->pools[0]);
+        config.moe_host_cache_bytes=3*bundle;
+        auto cache=make_moe_expert_cache(bundle,config);
+        std::array<std::shared_ptr<MfeWeight>,3> weights;
+        for(int projection=0;projection<3;++projection)weights[projection]=std::make_shared<MfeWeight>(
+            cache_quant_moe_weight(cache,std::to_string(projection),sources[projection],1,0,std::to_string(projection)));
+        auto forward=make_moe_ffn_pipeline({weights[0],weights[1]},{weights[2]});
+        finalize_moe_expert_cache(cache);
+        MoeResidencyManager manager(cache.get());
+        for(int step=1;step<=8;++step) {
+            manager.after_layer(0,std::vector<int32_t>(tokens,step%2),tokens,false,independent);
+            manager.apply_pending();
+            const auto stats=manager.stats();
+            if(stats.scheduled_rounds!=std::uint64_t(tokens==1 || (independent && tokens<=8)?step/4:step) ||
+                stats.observed_routes!=std::uint64_t(tokens*step))
+                throw std::runtime_error("short decode interval lost route observations or scheduled too often");
+            ++checks;
+        }
+    }
+    std::cout<<"short_decode_residency_interval checks="<<checks<<" independent rows1-6/8, MTP and prefill unchanged, all route observations retained PASS\n";
+}
 int verify_warm_residency(const std::filesystem::path& root, bool shared_cases=true) {
     int cases=0,phase_cases=0,async_cases=0,window_cases=0,fence_cases=0;
     struct TailGate {
@@ -1763,7 +1792,8 @@ void verify_prefill_quota_recovery(const std::filesystem::path& root) {
         }
         ~Setting(){set(previous.c_str());}
     } setting;
-    for(const std::string format:{"nint5","nvq3j-512"}) {
+    for(const std::string format:{"nint5","nvq3j-512"})
+    for(const std::string failure:{"CUDA VRAM limit exceeded:","CUDA pinned allocation failed:"}) {
         CudaExecutionContext execution;
         execution.config.moe_pipeline=true;execution.config.moe_preload_all=true;
         execution.config.moe_ram_pcie=true;execution.config.moe_ram_pcie_fraction=1;
@@ -1783,7 +1813,7 @@ void verify_prefill_quota_recovery(const std::filesystem::path& root) {
         bool inject=true,fatal=false;int shared_calls=0;
         auto ffn=make_moe_ffn_pipeline(gu,down,[&](CudaExecutionContext&,const tb::Tensor&) {
             ++shared_calls;
-            if(inject)throw mfq::cuda::Error("CUDA VRAM limit exceeded: injected after prefill transfer submission");
+            if(inject)throw mfq::cuda::Error(failure+" injected after prefill transfer submission");
             if(fatal)throw std::runtime_error("injected non-quota prefill failure");
             return tb::Tensor{};
         });
@@ -1793,7 +1823,7 @@ void verify_prefill_quota_recovery(const std::filesystem::path& root) {
         auto weights=tb::ones({16,3},x.options().dtype(tb::kFloat32));
         bool rejected=false;
         try {(void)ffn(execution,x,ids,weights);}
-        catch(const mfq::cuda::Error& error) {rejected=std::string(error.what()).starts_with("CUDA VRAM limit exceeded:");}
+        catch(const mfq::cuda::Error& error) {rejected=std::string(error.what()).starts_with(failure);}
         if(!rejected || shared_calls!=1)throw std::runtime_error("prefill quota fixture did not reach the eager transfer path");
         inject=false;
         auto first=ffn(execution,x,ids,weights).to(tb::kCPU).contiguous();
@@ -1809,7 +1839,8 @@ void verify_prefill_quota_recovery(const std::filesystem::path& root) {
         catch(const std::runtime_error& error) {poisoned=std::string(error.what()).starts_with("MFQ FFN session requires recovery");}
         if(!fatal_rejected || !poisoned)throw std::runtime_error("prefill recovery suppressed a non-quota failure");
         release_moe_decode_buffers(cache);
-        std::cout<<"prefill_quota_recovery format="<<format<<" subsequent_requests=2 output=PASS fatal_error_preserved=PASS\n";
+        std::cout<<"prefill_quota_recovery format="<<format<<" failure="<<failure
+            <<" subsequent_requests=2 output=PASS fatal_error_preserved=PASS\n";
     }
 }
 
@@ -1936,6 +1967,9 @@ int main(int argc,char** argv)try {
         }
         if(std::string(argv[2])=="--warm-residency-check") {
             verify_warm_residency(root);return 0;
+        }
+        if(std::string(argv[2])=="--short-decode-residency-interval-check") {
+            verify_short_decode_residency_interval(root);return 0;
         }
         if(std::string(argv[2])=="--warm-residency-dedicated-check") {
             verify_warm_residency(root,false);return 0;

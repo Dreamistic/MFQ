@@ -530,6 +530,7 @@ public:
                << " pipeline_mapped_copy_bytes=" << stats_.pipeline_mapped_copy_bytes
                << " pipeline_mapped_copy_descriptors=" << stats_.pipeline_mapped_copy_descriptors
                << " pipeline_wire_gpu_bytes=" << tensor_nbytes(pipeline_wire_gpu_)
+               << " pipeline_host_stage_bytes=" << tensor_nbytes(pipeline_host_stage_)
                << " pipeline_sigmoid_table_bytes=" << tensor_nbytes(pipeline_sigmoid_table_)
                << " pipeline_wire_route_bytes=" << pipeline_wire_route_bytes_
                << " pipeline_wire_route_fields=" << pipeline_wire_route_fields_
@@ -804,6 +805,8 @@ private:
     std::vector<mfq::MoeCacheKey> pipeline_prefetched_keys_;
     mfq_tensor_backend::Tensor pipeline_sigmoid_table_;
     int64_t pipeline_wire_route_bytes_=0,pipeline_wire_route_fields_=0;
+    std::array<std::pair<int64_t,int64_t>,2> pipeline_wire_geometry_{};
+    std::unordered_map<int,std::vector<int64_t>> pipeline_host_staged_expert_bytes_;
     std::shared_ptr<mfq_tensor_backend::Tensor> pipeline_ram_complement_;
     int64_t pipeline_ram_registered_bytes_=0;
     void* pipeline_ram_alias_=nullptr;

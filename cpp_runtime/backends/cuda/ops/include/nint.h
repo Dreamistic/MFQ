@@ -48,6 +48,8 @@ struct NintWeight {
     bool q8_zero = false;
     // Proven once from CPU row metadata; false for unclassified/grouped weights.
     bool aligned_q8 = false;
+    // Proven from immutable CPU row metadata; zero means mixed/unknown.
+    int uniform_qbits = 0;
     std::vector<int64_t> shape;
     mutable std::unordered_map<int, Workspace> workspaces;
 

@@ -74,7 +74,8 @@ struct CudaEngineState {
     }
     bool can_batch(const EngineRequest& request) const {
         if constexpr (std::is_same_v<Model,Qwen4CausalLm>)
-            return batching && !request.input.media && request.input.cache_plan.session_id.empty();
+            return batching && !request.input.media && request.input.cache_plan.session_id.empty() &&
+                !(request.input.sampling.enable_mtp && components.mtp);
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
     }
     bool exclusive() const { return duplex_active; }

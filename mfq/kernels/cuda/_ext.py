@@ -44,6 +44,8 @@ _SOURCES = [
     os.path.join(_DIR, "fp8_sq.cu"),
     os.path.join(_DIR, "mxfp4_sq.cu"),
     os.path.join(_DIR, "nint_matmul.cu"),
+    os.path.join(_DIR, "nint_short_decode.cu"),
+    os.path.join(_DIR, "nint_q8_decode.cu"),
     os.path.join(_DIR, "nvq_matmul.cu"),
     os.path.join(_DIR, "nepq.cu"),
     os.path.join(_DIR, "nepq_residual.cu"),

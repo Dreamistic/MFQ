@@ -9,6 +9,7 @@
 #include "core/attention.h"
 #include "core/rope.h"
 #include "mfq/kernels/cuda/qwen4_exp.h"
+#include "mfq/kernels/cuda/ple_fused.h"
 #include "runtime/nint_row_pipeline.h"
 #include "runtime/kv_offload.h"
 #include "storage/session_state.h"
@@ -162,7 +163,9 @@ class Gdn {
         auto weight=w_.conv.to(tb::kFloat32).contiguous();
         if(weight.dim()==2 && weight.size(0)==(2*nk_+nv_)*d_ && weight.size(1)==kernel_)
             weight=weight.reshape({(2*nk_+nv_)*d_,1,kernel_});
-        auto result=gdn_decode_core_cuda(projections[0].contiguous(),projections[1].contiguous(),
+        const auto* stride_setting=std::getenv("MFQ_GDN_STRIDED_PROJECTIONS");
+        const auto direct=[&](const Tensor& value){return !stride_setting || stride_setting[0]!='0'?value:value.contiguous();};
+        auto result=gdn_decode_core_cuda(direct(projections[0]),direct(projections[1]),
             projections[2].reshape({x.size(0),1,nv_}),projections[3].reshape({x.size(0),1,nv_}),
             conv_,state_,weight,w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
             w_.norm.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
@@ -243,14 +246,16 @@ class Gdn {
                 if(weight.dim()==2 && weight.size(0)==channels && weight.size(1)==kernel_)
                     weight=weight.reshape({channels,1,kernel_});
                 if(!core_workspace_.defined())core_workspace_=tb::zeros({b,nv_,d_+1},options);
-                auto decoded=gdn_decode_core_cuda(projections[0].contiguous(),projections[1].contiguous(),
+                const auto* stride_setting=std::getenv("MFQ_GDN_STRIDED_PROJECTIONS");
+                const auto direct=[&](const Tensor& value){return !stride_setting || stride_setting[0]!='0'?value:value.contiguous();};
+                auto decoded=gdn_decode_core_cuda(direct(projections[0]),direct(projections[1]),
                     projections[2].reshape({b,t,nv_}),projections[3].reshape({b,t,nv_}),previous,state_,
                     weight,w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
                     w_.norm.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
                     x.scalar_type()==tb::kFloat16,true,core_workspace_,
                     [] {const auto value=mfq::cuda::runtime_options::gdn_inplace_state();return !value || *value;}());
                 auto output=project_output?w_.output(execution,decoded[0]):decoded[0];
-                conv_.copy_(decoded[1]);
+                if(conv_.data_ptr()!=decoded[1].data_ptr())conv_.copy_(decoded[1]);
                 if(state_.data_ptr()!=decoded[2].data_ptr())state_.copy_(decoded[2]);
                 return output;
             }
@@ -275,6 +280,18 @@ class Gdn {
                         auto weight=w_.conv.to(tb::kFloat32).contiguous();
                         if(weight.dim()==2 && weight.size(0)==channels && weight.size(1)==kernel_)
                             weight=weight.reshape({channels,1,kernel_});
+                        const auto* short_option=std::getenv("MFQ_GDN_SHORT_FUSION");
+                        if(t<=8 && (!short_option || short_option[0]!='0') && projections.size()==4 &&
+                            projections[2].scalar_type()==projections[3].scalar_type() &&
+                            (projections[2].scalar_type()==tb::kFloat16 || projections[2].scalar_type()==tb::kFloat32)) {
+                            const auto* stride_setting=std::getenv("MFQ_GDN_STRIDED_PROJECTIONS");
+                            const auto direct=[&](const Tensor& value){return !stride_setting || stride_setting[0]!='0'?value:value.contiguous();};
+                            auto qkv=linear_conv_qkv_gate_short_cuda(previous,direct(projected),weight,
+                                direct(projections[2].reshape({b,t,nv_})),direct(projections[3].reshape({b,t,nv_})),
+                                w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6);
+                            prepared_gates={qkv[4],qkv[5]};
+                            return std::array<Tensor,4>{qkv[0],qkv[1],qkv[2],qkv[3]};
+                        }
                         auto qkv=linear_conv_qkv_prefill_cuda(previous,
                             projected.narrow(-1,0,2*kw).contiguous(),
                             projected.narrow(-1,2*kw,vw).contiguous(),weight,
@@ -353,6 +370,10 @@ class Gdn {
                 Tensor attended, next_state;
                 if (d_ == 32 || d_ == 64 || d_ == 128) {
                     auto result = execution.profiler.measure("prefill.gdn_recurrence",[&] {
+                        const auto* short_option=std::getenv("MFQ_GDN_SHORT_INPLACE");
+                        const auto inplace=mfq::cuda::runtime_options::gdn_inplace_state();
+                        if(cache && initial.defined() && t<=8 && (!short_option || short_option[0]!='0') && (!inplace || *inplace))
+                            return (transposed_state_?gdn_inplace_transposed_cuda:gdn_inplace_cuda)(q,k,v,decay,beta,initial);
                         return (transposed_state_ ? gdn_transposed_cuda : gdn_cuda)(
                             q, k, v, decay, beta,initial.defined() ? MfqOptional<Tensor>(initial) : mfq_nullopt);
                     });
@@ -380,13 +401,18 @@ class Gdn {
                 return std::array<Tensor, 2>{attended, next_state};
             },
             [&](Tensor attended) {
-                auto projected_gate=projections.empty()?w_.gate(execution,x):projections[1].contiguous();
+                const auto* stride_setting=std::getenv("MFQ_GDN_STRIDED_PROJECTIONS");
+                const bool strided=!stride_setting || stride_setting[0]!='0';
+                auto projected_gate=projections.empty()?w_.gate(execution,x):
+                    strided?projections[1]:projections[1].contiguous();
                 if(fused_decode_ && fused_output_ && attended.is_contiguous() &&
-                    attended.scalar_type()==tb::kFloat32 && projected_gate.is_contiguous() &&
+                    attended.scalar_type()==tb::kFloat32 && (projected_gate.is_contiguous() ||
+                        (strided && projected_gate.dim()==3 && projected_gate.stride(2)==1)) &&
                     (projected_gate.scalar_type()==tb::kFloat16 || projected_gate.scalar_type()==tb::kFloat32) &&
                     (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32))
                     return gdn_rms_norm_gate_cuda(attended,projected_gate,
                         w_.norm.to(tb::kFloat32).contiguous(),eps_,silu_gate_,x.scalar_type()==tb::kFloat16);
+                projected_gate=projected_gate.contiguous();
                 auto z = projected_gate.reshape({b, t, nv_, d_})
                              .permute({0, 2, 1, 3})
                              .to(tb::kFloat32);
@@ -411,7 +437,7 @@ class Gdn {
 #endif
                     conv_=request_state_storage_?convolution[3].clone():convolution[3];
                 }
-                if(state_.defined())state_.copy_(next);
+                if(state_.defined()) {if(state_.data_ptr()!=next.data_ptr())state_.copy_(next);}
                 else {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
                     ResidentAllocationScope resident(request_state_storage_);
@@ -611,6 +637,26 @@ class Ple {
                          bool cache,const Tensor& host_ids = {},const Tensor& graph_embeddings = {}) {
         auto context = embedding_.context();
         const auto b = x.size(0), t = x.size(1);
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        const auto* native=std::getenv("MFQ_PLE_NATIVE_FUSION");
+        if((!native || native[0]=='1') && x.is_contiguous() && t<=32 && hidden_>128 && hidden_<=8192 &&
+            (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32)) {
+            try {
+                auto embeddings=graph_embeddings.defined()?graph_embeddings:
+                    embedding_.forward(ids,cache,nullptr,host_ids);
+                auto key=mfq_qwen4_exp::grouped_rms_norm(w_.key(execution,embeddings),w_.key_norm,hidden_,eps_);
+                auto query=mfq_qwen4_exp::grouped_rms_norm(x,w_.query_norm,hidden_,eps_);
+                auto value=w_.value(execution,embeddings);
+                auto prepared=mfq_qwen4_exp::ple_gate_norm_cuda(key,query,value,
+                    w_.conv_norm.to(tb::kFloat32).contiguous(),hidden_,streams_,eps_);
+                auto output=mfq_qwen4_exp::ple_conv_add_cuda(prepared[1],w_.conv,
+                    cache && conv_.defined()?std::optional<Tensor>(conv_):std::nullopt,dilation_,prepared[0],
+                    x.scalar_type()==tb::kFloat16);
+                if(cache) {if(conv_.defined())conv_.copy_(output[1]);else conv_=output[1];}
+                return output[0];
+            }catch(...) {embedding_.restore(std::move(context));throw;}
+        }
+#endif
         return mfq::models::qwen4_exp::position_embedding(
             cache, [&] { return graph_embeddings.defined() ? graph_embeddings : embedding_.forward(ids, cache,nullptr,host_ids); },
             [&](const Tensor &embeddings) {

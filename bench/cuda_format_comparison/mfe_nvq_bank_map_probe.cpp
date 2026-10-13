@@ -45,25 +45,62 @@ static std::unique_ptr<Call> bank_call(Layer& layer,bool shared,int tokens,bool 
 }
 
 int main(int argc,char** argv)try {
-    if(argc!=3)throw std::runtime_error("expected model-first-shard and benchmark mode");
+    if(argc!=3 && argc!=4)throw std::runtime_error("expected model-first-shard, benchmark mode and optional token counts");
+    std::vector<int> sweep_tokens{8};
+    if(argc==4) {
+        sweep_tokens.clear();
+        std::istringstream counts(argv[3]);
+        for(std::string value;std::getline(counts,value,',');) {
+            const int tokens=std::stoi(value);
+            if(tokens<1 || tokens>8)throw std::runtime_error("sweep supports 1 through 8 tokens");
+            sweep_tokens.push_back(tokens);
+        }
+        if(sweep_tokens.empty())throw std::runtime_error("empty token counts");
+    }
     auto context=mfq::cuda::default_context(0);
     auto stream=mfq_get_stream_from_pool(false);MfqCudaStreamGuard guard(stream);
     auto model=mfq::open_model_source(argv[1]);
     std::vector<std::unique_ptr<Layer>> layers;
     for(int layer:{0,8,16,24,32,40})layers.push_back(std::make_unique<Layer>(*model,layer));
     const auto mode=std::string(argv[2]);
-    if(mode=="--capacity-sweep") {
+    const bool shared_sweep=mode=="--shared-capacity-sweep";
+    const bool quant_warps=mode=="--quant-warp-sweep";
+    const bool quant_sweep=mode=="--quant-sweep" || quant_warps;
+    if(mode=="--capacity-sweep" || shared_sweep || quant_sweep) {
         constexpr int capacities[]{2,4,8};
-        for(bool shared:{false,true}) {
+        const auto quant_option=[&](int candidate) {
+            const char* value=quant_sweep && (candidate || quant_warps)?"1":"0";
+#ifdef _WIN32
+            if(_putenv_s("MFQ_MFE_SEPARATE_HIDDEN_QUANT",value))throw std::runtime_error("hidden quant option");
+            if(quant_warps && _putenv_s("MFQ_MFE_HIDDEN_QUANT_WARPS",candidate==0?"1":candidate==1?"4":"8"))
+                throw std::runtime_error("hidden quant warp option");
+#else
+            if(setenv("MFQ_MFE_SEPARATE_HIDDEN_QUANT",value,1))throw std::runtime_error("hidden quant option");
+            if(quant_warps && setenv("MFQ_MFE_HIDDEN_QUANT_WARPS",candidate==0?"1":candidate==1?"4":"8",1))
+                throw std::runtime_error("hidden quant warp option");
+#endif
+        };
+        int checks=0;
+        for(int tokens:sweep_tokens)for(bool shared:shared_sweep?std::vector<bool>{true}:std::vector<bool>{false,true}) {
             std::array<std::vector<std::unique_ptr<Call>>,3> variants;
             for(int candidate=0;candidate<3;++candidate)for(auto& layer:layers) {
+                quant_option(candidate);
+                const bool quant_shared=quant_sweep && !quant_warps && candidate==2 && shared && tokens>=3 && tokens<=6;
 #ifdef _WIN32
-                if(_putenv_s("MFQ_MFE_TOKEN_GROUP_CAPACITY",""))throw std::runtime_error("group capacity option");
+                const auto option=quant_sweep?(quant_shared?std::string("shared8"):std::string("2")):
+                    shared_sweep && candidate?"shared"+std::to_string(capacities[candidate]):std::to_string(capacities[candidate]);
+                if(_putenv_s("MFQ_MFE_TOKEN_GROUP_CAPACITY",option.c_str()))
+                    throw std::runtime_error("group capacity option");
 #else
-                if(unsetenv("MFQ_MFE_TOKEN_GROUP_CAPACITY"))throw std::runtime_error("group capacity option");
+                const auto option=quant_sweep?(quant_shared?std::string("shared8"):std::string("2")):
+                    shared_sweep && candidate?"shared"+std::to_string(capacities[candidate]):std::to_string(capacities[candidate]);
+                if(setenv("MFQ_MFE_TOKEN_GROUP_CAPACITY",option.c_str(),1))
+                    throw std::runtime_error("group capacity option");
 #endif
-                auto call=bank_call(*layer,shared,8,true,capacities[candidate]==2?0:capacities[candidate]);
-                if(call->fused->batch().token_group_capacity!=capacities[candidate])
+                auto call=bank_call(*layer,shared,tokens,true,capacities[candidate]==2?0:capacities[candidate]);
+                const int expected_capacity=quant_sweep?(tokens==1?0:quant_shared?24:2):
+                    shared_sweep && candidate?16+capacities[candidate]:capacities[candidate];
+                if(call->fused->batch().token_group_capacity!=expected_capacity)
                     throw std::runtime_error("sweep hint did not select requested capacity");
                 variants[candidate].push_back(std::move(call));
             }
@@ -73,10 +110,57 @@ int main(int argc,char** argv)try {
             std::array<MfqCudaGraph,3> graphs;
             mfq_prepare_cuda_graph_memory(graphs[0]);
             for(int candidate=0;candidate<3;++candidate) {
+                quant_option(candidate);
                 for(auto& call:variants[candidate])call->fused->run();
                 if(candidate)graphs[candidate].capture_begin_shared();else graphs[candidate].capture_begin();
                 for(auto& call:variants[candidate])call->fused->run();
                 graphs[candidate].capture_end();
+            }
+            for(int step=0;step<3;++step) {
+                auto values=fb::input(tokens,hidden);
+                for(size_t i=0;i<values.size();++i)values[i]=step==0?0.f:
+                    values[i]*float(step)+std::sin(float(i)*.019f+step)*.21f;
+                const auto input=tb::tensor(values).reshape({tokens,hidden}).to(tb::kCUDA,tb::kFloat16);
+                for(size_t layer=0;layer<layers.size();++layer) {
+                    std::vector<int32_t> selected(tokens*routes);
+                    for(int i=0;i<tokens*routes;++i) {
+                        selected[i]=layers[layer]->selected[(i/(step==1?2:1)+step)%routes];
+                        if(step==2 && i%3==0)selected[i]=-1;
+                        if(step==2 && i%3==1)selected[i]=experts;
+                    }
+                    const auto ids=tb::tensor(selected).reshape({tokens,routes}).to(tb::kCUDA);
+                    for(int candidate=0;candidate<3;++candidate) {
+                        variants[candidate][layer]->x.copy_(input);
+                        variants[candidate][layer]->ids.copy_(ids);
+                    }
+                }
+                for(auto& graph:graphs)graph.replay();
+                for(size_t layer=0;layer<layers.size();++layer)for(int candidate=1;candidate<3;++candidate) {
+                    auto& reference=*variants[0][layer];auto& actual=*variants[candidate][layer];
+                    probe_exact(reference.fused->output().cpu(),actual.fused->output().cpu());
+                    auto a=reference.fused->hidden().cpu(),b=actual.fused->hidden().cpu();
+                    const auto selected=reference.ids.cpu();const auto& batch=actual.fused->batch();
+                    for(int token=0;token<tokens;++token)for(int route=0;route<routes+int(shared);++route) {
+                        if(route<routes && unsigned(selected.data_ptr<int32_t>()[token*routes+route])>=unsigned(experts))continue;
+                        const auto offset=size_t(token*(routes+int(shared))+route)*batch.hidden_stride*a.element_size();
+                        const auto width=route==routes?batch.shared_intermediate:batch.intermediate;
+                        if(std::memcmp(static_cast<const char*>(a.data_ptr())+offset,
+                                       static_cast<const char*>(b.data_ptr())+offset,width*a.element_size()))
+                            throw std::runtime_error("group capacity changed active hidden bits");
+                    }
+                    ++checks;
+                }
+            }
+            const auto input=tb::tensor(fb::input(tokens,hidden)).reshape({tokens,hidden}).to(tb::kCUDA,tb::kFloat16);
+            for(size_t layer=0;layer<layers.size();++layer) {
+                std::vector<int32_t> selected;
+                for(int token=0;token<tokens;++token)
+                    selected.insert(selected.end(),layers[layer]->selected.begin(),layers[layer]->selected.end());
+                const auto ids=tb::tensor(selected).reshape({tokens,routes}).to(tb::kCUDA);
+                for(int candidate=0;candidate<3;++candidate) {
+                    variants[candidate][layer]->x.copy_(input);
+                    variants[candidate][layer]->ids.copy_(ids);
+                }
             }
             std::array<std::vector<double>,3> times;
             for(int repeat=0;repeat<6;++repeat)for(int offset=0;offset<3;++offset) {
@@ -85,10 +169,14 @@ int main(int argc,char** argv)try {
                     stream.stream(),layers.size())));
             }
             for(int candidate=0;candidate<3;++candidate)
-                std::cout<<"actual_mfe_capacity_sweep tokens=8 shared="<<shared
-                    <<" capacity="<<capacities[candidate]<<" us="<<fb::median(times[candidate])<<"\n"<<std::flush;
+                std::cout<<(quant_warps?"actual_mfe_quant_warp_sweep":quant_sweep?"actual_mfe_quant_sweep":shared_sweep?"actual_mfe_shared_capacity_sweep":"actual_mfe_capacity_sweep")
+                    <<" tokens="<<tokens<<" shared="<<shared<<" variant="<<candidate
+                    <<" capacity="<<variants[candidate][0]->fused->batch().token_group_capacity
+                    <<" separate_quant="<<int(quant_sweep && (candidate>0 || quant_warps))
+                    <<" quant_warps="<<(quant_warps?(candidate==0?1:candidate==1?4:8):1)
+                    <<" us="<<fb::median(times[candidate])<<"\n"<<std::flush;
         }
-        std::cout<<"actual_mfe_capacity_sweep PASS\n";
+        std::cout<<"actual_mfe_capacity_sweep checks="<<checks<<" PASS\n";
         return 0;
     }
     const bool grouped=mode=="--grouped-check" || mode=="--grouped-bench";

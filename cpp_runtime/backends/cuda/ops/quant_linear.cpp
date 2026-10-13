@@ -1,5 +1,6 @@
 #include "mfq_cuda_activation_ops.h"
 #include "mfq_cuda_quant_ops.h"
+#include "mfq_cuda_nint_route_hint.h"
 #include "storage/weight_loader.h"
 #include "quant_linear.h"
 #include "mfq_weight_memory.h"
@@ -197,7 +198,9 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     int64_t out = 0;
     int64_t q_bit_base = 0;
     bool aligned_q8 = !a.q8_zero;
+    int uniform_qbits=a.uniform_qbits;
     for (const auto & w : ws) {
+        if(w.uniform_qbits!=uniform_qbits)uniform_qbits=0;
         if (w.ng != a.ng || w.gs != a.gs ||
             w.neuron_len != a.neuron_len || w.q8_zero != a.q8_zero) {
             throw std::runtime_error("cannot group NINT tensors with different input layout");
@@ -228,6 +231,7 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     g.neuron_len = a.neuron_len;
     g.q8_zero = a.q8_zero;
     g.aligned_q8 = aligned_q8;
+    g.uniform_qbits=uniform_qbits;
     g.shape = a.shape;
     g.shape[0] = out;
     g.q_packed = mfq_tensor_backend::cat(qp, 0).contiguous();
@@ -2239,6 +2243,22 @@ std::vector<mfq_tensor_backend::Tensor> NintLinearGroup::forward(
         }
     } else if (!split_w.empty()) {
         parts.reserve(outs.size());
+        std::vector<int> shared_groups;
+        const auto* quant_group_setting=std::getenv("MFQ_NINT_GROUP_QUANTIZE");
+        if((!quant_group_setting || quant_group_setting[0]!='0') && serial_branches &&
+                kl_mmq.mode==KlMmqMode::Default && xf.is_contiguous() &&
+                xf.size(0)>=1 && xf.size(0)<=6 &&
+                (xf.scalar_type()==mfq_tensor_backend::kFloat16 || xf.scalar_type()==mfq_tensor_backend::kFloat32)) {
+            bool compatible=true;
+            for(const auto& weight:split_w) {
+                compatible=compatible && !weight.q8_zero && weight.neuron_len==xf.size(1) &&
+                    (weight.gs==24 || weight.gs==28 || weight.gs==48);
+                if(std::find(shared_groups.begin(),shared_groups.end(),weight.gs)==shared_groups.end())
+                    shared_groups.push_back(weight.gs);
+            }
+            if(!compatible || shared_groups.size()<2)shared_groups.clear();
+        }
+        NintInputQuantizationScope prepared(xf,shared_groups);
         std::vector<mfq_tensor_backend::Tensor> grouped_outputs;
         const bool parallel =
             decode_branch_parallel_enabled(

@@ -9,9 +9,10 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument("mode", choices=("check", "bench", "capacity-check", "capacity-bench",
-                                    "capacity4-check", "capacity4-bench", "capacity-sweep",
+                                    "capacity4-check", "capacity4-bench", "capacity-sweep", "shared-capacity-sweep", "quant-sweep", "quant-warp-sweep",
                                     "grouped-check", "grouped-bench"))
 parser.add_argument("--model", type=Path)
+parser.add_argument("--tokens", type=int, nargs="+", choices=range(1, 9))
 args = parser.parse_args()
 mode = args.mode
 config_path = ROOT / "workspace/local-server/decode-matched-config.json"
@@ -31,13 +32,17 @@ executable = ROOT / "build/cuda-parity/cuda/mfq-cuda-mfe-nvq-bank-map-probe.exe"
 if args.model is None and "command" not in config:
     parser.error("--model is required without workspace/local-server/decode-matched-config.json")
 model = args.model.resolve() if args.model is not None else ROOT / config["command"][2]
-log = ROOT / f"workspace/local-server/nvq-bank-map-real-mfe-{mode}.log"
+suffix = "-m" + "-".join(map(str, args.tokens)) if args.tokens else ""
+log = ROOT / f"workspace/local-server/nvq-bank-map-real-mfe-{mode}{suffix}.log"
 log.parent.mkdir(parents=True, exist_ok=True)
 started = time.monotonic()
 with log.open("wb") as output:
-    result = subprocess.run([str(executable), str(model), "--" + mode],
+    command = [str(executable), str(model), "--" + mode]
+    if args.tokens:
+        command.append(",".join(map(str, args.tokens)))
+    result = subprocess.run(command,
                             cwd=ROOT, env=environment, stdout=output,
-                            stderr=subprocess.STDOUT, timeout=120)
+                            stderr=subprocess.STDOUT, timeout=240)
 print(json.dumps({"mode": mode, "seconds": time.monotonic() - started,
                   "exit_code": result.returncode}))
 print("\n".join(log.read_text(errors="replace").splitlines()[-7:]))

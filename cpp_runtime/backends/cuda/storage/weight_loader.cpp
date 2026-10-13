@@ -4,9 +4,11 @@
 #include "float_projection.h"
 #include "gated_residual_fused.h"
 #include "selected_attention.h"
+#include "qwen4_exp.h"
 #include <limits>
 #include <fstream>
 #include <iterator>
+#include <numeric>
 #include "moe.h"
 #include "moe_expert_cache.h"
 #include "mfe_expert_store.h"
@@ -187,8 +189,10 @@ std::shared_ptr<const QuantLinear> linear_weight(const Linear& function) {
     const auto* loaded=function.target<LoadedLinear>();return loaded?loaded->weight:nullptr;
 }
 
-LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>& functions) {
+LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>& functions,
+                           std::size_t joined_prefix) {
     if (functions.empty() || execution.loading_cpu_layer || !execution.config.diagnostic_nint_group) return {};
+    MFQ_RUNTIME_CHECK(joined_prefix>=1 && joined_prefix<=functions.size(),"invalid grouped projection prefix");
     std::vector<QuantLinear> weights;
     weights.reserve(functions.size());
     for (const auto& function : functions) {
@@ -233,13 +237,35 @@ LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>&
     MFQ_RUNTIME_CHECK(row == 0 && matrix_index == (group->nint.split_w.empty() ? 1 : group->nint.split_w.size()),
         "grouped projection storage is not fully covered");
     functions = separate;
-    return [group=std::move(group), separate=std::move(separate)](CudaExecutionContext& context, const Tensor& input) {
+    // Q/K/V already occupy adjacent rows of the same packed projection. Change
+    // only the returned view boundaries, preserving all separate GEMM weights.
+    bool joined_view=joined_prefix>1 && (group->nint.split_w.empty() ||
+        group->nint.split_outs.front().size()>=joined_prefix);
+    const auto join_sizes=[joined_prefix](auto& sizes) {
+        const auto combined=std::accumulate(sizes.begin(),sizes.begin()+joined_prefix,int64_t(0));
+        sizes.erase(sizes.begin(),sizes.begin()+joined_prefix);sizes.insert(sizes.begin(),combined);
+    };
+    if(joined_view) {
+        if(group->nint.split_w.empty())join_sizes(group->nint.outs);
+        else join_sizes(group->nint.split_outs.front());
+    }
+    return [group=std::move(group), separate=std::move(separate),joined_prefix,joined_view](CudaExecutionContext& context, const Tensor& input) {
+        const auto join=[joined_prefix](std::vector<Tensor> outputs) {
+            if(joined_prefix<=1)return outputs;
+            std::vector<Tensor> prefix(outputs.begin(),outputs.begin()+joined_prefix);
+            auto joined=tb::cat(prefix,-1);
+            outputs.erase(outputs.begin(),outputs.begin()+joined_prefix);
+            outputs.insert(outputs.begin(),std::move(joined));return outputs;
+        };
         if (input.is_cuda() && context.kl_mmq.mode == KlMmqMode::Default &&
-            input.numel() / input.size(-1) <= 8) return group->forward(context, input);
+            input.numel() / input.size(-1) <= 8) {
+            auto outputs=group->forward(context,input);
+            return joined_view?outputs:join(std::move(outputs));
+        }
         std::vector<Tensor> outputs;
         outputs.reserve(separate.size());
         for (const auto& projection : separate) outputs.push_back(projection(context, input));
-        return outputs;
+        return join(std::move(outputs));
     };
 }
 
@@ -266,7 +292,27 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
                 return tb::matmul(input.to(tb::kFloat32),promoted);
             return mfq_selected_attention::promoted_matmul(input,right);
         };
-        return {std::move(forward),{}, {},std::move(weight),std::move(prepared_right)};
+        GatedResidualActivationProjection activated;
+        GatedResidualMixProjection mixed;
+        if(weight->dense.scalar_type()==tb::kBFloat16 && weight->dense.is_contiguous() &&
+                (name=="model.mhc.pre.down.weight" || name=="predictor.mhc.pre.down.weight"))
+            activated=[weight,forward](CudaExecutionContext& execution,const Tensor& input,int64_t streams,bool injection) {
+                const auto* option=std::getenv("MFQ_GR_DENSE_BF16_DIRECT");
+                if(!injection && (!option || option[0]!='0'))
+                    if(auto output=try_gr_bf16_down_cuda(input,weight->dense,streams);output.defined())return output;
+                auto projected=forward(execution,input);
+                return injection?mfq_qwen4_exp::gated_residual_injection(projected,streams):
+                    mfq_qwen4_exp::gated_residual_bottleneck(projected,streams);
+            };
+        if(weight->dense.scalar_type()==tb::kBFloat16 && weight->dense.is_contiguous() &&
+                (name=="model.mhc.pre.up.weight" || name=="predictor.mhc.pre.up.weight"))
+            mixed=[weight,forward](CudaExecutionContext& execution,const Tensor& input,const Tensor& normalized,int64_t streams) {
+                const auto* option=std::getenv("MFQ_GR_DENSE_BF16_DIRECT");
+                if(!option || option[0]!='0')
+                    if(auto output=try_gr_bf16_up_mix_cuda(input,normalized,weight->dense,streams);output.defined())return output;
+                return mfq_qwen4_exp::gated_residual_mix(forward(execution,input),normalized,streams);
+            };
+        return {std::move(forward),std::move(mixed),std::move(activated),std::move(weight),std::move(prepared_right)};
     }
     Linear forward=[weight](CudaExecutionContext& execution, const Tensor& input) {
         auto output = execution.profiler.measure("nint.float_projection", [&] {
@@ -292,7 +338,13 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
                 execution.config.gr_native_projection_input,execution.config.gr_fixed_group_projection);
         });
     };
-    return {std::move(forward),std::move(mixed),std::move(activated),std::move(weight)};
+    Tensor group_coefficients;
+    const auto* group_option=std::getenv("MFQ_GR_UP_GROUP_COEFFICIENTS");
+    if(group_option && group_option[0]!='0' && weight->nint.aligned_q8 && !weight->nint.q8_zero &&
+            weight->nint.gs==48 && weight->nint.out==10240 && weight->nint.neuron_len==320)
+        group_coefficients=group_option[0]=='2'?prepare_gr_up_packed_metadata(weight->nint):
+            prepare_gr_up_group_coefficients(weight->nint);
+    return {std::move(forward),std::move(mixed),std::move(activated),std::move(weight),Tensor{},std::move(group_coefficients)};
 }
 
 Tensor dense(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {

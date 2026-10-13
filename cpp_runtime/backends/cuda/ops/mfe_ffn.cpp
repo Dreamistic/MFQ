@@ -3,6 +3,7 @@
 #include "mfe_e8_narrow_bounds.h"
 #include "mfe_ffn_launch.h"
 #include "mfe_ffn_compact.h"
+#include "mfe_ffn_token_groups.h"
 #include "mfe_nvq_dense_bounds.h"
 #include "mfq_cuda_nint_route_hint.h"
 #include "runtime/decode_window.h"
@@ -162,7 +163,10 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
             shared[2]->out<batch_.output_width)throw std::invalid_argument("two-stage MFE shared geometry invalid");
         for(int p=0;p<3;++p) {
             auto d=nint_view(*shared[p],int(shared[p]->out),1,owners_);d.expert_local=nullptr;
-            d.nint_whole=nint_whole && (d.group_size==28 || (p<2 && d.group_size==24));
+            const auto* small_whole=std::getenv("MFQ_MFE_SHARED_SMALL_WHOLE");
+            const bool small_down=p==2 && d.group_size==24 && d.groups<=32 &&
+                (small_whole?small_whole[0]!='0':(batch_.tokens==1 || batch_.tokens==5 || batch_.tokens==6));
+            d.nint_whole=nint_whole && (d.group_size==28 || (p<2 && d.group_size==24) || small_down);
             const auto grouped=mfq::cuda::runtime_options::nint_group_dot();
             if(batch_.shared_dense_math && shared[p]->aligned_q8)
                 d.dense_reduction_warps=-1; // Dense q8 uses four-value chunk accumulation.
@@ -244,8 +248,8 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
     // independent eight-row decode tiles may request expert reuse explicitly.
     if(batch_.tokens>=2 && batch_.tokens<=32 &&
        (batch_.nvq_format_mask || batch_.tokens>8 || token_group_capacity_hint>=4)) {
-        // Small speculative batches favor two accumulators and more CTAs;
-        // larger decode batches amortize decoding across up to eight rows.
+        // Routed short batches retain the measured pair-sized groups.
+        // Shared-expert reuse has a separate plan and launch bounds.
         batch_.token_group_capacity=batch_.tokens<=8?2:8;
         if(token_group_capacity_hint==4 || token_group_capacity_hint==8)
             batch_.token_group_capacity=token_group_capacity_hint;
@@ -253,9 +257,19 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
             if(std::strcmp(capacity,"2")==0)batch_.token_group_capacity=2;
             else if(std::strcmp(capacity,"4")==0)batch_.token_group_capacity=4;
             else if(std::strcmp(capacity,"8")==0)batch_.token_group_capacity=8;
+            else if(std::strcmp(capacity,"auto")==0 && batch_.tokens>=3 && batch_.tokens<=6)
+                batch_.token_group_capacity=batch_.tokens<=4?4:8;
+            else if(shared[0] && batch_.tokens>=3 && batch_.tokens<=6) {
+                if(std::strcmp(capacity,"shared4")==0)
+                    batch_.token_group_capacity=mfq::cuda::kMfeSharedGroupEncoding+4;
+                else if(std::strcmp(capacity,"shared8")==0)
+                    batch_.token_group_capacity=mfq::cuda::kMfeSharedGroupEncoding+8;
+            }
         }
+        const int plan_capacity=batch_.token_group_capacity>mfq::cuda::kMfeSharedGroupEncoding?
+            2:batch_.token_group_capacity;
         batch_.token_groups=batch_.tokens*batch_.routes+
-            (shared[0]?(batch_.tokens+batch_.token_group_capacity-1)/batch_.token_group_capacity:0);
+            (shared[0]?(batch_.tokens+plan_capacity-1)/plan_capacity:0);
         token_group_counts_=tb::empty({batch_.token_groups},input.options().dtype(tb::kInt32));
         token_group_slots_=tb::empty({batch_.token_groups,8},input.options().dtype(tb::kInt32));
         batch_.token_group_counts=token_group_counts_.data_ptr<int32_t>();
@@ -411,10 +425,16 @@ void MfeFfnRuntime::trace_dispatch() {
 void MfeFfnRuntime::prepare(){
     trace_dispatch();
     auto prepared=batch_;
+    const bool shared_plan=batch_.token_group_capacity>mfq::cuda::kMfeSharedGroupEncoding;
+    if(shared_plan)prepared.token_group_capacity=2;
     if(const auto* setting=std::getenv("MFQ_MFE_TOKEN_GROUPS"))
         if(setting[0]=='0')prepared.token_group_counts=nullptr;
     mfq::cuda::mfe_ffn_prepare(prepared,reinterpret_cast<const mfq::cuda::MfeInputQuantization*>(quantization_.data_ptr()),
         quantization_count_,quantization_groups_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    if(shared_plan && prepared.token_group_counts) {
+        mfq::cuda::mfe_ffn_token_group_shared_plan(batch_,mfq_current_cuda_stream());
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 }
 void MfeFfnRuntime::gate_up(){mfq::cuda::mfe_ffn_gate_up(batch_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();}
 void MfeFfnRuntime::resident(){mfq::cuda::mfe_ffn_resident(batch_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();}

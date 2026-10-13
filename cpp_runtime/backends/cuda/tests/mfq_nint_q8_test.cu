@@ -44,6 +44,7 @@ void exact_batch_path(bool enabled) {
 
 double grouped_max_nrmse = 0.0;
 double grouped_max_absolute = 0.0;
+int grouped_q8_cases=0;
 
 void require(bool condition, const char *message) {
     if (!condition) {
@@ -142,7 +143,14 @@ void check_case(int gs, int ng, int m, int width_tail, int storage_offset,
     exact_batch_path(true);
     const auto actual = run(true);
     MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
-    exact_half(actual, expected);
+    const auto* q8_option=std::getenv("MFQ_NINT_Q8_DECODE");
+    const bool reassociated=gs==48 && m>1 && storage_offset==0 &&
+        (!q8_option || std::atoi(q8_option)==2);
+    const auto compare=[&](const Tensor& value) {
+        if(reassociated)grouped_half(value,expected);else exact_half(value,expected);
+    };
+    compare(actual);
+    if(reassociated)++grouped_q8_cases;
     ++cases;
 
     // Compare both specialization branches during capture/replay. Odd group
@@ -161,7 +169,7 @@ void check_case(int gs, int ng, int m, int width_tail, int storage_offset,
         for (int repeat = 0; repeat < 3; ++repeat) {
             graph.replay();
             MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
-            exact_half(result, expected);
+            compare(result);
         }
         ++graphs;
     }
@@ -395,7 +403,8 @@ int main(int argc,char** argv) {
                 }
             }
         }
-        std::cout << "NINT q8 bit-exact FP16 cases=" << cases
+        std::cout << "NINT q8 bit-exact FP16 cases=" << cases-grouped_q8_cases
+                  << " grouped_fp16_cases=" << grouped_q8_cases
                   << " graph_cases=" << graphs << " replays_per_case=3\n";
         int grouped_cases = 0;
         struct GroupedCase { int group_size, width, bits; };

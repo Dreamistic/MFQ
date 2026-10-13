@@ -94,9 +94,13 @@ std::shared_ptr<TensorStorage> allocate_pinned_storage(std::size_t bytes) {
     void* pointer = nullptr;
     if (bytes != 0) {
         const auto result=cudaHostAlloc(&pointer,bytes,cudaHostAllocDefault);
-        if(result==cudaErrorMemoryAllocation)
+        if(result==cudaErrorMemoryAllocation) {
+            // Allocation rejection is recoverable. Do not leave the driver's
+            // last error for an unrelated kernel launch or state restoration.
+            (void)cudaGetLastError();
             throw Error("CUDA pinned allocation failed: requested="+std::to_string(bytes)+
                 " host_allocated="+std::to_string(tensor_host_bytes.load()));
+        }
         MFQ_NATIVE_CUDA_CHECK(result);
     }
     charge_tensor_host_bytes(bytes);

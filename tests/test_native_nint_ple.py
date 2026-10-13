@@ -184,6 +184,29 @@ def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1,
     return paths
 
 
+@pytest.mark.parametrize("quantized_experts", [True, "nvq"])
+def test_native_cuda_flash_mtp_graph_position_buffer(tmp_path, quantized_experts):
+    executable = Path(__file__).resolve().parents[1] / "build/cuda-parity/mfq-diagnostics.exe"
+    if not executable.is_file():
+        pytest.skip("build mfq-diagnostics to check CUDA MTP graphs")
+    model = _models(tmp_path, mtp=True, qsa=True, ple_layer=3, context_size=512,
+                    quantized_experts=quantized_experts)[1]
+    env = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1",
+               MFQ_MOE_PRELOAD_ALL="1", MFQ_MOE_ASSERT_RESIDENT="1",
+               MFQ_MOE_HOST_CACHE_BYTES="8388608", MFQ_TRACE_LAYER_TIMINGS="0")
+    outputs = []
+    for buffered in ("0", "1"):
+        env["MFQ_MTP_POSITION_BUFFER"] = buffered
+        result = subprocess.run([str(executable), "--model", str(model), "--ids", "1,2,3,4,5,6,7",
+            "--ctx-size", "512", "--moe-gpu-cache-gb", "0.25", "--check-flash-next-mtp"],
+            env=env, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stderr[-3000:] + result.stdout[-1000:]
+        record = next(line for line in result.stdout.splitlines() if line.startswith("flash_next_mtp_check "))
+        outputs.append(json.loads(record.removeprefix("flash_next_mtp_check ")))
+    assert outputs[0]["greedy"] == outputs[1]["greedy"]
+    assert outputs[1]["predictor_graph_replays"] > 0
+
+
 @pytest.mark.parametrize("ple_layer", [1, 3])
 def test_native_qwen_ple_mixed_qk_matches_scaled_fp8_graph(tmp_path, ple_layer):
     executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
@@ -520,8 +543,10 @@ def test_cuda_flash_next_continuous_batching_preserves_request_state(tmp_path, r
     if requests == 17 and quantized_experts == "nvq":
         phases = [dict(field.split("=", 1) for field in line.split()[1:])
                   for line in process.stderr.splitlines() if line.startswith("native_layer_gpu ")]
+        tile_rows = int(environment.get("MFQ_CONTINUOUS_FFN_TILE", "8"))
+        expected_tiles = {str(tile) for tile in range((requests + tile_rows - 1) // tile_rows)}
         assert {phase["tile"] for phase in phases if phase["from"] == "hot_begin"
-                and phase["to"] == "hot_end"} >= {"0", "1", "2"}
+                and phase["to"] == "hot_end"} >= expected_tiles
     if requests == 32:
         assert "continuous_batching_growth_check requests=32 boundary=256 PASS" in process.stdout
     state = next(line for line in process.stdout.splitlines()
@@ -591,6 +616,54 @@ def test_cuda_flash_next_stdio_batches_normal_chat_requests(tmp_path, requests):
                     process.terminate()
                 await process.wait()
 
+    asyncio.run(asyncio.wait_for(run(),30))
+
+
+def test_cuda_flash_next_stdio_mtp_avoids_ordinary_batch_path(tmp_path):
+    from mfq.server.runtime.client import StdioRuntimeClient
+
+    executable=os.environ.get("MFQ_FLASH_NEXT_CUDA_RUNTIME")
+    if not executable:
+        pytest.skip("MFQ_FLASH_NEXT_CUDA_RUNTIME must point to CUDA mfq-runtime")
+    _,model=_models(tmp_path,mtp=True,qsa=True,ple_layer=3,context_size=512,
+        quantized_experts=True)
+    header,weights=io.load(model);weights["model.output.weight"].fill(0);io.save(model,header,weights)
+    tokenizer=_worker_tokenizer(tmp_path)
+    environment=dict(os.environ,MFQ_MOE_PIPELINE="1",MFQ_MOE_TWO_STAGE_FFN="1",
+        MFQ_MOE_PRELOAD_ALL="1",MFQ_MOE_ASSERT_RESIDENT="1",MFQ_MOE_HOST_CACHE_BYTES="8388608")
+
+    async def run():
+        with (tmp_path/"worker.log").open("wb") as log:
+            process=await asyncio.create_subprocess_exec(executable,"--model",str(model),
+                "--tokenizer",str(tokenizer),"--transport","stdio","--ctx-size","512",
+                "--continuous-batching","2","--moe-gpu-cache-gb","0.00004",
+                stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=log,env=environment)
+            client=StdioRuntimeClient(process,control_timeout_seconds=15)
+            try:
+                await client.status()
+                for use_mtp in [False,True,False,True]:
+                    before=await client.status()
+                    async with client.generate({"messages":[{"role":"user","content":"ababab"}],
+                        "temperature":0,"top_k":1,"max_tokens":16,"enable_mtp":use_mtp,
+                        "stream":True,"stream_options":{"include_usage":True},
+                        "mfq_prefix_cache_enabled":False}) as events:
+                        chunks=[event async for event in events if event is not None]
+                    after=await client.status()
+                    text="".join(choice.get("delta",{}).get("content","")
+                        for event in chunks for choice in event.get("choices",[]))
+                    assert text=="a"*16
+                    metrics={key:value for event in chunks for key,value in event.get("mfq_metrics",{}).items()}
+                    assert metrics["mtp_used"]==int(use_mtp),metrics
+                    if use_mtp:
+                        assert metrics["mtp_cycles"]>0,metrics
+                        assert after["continuous_batching_admissions"]==before["continuous_batching_admissions"]
+                        assert after["mtp_predictor_graph_replays"]>0,after
+                    else:
+                        assert after["continuous_batching_admissions"]==before["continuous_batching_admissions"]+1
+            finally:
+                with suppress(Exception):await client.aclose()
+                if process.returncode is None:process.terminate()
+                await process.wait()
     asyncio.run(asyncio.wait_for(run(),30))
 
 

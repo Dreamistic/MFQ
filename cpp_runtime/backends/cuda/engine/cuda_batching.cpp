@@ -484,10 +484,11 @@ static std::exception_ptr flash_next_prefill_failure(std::exception_ptr failure)
     catch(const Error& error) {
         const std::string message=error.what();
         if(message.starts_with("CUDA process VRAM limit exceeded:") ||
-           message.starts_with("CUDA VRAM limit exceeded:"))
+           message.starts_with("CUDA VRAM limit exceeded:") ||
+           message.starts_with("CUDA pinned allocation failed:"))
             return std::make_exception_ptr(mfq::engine::InferenceInputError(
                 mfq::engine::InferenceInputErrorCode::ContextLength,
-                "insufficient VRAM for prefill workspace; reduce concurrent requests or the packed prefill token budget"));
+                "insufficient GPU or pinned RAM for prefill workspace; reduce concurrent requests or the packed prefill token budget"));
     } catch(...) {}
     return failure;
 }
@@ -671,9 +672,10 @@ FlashNextBatchOperations::Decoded FlashNextBatchOperations::decode(State& state)
     catch(const Error& error) {
         const std::string message=error.what();
         if(!message.starts_with("CUDA process VRAM limit exceeded:") &&
-           !message.starts_with("CUDA VRAM limit exceeded:"))throw;
+           !message.starts_with("CUDA VRAM limit exceeded:") &&
+           !message.starts_with("CUDA pinned allocation failed:"))throw;
         throw mfq::engine::InferenceInputError(mfq::engine::InferenceInputErrorCode::ContextLength,
-            "insufficient VRAM for the batch decode workspace; reduce concurrent requests");
+            "insufficient GPU or pinned RAM for the batch decode workspace; reduce concurrent requests");
     }
     auto logits = captured ? std::move(*captured) : qwen4_batch_decode(model_,caches,std::move(ids),host_ids);
     Tensor greedy_tokens;

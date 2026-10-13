@@ -364,7 +364,7 @@ void MoeResidencyManager::finish_window(int layer) {
     {std::lock_guard<std::mutex> lock(s.worker_mutex);s.window_inflight=false;}
     s.work_finished.notify_all();
 }
-void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight) {
+void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight,bool independent_sequences) {
     auto& s=*impl_;
     for(std::size_t b=0;b<s.cache->pipeline_bundles_.size();++b)
         if(s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_==layer)
@@ -374,7 +374,12 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
     if(!s.cache->config_.moe_residency_warm && (tokens>8 || (++s.rounds%4)!=0))return;
     // Strata adjusts its cache every few completed windows. Keep collecting
     // all routes between rounds; prompt batches still prepare immediately.
-    if(s.cache->config_.moe_residency_warm && tokens==1 && (++s.rounds%s.interval)!=0)return;
+    // Independent decode rows accumulate routes every step and transact at
+    // the single-token interval. Speculative windows retain their existing
+    // cache response because reducing its frequency regressed complete MTP.
+    const auto* short_interval=std::getenv("MFQ_MOE_SHORT_DECODE_INTERVAL");
+    const bool interval_decode=tokens==1 || (independent_sequences && tokens<=8 && (!short_interval || short_interval[0]!='0'));
+    if(s.cache->config_.moe_residency_warm && interval_decode && (++s.rounds%s.interval)!=0)return;
     if(!s.pending.empty())throw std::logic_error("adaptive tier has an unpublished transaction");
     for(std::size_t b=0;b<s.heat.size();++b)for(std::size_t e=0;e<s.heat[b].size();++e) {
         s.heat[b][e]+=s.observations[b][e];s.observations[b][e]=0;

@@ -13,6 +13,8 @@
 #include "quant_linear.h"
 #include <cuda.h>
 #include <array>
+#include <algorithm>
+#include <functional>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -53,7 +55,13 @@ struct Mapped {
     void* host=nullptr;void* device=nullptr;std::size_t bytes=0;
     std::shared_ptr<Mapped> shared_owner;
     explicit Mapped(std::size_t n):bytes(n) {
-        MFQ_CUDA_CHECK(cudaHostAlloc(&host,n,cudaHostAllocMapped));
+        const auto allocation=cudaHostAlloc(&host,n,cudaHostAllocMapped);
+        if(allocation==cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            throw mfq::cuda::Error("CUDA pinned allocation failed: requested="+std::to_string(n)+
+                " host_allocated="+std::to_string(mfq::cuda::tensor_host_bytes.load()));
+        }
+        MFQ_CUDA_CHECK(allocation);
         const auto status=cudaHostGetDevicePointer(&device,host,0);
         if(status!=cudaSuccess) {cudaFreeHost(host);host=nullptr;MFQ_CUDA_CHECK(status);}
         mfq::cuda::charge_tensor_host_bytes(n);std::memset(host,0,n);
@@ -650,7 +658,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         catch(const mfq::cuda::Error& error) {
             const std::string message=error.what();
             if(message.starts_with("CUDA process VRAM limit exceeded:") ||
-                    message.starts_with("CUDA VRAM limit exceeded:")) {
+                    message.starts_with("CUDA VRAM limit exceeded:") ||
+                    message.starts_with("CUDA pinned allocation failed:")) {
                 try {
                     release_moe_prefill_buffers(cache_);
                     mfq::cuda::default_context(mfq_current_cuda_device())->reclaim_idle_memory();
@@ -999,10 +1008,15 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         // Eight-row tiles need eight route lists. Large windows trade some
         // cached history for smaller staging arenas, retaining every route.
         const int decode_history_slots=window && execution.continuous_batch_ffn_tiles>2 ? 96 : 128;
+        // Explicit independent-request tiles bound the live route union. Keep
+        // one sixteen-row arena for their 9–16 row tails instead of reserving
+        // thirty-two route lists. Untiled callers retain their shared capacity.
+        const int decode_route_rows=cell.tokens>8?
+            (execution.continuous_batch_ffn_tiles>0 && cell.tokens<=16?16:32):8;
         if(cell.transfer_cache)for(int p=0;p<3;++p)for(auto& cohort:sources_[p]->cohorts_) {
             // Share one capacity across M=9..32; changing concurrency must not
             // retain a separate weight staging arena for every batch size.
-            auto& arena=stage(p,cohort,std::max(decode_history_slots,(cell.tokens>8?32:8)*cell.routes));
+            auto& arena=stage(p,cohort,std::max(decode_history_slots,decode_route_rows*cell.routes));
             if(!arena.book)arena.book=std::make_unique<mfq::MoeCacheSlotBook>(arena.slots);
             cell.binding[p].stages.push_back(&arena);
         }
@@ -1077,32 +1091,93 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(!cell.two_stage)cell.dispatch_pointers=tb::tensor(dispatch).to(tb::kCUDA);
         cell.device_abort=tb::empty({1},cell.input.options().dtype(tb::kInt32));
         cell.device_kind=tb::empty({experts_},cell.input.options().dtype(tb::kInt32));
-        if(!cache_->pipeline_wire_route_bytes_) {
-                std::unordered_map<int,int64_t> layer_bytes,layer_fields;
-                for(const auto& source:cache_->sources_)if(source->quant_source_ && pipeline_source(*source)) {
-                    int64_t bytes=0,fields=0;
-                    for(int e=0;e<source->n_experts();++e) {
-                        const auto n=static_cast<int64_t>(source->cohorts_[source->expert_to_cohort_[e]].bytes_per_expert.size());
-                        bytes=std::max(bytes,source->bytes_for_expert(e)+16*n);fields=std::max(fields,n);
-                    }
-                    layer_bytes[source->layer_id_]+=bytes;layer_fields[source->layer_id_]+=fields;
+        // Predictor experts can be much larger than backbone experts. Size
+        // this invocation from its own projections before sharing the arenas;
+        // a one-row predictor must not multiply its geometry by 32 decode rows.
+        int64_t route_bytes=0,route_fields=0;
+        for(int p=0;p<3;++p) {
+            if(combined_gate_up_ && p==1)continue;
+            int64_t bytes=0,fields=0;
+            for(const auto& cohort:sources_[p]->cohorts_) {
+                const auto n=static_cast<int64_t>(cohort.bytes_per_expert.size());
+                int64_t payload=16*n;
+                for(const auto count:cohort.bytes_per_expert)payload+=count;
+                bytes=std::max(bytes,payload);fields=std::max(fields,n);
+            }
+            route_bytes+=bytes;route_fields+=fields;
+        }
+        cache_->pipeline_wire_route_bytes_=std::max(cache_->pipeline_wire_route_bytes_,route_bytes);
+        cache_->pipeline_wire_route_fields_=std::max(cache_->pipeline_wire_route_fields_,route_fields);
+        auto& wire_geometry=cache_->pipeline_wire_geometry_[sources_[0]->layer_id_<0];
+        if(!wire_geometry.first) {
+            std::unordered_map<int,int64_t> layer_bytes,layer_fields;
+            for(const auto& source:cache_->sources_)if(source->quant_source_ && pipeline_source(*source) &&
+                    (source->layer_id_<0)==(sources_[0]->layer_id_<0)) {
+                int64_t bytes=0,fields=0;
+                for(const auto& cohort:source->cohorts_) {
+                    const auto n=int64_t(cohort.bytes_per_expert.size());int64_t payload=16*n;
+                    for(const auto count:cohort.bytes_per_expert)payload+=count;
+                    bytes=std::max(bytes,payload);fields=std::max(fields,n);
                 }
-                for(const auto& item:layer_bytes)cache_->pipeline_wire_route_bytes_=std::max(cache_->pipeline_wire_route_bytes_,item.second);
-                for(const auto& item:layer_fields)cache_->pipeline_wire_route_fields_=std::max(cache_->pipeline_wire_route_fields_,item.second);
+                layer_bytes[source->layer_id_]+=bytes;layer_fields[source->layer_id_]+=fields;
+            }
+            for(const auto& [layer,bytes]:layer_bytes)wire_geometry.first=std::max(wire_geometry.first,bytes);
+            for(const auto& [layer,fields]:layer_fields)wire_geometry.second=std::max(wire_geometry.second,fields);
         }
         const auto host_routes=std::min(experts_,cell.batch_decode?cell.entries:std::max(cell.entries,8*cell.routes));
-        const auto host_header=(32+24*host_routes*cache_->pipeline_wire_route_fields_+15)&~int64_t(15);
-        const auto host_bytes=host_header+host_routes*cache_->pipeline_wire_route_bytes_;
+        const auto host_header=(32+24*host_routes*route_fields+15)&~int64_t(15);
+        int64_t host_payload=host_routes*route_bytes;
+        const auto* compact_host=std::getenv("MFQ_MOE_COMPACT_HOST_STAGE");
+        if(cell.transfer_cache && cache_->pipeline_prefill_layer_layout_ && compact_host && compact_host[0]=='1') {
+            // RAM expert leases are stable after full preload. Inspect their
+            // actual fields once: retained warm copies may live outside the
+            // registered cold arena. Only pageable fields and packed metadata
+            // need a second pinned copy; direct payloads leave no host holes.
+            std::vector<int64_t> staged(experts_);
+            const bool pack_small=mfq::cuda::runtime_options::ram_field_packing();
+            const auto ram_begin=reinterpret_cast<uintptr_t>(cache_->pipeline_ram_complement_->data_ptr());
+            const auto ram_bytes=uint64_t(cache_->pipeline_ram_registered_bytes_);
+            for(int p=0;p<3;++p) {
+                if(combined_gate_up_ && p==1)continue;
+                auto& source=*sources_[p];
+                auto [found,fresh]=cache_->pipeline_host_staged_expert_bytes_.try_emplace(source.id_);
+                auto& costs=found->second;
+                if(fresh) {
+                    costs.resize(experts_);
+                    for(int e=0;e<experts_;++e) {
+                        if(source.quant_source_->gpu_resident(e))continue;
+                        auto lease=source.quant_source_->acquire_expert(e);
+                        for(const auto& field:moe_cache_fields(lease->weights)) {
+                            const auto bytes=tensor_nbytes(field);if(!bytes)continue;
+                            const auto address=reinterpret_cast<uintptr_t>(field.data_ptr());
+                            if((pack_small && bytes<=16*1024) || address<ram_begin ||
+                                    address-ram_begin>ram_bytes || uint64_t(bytes)>ram_bytes-(address-ram_begin))
+                                costs[e]+=bytes+15;
+                        }
+                    }
+                }
+                for(int e=0;e<experts_;++e)staged[e]+=costs[e];
+            }
+            std::sort(staged.begin(),staged.end(),std::greater<int64_t>{});
+            host_payload=0;for(int64_t i=0;i<host_routes;++i)host_payload+=staged[i];
+        }
+        const auto host_bytes=host_header+host_payload+32;
         if(!cache_->pipeline_host_stage_.defined() || cache_->pipeline_host_stage_.numel()<host_bytes) {
             MFQ_CUDA_CHECK(cudaStreamSynchronize(stream_));
             MFQ_CUDA_CHECK(cudaStreamSynchronize(cache_->weight_stream_));
-            cache_->pipeline_host_stage_=tb::empty({host_bytes},tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true));
+            // DMA consumers are drained before replacing their pinned source.
+            // Release the old allocation first to avoid doubling the peak.
+            for(auto& batch:cache_->pipeline_dma_batches_)batch.reset();
+            cache_->pipeline_host_stage_={};
             cache_->pipeline_host_stage_alias_=nullptr;
+            cache_->pipeline_host_stage_=tb::empty({host_bytes},tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true));
         }
         if(cell.batch_decode) {
             const auto routes=std::min(cell.entries,experts_);
-            cell.wire_header_bytes=(32+24*routes*cache_->pipeline_wire_route_fields_+15)&~int64_t(15);
-            const auto capacity=cell.wire_header_bytes+routes*cache_->pipeline_wire_route_bytes_;
+            cell.wire_header_bytes=(32+24*routes*route_fields+15)&~int64_t(15);
+            // All backbone cells share one pre-sized wire image, avoiding
+            // retained intermediate images as differently sized layers appear.
+            const auto capacity=((32+24*routes*wire_geometry.second+15)&~int64_t(15))+routes*wire_geometry.first;
             if(!cache_->pipeline_wire_gpu_.defined() || cache_->pipeline_wire_gpu_.numel()<capacity)
                 cache_->pipeline_wire_gpu_=tb::empty({capacity},cell.input.options().dtype(tb::kUInt8));
             cell.wire=cache_->pipeline_wire_gpu_;
@@ -1120,7 +1195,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 &cache_->pipeline_ram_alias_,cache_->pipeline_ram_complement_->data_ptr(),0));
             if(!cache_->pipeline_host_stage_alias_)MFQ_CUDA_CHECK(cudaHostGetDevicePointer(
                 &cache_->pipeline_host_stage_alias_,cache_->pipeline_host_stage_.data_ptr(),0));
-            const auto fields=std::size_t(cell.entries)*cache_->pipeline_wire_route_fields_+1;
+            const auto fields=std::size_t(cell.entries)*route_fields+1;
             cell.mapped_copy_table=std::make_unique<Mapped>(32+fields*sizeof(mfq::cuda::MoeMappedCopyDescriptor));
             cell.mapped_copy_snapshot=tb::empty({int64_t(cell.mapped_copy_table->bytes)},
                 cell.input.options().dtype(tb::kUInt8));
@@ -1754,15 +1829,29 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         };
         if(cell.phased_transfer) {
             std::array<std::vector<Interval>,2> intervals;
-            std::array<int64_t,2> staged_begin{},staged_end{};
+            std::array<std::vector<mfq::cuda::DmaCopy>,2> cache_copies;
+            std::vector<bool> direct_to_cache(fields.size(),false);
+            const auto* direct_option=std::getenv("MFQ_MOE_DIRECT_CACHE_DMA");
+            const bool direct_cache=cell.transfer_cache && direct_option && direct_option[0]=='1';
+            std::array<int64_t,2> staged_begin{},staged_end{},staged_host_begin{};
             int64_t offset=cell.wire_header_bytes,direct_bytes=0,staged_bytes=0,gate_up_end=0;
+            int64_t host_offset=cell.wire_header_bytes;
             // A packet boundary separates Gate/Up from Down. Cache ownership,
             // original RAM leases and the final completion event are shared.
             for(int phase=0;phase<2;++phase) {
                 std::vector<std::size_t> direct,staged;
                 for(std::size_t i=0;i<fields.size();++i) {
                     if((fields[i].projection==2)!=(phase==1))continue;
-                    if(direct_field(fields[i]))direct.push_back(i);
+                    if(direct_cache && fields[i].bytes>16*1024 && direct_field(fields[i])) {
+                        // The protected cache slot is the final consumer's
+                        // storage. DMA large registered payloads there once;
+                        // only small metadata needs the wire scatter. Both
+                        // copies precede the original phase-ready publication.
+                        const auto& field=fields[i];
+                        cache_copies[phase].push_back({field.destination,field.source.data_ptr(),std::size_t(field.bytes)});
+                        direct_to_cache[i]=true;direct_bytes+=field.bytes;
+                    }
+                    else if(direct_field(fields[i]))direct.push_back(i);
                     else staged.push_back(i);
                 }
                 std::sort(direct.begin(),direct.end(),[&](auto a,auto b) {
@@ -1787,26 +1876,39 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     offset+=bytes;direct_bytes+=bytes;first=last;
                 }
                 offset=(offset+15)&~int64_t(15);staged_begin[phase]=offset;
+                host_offset=(host_offset+15)&~int64_t(15);staged_host_begin[phase]=host_offset;
                 for(const auto i:staged) {
                     offset=(offset+15)&~int64_t(15);auto& field=fields[i];
-                    if(field.bytes>cell.wire.numel()-offset || field.bytes>cache_->pipeline_host_stage_.numel()-offset)
-                        throw std::logic_error("MFQ phased exchanged RAM field exceeds wire geometry");
-                    std::memcpy(packed+offset,field.source.data_ptr(),std::size_t(field.bytes));
-                    field.wire_offset=offset;offset+=field.bytes;staged_bytes+=field.bytes;
+                    host_offset=staged_host_begin[phase]+offset-staged_begin[phase];
+                    if(field.bytes>cell.wire.numel()-offset || field.bytes>cache_->pipeline_host_stage_.numel()-host_offset)
+                        throw std::logic_error("MFQ phased exchanged RAM field exceeds wire geometry: layer="+
+                            std::to_string(sources_[0]->layer_id_)+" projection="+std::to_string(field.projection)+
+                            " expert="+std::to_string(field.expert)+" field="+std::to_string(field.field)+
+                            " bytes="+std::to_string(field.bytes)+" wire="+std::to_string(cell.wire.numel())+
+                            " offset="+std::to_string(offset)+" host="+std::to_string(cache_->pipeline_host_stage_.numel())+
+                            " host_offset="+std::to_string(host_offset));
+                    std::memcpy(packed+host_offset,field.source.data_ptr(),std::size_t(field.bytes));
+                    field.wire_offset=offset;offset+=field.bytes;host_offset+=field.bytes;staged_bytes+=field.bytes;
                 }
                 staged_end[phase]=offset;
                 if(!phase)gate_up_end=(offset+15)&~int64_t(15);
             }
             if(32+fields.size()*24>std::size_t(cell.wire_header_bytes))
                 throw std::logic_error("MFQ phased RAM descriptors exceed route geometry");
-            std::sort(fields.begin(),fields.end(),[](const auto& a,const auto& b){return a.wire_offset<b.wire_offset;});
+            std::vector<std::size_t> wire_fields;
+            for(std::size_t i=0;i<fields.size();++i)if(!direct_to_cache[i])wire_fields.push_back(i);
+            std::sort(wire_fields.begin(),wire_fields.end(),[&](auto a,auto b){return fields[a].wire_offset<fields[b].wire_offset;});
             auto* words=reinterpret_cast<uint64_t*>(packed);
-            words[0]=fields.size();words[1]=cell.wire_header_bytes;words[2]=offset;words[3]=gate_up_end;
+            words[0]=wire_fields.size();words[1]=cell.wire_header_bytes;words[2]=offset;words[3]=gate_up_end;
             int64_t payload_bytes=0;
             for(std::size_t i=0;i<fields.size();++i) {
-                words[4+i*3]=reinterpret_cast<uint64_t>(fields[i].destination);
-                words[5+i*3]=fields[i].wire_offset;words[6+i*3]=fields[i].bytes;payload_bytes+=fields[i].bytes;
+                payload_bytes+=fields[i].bytes;
                 (fields[i].projection==2?cache_->stats_.pipeline_down_dma_bytes:cache_->stats_.pipeline_gate_up_dma_bytes)+=fields[i].bytes;
+            }
+            for(std::size_t i=0;i<wire_fields.size();++i) {
+                const auto& field=fields[wire_fields[i]];
+                words[4+i*3]=reinterpret_cast<uint64_t>(field.destination);
+                words[5+i*3]=field.wire_offset;words[6+i*3]=field.bytes;
             }
             auto* wire=cell.wire.data_ptr<uint8_t>();
             const bool batched=mfq::cuda::runtime_options::dma_graph_batch();
@@ -1818,6 +1920,12 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             const auto descriptor_bytes=upload_transfer_views(cell,batched?&batches[0]:nullptr);
             int64_t copies=1+(descriptor_bytes>0),wire_bytes=cell.wire_header_bytes+descriptor_bytes;
             for(int phase=0;phase<2;++phase) {
+                for(const auto& copy:cache_copies[phase]) {
+                    if(batched)batches[phase].push_back(copy);
+                    else MFQ_CUDA_CHECK(cudaMemcpyAsync(copy.destination,copy.source,copy.bytes,
+                        cudaMemcpyHostToDevice,cache_->weight_stream_));
+                    ++copies;wire_bytes+=copy.bytes;
+                }
                 for(const auto& interval:intervals[phase]) {
                     if(batched)batches[phase].push_back({wire+interval.offset,interval.source,std::size_t(interval.bytes)});
                     else MFQ_CUDA_CHECK(cudaMemcpyAsync(wire+interval.offset,interval.source,
@@ -1826,8 +1934,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 }
                 if(staged_end[phase]>staged_begin[phase]) {
                     const auto bytes=staged_end[phase]-staged_begin[phase];
-                    if(batched)batches[phase].push_back({wire+staged_begin[phase],packed+staged_begin[phase],std::size_t(bytes)});
-                    else MFQ_CUDA_CHECK(cudaMemcpyAsync(wire+staged_begin[phase],packed+staged_begin[phase],
+                    if(batched)batches[phase].push_back({wire+staged_begin[phase],packed+staged_host_begin[phase],std::size_t(bytes)});
+                    else MFQ_CUDA_CHECK(cudaMemcpyAsync(wire+staged_begin[phase],packed+staged_host_begin[phase],
                         std::size_t(bytes),cudaMemcpyHostToDevice,cache_->weight_stream_));
                     ++copies;wire_bytes+=bytes;
                 }
@@ -1846,7 +1954,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             cache_->stats_.ram_pcie_bytes+=payload_bytes;
             cache_->stats_.pipeline_dma_copies+=copies;
             cache_->stats_.pipeline_direct_ram_bytes+=direct_bytes;
-            cache_->stats_.pipeline_direct_ram_copies+=intervals[0].size()+intervals[1].size();
+            cache_->stats_.pipeline_direct_ram_copies+=intervals[0].size()+intervals[1].size()+
+                cache_copies[0].size()+cache_copies[1].size();
             cache_->stats_.pipeline_staged_ram_bytes+=staged_bytes;
             if(cell.in_window) {
                 cache_->stats_.pipeline_window_dma_copies+=copies;cache_->stats_.pipeline_window_dma_bytes+=wire_bytes;
@@ -1883,9 +1992,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         const auto staged_start=staged.empty()?offset:(offset+15)&~int64_t(15);offset=staged_start;
         for(const auto i:staged) {
             offset=(offset+15)&~int64_t(15);auto& field=fields[i];
-            if(field.bytes>cell.wire.numel()-offset || field.bytes>cache_->pipeline_host_stage_.numel()-offset)
+            const auto host_offset=cell.wire_header_bytes+offset-staged_start;
+            if(field.bytes>cell.wire.numel()-offset || field.bytes>cache_->pipeline_host_stage_.numel()-host_offset)
                 throw std::logic_error("MFQ exchanged RAM field exceeds wire geometry");
-            std::memcpy(packed+offset,field.source.data_ptr(),static_cast<std::size_t>(field.bytes));
+            std::memcpy(packed+host_offset,field.source.data_ptr(),static_cast<std::size_t>(field.bytes));
             field.wire_offset=offset;offset+=field.bytes;staged_bytes+=field.bytes;
         }
         if(!staged.empty() && offset>cell.wire.numel())throw std::logic_error("MFQ staged RAM transfer exceeds wire geometry");
@@ -1906,7 +2016,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         }
         copy_transfer(cell,wire,packed,static_cast<std::size_t>(cell.wire_header_bytes));
         for(const auto& interval:intervals)copy_transfer(cell,wire+interval.offset,interval.source,static_cast<std::size_t>(interval.bytes));
-        if(!staged.empty())copy_transfer(cell,wire+staged_start,packed+staged_start,static_cast<std::size_t>(offset-staged_start));
+        if(!staged.empty())copy_transfer(cell,wire+staged_start,packed+cell.wire_header_bytes,static_cast<std::size_t>(offset-staged_start));
         const auto descriptor_bytes=upload_transfer_views(cell);
         const int64_t copies=1+intervals.size()+!staged.empty()+(descriptor_bytes>0);
         cache_->stats_.ram_pcie_bytes+=payload_bytes;
@@ -2531,6 +2641,7 @@ public:
         }
         if(window) {
             auto* captured=cell.get();
+            const bool independent=window->independent_sequences();
             std::shared_ptr<WindowRoutes> grouped;
             if(execution.continuous_batch_ffn_tiles>1) {
                 auto& group=window_routes_[window];
@@ -2546,7 +2657,7 @@ public:
                     }
                     std::memset(captured->flags.host,0,captured->flags.bytes);
                 },
-                [this,captured,grouped,final_tile] {
+                [this,captured,grouped,final_tile,independent] {
                     serve(*captured);
                     if(grouped) {
                         grouped->ids.insert(grouped->ids.end(),captured->host_ids.h<int32_t>(),
@@ -2556,10 +2667,10 @@ public:
                     if(final_tile && cache_->moe_residency_->prepare_during_window()) {
                         const std::vector<int32_t> routed(captured->host_ids.h<int32_t>(),captured->host_ids.h<int32_t>()+captured->entries);
                         cache_->moe_residency_->after_layer(sources_[0]->layer_id_,
-                            grouped?grouped->ids:routed,grouped?grouped->tokens:captured->tokens,true);
+                            grouped?grouped->ids:routed,grouped?grouped->tokens:captured->tokens,true,independent);
                     }
                 },
-                [this,captured,grouped,final_tile] {
+                [this,captured,grouped,final_tile,independent] {
                     observe_gpu(*captured);
                     if(!final_tile)return;
                     cache_->pipeline_dma_leases_.clear();
@@ -2568,7 +2679,7 @@ public:
                         cache_->record_compute_use();
                         const std::vector<int32_t> routed(captured->host_ids.h<int32_t>(),captured->host_ids.h<int32_t>()+captured->entries);
                         cache_->moe_residency_->after_layer(sources_[0]->layer_id_,
-                            grouped?grouped->ids:routed,grouped?grouped->tokens:captured->tokens);
+                            grouped?grouped->ids:routed,grouped?grouped->tokens:captured->tokens,false,independent);
                     }
                 },
                 [this,captured,final_tile] {

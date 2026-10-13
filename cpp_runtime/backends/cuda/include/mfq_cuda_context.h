@@ -24,6 +24,7 @@ public:
 
 void check(cudaError_t status, const char* expression, const char* file, int line);
 void check(cublasStatus_t status, const char* expression, const char* file, int line);
+void record_gpu_timestamp(uint64_t* timestamps, std::size_t index, cudaStream_t stream);
 
 #define MFQ_NATIVE_CUDA_CHECK(expression) \
     ::mfq::cuda::check((expression), #expression, __FILE__, __LINE__)

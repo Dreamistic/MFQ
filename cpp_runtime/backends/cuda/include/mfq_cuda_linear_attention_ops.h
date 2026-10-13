@@ -13,6 +13,11 @@ std::vector<mfq_tensor_backend::Tensor> gdn_cuda(mfq_tensor_backend::Tensor q, m
 std::vector<mfq_tensor_backend::Tensor> gdn_transposed_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
     mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, MfqOptional<mfq_tensor_backend::Tensor> state);
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_gate_short_cuda(
+    mfq_tensor_backend::Tensor state,mfq_tensor_backend::Tensor qkv,
+    mfq_tensor_backend::Tensor weight,mfq_tensor_backend::Tensor alpha,
+    mfq_tensor_backend::Tensor beta,mfq_tensor_backend::Tensor dt_bias,
+    mfq_tensor_backend::Tensor a_log,int64_t nk,int64_t nv,int64_t width,double eps);
 std::vector<mfq_tensor_backend::Tensor> gdn_inplace_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
                                              mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor state);
 std::vector<mfq_tensor_backend::Tensor> gdn_inplace_transposed_cuda(

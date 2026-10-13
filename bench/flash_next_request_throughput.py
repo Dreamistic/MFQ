@@ -31,9 +31,18 @@ async def main():
     environment["MFQ_TRACE_LAYER_TIMINGS"] = os.environ.get("MFQ_TRACE_LAYER_TIMINGS", "0")
     environment["MFQ_MOE_HOST_CACHE_BYTES"] = "42949672960"
     environment["MFQ_TRACE_NATIVE_CUDA_GRAPH"] = "1"
+    concurrency = int(os.environ.get("MFQ_BENCH_CONCURRENCY", "6"))
+    context = int(os.environ.get("MFQ_BENCH_CONTEXT", "4096"))
+    prefill_chunk = int(os.environ.get("MFQ_BENCH_PREFILL_CHUNK", "2048"))
+    assert 1 <= concurrency <= 32
+    assert context >= 16 and 16 <= prefill_chunk <= 16384
     command = [str(executable), "--model", model, "--tokenizer", str(tokenizers[0]),
-               "--transport", "stdio", "--ctx-size", "4096", "--continuous-batching", "32",
-               "--moe-gpu-cache-gb", "10.66", "--prefill-chunk-size", "2048"]
+               "--transport", "stdio", "--ctx-size", str(context), "--continuous-batching", str(concurrency),
+               "--moe-gpu-cache-gb", "10.66", "--prefill-chunk-size", str(prefill_chunk)]
+    (RESULTS / "worker-config.json").write_text(json.dumps({"command": command,
+        "environment": {key: value for key, value in environment.items()
+                        if key.startswith("MFQ_")},
+        "executable_mtime_ns": executable.stat().st_mtime_ns}, indent=2), encoding="utf-8")
     with (RESULTS / "worker.log").open("wb") as log:
         process = await asyncio.create_subprocess_exec(*command, cwd=ROOT, env=environment,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log)
@@ -42,6 +51,14 @@ async def main():
             status = await client.status()
             print(json.dumps({"ready": True, "pid": process.pid,
                               "free_bytes": status.get("device_free_bytes")}), flush=True)
+            if ready_name := os.environ.get("MFQ_BENCH_READY_FILE"):
+                ready_file=(ROOT / ready_name).resolve()
+                assert ready_file.is_relative_to(ROOT)
+                deadline=time.monotonic()+240
+                while not ready_file.exists():
+                    if time.monotonic()>deadline:
+                        raise TimeoutError("benchmark preparation did not finish")
+                    await asyncio.sleep(.2)
             reference = json.loads((ROOT / "workspace/local-server/prefill-restored-service-mtp-warm.json")
                                    .read_text(encoding="utf-8"))["content"]
             while line := await asyncio.to_thread(sys.stdin.readline):
@@ -49,7 +66,9 @@ async def main():
                 if case.get("stop"):
                     break
                 requests, tokens = case.get("requests", 1), case.get("tokens", 256)
-                assert 1 <= requests <= 32 and 1 <= tokens <= 2048
+                assert 1 <= requests <= concurrency and 1 <= tokens <= 2048
+                if "prompt" in case and case.get("mtp") and not case.get("reference_tag"):
+                    raise ValueError("custom-prompt MTP needs its serial reference_tag")
                 started = time.perf_counter()
                 before = await client.status()
                 log_start = (RESULTS / "worker.log").stat().st_size
@@ -57,7 +76,7 @@ async def main():
                 async def generate(row):
                     if row and (arrival_delay := case.get("arrival_delay_s", 0)):
                         await asyncio.sleep(arrival_delay)
-                    prompt = "请从一开始连续列出数字，用逗号分隔，至少列出1000个数字。"
+                    prompt = case.get("prompt", "请从一开始连续列出数字，用逗号分隔，至少列出1000个数字。")
                     if case.get("heterogeneous"):
                         prompt = f"本次请求编号{row}。" + "请按要求回答。" * (row % 7) + prompt
                     payload = {"messages": [{"role": "user", "content": prompt}],
@@ -68,13 +87,15 @@ async def main():
                         "mfq_prefix_cache_enabled": False}
                     if case.get("exclusive"):
                         payload["mfq_session_id"] = "throughput-exclusive"
-                    first, text, reasoning, usage = None, "", "", None
+                    first, text, reasoning, usage, generation_metrics = None, "", "", None, {}
                     async with client.generate(payload) as events:
                         async for event in events:
                             if event is None:
                                 continue
                             if event.get("usage"):
                                 usage = event["usage"]
+                            if event.get("mfq_metrics"):
+                                generation_metrics.update(event["mfq_metrics"])
                             for choice in event.get("choices", []):
                                 delta = choice.get("delta", {})
                                 chunk = delta.get("content", "")
@@ -84,6 +105,7 @@ async def main():
                                 text += chunk
                     finished = time.perf_counter()
                     return {"row": row, "text": text, "reasoning": reasoning, "usage": usage,
+                            "generation_metrics": generation_metrics,
                             "ttft_s": None if first is None else first - started,
                             "finish_s": finished - started,
                             "decode_s": None if first is None else finished - first}
@@ -107,22 +129,29 @@ async def main():
                         errors.append("early stop invalidates throughput measurement")
                     if not outputs or not all(out["text"] for out in outputs):
                         errors.append("no ordinary text output")
-                    if not case.get("heterogeneous"):
+                    output_differences = []
+                    if not case.get("heterogeneous") and "prompt" not in case:
                         if not all(out["text"][:len(reference)] == reference[:len(out["text"])]
                                    for out in outputs):
-                            errors.append("batch output differs from the verified serial response")
+                            output_differences.append("batch output differs from the verified serial response")
                     if reference_tag := case.get("reference_tag"):
                         expected = json.loads((RESULTS / f"{reference_tag}.json").read_text(encoding="utf-8"))["outputs"]
                         expected_rows = {out["row"]: out["text"] for out in expected}
                         if any(out["row"] not in expected_rows or out["text"] != expected_rows[out["row"]]
                                for out in outputs):
-                            errors.append("heterogeneous batch output differs from its serial oracle")
+                            output_differences.append("output differs from its serial reference")
+                    allow_output_difference = bool(case.get("mtp")) and os.environ.get(
+                        "MFQ_BENCH_ALLOW_MTP_OUTPUT_DIFFERENCE", "0") == "1"
+                    if not allow_output_difference:
+                        errors.extend(output_differences)
                     metric_delta = {key: value - before.get(key, 0) for key, value in after.items()
                                     if isinstance(value, (int, float)) and
-                                    key.startswith(("continuous_batching_", "moe_pipeline_", "moe_cache_"))}
+                                    (key.startswith(("continuous_batching_", "moe_pipeline_", "moe_cache_")) or
+                                     key == "ram_expert_pcie_read_bytes")}
                     result = {"case": case, "seconds": seconds, "tokens": completion_tokens,
                               "total_tps": completion_tokens / seconds if not errors else None,
-                              "errors": errors, "metrics": metric_delta,
+                              "errors": errors, "output_differences": output_differences,
+                              "mtp_output_difference_allowed": allow_output_difference, "metrics": metric_delta,
                               "status": after, "outputs": outputs, "windows": windows}
                     replay_ns = sum(window.get("replay_ns", 0) for window in windows)
                     decode_tokens = metric_delta.get("continuous_batching_decode_tokens", 0)

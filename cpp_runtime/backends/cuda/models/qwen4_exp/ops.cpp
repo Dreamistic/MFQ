@@ -29,6 +29,45 @@
 #include <cstdio>
 #include <chrono>
 
+namespace mfq::cuda {
+static mfq_tensor_backend::Tensor join_request_outputs(
+        const std::vector<mfq_tensor_backend::Tensor>& outputs,int64_t axis) {
+    const auto* option=std::getenv("MFQ_SINGLE_OUTPUT_VIEW");
+    if(outputs.size()==1 && outputs.front().is_contiguous() && (!option || option[0]!='0'))
+        return outputs.front();
+    return mfq_tensor_backend::cat(outputs,axis);
+}
+static mfq_tensor_backend::Tensor append_decode_positions(
+        const mfq_tensor_backend::Tensor& previous,const mfq_tensor_backend::Tensor& current,
+        mfq_tensor_backend::Tensor& storage,int64_t maximum,
+        const char* option_name="MFQ_QWEN4_POSITION_BUFFER") {
+    namespace tb=mfq_tensor_backend;
+    if(const auto* option=std::getenv(option_name))if(option[0]=='0')
+        return previous.defined()?tb::cat({previous,current},-1):current.clone();
+    MFQ_RUNTIME_CHECK(current.dim()>=1 && (!previous.defined() || (previous.dim()==current.dim() &&
+        previous.scalar_type()==current.scalar_type() && previous.device()==current.device())),
+        "invalid decode position history");
+    const int64_t count=previous.defined()?previous.size(-1):0,required=count+current.size(-1);
+    MFQ_RUNTIME_CHECK(required<=maximum,"decode position history exceeds context");
+    for(int axis=0;previous.defined() && axis+1<current.dim();++axis)
+        MFQ_RUNTIME_CHECK(previous.size(axis)==current.size(axis),"decode position history axes changed");
+    // Rollback retains a prefix view; restored histories receive a new arena.
+    // The same last-axis append serves 1D target and 3D MTP rotary positions.
+    const bool owns_prefix=storage.defined() && previous.defined() &&
+        previous.data_ptr()==storage.data_ptr();
+    if(!owns_prefix || storage.size(-1)<required) {
+        int64_t capacity=owns_prefix?storage.size(-1):std::min<int64_t>(256,maximum);
+        while(capacity<required)capacity=capacity>maximum/2?maximum:capacity*2;
+        auto shape=current.sizes().vec();shape.back()=capacity;
+        auto expanded=tb::empty(shape,current.options());
+        if(count)expanded.narrow(-1,0,count).copy_(previous);
+        storage=std::move(expanded);
+    }
+    storage.narrow(-1,count,current.size(-1)).copy_(current);
+    return storage.narrow(-1,0,required);
+}
+}
+
 namespace mfq::cuda::qwen4_exp {
 using Config = mfq::models::qwen4_exp::Config;
 
@@ -110,7 +149,7 @@ struct Gr {
         const auto& projection=*injection.weight;
         return gated_residual_two_stage_cuda(branch,residual,prior,norm,down.weight->nint,up.weight->nint,
             projection.is_nint()?&projection.nint:nullptr,streams,eps,after,
-            projection.is_dense()?projection.dense:Tensor{},injection.prepared_right,marker);
+            projection.is_dense()?projection.dense:Tensor{},injection.prepared_right,marker,up.up_group_coefficients);
     }
     std::vector<Tensor> pre(CudaExecutionContext &execution, const Tensor &x,
         const GatedResidualMarker& marker={}) const {
@@ -231,6 +270,18 @@ static LinearGroup qwen_gdn_preserve_projection_rows(LinearGroup project) {
             MFQ_RUNTIME_CHECK(part.size()==output.size(),"GDN projection count changed across chunks");
             for(size_t i=0;i<part.size();++i)output[i].narrow(1,begin,count).copy_(part[i]);
         }
+        return output;
+    };
+}
+
+template<class Projection>
+static Projection qwen_gdn_profile_projection(Projection project,const char* begin,const char* end) {
+    if(!project)return {};
+    return [project,begin,end](CudaExecutionContext& execution,const Tensor& input) {
+        auto* window=mfq::cuda::DecodeWindow::recording();
+        if(window)window->mark_current(begin);
+        auto output=project(execution,input);
+        if(window)window->mark_current(end);
         return output;
     };
 }
@@ -392,9 +443,12 @@ struct BlockLoader : weight_loader::Loader {
             ? std::vector<Linear>{weights.qkv} : weights.split_qkv;
         const bool independent = !weights.split_qkv.empty();
         projections.insert(projections.end(), {weights.gate,weights.alpha,weights.beta});
-        auto group = weight_loader::grouped_linear(execution,projections);
+        const auto* packed_qkv_option=std::getenv("MFQ_GDN_PACKED_QKV");
+        const bool packed_qkv=independent && (!packed_qkv_option || packed_qkv_option[0]!='0');
+        auto group = weight_loader::grouped_linear(execution,projections,packed_qkv?3:1);
         if (independent) {
-            if (group)
+            if(group && packed_qkv)weights.input_projection=std::move(group);
+            else if (group)
                 weights.input_projection = [group](CudaExecutionContext &e, const Tensor &x) {
                     auto p = group(e,x);
                     return std::vector<Tensor>{tb::cat({p[0],p[1],p[2]},-1),p[3],p[4],p[5]};
@@ -415,6 +469,10 @@ struct BlockLoader : weight_loader::Loader {
         weights.alpha=qwen_gdn_preserve_projection_rows(std::move(weights.alpha));
         weights.beta=qwen_gdn_preserve_projection_rows(std::move(weights.beta));
         weights.output=qwen_gdn_preserve_projection_rows(std::move(weights.output));
+        weights.input_projection=qwen_gdn_profile_projection(std::move(weights.input_projection),
+            "gdn_input_begin","gdn_input_end");
+        weights.output=qwen_gdn_profile_projection(std::move(weights.output),
+            "gdn_output_begin","gdn_output_end");
         return std::make_unique<Gdn>(std::move(weights), c.key_heads, c.value_heads, c.linear_width,
                                      c.kernel, c.eps, c.silu_gate,true,execution.config.gdn_transposed_state,
                                      execution.config.gdn_fused_output,true,execution.config.gdn_fused_preparation,
@@ -505,8 +563,10 @@ struct Qwen4Block final : Block {
     std::unique_ptr<Qsa> qsa;
     std::unique_ptr<Ple> ple;
     Tensor batch_ffn(CudaExecutionContext& execution,const Tensor& input) {
-        constexpr int64_t rows=8;
-        if(input.size(0)<=rows)return ffn(execution,input);
+        if(input.size(0)<=8)return ffn(execution,input);
+        const auto* option=std::getenv("MFQ_CONTINUOUS_FFN_TILE");
+        const int64_t rows=option?std::atoll(option):8;
+        MFQ_RUNTIME_CHECK(rows==8 || rows==16,"continuous FFN tile must be 8 or 16 rows");
         auto* window=DecodeWindow::recording();
         const int previous_profile_tile=window ? window->set_profile_tile(-1) : -1;
         struct TileScope {
@@ -610,7 +670,9 @@ struct Qwen4Block final : Block {
     }
     Tensor execute_graph(CudaExecutionContext& execution,Tensor x,const Tensor& ids,
                          const Tensor& positions,const Tensor& cache_positions,const Tensor& ple_rows,int layer,
-                         int64_t confirmed=0,RecurrentGraphCheckpoint* checkpoint=nullptr) {
+                         int64_t confirmed=0,RecurrentGraphCheckpoint* checkpoint=nullptr,
+                         const std::vector<Tensor>& prior_mix={},std::vector<Tensor>* deferred_mix=nullptr) {
+        if(auto* window=DecodeWindow::recording())window->set_profile_layer_kind(layer,gdn?"gdn":"qsa");
         const auto mark=[&](const char* phase){if(auto* window=DecodeWindow::recording())window->mark(layer,phase);};
         const bool detailed=mfq::cuda::runtime_options::mhc_timings();
         const auto marker=[&](const char* role)->GatedResidualMarker {
@@ -624,7 +686,10 @@ struct Qwen4Block final : Block {
                 ? ple->forward_graph(execution,hidden,ids,ple_rows,confirmed,checkpoint->ple_conv)
                 : ple->forward_chunk(execution,hidden,ids,true,{},ple_rows);},
             [](Tensor hidden,Tensor positional){return hidden+positional;},
-            [&](const Tensor& hidden){auto result=attention_gr.pre(execution,hidden,marker("attention_mhc_"));mark("attention_core_begin");return result;},
+            [&](const Tensor& hidden){auto result=prior_mix.empty()?
+                attention_gr.pre(execution,hidden,marker("attention_mhc_")):
+                attention_gr.pre_after(execution,hidden,prior_mix,marker("attention_mhc_"));
+                mark("attention_core_begin");return result;},
             [&](Tensor branch){auto result=confirmed
                 ? gdn->forward_graph(execution,branch,confirmed,checkpoint->gdn_conv,checkpoint->gdn_state)
                 : gdn->forward_chunk(execution,branch,true);mark("attention_core_end");return result;},
@@ -648,7 +713,9 @@ struct Qwen4Block final : Block {
                 if(prediction.identity)DecodeWindow::recording()->enroll(std::move(prediction));
                 return result;
             },
-            [&](Tensor branch,const auto& mix){return ffn_gr.post(branch,mix);});
+            [&](Tensor branch,const auto& mix){
+                if(deferred_mix){*deferred_mix=mix;return branch;}
+                return ffn_gr.post(branch,mix);});
     }
 };
 
@@ -664,10 +731,14 @@ struct Qwen4MtpGraph {
             :ids(tb::empty_like(token_ids)),hidden(tb::empty_like(source)),
              positions(tb::empty({3,1,source.size(1)},token_ids.options().dtype(tb::kInt32))),
              cache_positions(tb::empty({source.size(1)},token_ids.options().dtype(tb::kInt64))),
-             greedy_host(tb::empty({1},token_ids.options().device(tb::kCPU).dtype(tb::kInt64).pinned_memory(true))),window(stream) {}
+             greedy_host(tb::empty({1},token_ids.options().device(tb::kCPU).dtype(tb::kInt64).pinned_memory(true))),
+             window(stream,mfq::cuda::runtime_options::layer_timings()) {
+            window.set_profile_geometry("mtp_predictor",static_cast<int>(source.size(1)));
+        }
     };
     MfqCudaStream stream=mfq_get_current_cuda_stream();
     std::map<std::pair<int,int>,std::unique_ptr<Cell>> cells;
+    Tensor position_storage;
     int64_t capacity=0;
     bool failed=false;
     void restore_legacy(Qwen4ExpMtp& predictor) {
@@ -694,21 +765,25 @@ struct Qwen4MtpGraph {
                 predictor.graph_initialized=true;
                 block.qsa->prepare_graph(predictor.positions[0],capacity);
                 cell.window.capture([&] {
+                    cell.window.mark(-1,"window_begin");
                     auto embeddings=target.embed(cell.ids);
                     auto e=predictor.embedding_fusion(execution,rms_norm(embeddings,predictor.embedding_norm+1,predictor.config.eps));
                     auto h=predictor.hidden_fusion(execution,rms_norm(cell.hidden,predictor.hidden_norm+1,predictor.config.eps)
                         .reshape({1,tokens,predictor.config.streams,predictor.config.hidden}));
                     auto input=(h+e.unsqueeze(-2)).reshape({1,tokens,predictor.config.streams*predictor.config.hidden});
                     cell.multi=block.execute_graph(execution,std::move(input),cell.ids,cell.positions,cell.cache_positions,{},0);
+                    cell.window.mark(-1,"head_begin");
                     cell.normalized=predictor.final_mixer->pre(execution,cell.multi)[0];
                     cell.logits=target.logits(cell.normalized.narrow(1,tokens-1,1).contiguous());
                     auto greedy=sample_greedy_cuda(cell.logits.reshape({1,-1}).contiguous());
                     MFQ_CUDA_CHECK(cudaMemcpyAsync(cell.greedy_host.data_ptr(),greedy.data_ptr(),sizeof(int64_t),
                         cudaMemcpyDeviceToHost,stream.stream()));
+                    cell.window.mark(-1,"window_end");
                 },[]{},[&]{cell.multi={};cell.normalized={};cell.logits={};});
             }
             cell.window.run();++predictor.graph_replays;block.qsa->advance_graph(tokens);
-            predictor.positions[0]=tb::cat({predictor.positions[0],cell.positions},-1);
+            predictor.positions[0]=append_decode_positions(predictor.positions[0],cell.positions,
+                position_storage,predictor.config.maximum,"MFQ_MTP_POSITION_BUFFER");
             predictor.lengths[0]=required;predictor.batch=1;
             return {cell.normalized.clone(),cell.multi.clone(),cell.logits.clone(),
                 static_cast<int32_t>(*cell.greedy_host.data_ptr<int64_t>())};
@@ -980,6 +1055,7 @@ struct Qwen4DecodeGraph {
     MfqCudaStream stream,ple_stream;
     std::map<std::tuple<int,int,int>,std::unique_ptr<Cell>> cells;
     std::vector<qwen4_exp::Qsa*> qsa;
+    mfq_tensor_backend::Tensor position_storage;
     int64_t kv_capacity=0;
     bool failed=false;
     explicit Qwen4DecodeGraph(Qwen4CausalLm& model):stream(mfq_get_current_cuda_stream()),ple_stream(mfq_get_stream_from_pool()) {
@@ -1022,6 +1098,7 @@ struct Qwen4DecodeGraph {
         }
         auto& owner=cells[{tokens,kind,confirmed}];
         if(!owner)owner=std::make_unique<Cell>(tokens,model.config.hidden,model.blocks,stream.stream(),confirmed);
+        owner->window.set_profile_geometry(raw_hidden?"mtp_target":"target_decode",tokens);
         auto& cell=*owner;
         if(initialized)*initialized=!cell.window.valid();
         if(host_ids.defined()) {
@@ -1055,6 +1132,9 @@ struct Qwen4DecodeGraph {
                     cell.window.mark(-1,"window_begin");
                     auto hidden=model.adapter_prepare_hidden(model.embed_tokens(cell.ids),1,tokens);
                     std::size_t ple_index=0;int layer=0;
+                    std::vector<tb::Tensor> prior_mix;
+                    const auto* chain_setting=std::getenv("MFQ_GR_CHAIN_FFN_POST");
+                    const bool chain_post=(!chain_setting || chain_setting[0]=='1') && tokens<=8;
                     for(const auto& block:model.blocks) {
                         cell.window.mark(layer,"block_begin");
                         auto& b=static_cast<qwen4_exp::Qwen4Block&>(*block);tb::Tensor rows;
@@ -1089,8 +1169,17 @@ struct Qwen4DecodeGraph {
                             cell.window.mark(layer,"ple_end");
                         }
                         cell.window.mark(layer,"attention_begin");
+                        std::vector<tb::Tensor> next_mix;
+                        bool defer=false;
+                        if(chain_post && size_t(layer+1)<model.blocks.size()) {
+                            auto& next=static_cast<qwen4_exp::Qwen4Block&>(*model.blocks[layer+1]);
+                            defer=!next.ple && next.attention_gr.can_fuse(*model.execution,
+                                prior_mix.empty()?hidden:prior_mix[1]);
+                        }
                         hidden=b.execute_graph(*model.execution,std::move(hidden),cell.ids,cell.positions,
-                            cell.cache_positions,rows,layer,confirmed,confirmed?&cell.checkpoints[layer]:nullptr);
+                            cell.cache_positions,rows,layer,confirmed,confirmed?&cell.checkpoints[layer]:nullptr,
+                            prior_mix,defer?&next_mix:nullptr);
+                        prior_mix=std::move(next_mix);
                         cell.window.mark(layer++,"block_end");
                     }
                     if(kind>=3)cell.raw_hidden=hidden.clone();
@@ -1130,7 +1219,8 @@ struct Qwen4DecodeGraph {
                 auto& b=static_cast<qwen4_exp::Qwen4Block&>(*block);if(b.qsa)b.qsa->advance_graph(tokens);
             }
             model.cache_pos+=tokens;
-            model.positions=tb::cat({model.positions,cell.positions},-1);model.batch=1;
+            model.positions=append_decode_positions(model.positions,cell.positions,position_storage,
+                model.max_position_embeddings());model.batch=1;
             // MTP can retain history until a later probe. Each step must own its
             // raw residual rather than alias the next replay's capture buffer.
             if(raw_hidden)*raw_hidden=cell.raw_hidden.clone();
@@ -1253,6 +1343,7 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
     };
     for(const auto& block:model.blocks)block_cache(static_cast<const qwen4_exp::Qwen4Block&>(*block));
     add(model.positions);
+    if(model.graph_registry)add(model.graph_registry->position_storage);
     if(model.graph_registry)for(const auto& [key,cell]:model.graph_registry->cells)
         for(const auto& checkpoint:cell->checkpoints) {
             add(checkpoint.gdn_conv);add(checkpoint.gdn_state);add(checkpoint.ple_conv);
@@ -1260,6 +1351,7 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
     if(const auto* predictor=dynamic_cast<const qwen4_exp::Qwen4ExpMtp*>(mtp)) {
         for(const auto& block:predictor->layers)block_cache(*block);
         for(const auto& positions:predictor->positions)add(positions);
+        if(predictor->graph_registry)add(predictor->graph_registry->position_storage);
     }
     std::size_t bytes=0;
     for(const auto& [address,size]:allocations)bytes+=size;
@@ -1283,6 +1375,7 @@ struct Qwen4BatchRequestState::Impl {
     };
     std::vector<Layer> layers;
     mfq_tensor_backend::Tensor positions;
+    mfq_tensor_backend::Tensor position_storage;
     int64_t cache_position = 0, batch = 1;
     void swap(Qwen4CausalLm& model) {
         for (std::size_t i = 0; i < layers.size(); ++i) {
@@ -1339,6 +1432,7 @@ std::size_t Qwen4BatchRequestState::resident_bytes() const {
         bytes = std::max(bytes, std::size_t(tensor.numel()) * tensor.element_size());
     };
     add(state_->positions);
+    add(state_->position_storage);
     for (const auto& layer : state_->layers) {
         if (layer.qsa) for (const auto& tensor : layer.qsa->resident_cache_tensors()) add(tensor);
         if (layer.gdn) for (const auto* tensor : layer.gdn->graph_state()) add(*tensor);
@@ -1484,7 +1578,8 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
             default_context(mfq_current_cuda_device())->end_graph_warmup(mfq_current_cuda_stream());
         }
         graph.window = std::make_unique<DecodeWindow>(
-            mfq_current_cuda_stream(),mfq::cuda::runtime_options::layer_timings());
+            mfq_current_cuda_stream(),mfq::cuda::runtime_options::layer_timings(),true);
+        graph.window->set_profile_geometry("batch_decode",static_cast<int>(batch));
     }
     graph.ids.copy_(ids);
     std::vector<std::pair<qwen4_exp::Ple*,qwen4_exp::NgramEmbedding::Context>> ple_contexts;
@@ -1516,9 +1611,19 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
             auto& execution = *model.execution;
             graph.window->mark(-1,"window_begin");
             auto hidden = model.adapter_prepare_hidden(model.embed_tokens(graph.ids),batch,1);
+            std::vector<tb::Tensor> prior_mix;
+            const auto* chain_setting=std::getenv("MFQ_GR_CHAIN_FFN_POST");
+            const bool chain_post=(!chain_setting || chain_setting[0]=='1') && batch<=8;
             for (std::size_t i = 0; i < model.blocks.size(); ++i) {
                 graph.window->mark(static_cast<int>(i),"block_begin");
                 auto& block = static_cast<qwen4_exp::Qwen4Block&>(*model.blocks[i]);
+                graph.window->set_profile_layer_kind(static_cast<int>(i),block.gdn?"gdn":"qsa");
+                const auto marker=[&](const char* role)->GatedResidualMarker {
+                    if(!runtime_options::mhc_timings())return {};
+                    return [&,role](const char* phase) {
+                        graph.window->mark(static_cast<int>(i),(std::string(role)+phase).c_str());
+                    };
+                };
                 if (block.ple) {
                     graph.window->mark(static_cast<int>(i),"ple_begin");
                     std::vector<tb::Tensor> positional;
@@ -1529,10 +1634,11 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
                         positional.push_back(x + requests[row]->state_->layers[i].ple->forward_chunk(
                             execution,x,graph.ids.narrow(0,row,1),true,{},rows));
                     }
-                    hidden = tb::cat(positional,0);
+                    hidden = join_request_outputs(positional,0);
                     graph.window->mark(static_cast<int>(i),"ple_end");
                 }
-                auto mix = block.attention_gr.pre(execution,hidden);
+                auto mix = prior_mix.empty()?block.attention_gr.pre(execution,hidden,marker("attention_mhc_")):
+                    block.attention_gr.pre_after(execution,hidden,prior_mix,marker("attention_mhc_"));
                 graph.window->mark(static_cast<int>(i),"attention_core_begin");
                 const bool project_batch=batch>1 && runtime_options::batch_attention_projections();
                 const auto projections=project_batch ? (block.gdn ? block.gdn->project_inputs(execution,mix[0])
@@ -1550,13 +1656,20 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
                         : layer.qsa->forward_graph(execution,branch,graph.positions[row],graph.cache_positions[row],
                             std::move(projected),!project_batch));
                 }
-                if(!attention.defined())attention=tb::cat(attended,0);
+                if(!attention.defined())attention=join_request_outputs(attended,0);
                 if(project_batch)attention=block.gdn ? block.gdn->project_output(execution,attention)
                     : block.qsa->project_output(execution,attention);
                 graph.window->mark(static_cast<int>(i),"attention_core_end");
-                auto ffn_mix = block.ffn_gr.pre_after(execution,std::move(attention),mix);
+                auto ffn_mix = block.ffn_gr.pre_after(execution,std::move(attention),mix,marker("ffn_mhc_"));
                 graph.window->mark(static_cast<int>(i),"ffn_pre_end");
-                hidden = block.ffn_gr.post(block.batch_ffn(execution,ffn_mix[0]),ffn_mix);
+                auto branch=block.batch_ffn(execution,ffn_mix[0]);
+                bool defer=false;
+                if(chain_post && i+1<model.blocks.size()) {
+                    auto& next=static_cast<qwen4_exp::Qwen4Block&>(*model.blocks[i+1]);
+                    defer=!next.ple && next.attention_gr.can_fuse(execution,ffn_mix[1]);
+                }
+                if(defer){hidden=std::move(branch);prior_mix=std::move(ffn_mix);}
+                else {hidden=block.ffn_gr.post(branch,ffn_mix);prior_mix.clear();}
                 graph.window->mark(static_cast<int>(i),"block_end");
             }
             auto finalized=model.finalize_hidden(std::move(hidden),batch,1);
@@ -1568,10 +1681,12 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
         catch(const Error& error) {
             const std::string message=error.what();
             if(!message.starts_with("CUDA process VRAM limit exceeded:") &&
-               !message.starts_with("CUDA VRAM limit exceeded:"))throw;
+               !message.starts_with("CUDA VRAM limit exceeded:") &&
+               !message.starts_with("CUDA pinned allocation failed:"))throw;
             // Capture has not accepted a token. Retire its consumers before
             // restoring state, then let admission reject only the newest row.
             graph.clear();
+            (void)cudaGetLastError();
             for(const auto& saved:recurrent)saved.tensor->copy_(saved.snapshot);
             for(auto& [layer,context]:ple_contexts)layer->restore_graph_context(std::move(context));
             throw;
@@ -1580,11 +1695,11 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
     }
     graph.window->run();
     ++graph.replays;
-    for (auto* request : requests) {
-        auto& state = *request->state_;
+    for (std::size_t row=0;row<requests.size();++row) {
+        auto& state = *requests[row]->state_;
         for (auto& layer : state.layers) if (layer.qsa) layer.qsa->advance_graph(1);
-        auto current = tb::full({1},state.cache_position,ids.options());
-        state.positions = state.positions.defined() ? tb::cat({state.positions,current},-1) : current;
+        state.positions=append_decode_positions(state.positions,graph.cache_positions[row],
+            state.position_storage,model.max_position_embeddings());
         ++state.cache_position;
     }
     return graph.logits;
@@ -1623,7 +1738,7 @@ std::vector<mfq_tensor_backend::Tensor> qwen4_batch_prefill(Qwen4CausalLm& model
                 positional.push_back(x+requests[row]->state_->layers[i].ple->forward(
                     execution,x,chunks[row],true,0,host_ids.narrow(1,offsets[row],chunks[row].size(1))));
             }
-            hidden=tb::cat(positional,1);
+            hidden=join_request_outputs(positional,1);
         }
         auto mix=block.attention_gr.pre(execution,hidden);
         const auto projections=block.gdn?block.gdn->project_inputs(execution,mix[0])
@@ -1638,7 +1753,7 @@ std::vector<mfq_tensor_backend::Tensor> qwen4_batch_prefill(Qwen4CausalLm& model
             attended.push_back(layer.gdn?layer.gdn->forward_chunk(execution,branch,true,std::move(projected),false)
                 :layer.qsa->forward(execution,branch,current[row],full[row],true,nullptr,std::move(projected),false));
         }
-        auto attention=tb::cat(attended,1);
+        auto attention=join_request_outputs(attended,1);
         attention=block.gdn?block.gdn->project_output(execution,attention):block.qsa->project_output(execution,attention);
         auto ffn_mix=block.ffn_gr.pre_after(execution,std::move(attention),mix);
         // All prompt tokens share each expert transfer and compressed decode.
@@ -1685,7 +1800,7 @@ mfq_tensor_backend::Tensor qwen4_batch_decode(Qwen4CausalLm& model,
                 positional.push_back(x + layer.ple->forward(execution,x,ids.narrow(0,row,1),true,0,
                                                            host_ids.narrow(0,row,1)));
             }
-            hidden = tb::cat(positional,0);
+            hidden = join_request_outputs(positional,0);
         }
         auto mix = block.attention_gr.pre(execution,hidden);
         const bool project_batch=batch>1 && block.gdn && runtime_options::batch_attention_projections();
@@ -1699,7 +1814,7 @@ mfq_tensor_backend::Tensor qwen4_batch_decode(Qwen4CausalLm& model,
             attended.push_back(layer.gdn ? layer.gdn->forward_chunk(execution,branch,true,std::move(projected),!project_batch)
                 : layer.qsa->forward(execution,branch,current[row],full[row],true));
         }
-        auto attention=tb::cat(attended,0);
+        auto attention=join_request_outputs(attended,0);
         if(project_batch)attention=block.gdn->project_output(execution,attention);
         auto ffn_mix = block.ffn_gr.pre_after(execution,std::move(attention),mix);
         // Tiles share the expert transfer cache across all eligible rows.
@@ -2040,7 +2155,12 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
 mfq_tensor_backend::Tensor Qwen4Model::adapter_finalize_hidden(mfq_tensor_backend::Tensor hidden,
                                                                const mfq_tensor_backend::Tensor &,
                                                                int64_t, int64_t) const {
-    return final_mixer->pre(*execution, hidden)[0];
+    auto* window=DecodeWindow::recording();
+    GatedResidualMarker marker;
+    if(window && runtime_options::mhc_timings())marker=[window](const char* phase) {
+        window->mark(-1,(std::string("final_mhc_")+phase).c_str());
+    };
+    return final_mixer->pre(*execution, hidden,marker)[0];
 }
 
 mfq_tensor_backend::Tensor
@@ -2051,8 +2171,13 @@ Qwen4Model::adapter_last_logits(const QuantLinear &lm_head,
 
 mfq_tensor_backend::Tensor Qwen4Model::adapter_next_token(const QuantLinear &lm_head,
                                                           mfq_tensor_backend::Tensor hidden) const {
-    return mfq_tensor_backend::argmax(adapter_logits(lm_head, std::move(hidden)), -1)
-        .to(mfq_tensor_backend::kInt64);
+    auto* window=DecodeWindow::recording();
+    if(window)window->mark(-1,"lm_head_begin");
+    auto logits=adapter_logits(lm_head,std::move(hidden));
+    if(window)window->mark(-1,"lm_head_projection_end");
+    auto output=mfq_tensor_backend::argmax(logits,-1).to(mfq_tensor_backend::kInt64);
+    if(window)window->mark(-1,"lm_head_sample_end");
+    return output;
 }
 
 void Qwen4Model::adapter_rollback_speculative(int64_t keep) {

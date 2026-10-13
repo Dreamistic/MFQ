@@ -24,6 +24,17 @@
 #endif
 
 namespace mfq::cuda {
+namespace {
+__global__ void record_gpu_timestamp_kernel(uint64_t* timestamps, std::size_t index) {
+    unsigned long long nanoseconds;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(nanoseconds));
+    timestamps[index]=nanoseconds;
+}
+}
+void record_gpu_timestamp(uint64_t* timestamps, std::size_t index, cudaStream_t stream) {
+    record_gpu_timestamp_kernel<<<1,1,0,stream>>>(timestamps,index);
+    MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+}
 namespace { thread_local bool resident_allocations=false; }
 ResidentAllocationScope::ResidentAllocationScope(bool enabled) noexcept
     :previous_(resident_allocations) {resident_allocations=enabled;}
@@ -1048,7 +1059,12 @@ HostBuffer::HostBuffer(std::size_t bytes, bool mapped) : bytes_(bytes) {
         return;
     }
     const auto flags = mapped ? cudaHostAllocMapped : cudaHostAllocDefault;
-    MFQ_NATIVE_CUDA_CHECK(cudaHostAlloc(&data_, bytes_, flags));
+    const auto allocation=cudaHostAlloc(&data_,bytes_,flags);
+    if(allocation==cudaErrorMemoryAllocation) {
+        (void)cudaGetLastError();
+        throw Error("CUDA pinned allocation failed: requested="+std::to_string(bytes_));
+    }
+    MFQ_NATIVE_CUDA_CHECK(allocation);
 }
 
 HostBuffer::~HostBuffer() noexcept {

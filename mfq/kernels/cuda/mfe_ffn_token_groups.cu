@@ -143,7 +143,7 @@ __device__ __forceinline__ void nvq_token_dot(const MfePackedProjection& d,int l
     }
 }
 
-template<int GroupSize,int Capacity>
+template<int GroupSize,int Capacity,int Rows=2>
 __device__ __forceinline__ void nint_token_pair(const MfePackedProjection& d,int local,int first,
         const int8_t* const* inputs,const float* const* scales,int count,__half result[Capacity][4],int destination) {
     constexpr int chunks=GroupSize/4;
@@ -155,17 +155,17 @@ __device__ __forceinline__ void nint_token_pair(const MfePackedProjection& d,int
     const auto* submin=static_cast<const uint8_t*>(d.fields[4]);
     const auto* outer_scale=static_cast<const float*>(d.fields[5]);
     const auto* outer_min=static_cast<const float*>(d.fields[6]);
-    float partial[Capacity][2]{};
-    int widths[2]{};uint64_t starts[2]{};float factors[2]{},minima[2]{};
+    float partial[Capacity][Rows]{};
+    int widths[Rows]{};uint64_t starts[Rows]{};float factors[Rows]{},minima[Rows]{};
 #pragma unroll
-    for(int r=0;r<2;++r)if(first+r<d.output_rows) {
+    for(int r=0;r<Rows;++r)if(first+r<d.output_rows) {
         const int neuron=local*d.output_rows+first+r;
         widths[r]=bits[neuron];starts[r]=uint64_t(offsets[neuron]);
         factors[r]=outer_scale[neuron];minima[r]=outer_min[neuron];
     }
     for(int group=lane;group<d.groups;group+=32) {
 #pragma unroll
-        for(int r=0;r<2;++r)if(first+r<d.output_rows) {
+        for(int r=0;r<Rows;++r)if(first+r<d.output_rows) {
             int weight[chunks];
 #pragma unroll
             for(int chunk=0;chunk<chunks;chunk+=2) {
@@ -199,12 +199,25 @@ __device__ __forceinline__ void nint_token_pair(const MfePackedProjection& d,int
 #pragma unroll
     for(int k=0;k<Capacity;++k)if(k<count) {
 #pragma unroll
-        for(int r=0;r<2;++r) {
+        for(int r=0;r<Rows;++r) {
 #pragma unroll
             for(int offset=16;offset>0;offset>>=1)partial[k][r]+=__shfl_xor_sync(0xffffffffu,partial[k][r],offset);
             result[k][destination+r]=__float2half(partial[k][r]);
         }
     }
+}
+
+template<int Capacity>
+__device__ __forceinline__ void shared_nint_project(const MfePackedProjection& d,int first,
+        const int8_t* const* inputs,const float* const* scales,int count,
+        __half result[Capacity][4],bool multi_sum) {
+    if(!d.dense_reduction_warps && !d.nint_late_bits && !multi_sum) {
+        if(d.group_size==24){nint_token_pair<24,Capacity,1>(d,0,first,inputs,scales,count,result,0);return;}
+        if(d.group_size==28){nint_token_pair<28,Capacity,1>(d,0,first,inputs,scales,count,result,0);return;}
+        if(d.group_size==32){nint_token_pair<32,Capacity,1>(d,0,first,inputs,scales,count,result,0);return;}
+    }
+    for(int k=0;k<count;++k)
+        project_pair<true,0>(&d,0,first,inputs[k],scales[k],result[k],multi_sum);
 }
 
 template<int Capacity,int Rows>
@@ -254,6 +267,42 @@ __device__ __forceinline__ bool accepts_count(int count) {
     return count>Capacity/2 && count<=Capacity;
 }
 
+__global__ void __launch_bounds__(64) token_shared_plan(MfeFfnBatch b,int capacity) {
+    const int lane=threadIdx.x,entries=b.tokens*b.routes;
+    if(b.token_group_buckets && lane<4)b.token_group_buckets[lane*(b.token_groups+1)]=0;
+    for(int group=entries+lane;group<b.token_groups;group+=64) {
+        const int first=(group-entries)*capacity;
+        const int count=max(0,min(capacity,b.tokens-first));
+        b.token_group_counts[group]=count;
+        for(int k=0;k<count;++k)b.token_group_slots[group*8+k]=
+            (first+k)*(b.routes+1)+b.routes;
+    }
+    __syncthreads();
+    if(!b.token_group_buckets)return;
+    for(int group=lane;group<b.token_groups;group+=64) {
+        const int count=b.token_group_counts[group];
+        if(!count)continue;
+        const int bucket=count==1?0:count<=2?1:count<=4?2:3;
+        auto* plan=b.token_group_buckets+bucket*(b.token_groups+1);
+        const int index=atomicAdd(plan,1);plan[index+1]=group;
+    }
+}
+
+template<int Capacity>
+int token_launch_bound(const MfeFfnBatch& b) {
+    if(b.token_group_capacity<=kMfeSharedGroupEncoding || !b.token_group_buckets)
+        return mfe_token_group_bound(b,Capacity);
+    // Larger routed groups cannot exist in this plan. Bound their grids by
+    // the shared groups instead of the total number of routed token slots.
+    int groups=Capacity<=2?b.tokens*b.routes/Capacity:0;
+    const int shared_capacity=b.token_group_capacity-kMfeSharedGroupEncoding;
+    for(int first=0;first<b.tokens;first+=shared_capacity) {
+        const int count=std::min(shared_capacity,b.tokens-first);
+        groups+=Capacity==1?count==1:count>Capacity/2 && count<=Capacity;
+    }
+    return groups;
+}
+
 __device__ __forceinline__ int group_kind(const MfeFfnBatch& b,int expert,bool shared,int partition,bool& early) {
     early=false;
     const int tagged=shared?1:aborted(b)?-1:b.kinds?b.kinds[expert]:1;
@@ -263,6 +312,26 @@ __device__ __forceinline__ int group_kind(const MfeFfnBatch& b,int expert,bool s
         else if((partition&3)==2)kind=-1;
     }
     return kind;
+}
+
+// Gate/Up and Down execute in one stream. A completed producer kernel is
+// sufficient publication for the hidden tensor; no per-neuron fence or
+// cross-CTA completion counter is needed by this separate quantizer.
+template<int Warps>
+__global__ void __launch_bounds__(32*Warps) hidden_quantize(MfeFfnBatch b,int partition) {
+    const int slot=int(blockIdx.y),all_routes=b.routes+int(b.shared!=nullptr);
+    const int token=slot/all_routes,route=slot%all_routes;
+    const bool shared=route==b.routes;
+    const int expert=shared?0:b.ids[token*b.routes+route];
+    if(!shared && unsigned(expert)>=unsigned(b.experts))return;
+    bool early;const int kind=group_kind(b,expert,shared,partition,early);
+    if(kind<=0 || ((partition&3) && kind!=(partition&3)))return;
+    int local;const auto* d=projection(b,2,expert,shared,local,b.plan_ready && kind==2);
+    if(!d || (!early && (local<0 || local>=d->local_experts)))return;
+    const int width=shared?b.shared_intermediate:b.intermediate;
+    const int group=int(blockIdx.x)*Warps+int(threadIdx.y);
+    if(group*d->group_size>=width)return;
+    quantize_completed_group(b,slot,width,d->group_size,group);
 }
 
 template<int Capacity>
@@ -313,8 +382,9 @@ __global__ void __launch_bounds__(256,Capacity<=2?4:Capacity<=4?3:2) token_gate_
             const auto gate=projected[lane/2][k][lane&1],up=projected[lane/2+team][k][lane&1];
             const auto activated=__float2half_rn(__half2float(gate)*__half2float(table[__half_as_ushort(gate)]));
             b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=__float2half_rn(__half2float(activated)*__half2float(up));
-            __threadfence();
+            if(b.completion)__threadfence();
         }
+        if(!b.completion)continue;
         __syncwarp();
         const auto* down=present[2]?descriptors+2:nullptr;
         if(!down || (!early && (locals[2]<0 || locals[2]>=down->local_experts)))continue;
@@ -393,6 +463,76 @@ __global__ void __launch_bounds__(512,Capacity<=2?2:1) token_gate_up_aligned(Mfe
     }
 }
 
+// Shared experts always use NINT. One output per warp halves live result
+// state and supplies enough CTAs for a single expert with four/eight tokens.
+template<int Capacity>
+__global__ void __launch_bounds__(256,4) shared_token_gate_up(MfeFfnBatch b,int partition) {
+    if((partition&3)==2)return;
+    const int group=token_group_index<Capacity>(b,blockIdx.y);
+    if(group<0)return;
+    const int count=b.token_group_counts[group];
+    if(!accepts_count<Capacity>(count))return;
+    const int* slots=b.token_group_slots+group*8;
+    const int lane=threadIdx.x,warp=threadIdx.y,team=4;
+    const int base=int(blockIdx.x)*team,first=base+warp%team,p=warp/team;
+    if(base>=b.shared_intermediate)return;
+    const auto& d=b.shared[p];
+    const int8_t* inputs[Capacity]{};const float* scales[Capacity]{};
+    #pragma unroll
+    for(int k=0;k<Capacity;++k)if(k<count) {
+        const int token=slots[k]/(b.routes+1);
+        inputs[k]=static_cast<const int8_t*>(d.fields[7])+int64_t(token)*d.groups*d.group_size;
+        scales[k]=static_cast<const float*>(d.fields[8])+int64_t(token)*d.groups;
+    }
+    __half values[Capacity][4]{};
+    shared_nint_project<Capacity>(d,first,inputs,scales,count,values,b.warp_multi_sum);
+    __shared__ __half projected[8][Capacity];
+    if(lane==0)for(int k=0;k<count;++k)projected[warp][k]=values[k][0];
+    __syncthreads();
+    if(warp!=0)return;
+    const int end=min(base+team,b.shared_intermediate),gs=b.shared[2].group_size;
+    for(int k=0;k<count;++k) {
+        const int slot=slots[k];
+        if(base+lane<end) {
+            const auto gate=projected[lane][k],up=projected[lane+team][k];
+            const auto activated=__float2half_rn(__half2float(gate)*__half2float(b.sigmoid_table[__half_as_ushort(gate)]));
+            b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=__float2half_rn(__half2float(activated)*__half2float(up));
+            if(b.completion)__threadfence();
+        }
+        if(!b.completion)continue;
+        __syncwarp();
+        for(int g=base/gs;g<=(end-1)/gs;++g) {
+            const int written=min(end,(g+1)*gs)-max(base,g*gs);int complete=0;
+            if(lane==0)complete=atomicAdd(b.completion+int64_t(slot)*b.scale_stride+g,written)+written==
+                min(gs,b.shared_intermediate-g*gs);
+            complete=__shfl_sync(0xffffffffu,complete,0);
+            if(complete)quantize_completed_group(b,slot,b.shared_intermediate,gs,g);
+        }
+    }
+}
+
+template<int Capacity>
+__global__ void __launch_bounds__(128,8) shared_token_down(MfeFfnBatch b,int partition) {
+    if(partition && partition!=1)return;
+    const int group=token_group_index<Capacity>(b,blockIdx.y);
+    if(group<0)return;
+    const int count=b.token_group_counts[group];
+    if(!accepts_count<Capacity>(count))return;
+    const int* slots=b.token_group_slots+group*8;
+    const int first=int(blockIdx.x)*4+threadIdx.y;
+    if(first>=b.output_width)return;
+    const int8_t* inputs[Capacity]{};const float* scales[Capacity]{};
+    #pragma unroll
+    for(int k=0;k<Capacity;++k)if(k<count) {
+        inputs[k]=b.hidden_quantized+int64_t(slots[k])*b.quantized_stride;
+        scales[k]=b.hidden_scales+int64_t(slots[k])*b.scale_stride;
+    }
+    __half values[Capacity][4]{};
+    shared_nint_project<Capacity>(b.shared[2],first,inputs,scales,count,values,b.warp_multi_sum);
+    if(threadIdx.x==0)for(int k=0;k<count;++k)
+        b.resident_pairs[int64_t(slots[k])*b.output_width+first]=values[k][0];
+}
+
 template<int Capacity,int Rows>
 __global__ void __launch_bounds__(128,Capacity<=2?8:Capacity<=4?6:4) token_down(MfeFfnBatch b,int partition) {
     const int group=token_group_index<Capacity>(b,blockIdx.y);
@@ -465,20 +605,45 @@ void launch_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t st
         const auto* early=std::getenv("MFQ_MFE_EARLY_GU");
         if(!early || early[0]!='0')partition|=8;
     }
-    const int groups=mfe_token_group_bound(b,Capacity);
+    const int groups=token_launch_bound<Capacity>(b);
     if(groups<=0)return;
+    if constexpr(Capacity>=4)if(b.token_group_capacity>kMfeSharedGroupEncoding) {
+        if((partition&3)!=2)shared_token_gate_up<Capacity><<<
+            dim3((b.shared_intermediate+3)/4,groups),dim3(32,8),0,stream>>>(b,partition);
+        return;
+    }
     if(b.token_group_aligned_gu)
         token_gate_up_aligned<Capacity><<<dim3(b.scale_stride,groups),dim3(32,16),0,stream>>>(b,partition);
     else token_gate_up<Capacity><<<dim3((width+7)/8,groups),dim3(32,8),0,stream>>>(b,partition);
 }
 template<int Capacity>
 void launch_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
-    const int groups=mfe_token_group_bound(b,Capacity);
+    const int groups=token_launch_bound<Capacity>(b);
     if(groups<=0)return;
+    if constexpr(Capacity>=4)if(b.token_group_capacity>kMfeSharedGroupEncoding) {
+        if(!partition || partition==1)shared_token_down<Capacity><<<
+            dim3((b.output_width+3)/4,groups),dim3(32,4),0,stream>>>(b,partition);
+        return;
+    }
     if(b.shared && !b.shared_dense_math)
         token_down<Capacity,4><<<dim3((b.output_width+15)/16,groups),dim3(32,4),0,stream>>>(b,partition);
     else token_down<Capacity,2><<<dim3((b.output_width+7)/8,groups),dim3(32,4),0,stream>>>(b,partition);
 }
+}
+void mfe_ffn_token_group_shared_plan(const MfeFfnBatch& b,cudaStream_t stream) {
+    token_shared_plan<<<1,64,0,stream>>>(b,b.token_group_capacity-kMfeSharedGroupEncoding);
+}
+void mfe_ffn_quantize_hidden(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
+    const auto* option=std::getenv("MFQ_MFE_HIDDEN_QUANT_WARPS");
+    const int warps=option?std::atoi(option):1;
+    const auto launch=[&](auto count) {
+        constexpr int value=decltype(count)::value;
+        hidden_quantize<value><<<dim3((b.scale_stride+value-1)/value,b.tokens*(b.routes+int(b.shared!=nullptr))),
+            dim3(32,value),0,stream>>>(b,partition);
+    };
+    if(warps==4)launch(std::integral_constant<int,4>{});
+    else if(warps==8)launch(std::integral_constant<int,8>{});
+    else launch(std::integral_constant<int,1>{});
 }
 bool mfe_ffn_token_group_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
     if(!enabled(b))return false;

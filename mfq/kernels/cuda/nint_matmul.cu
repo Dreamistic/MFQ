@@ -31,6 +31,8 @@
 #include "packed_backward.cuh"
 #include "packed_nint.cuh"
 #include "nint_route_group.cuh"
+#include "nint_short_decode.h"
+#include "../../../cpp_runtime/backends/cuda/kernels/kernel_dispatch_trace.h"
 
 
 #define MFQ_CUBLAS_CHECK(expression) \
@@ -43,6 +45,14 @@ namespace {
 
 
 using namespace mfq::cuda::packed_nint;
+
+thread_local NintInputQuantizationScope* prepared_input_scope=nullptr;
+struct NintGroupQuantizeArgs {
+    struct Group {int8_t *codes,*interleaved;float* scale;int* sum;int gs,groups,begin,columns;} group[4]{};
+    const void* input=nullptr;
+    int count=0,rows=0,width=0;
+    bool fp32=false;
+};
 
 __global__ void nint8_one_quantize_reconstruct_kernel(
         const __half * __restrict__ input,
@@ -144,6 +154,7 @@ __device__ __forceinline__ float nint_activation_value(
                 : __half2float(static_cast<const __half*>(input)[index]);
 }
 
+template<bool CachedSum=false,int InterleavedColumns=0>
 __global__ void __launch_bounds__(64) nint_quantize_activation_kernel(
         const void * __restrict__ input,
         const void * __restrict__ gate,
@@ -156,7 +167,9 @@ __global__ void __launch_bounds__(64) nint_quantize_activation_kernel(
         int group_size,
         int activation_mode,
         bool input_fp32,
-        bool gate_fp32) {
+        bool gate_fp32,
+        int* sum_output=nullptr,
+        int8_t* interleaved_output=nullptr) {
     const int row = static_cast<int>(blockIdx.x);
     const int group = static_cast<int>(blockIdx.y);
     const int lane = static_cast<int>(threadIdx.x);
@@ -182,9 +195,33 @@ __global__ void __launch_bounds__(64) nint_quantize_activation_kernel(
         maximum = __shfl_sync(0xffffffffu, maximum, 0);
         const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
         if (lane == 0) scale_output[static_cast<size_t>(row) * groups + group] = scale;
+        const int code = valid ? max(-127, min(127, static_cast<int>(roundf(value / scale)))) : 0;
         if (lane < group_size) {
-            const int code = valid ? max(-127, min(127, static_cast<int>(roundf(value / scale)))) : 0;
+            if constexpr(InterleavedColumns>0) {
+                if constexpr(InterleavedColumns==5 || InterleavedColumns==6) {
+                    const size_t index=size_t(group)*7+lane/4;
+                    const size_t at=row<4?index*4+row:
+                        size_t(groups)*7*4+index*(InterleavedColumns-4)+(row-4);
+                    interleaved_output[at*4+lane%4]=static_cast<int8_t>(code);
+                }else {
+                const size_t at=(size_t(group)*7+lane/4)*InterleavedColumns*4+lane%4;
+                interleaved_output[at+row*4]=static_cast<int8_t>(code);
+                if(row==rows-1) {
+                    #pragma unroll
+                    for(int padding=0;padding<InterleavedColumns;++padding)
+                        if(padding>=rows)interleaved_output[at+padding*4]=0;
+                }
+                }
+            }else {
             quantized[static_cast<size_t>(row) * padded_width + column] = static_cast<int8_t>(code);
+            }
+        }
+        if constexpr(CachedSum) {
+            int sum=code;
+            #pragma unroll
+            for(int offset=16;offset>0;offset>>=1)
+                sum+=__shfl_down_sync(0xffffffffu,sum,offset);
+            if(lane==0)sum_output[size_t(row)*groups+group]=sum;
         }
         return;
     }
@@ -209,8 +246,8 @@ __global__ void __launch_bounds__(64) nint_quantize_activation_kernel(
         scale_output[static_cast<size_t>(row) * groups + group] = group_scale;
     }
     __syncthreads();
+    int code = 0;
     if (lane < group_size) {
-        int code = 0;
         if (valid) {
             code = static_cast<int>(roundf(value / group_scale));
             code = max(-127, min(127, code));
@@ -218,8 +255,58 @@ __global__ void __launch_bounds__(64) nint_quantize_activation_kernel(
         quantized[static_cast<size_t>(row) * padded_width + column] =
             static_cast<int8_t>(code);
     }
+    if constexpr(CachedSum) {
+        int sum=code;
+        #pragma unroll
+        for(int offset=16;offset>0;offset>>=1)sum+=__shfl_down_sync(0xffffffffu,sum,offset);
+        __shared__ int warp_sums[2];
+        if((lane&31)==0)warp_sums[lane>>5]=sum;
+        __syncthreads();
+        if(lane==0)sum_output[size_t(row)*groups+group]=warp_sums[0]+warp_sums[1];
+    }
 }
 
+
+// One warp per original group, including GS48's two values per lane.
+// All formats keep the canonical fp16 rounding and per-group division.
+__global__ void __launch_bounds__(32) nint_group_quantize_kernel(NintGroupQuantizeArgs a) {
+    int selected=0;
+    for(int i=1;i<a.count;++i)if(int(blockIdx.x)>=a.group[i].begin)selected=i;
+    const auto g=a.group[selected];
+    const int group=int(blockIdx.x)-g.begin,row=blockIdx.y,lane=threadIdx.x;
+    const int column=group*g.gs+lane;
+    const bool valid0=lane<g.gs && column<a.width;
+    const bool valid1=lane+32<g.gs && column+32<a.width;
+    const float v0=valid0?nint_activation_value(a.input,size_t(row)*a.width+column,a.fp32):0.f;
+    const float v1=valid1?nint_activation_value(a.input,size_t(row)*a.width+column+32,a.fp32):0.f;
+    float maximum=fmaxf(fabsf(v0),fabsf(v1));
+    #pragma unroll
+    for(int offset=16;offset>0;offset>>=1)
+        maximum=fmaxf(maximum,__shfl_down_sync(0xffffffffu,maximum,offset));
+    maximum=__shfl_sync(0xffffffffu,maximum,0);
+    const float scale=maximum>0.f?maximum/127.f:1.f;
+    if(lane==0)g.scale[size_t(row)*g.groups+group]=scale;
+    const int c0=valid0?max(-127,min(127,int(roundf(v0/scale)))):0;
+    const int c1=valid1?max(-127,min(127,int(roundf(v1/scale)))):0;
+    if(lane<g.gs)g.codes[size_t(row)*g.groups*g.gs+column]=int8_t(c0);
+    if(lane+32<g.gs)g.codes[size_t(row)*g.groups*g.gs+column+32]=int8_t(c1);
+    if(g.interleaved && lane<g.gs) {
+        const size_t index=size_t(group)*7+lane/4;
+        if(g.columns==5 || g.columns==6) {
+            const size_t at=row<4?index*4+row:size_t(g.groups)*7*4+index*(g.columns-4)+(row-4);
+            g.interleaved[at*4+lane%4]=int8_t(c0);
+        } else {
+            const size_t at=index*g.columns*4+lane%4;
+            g.interleaved[at+row*4]=int8_t(c0);
+            if(row==a.rows-1)for(int padding=a.rows;padding<g.columns;++padding)
+                g.interleaved[at+padding*4]=0;
+        }
+    }
+    int sum=c0+c1;
+    #pragma unroll
+    for(int offset=16;offset>0;offset>>=1)sum+=__shfl_down_sync(0xffffffffu,sum,offset);
+    if(lane==0)g.sum[size_t(row)*g.groups+group]=sum;
+}
 
 constexpr int kNintPrefillTileN = 64;
 constexpr int kNintPrefillTileK = 64;
@@ -927,6 +1014,7 @@ __global__ void __launch_bounds__(128) nint_matmul_dense_kernel(
 }
 
 #include "nint_whole_group.cuh"
+#include "nint_whole_warp_rows.cuh"
 
 // Decode four adjacent values once and store one aligned eight-byte vector.
 template<int GroupSize>
@@ -1496,7 +1584,7 @@ __global__ void __launch_bounds__(1024) nint_matmul_activation_cache_kernel(
 // row widths, aligned offsets, four-element groups and aligned storage.
 #include "nint_q8_ordered.cuh"
 
-template<int maximum_activation_rows>
+template<int maximum_activation_rows,int FixedGroup=0>
 __global__ void __launch_bounds__(128) nint_matmul_aligned_q8_kernel(
         const uint8_t * __restrict__ bitstream,
         const int64_t * __restrict__ row_q_bit_offsets,
@@ -1508,7 +1596,8 @@ __global__ void __launch_bounds__(128) nint_matmul_aligned_q8_kernel(
         const float * __restrict__ activation_scale,
         __half * __restrict__ output,
         int activation_rows, int output_rows, int groups,
-        int padded_width, int group_size) {
+        int padded_width, int runtime_group_size) {
+    const int group_size=FixedGroup?FixedGroup:runtime_group_size;
     const int output_row = static_cast<int>(blockIdx.x) * 4 +
         static_cast<int>(threadIdx.y);
     if (output_row >= output_rows) {
@@ -1831,6 +1920,46 @@ mfq_tensor_backend::Tensor cublas_gemm_nt_f32_output(
 
 
 }  // namespace
+
+NintInputQuantizationScope::NintInputQuantizationScope(
+        mfq_tensor_backend::Tensor source,const std::vector<int>& sizes):input(std::move(source)) {
+    if(sizes.empty())return;
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.dim()==2 &&
+        input.size(0)>=1 && input.size(0)<=6 && input.size(1)>0 && input.size(1)<=INT_MAX-64 &&
+        (input.scalar_type()==tb::kFloat16 || input.scalar_type()==tb::kFloat32) &&
+        sizes.size()<=4,"invalid shared NINT quantization input");
+    const MfqCudaGuard guard(input.device());
+    NintGroupQuantizeArgs args;
+    args.input=input.data_ptr();args.rows=int(input.size(0));args.width=int(input.size(1));
+    args.fp32=input.scalar_type()==tb::kFloat32;
+    const auto* exact=std::getenv("MFQ_NINT_EXACT_BATCH");
+    const int columns=args.rows<=2?2:args.rows<=4?4:(exact && exact[0]=='0')?8:args.rows;
+    int total=0;
+    for(int gs:sizes) {
+        MFQ_RUNTIME_CHECK(gs==24 || gs==28 || gs==48,"unsupported shared NINT group size");
+        const int ng=(args.width+gs-1)/gs;
+        NintPreparedGroupInput prepared;prepared.gs=gs;
+        prepared.codes=tb::empty({args.rows,ng*gs},input.options().dtype(tb::kInt8));
+        prepared.scale=tb::empty({args.rows,ng},input.options().dtype(tb::kFloat32));
+        prepared.sum=tb::empty({args.rows,ng},input.options().dtype(tb::kInt32));
+        if(gs==28 && args.rows>=2)
+            prepared.interleaved=tb::empty({ng,7,columns,4},input.options().dtype(tb::kInt8));
+        args.group[args.count++]={prepared.codes.data_ptr<int8_t>(),
+            prepared.interleaved.defined()?prepared.interleaved.data_ptr<int8_t>():nullptr,
+            prepared.scale.data_ptr<float>(),prepared.sum.data_ptr<int32_t>(),gs,ng,total,columns};
+        total+=ng;groups.push_back(std::move(prepared));
+    }
+    nint_group_quantize_kernel<<<dim3(total,args.rows),32,0,mfq_current_cuda_stream()>>>(args);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(
+        mfq_current_cuda_stream(),"nint_group_quantize",reinterpret_cast<const void*>(nint_group_quantize_kernel),
+        "M="+std::to_string(args.rows)+" width="+std::to_string(args.width)+" formats="+std::to_string(args.count));
+    previous=prepared_input_scope;prepared_input_scope=this;
+}
+NintInputQuantizationScope::~NintInputQuantizationScope() {
+    if(!groups.empty())prepared_input_scope=previous;
+}
 
 bool nint_late_scale_enabled(int64_t input_width,int bits,int device) {
     if(const auto* setting=std::getenv("MFQ_NINT_LATE_SCALE"))return setting[0]!='0';
@@ -2392,7 +2521,7 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         int64_t group_size,
         mfq_tensor_backend::Tensor quantized_input,
         mfq_tensor_backend::Tensor input_scale,
-        bool aligned_q8 = false) {
+        bool aligned_q8 = false,int uniform_bits = 0) {
     MFQ_RUNTIME_CHECK(
         input.is_cuda() && input.is_contiguous() &&
         (input.scalar_type() == mfq_tensor_backend::kFloat16 ||
@@ -2483,7 +2612,71 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         {activation_rows, output_rows}, input.options().dtype(mfq_tensor_backend::kFloat16));
     const cudaStream_t stream = mfq_current_cuda_stream();
     const int quantize_threads = group_size <= 32 ? 32 : 64;
-    nint_quantize_activation_kernel<<<
+    const char* dense_group_setting = std::getenv("MFQ_NINT_GROUP_DOT");
+    const char* whole_setting_for_sum = std::getenv("MFQ_NINT_WHOLE_GROUP");
+    const char* batch_setting_for_sum = std::getenv("MFQ_NINT_BATCH_WHOLE_GROUP");
+    const char* sum_setting = std::getenv("MFQ_NINT_ACTIVATION_SUM");
+    const auto* interleaved_setting=std::getenv("MFQ_NINT_INTERLEAVED");
+    const bool interleaved_default=activation_rows>=3 && activation_rows<=6;
+    const bool interleaved_requested=interleaved_setting?interleaved_setting[0]=='1':interleaved_default;
+    const auto* float_whole_setting=std::getenv("MFQ_NINT_FLOAT_WHOLE_GROUP");
+    const bool whole_input=input.scalar_type()==mfq_tensor_backend::kFloat16 ||
+        (input.scalar_type()==mfq_tensor_backend::kFloat32 && (!float_whole_setting || float_whole_setting[0]!='0'));
+    const bool sum_default=nint_default_activation_sum(int(group_size),groups,activation_rows,uniform_bits,interleaved_requested);
+    const char* q8_decode_option=std::getenv("MFQ_NINT_Q8_DECODE");
+    const int q8_decode=q8_decode_option?std::atoi(q8_decode_option):2;
+    const bool grouped_router=output_rows==512 && groups==54;
+    const bool grouped_q8=aligned_q8 && group_size==48 && q8_decode>0 &&
+        (reinterpret_cast<uintptr_t>(bitstream.data_ptr())&3u)==0 &&
+        (activation_rows>1 || output_rows>2048 || q8_decode==3 || grouped_router);
+    const auto* q8_sum_setting=std::getenv("MFQ_NINT_Q8_SUM");
+    // Large vocabulary projections amortize this once-per-activation sum.
+    // Tiny router/alpha/beta matrices keep their existing launch costs.
+    const bool head_sum_default=output_rows>=65536 && groups==54 && activation_rows<=6;
+    const bool q8_sums=grouped_q8 && q8_decode>=2 &&
+        (q8_sum_setting?q8_sum_setting[0]=='1':head_sum_default);
+    const bool cached_packed_sums = (sum_setting?sum_setting[0]=='1':sum_default) && !aligned_q8 &&
+        (group_size==24 || group_size==28) && groups>32 &&
+        whole_input &&
+        (reinterpret_cast<uintptr_t>(bitstream.data_ptr())&3u)==0 &&
+        (!dense_group_setting || dense_group_setting[0]!='0') &&
+        (!whole_setting_for_sum || whole_setting_for_sum[0]!='0') &&
+        (activation_rows==1 || !batch_setting_for_sum || batch_setting_for_sum[0]!='0') &&
+        std::getenv("MFQ_NINT_DENSE_REFERENCE")==nullptr;
+    const bool cached_sums=cached_packed_sums || q8_sums;
+    const auto* fixed_setting=std::getenv("MFQ_NINT_FIXED_BITS");
+    const bool interleaved=interleaved_requested &&
+        uniform_bits==5 && group_size==28 && groups>32 && groups<=96 &&
+        activation_rows>=2 && activation_rows<=6 && !aligned_q8 &&
+        whole_input &&
+        (reinterpret_cast<uintptr_t>(bitstream.data_ptr())&3u)==0 &&
+        (!dense_group_setting || dense_group_setting[0]!='0') &&
+        (!whole_setting_for_sum || whole_setting_for_sum[0]!='0') &&
+        (!batch_setting_for_sum || batch_setting_for_sum[0]!='0') &&
+        (!fixed_setting || fixed_setting[0]!='0') &&
+        std::getenv("MFQ_NINT_DENSE_REFERENCE")==nullptr;
+    const auto* exact_batch=std::getenv("MFQ_NINT_EXACT_BATCH");
+    const int interleaved_columns=activation_rows<=2?2:activation_rows<=4?4:
+        (exact_batch && exact_batch[0]=='0')?8:activation_rows;
+    const NintPreparedGroupInput* prepared=nullptr;
+    if(!gate)for(auto* scope=prepared_input_scope;scope && !prepared;scope=scope->previous) {
+        if(scope->input.data_ptr()!=input.data_ptr() || scope->input.sizes()!=input.sizes() ||
+                scope->input.scalar_type()!=input.scalar_type() || scope->input.device()!=input.device())continue;
+        for(const auto& group:scope->groups)if(group.gs==group_size &&
+                group.scale.size(1)==groups && (!interleaved || group.interleaved.defined())) {
+            prepared=&group;break;
+        }
+    }
+    if(prepared){quantized_input=prepared->codes;input_scale=prepared->scale;}
+    mfq_tensor_backend::Tensor interleaved_activation;
+    if(interleaved)interleaved_activation=prepared?prepared->interleaved:mfq_tensor_backend::empty(
+        {groups,7,interleaved_columns,4},input.options().dtype(mfq_tensor_backend::kInt8));
+    mfq_tensor_backend::Tensor activation_sums;
+    if(cached_sums)activation_sums=prepared?prepared->sum:mfq_tensor_backend::empty(
+        {activation_rows,groups},input.options().dtype(mfq_tensor_backend::kInt32));
+    const auto quantize = [&](auto cached_sum) {
+    const auto quantize_columns = [&](auto columns) {
+    nint_quantize_activation_kernel<decltype(cached_sum)::value,decltype(columns)::value><<<
         dim3(activation_rows, groups), quantize_threads, 0, stream>>>(
             input.data_ptr(),
             gate == nullptr
@@ -2498,10 +2691,57 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
             static_cast<int>(group_size),
             static_cast<int>(activation_mode),
             input.scalar_type() == mfq_tensor_backend::kFloat32,
-            gate != nullptr && gate->scalar_type() == mfq_tensor_backend::kFloat32);
-    const char* dense_group_setting = std::getenv("MFQ_NINT_GROUP_DOT");
+            gate != nullptr && gate->scalar_type() == mfq_tensor_backend::kFloat32,
+            activation_sums.defined()?activation_sums.data_ptr<int32_t>():nullptr,
+            interleaved_activation.defined()?interleaved_activation.data_ptr<int8_t>():nullptr);
+    };
+    if(interleaved) {
+        if(interleaved_columns==2)quantize_columns(std::integral_constant<int,2>{});
+        else if(interleaved_columns==4)quantize_columns(std::integral_constant<int,4>{});
+        else if(interleaved_columns==5)quantize_columns(std::integral_constant<int,5>{});
+        else if(interleaved_columns==6)quantize_columns(std::integral_constant<int,6>{});
+        else quantize_columns(std::integral_constant<int,8>{});
+    }else quantize_columns(std::integral_constant<int,0>{});
+    };
+    if(!prepared) {
+        if(cached_sums)quantize(std::true_type{});else quantize(std::false_type{});
+    }
     if (aligned_q8 && group_size % 4 == 0 &&
         (reinterpret_cast<uintptr_t>(bitstream.data_ptr<uint8_t>()) & 3u) == 0) {
+        // The real 512-expert, 2560-wide router benefits from one affine per
+        // complete group at M=1 as well. Retain the ordered path for tiny
+        // projections such as GDN alpha/beta, which need more resident warps.
+        if(grouped_q8) {
+            const auto launch_short=[&](auto rows) {
+                if(q8_decode>=2) {
+                    const NintWholeArgs args{bitstream.data_ptr<uint8_t>(),row_q_bits.data_ptr<uint8_t>(),
+                        subgroup_scale.data_ptr<uint8_t>(),subgroup_minimum.data_ptr<uint8_t>(),row_q_bit_offsets.data_ptr<int64_t>(),
+                        neuron_scale.data_ptr<float>(),neuron_minimum.data_ptr<float>(),quantized_input.data_ptr<int8_t>(),
+                        input_scale.data_ptr<float>(),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+                        uint64_t(bitstream.numel()),output_rows,groups,activation_rows,false,
+                        activation_sums.defined()?activation_sums.data_ptr<int32_t>():nullptr};
+                    nint_launch_grouped_q8(args,stream);
+                } else {
+                    nint_matmul_aligned_q8_kernel<decltype(rows)::value,48><<<
+                        (output_rows+3)/4,dim3(32,4),0,stream>>>(
+                        bitstream.data_ptr<uint8_t>(),row_q_bit_offsets.data_ptr<int64_t>(),
+                        subgroup_scale.data_ptr<uint8_t>(),subgroup_minimum.data_ptr<uint8_t>(),
+                        neuron_scale.data_ptr<float>(),neuron_minimum.data_ptr<float>(),
+                        quantized_input.data_ptr<int8_t>(),input_scale.data_ptr<float>(),
+                        reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+                        activation_rows,output_rows,groups,padded_width,48);
+                }
+            };
+            switch(activation_rows) {
+            case 1:launch_short(std::integral_constant<int,1>{});break;
+            case 2:launch_short(std::integral_constant<int,2>{});break;
+            case 3:launch_short(std::integral_constant<int,3>{});break;
+            case 4:launch_short(std::integral_constant<int,4>{});break;
+            case 5:launch_short(std::integral_constant<int,5>{});break;
+            case 6:launch_short(std::integral_constant<int,6>{});break;
+            default:launch_short(std::integral_constant<int,8>{});break;
+            }
+        } else {
         // Specialize only the proven one-row input, independent of device.
         if (activation_rows == 1) {
         const char* ordered = std::getenv("MFQ_NINT_Q8_ORDERED");
@@ -2543,22 +2783,63 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
                 activation_rows, output_rows, groups, padded_width,
                 static_cast<int>(group_size));
         }
+        }
     } else if ((group_size == 24 || group_size == 28) &&
             (reinterpret_cast<std::uintptr_t>(bitstream.data_ptr()) & 3u) == 0 &&
             (!dense_group_setting || dense_group_setting[0] != '0') &&
             std::getenv("MFQ_NINT_DENSE_REFERENCE") == nullptr) {
         const char* whole_setting=std::getenv("MFQ_NINT_WHOLE_GROUP");
         const char* batch_whole_setting=std::getenv("MFQ_NINT_BATCH_WHOLE_GROUP");
+        const auto* small_group_setting=std::getenv("MFQ_NINT_FIXED_SMALL_GROUPS");
+        const bool fixed_small=(!small_group_setting || small_group_setting[0]!='0') && groups<=32 &&
+            activation_rows<=6 && (!fixed_setting || fixed_setting[0]!='0') &&
+            ((group_size==24 && uniform_bits==6) || (group_size==28 && uniform_bits==5));
         if((activation_rows==1 || (activation_rows<=8 && (!batch_whole_setting || batch_whole_setting[0]!='0'))) &&
-                groups>32 && input.scalar_type()==mfq_tensor_backend::kFloat16 &&
+                (groups>32 || fixed_small) && whole_input &&
                 (!whole_setting || whole_setting[0]!='0')) {
+            const auto* group_load_option=std::getenv("MFQ_NINT_GROUP_LOAD");
+            const bool group_load=group_load_option && group_load_option[0]=='1';
             const NintWholeArgs args{bitstream.data_ptr<uint8_t>(),row_q_bits.data_ptr<uint8_t>(),
                 subgroup_scale.data_ptr<uint8_t>(),subgroup_minimum.data_ptr<uint8_t>(),
                 row_q_bit_offsets.data_ptr<int64_t>(),neuron_scale.data_ptr<float>(),neuron_minimum.data_ptr<float>(),
                 quantized_input.data_ptr<int8_t>(),input_scale.data_ptr<float>(),
-                reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),uint64_t(bitstream.numel()),output_rows,groups,activation_rows};
+                reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),uint64_t(bitstream.numel()),output_rows,groups,activation_rows,group_load,activation_sums.defined()?activation_sums.data_ptr<int32_t>():nullptr,interleaved_activation.defined()?reinterpret_cast<const int*>(interleaved_activation.data_ptr<int8_t>()):nullptr};
             const auto launch_whole=[&](auto gs,auto rows) {
-                nint_whole_group_kernel<decltype(gs)::value,decltype(rows)::value><<<output_rows,dim3(32,4),0,stream>>>(args);
+                // Preserve the original group-to-lane map and four-term XOR
+                // tree. A projection with at most 96 groups has no work for
+                // warp 3; its contribution is the original positive zero.
+                const auto* short_warps=std::getenv("MFQ_NINT_SHORT_WARPS");
+                const auto* staged=std::getenv("MFQ_NINT_PACKED_STAGE");
+                const auto* warp_rows=std::getenv("MFQ_NINT_WARP_ROWS");
+                // Two-token projections benefit from four rows per CTA. At
+                // six tokens the extra live accumulators regress, so the
+                // default remains the original three-warps-per-row there.
+                const bool tracing=mfq::cuda::dispatch_trace::enabled();
+                const auto details=tracing?"M="+std::to_string(activation_rows)+" N="+std::to_string(output_rows)+
+                    " gs="+std::to_string(group_size)+" groups="+std::to_string(groups)+" capacity="+std::to_string(decltype(rows)::value):std::string{};
+                if(nint_launch_fixed_decode(args,int(group_size),uniform_bits,stream))return;
+                const auto launch_cached=[&](auto sum_constant) {
+                constexpr bool CachedSum=decltype(sum_constant)::value;
+                if(groups<=96 && (warp_rows?warp_rows[0]=='1':activation_rows==2)) {
+                    nint_whole_warp_rows_kernel<decltype(gs)::value,decltype(rows)::value,CachedSum><<<(output_rows+3)/4,dim3(32,4),0,stream>>>(args);
+                    if(tracing)mfq::cuda::dispatch_trace::record(stream,"nint_whole_warp_rows",
+                        reinterpret_cast<const void*>(nint_whole_warp_rows_kernel<decltype(gs)::value,decltype(rows)::value,CachedSum>),details);
+                }else if(groups<=96 && staged && staged[0]=='1' &&
+                    (reinterpret_cast<uintptr_t>(bitstream.data_ptr())&15u)==0) {
+                    nint_whole_group_kernel<decltype(gs)::value,decltype(rows)::value,3,true,CachedSum><<<output_rows,dim3(32,3),0,stream>>>(args);
+                    if(tracing)mfq::cuda::dispatch_trace::record(stream,"nint_packed_stage",
+                        reinterpret_cast<const void*>(nint_whole_group_kernel<decltype(gs)::value,decltype(rows)::value,3,true,CachedSum>),details);
+                }else if(groups<=96 && (!short_warps || short_warps[0]!='0')) {
+                    nint_whole_group_kernel<decltype(gs)::value,decltype(rows)::value,3,false,CachedSum><<<output_rows,dim3(32,3),0,stream>>>(args);
+                    if(tracing)mfq::cuda::dispatch_trace::record(stream,"nint_whole_group_3warp",
+                        reinterpret_cast<const void*>(nint_whole_group_kernel<decltype(gs)::value,decltype(rows)::value,3,false,CachedSum>),details);
+                }else {
+                    nint_whole_group_kernel<decltype(gs)::value,decltype(rows)::value,4,false,CachedSum><<<output_rows,dim3(32,4),0,stream>>>(args);
+                    if(tracing)mfq::cuda::dispatch_trace::record(stream,"nint_whole_group_4warp",
+                        reinterpret_cast<const void*>(nint_whole_group_kernel<decltype(gs)::value,decltype(rows)::value,4,false,CachedSum>),details);
+                }
+                };
+                if(cached_sums)launch_cached(std::true_type{});else launch_cached(std::false_type{});
             };
             const auto select_whole_rows=[&](auto gs) {
                 if(activation_rows==1)launch_whole(gs,std::integral_constant<int,1>{});
@@ -2709,6 +2990,18 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
 }
 
 
+mfq_tensor_backend::Tensor nint_matmul_fixed_bits_ws_cuda(
+        mfq_tensor_backend::Tensor bitstream,mfq_tensor_backend::Tensor row_q_bits,
+        mfq_tensor_backend::Tensor row_q_bit_offsets,mfq_tensor_backend::Tensor subgroup_scale,
+        mfq_tensor_backend::Tensor subgroup_minimum,mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_minimum,mfq_tensor_backend::Tensor input,
+        int64_t group_size,mfq_tensor_backend::Tensor quantized_input,
+        mfq_tensor_backend::Tensor input_scale,int uniform_bits) {
+    return nint_matmul_ws_impl(bitstream,row_q_bits,row_q_bit_offsets,subgroup_scale,
+        subgroup_minimum,neuron_scale,neuron_minimum,input,nullptr,0,group_size,
+        quantized_input,input_scale,false,uniform_bits);
+}
+
 mfq_tensor_backend::Tensor nint_matmul_ws_cuda(
         mfq_tensor_backend::Tensor bitstream,
         mfq_tensor_backend::Tensor row_q_bits,
@@ -2808,6 +3101,18 @@ mfq_tensor_backend::Tensor nint_matmul_online_f16_cuda(
         partial.data_ptr<float>(),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),rows*outputs,split);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+mfq_tensor_backend::Tensor nint_matmul_input_mul_fixed_bits_ws_cuda(
+        mfq_tensor_backend::Tensor bitstream,mfq_tensor_backend::Tensor row_q_bits,
+        mfq_tensor_backend::Tensor row_q_bit_offsets,mfq_tensor_backend::Tensor subgroup_scale,
+        mfq_tensor_backend::Tensor subgroup_minimum,mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_minimum,mfq_tensor_backend::Tensor input,
+        mfq_tensor_backend::Tensor gate,int64_t activation_mode,int64_t group_size,
+        mfq_tensor_backend::Tensor quantized_input,mfq_tensor_backend::Tensor input_scale,int uniform_bits) {
+    return nint_matmul_ws_impl(bitstream,row_q_bits,row_q_bit_offsets,subgroup_scale,
+        subgroup_minimum,neuron_scale,neuron_minimum,input,&gate,activation_mode,
+        group_size,quantized_input,input_scale,false,uniform_bits);
 }
 
 mfq_tensor_backend::Tensor nint_matmul_input_mul_ws_cuda(
@@ -3025,7 +3330,7 @@ mfq_tensor_backend::Tensor nint8_zero_gemv_ws_cuda(
     auto output = mfq_tensor_backend::empty(
         {activation_rows, output_rows}, input.options().dtype(mfq_tensor_backend::kFloat16));
     const cudaStream_t stream = mfq_current_cuda_stream();
-    nint_quantize_activation_kernel<<<
+    nint_quantize_activation_kernel<false><<<
         dim3(activation_rows, groups), 32, 0, stream>>>(
             input.data_ptr(),
             nullptr,

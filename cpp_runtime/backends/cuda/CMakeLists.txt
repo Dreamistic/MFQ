@@ -77,6 +77,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/embedding.cu
     ${MFQ_CUDA_KERNEL_ROOT}/selected_attention.cu
     ${MFQ_CUDA_KERNEL_ROOT}/qwen4_exp.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/ple_fused.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm5_next.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gated_delta_net.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
@@ -93,6 +94,8 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/nepq.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nepq_residual.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nint_short_decode.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nint_q8_decode.cu
     ${MFQ_CUDA_KERNEL_ROOT}/norm.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq_routed_reuse.cu
@@ -479,6 +482,12 @@ if(BUILD_TESTING)
     mfq_configure_cuda_runtime_target(mfq-cuda-gr-batch-probe)
     target_compile_definitions(mfq-cuda-gr-batch-probe PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-cuda-gr-batch-probe PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-cuda-nint-dense-decode-probe
+        ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/nint_dense_decode_probe.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-nint-dense-decode-probe)
+    target_include_directories(mfq-cuda-nint-dense-decode-probe PRIVATE ${MFQ_REPOSITORY_ROOT}/bench)
+    target_compile_definitions(mfq-cuda-nint-dense-decode-probe PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-nint-dense-decode-probe PRIVATE mfq-cuda-runtime)
     add_executable(mfq-cuda-shared-gate-bench
         ${MFQ_REPOSITORY_ROOT}/bench/cuda_format_comparison/mfq_shared_gate_bench.cu)
     mfq_configure_cuda_runtime_target(mfq-cuda-shared-gate-bench)
