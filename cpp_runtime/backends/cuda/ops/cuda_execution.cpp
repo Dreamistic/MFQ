@@ -182,6 +182,15 @@ std::size_t workspace_reserve_bytes() {
     }
     return reserve;
 }
+std::size_t resident_budget_bytes() {
+    const auto value=environment("MFQ_SERVER_RESIDENT_BUDGET_BYTES");
+    if(!value)return 0;
+    std::size_t bytes=0;
+    const auto [end,error]=std::from_chars(value->data(),value->data()+value->size(),bytes);
+    if(error!=std::errc{} || end!=value->data()+value->size())
+        throw std::invalid_argument("MFQ_SERVER_RESIDENT_BUDGET_BYTES must be a non-negative integer");
+    return bytes;
+}
 bool phased_transfer() { return exact_one("MFQ_MOE_FFN_TRANSFER_PHASES", true); }
 bool ram_field_packing() { return exact_one("MFQ_MOE_RAM_FIELD_PACKING", true); }
 bool mapped_copy_overlap() { return exact_one("MFQ_MOE_MAPPED_COPY_OVERLAP"); }

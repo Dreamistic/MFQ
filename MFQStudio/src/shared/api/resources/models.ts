@@ -67,7 +67,7 @@ export const modelsApi = {
     model: string,
     contextSize: number | null = null,
     prefillChunkSize = 2048,
-    policy: { pin?: boolean; idle_ttl_seconds?: number | null } = {},
+    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[] } = {},
   ): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/v1/models/load', {
       method: 'POST',
@@ -76,6 +76,7 @@ export const modelsApi = {
         context_size: contextSize,
         prefill_chunk_size: prefillChunkSize,
         pin: policy.pin ?? false,
+        ...(policy.device_ids?.length ? { device_ids: policy.device_ids } : {}),
         idle_ttl_seconds: policy.pin ? null : (policy.idle_ttl_seconds ?? null),
       }),
     });

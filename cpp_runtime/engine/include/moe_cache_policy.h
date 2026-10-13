@@ -61,6 +61,29 @@ public:
         return static_cast<int>(slots_.size());
     }
 
+    void prepare_resize(int capacity) {
+        if (capacity <= 0) throw std::invalid_argument("MoE cache capacity must be positive");
+        for (const auto& slot : slots_) if (slot.inflight)
+            throw std::runtime_error("cannot resize an in-flight MoE cache");
+        slots_.reserve(static_cast<size_t>(capacity));
+        free_.reserve(static_cast<size_t>(capacity));
+    }
+
+    // Request boundary only. The caller retains evicted payloads before shrinking.
+    void resize(int capacity) {
+        prepare_resize(capacity);
+        const int previous = this->capacity();
+        if (capacity < previous) {
+            for (int slot = capacity; slot < previous; ++slot) {
+                if (slots_[slot].key) by_key_.erase(*slots_[slot].key);
+                erase_lru(slot);
+            }
+            free_.erase(std::remove_if(free_.begin(), free_.end(), [&](int slot) { return slot >= capacity; }), free_.end());
+        }
+        slots_.resize(static_cast<size_t>(capacity));
+        for (int slot = capacity - 1; slot >= previous; --slot) free_.push_back(slot);
+    }
+
     int size() const noexcept {
         return static_cast<int>(by_key_.size());
     }

@@ -220,7 +220,7 @@ class RuntimeClient(Protocol):
 
     async def trim_cache(self, target_bytes: int) -> dict[str, Any]: ...
 
-    async def set_cache_budget(self, target_bytes: int, disk_target_bytes: int | None = None) -> dict[str, Any]: ...
+    async def set_cache_budget(self, target_bytes: int, disk_target_bytes: int | None = None, ram_target_bytes: int | None = None) -> dict[str, Any]: ...
     async def refresh_cache_index(self) -> dict[str, Any]: ...
     async def set_resident_memory_budget(self, target_bytes: int, weight_target_bytes: int | None = None) -> dict[str, Any]: ...
 
@@ -356,10 +356,12 @@ class HttpRuntimeClient:
             json_body={"target_bytes": target_bytes},
         )
 
-    async def set_cache_budget(self, target_bytes: int, disk_target_bytes: int | None = None) -> dict[str, Any]:
+    async def set_cache_budget(self, target_bytes: int, disk_target_bytes: int | None = None, ram_target_bytes: int | None = None) -> dict[str, Any]:
         body = {"target_bytes": target_bytes}
         if disk_target_bytes is not None:
             body["disk_target_bytes"] = disk_target_bytes
+        if ram_target_bytes is not None:
+            body["ram_target_bytes"] = ram_target_bytes
         return await self._json_request("POST", "/runtime/cache/budget", json_body=body)
 
     async def refresh_cache_index(self) -> dict[str, Any]:
@@ -637,10 +639,12 @@ class StdioRuntimeClient:
     async def trim_cache(self, target_bytes: int) -> dict[str, Any]:
         return await self._unary("cache.trim", {"target_bytes": target_bytes})
 
-    async def set_cache_budget(self, target_bytes: int, disk_target_bytes: int | None = None) -> dict[str, Any]:
+    async def set_cache_budget(self, target_bytes: int, disk_target_bytes: int | None = None, ram_target_bytes: int | None = None) -> dict[str, Any]:
         body = {"target_bytes": target_bytes}
         if disk_target_bytes is not None:
             body["disk_target_bytes"] = disk_target_bytes
+        if ram_target_bytes is not None:
+            body["ram_target_bytes"] = ram_target_bytes
         return await self._unary("cache.budget", body)
 
     async def refresh_cache_index(self) -> dict[str, Any]:

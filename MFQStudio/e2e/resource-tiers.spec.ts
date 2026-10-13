@@ -29,7 +29,7 @@ for (const language of ['zh-CN', 'en'] as const) {
       await trigger.scrollIntoViewIfNeeded();
       await trigger.hover();
       await expect(help).toBeVisible();
-      await expect(help).toContainText(language === 'zh-CN' ? '持久化前缀缓存' : 'persistent prefix caches');
+      await expect(help).toContainText(language === 'zh-CN' ? '前缀缓存' : 'prefix caches');
       const bounds = await help.boundingBox();
       expect(bounds!.x).toBeGreaterThanOrEqual(0);
       expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width);

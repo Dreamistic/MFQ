@@ -24,6 +24,17 @@ beforeEach(() => {
   state.confirm.mockResolvedValue(true);
 });
 
+it('shows separate VRAM, RAM and SSD prefix totals', () => {
+  state.runtime = { memory_architecture: 'discrete', prefix_cache_total_hot_bytes: 100,
+    prefix_cache_total_hot_max_bytes: 1000, prefix_cache_total_ram_bytes: 200,
+    prefix_cache_total_ram_max_bytes: 2000, prefix_cache_total_disk_bytes: 300,
+    prefix_cache_total_disk_max_bytes: 3000 };
+  render(<CachePage />);
+  expect(screen.getByText('Total VRAM hot cache')).toBeInTheDocument();
+  expect(screen.getByText('Total RAM prefix cache')).toBeInTheDocument();
+  expect(screen.getByText('Total SSD prefix cache')).toBeInTheDocument();
+});
+
 it('resources contains monitoring and cache but no service configuration', () => {
   state.runtime = null;
   render(<CachePage />);

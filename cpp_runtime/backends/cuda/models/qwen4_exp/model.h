@@ -12,6 +12,7 @@
 #include "mfq/kernels/cuda/ple_fused.h"
 #include "runtime/nint_row_pipeline.h"
 #include "runtime/kv_offload.h"
+#include "mfq_cuda_kv_quantization.h"
 #include "storage/session_state.h"
 #include <array>
 #include <cstdlib>
@@ -721,8 +722,8 @@ class Qsa {
         bool fused_projection = true, bool grouped_projection = true,
         std::shared_ptr<KvOffloadStore> offload = {})
         : w_(std::move(weights)), c_(config), rotary_(std::move(rotary)), fused_projection_(fused_projection), grouped_projection_(grouped_projection),
-          keys_(config.maximum, config.kv_heads * config.width),
-          values_(config.maximum, config.kv_heads * config.width),
+          keys_(config.maximum, config.kv_heads * key_width(), cache_dtype()),
+          values_(config.maximum, config.kv_heads * value_width(), cache_dtype()),
           index_(config.maximum, config.index_width) {
         MFQ_RUNTIME_CHECK(c_.heads > 0 && c_.kv_heads > 0 && c_.heads % c_.kv_heads == 0 &&
                               c_.width > 0 && c_.index_heads > 0 && c_.pool > 0 && c_.budget > 0 &&
@@ -734,7 +735,7 @@ class Qsa {
             if(weight->defined())*weight=weight->to(tb::kFloat32).contiguous();
         offload_ = std::move(offload);
         if (offload_) {
-            offloaded_kv_ = std::make_unique<KvOffloadSequence>(offload_, 2 * c_.kv_heads * c_.width, c_.pool);
+            offloaded_kv_ = std::make_unique<KvOffloadSequence>(offload_, c_.kv_heads * (key_width()+value_width()), c_.pool, cache_dtype());
             offloaded_index_ = std::make_unique<KvOffloadSequence>(offload_, c_.index_width, c_.pool);
             offloaded_pooled_ = std::make_unique<KvOffloadSequence>(offload_, c_.index_width, 16);
         }
@@ -763,14 +764,14 @@ class Qsa {
             int64_t capacity = current ? current : std::min<int64_t>(16, c_.maximum);
             while (capacity < required)
                 capacity = std::min(c_.maximum, capacity > c_.maximum / 2 ? c_.maximum : capacity * 2);
-            const auto width = cache == &index_ ? c_.index_width : c_.kv_heads * c_.width;
-            bytes += std::size_t(capacity) * width * 2;
+            const auto width = cache == &index_ ? c_.index_width : c_.kv_heads * (cache == &keys_ ? key_width() : value_width());
+            bytes += std::size_t(capacity) * width * (cache != &index_ && quantization_.enabled() ? 4 : 2);
         }
         return bytes;
     }
     std::size_t graph_growth_bytes(int64_t capacity) const {
         if (graph_keys_.defined()) return 0;
-        auto bytes = std::size_t(capacity) * 2 * c_.kv_heads * c_.width * 2;
+        auto bytes = std::size_t(capacity) * c_.kv_heads * (key_width()+value_width()) * (quantization_.enabled()?4:2);
         if (!index_.storage().defined() || index_.storage().size(1) != capacity)
             bytes += std::size_t(capacity) * c_.index_width * 2;
         bytes += std::size_t((capacity+c_.pool-1)/c_.pool) * c_.index_width * 2;
@@ -783,8 +784,8 @@ class Qsa {
             auto saved=tensor.contiguous().clone();bytes+=session_tensor_bytes(saved);return saved;
         };
         if(graph_keys_.defined()) {
-            state.keys=save(graph_keys_.narrow(2,0,count).permute({0,2,1,3}).reshape({1,count,c_.kv_heads*c_.width}));
-            state.values=save(graph_values_.narrow(2,0,count).permute({0,2,1,3}).reshape({1,count,c_.kv_heads*c_.width}));
+            state.keys=save(graph_keys_.narrow(2,0,count).permute({0,2,1,3}).reshape({1,count,c_.kv_heads*key_width()}));
+            state.values=save(graph_values_.narrow(2,0,count).permute({0,2,1,3}).reshape({1,count,c_.kv_heads*value_width()}));
         } else {
             state.keys=save(keys_.storage().narrow(1,0,count));
             state.values=save(values_.storage().narrow(1,0,count));
@@ -794,7 +795,9 @@ class Qsa {
     void restore_session(const Qwen4BlockSessionState& state,int64_t count) {
         MFQ_RUNTIME_CHECK(!offload_ && state.keys.defined() && state.values.defined() && state.index.defined() &&
             state.keys.dim()==3 && state.keys.size(0)==1 && state.keys.size(1)==count &&
-            state.keys.size(2)==c_.kv_heads*c_.width && state.values.sizes()==state.keys.sizes() &&
+            state.keys.size(2)==c_.kv_heads*key_width() && state.keys.scalar_type()==cache_dtype() &&
+            state.values.dim()==3 && state.values.size(0)==1 && state.values.size(1)==count &&
+            state.values.size(2)==c_.kv_heads*value_width() && state.values.scalar_type()==cache_dtype() &&
             state.index.dim()==3 && state.index.size(0)==1 && state.index.size(1)==count && state.index.size(2)==c_.index_width,
             "incompatible Qwen4 QSA session state");
         reset();keys_.append(state.keys);values_.append(state.values);index_.append(state.index);
@@ -814,8 +817,8 @@ class Qsa {
     void leave_graph() {
         if(!graph_keys_.defined())return;
         const auto n=position();
-        keys_.replace_storage(graph_keys_.narrow(2,0,n).permute({0,2,1,3}).contiguous().reshape({1,n,c_.kv_heads*c_.width}));
-        values_.replace_storage(graph_values_.narrow(2,0,n).permute({0,2,1,3}).contiguous().reshape({1,n,c_.kv_heads*c_.width}));
+        keys_.replace_storage(graph_keys_.narrow(2,0,n).permute({0,2,1,3}).contiguous().reshape({1,n,c_.kv_heads*key_width()}));
+        values_.replace_storage(graph_values_.narrow(2,0,n).permute({0,2,1,3}).contiguous().reshape({1,n,c_.kv_heads*value_width()}));
         graph_keys_={};graph_values_={};graph_pooled_={};
     }
     void reset() {
@@ -832,10 +835,10 @@ class Qsa {
             "QSA graph requires a prefilled single sequence");
         const auto n=position();
         MFQ_RUNTIME_CHECK(capacity>=n && capacity<=c_.maximum,"invalid QSA graph capacity");
-        auto graph_keys=tb::zeros({1,c_.kv_heads,capacity,c_.width},keys_.storage().options());
-        auto graph_values=tb::zeros_like(graph_keys);
-        graph_keys.narrow(2,0,n).copy_(keys_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
-        graph_values.narrow(2,0,n).copy_(values_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
+        auto graph_keys=tb::zeros({1,c_.kv_heads,capacity,key_width()},keys_.storage().options());
+        auto graph_values=tb::zeros({1,c_.kv_heads,capacity,value_width()},values_.storage().options());
+        graph_keys.narrow(2,0,n).copy_(keys_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,key_width()}).permute({0,2,1,3}));
+        graph_values.narrow(2,0,n).copy_(values_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,value_width()}).permute({0,2,1,3}));
         index_.prepare_fixed(capacity);
         auto graph_pooled=tb::zeros({1,(capacity+c_.pool-1)/c_.pool,c_.index_width},index_.storage().options());
         const auto pools=n/c_.pool;
@@ -858,19 +861,24 @@ class Qsa {
             "QSA graph cache is not prepared");
         const auto t=hidden.size(1),pools=graph_pooled_.size(1);
         const bool dense_capacity=graph_keys_.size(2)<=c_.budget;
-        auto p=project(execution,hidden,positions,!dense_capacity,cache_positions,graph_keys_,graph_values_,
+        auto p=project(execution,hidden,positions,!dense_capacity,cache_positions,
+                       quantization_.enabled()?Tensor{}:graph_keys_,quantization_.enabled()?Tensor{}:graph_values_,
                        std::move(projections));
         const auto finish=[&](Tensor output) {
             output=output.reshape({1,t,c_.heads*c_.width});
             return project_output?w_.output(execution,output):output;
         };
         if (!p.cache_written) {
-            graph_keys_.index_copy_(2,cache_positions,p.key.permute({0,2,1,3}).to(tb::kFloat16));
-            graph_values_.index_copy_(2,cache_positions,p.value.permute({0,2,1,3}).to(tb::kFloat16));
+            graph_keys_.index_copy_(2,cache_positions,encode_key(p.key).permute({0,2,1,3}));
+            graph_values_.index_copy_(2,cache_positions,encode_value(p.value).permute({0,2,1,3}));
         }
         index_.append_fixed(p.raw,cache_positions);
         if(dense_capacity) {
             const auto columns=std::min(graph_keys_.size(2),c_.budget+c_.pool-1);
+            if(quantization_.enabled()) {
+                auto attended=cuda_kv_attention(p.query,graph_keys_,graph_values_,quantization_,{},cache_positions);
+                return finish((attended*tb::sigmoid(p.gate.to(tb::kFloat32))).to(hidden.scalar_type()));
+            }
             if(fused_projection_ && rotary_->fused() &&
                 (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)) {
                 auto gated=mfq_qwen4_exp::causal_gqa_attention_gate(p.query,graph_keys_,graph_values_,
@@ -922,7 +930,10 @@ class Qsa {
         selected=tb::where(absolute+1<=c_.budget,dense,selected).to(tb::kInt32).contiguous();
         }
         Tensor gated;
-        if(fused_projection_ && rotary_->fused() &&
+        if(quantization_.enabled()) {
+            auto attended=cuda_kv_attention(p.query,graph_keys_,graph_values_,quantization_,selected,cache_positions);
+            gated=(attended*tb::sigmoid(p.gate.to(tb::kFloat32))).to(hidden.scalar_type());
+        } else if(fused_projection_ && rotary_->fused() &&
             (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)) {
             const auto sparse_gate=mfq::cuda::runtime_options::qsa_sparse_gate_fused();
             if(!sparse_gate || *sparse_gate)
@@ -995,15 +1006,14 @@ class Qsa {
                 return Projection{gate, query, key, value, iq, raw};
             },
             [&](Projection &p) {
-                p.key = keys_.append(p.key.reshape({b, t, -1}))
-                            .reshape({b, offset + t, c_.kv_heads, c_.width});
-                p.value = values_.append(p.value.reshape({b, t, -1}))
-                              .reshape({b, offset + t, c_.kv_heads, c_.width});
+                p.key = keys_.append(encode_key(p.key).reshape({b, t, -1}))
+                            .reshape({b, offset + t, c_.kv_heads, key_width()});
+                p.value = values_.append(encode_value(p.value).reshape({b, t, -1}))
+                              .reshape({b, offset + t, c_.kv_heads, value_width()});
                 p.raw = index_.append(p.raw);
             },
             [&](const Projection &p) {
-                return mfq_qwen4_exp::dense_gqa_attention(p.query, p.key.permute({0, 2, 1, 3}),
-                                                          p.value.permute({0, 2, 1, 3}), offset);
+                return attend(p.query, p.key.permute({0,2,1,3}), p.value.permute({0,2,1,3}), {}, offset);
             },
             [&](const Projection &p) {
                 const auto &raw = p.raw;
@@ -1029,9 +1039,8 @@ class Qsa {
                     *selection_trace = {scores, ids, p.iq, pooled};
                 return ids;
             },
-            [](const Projection &p, Tensor ids) {
-                return mfq_qwen4_exp::sparse_gqa_attention(p.query, p.key.permute({0, 2, 1, 3}),
-                                                           p.value.permute({0, 2, 1, 3}), ids);
+            [&](const Projection &p, Tensor ids) {
+                return attend(p.query, p.key.permute({0,2,1,3}), p.value.permute({0,2,1,3}), ids, offset);
             },
             [&](Tensor attended, const Projection &p) {
                 auto gated = attended.to(tb::kFloat32) * tb::sigmoid(p.gate.to(tb::kFloat32));
@@ -1042,6 +1051,26 @@ class Qsa {
     }
 
   private:
+    Tensor attend(const Tensor& query, Tensor keys, Tensor values, const Tensor& selected, int64_t offset) const {
+        if (keys.scalar_type() == tb::kInt32) {
+            // Large query tiles amortize one decode per KV row and use the
+            // existing matrix attention kernels. Persistent caches stay packed;
+            // floating workspace is bounded and lives only for this layer.
+            const auto floating_bytes = std::size_t(keys.size(0)) * keys.size(1) * keys.size(2) * c_.width * 4;
+            if (query.size(2) <= 8 || floating_bytes > (128ULL << 20))
+                return cuda_kv_attention(query, keys, values, quantization_, selected, {}, offset);
+            keys = cuda_kv_decode(keys, int(c_.width), quantization_.key_bits(), false);
+            values = cuda_kv_decode(values, int(c_.width), quantization_.value_bits(), true);
+        }
+        if (selected.defined())
+            return mfq_qwen4_exp::sparse_gqa_attention(query, keys, values, selected);
+        return mfq_qwen4_exp::dense_gqa_attention(query, keys, values, offset);
+    }
+    int64_t key_width() const { return quantization_.enabled()?cuda_kv_packed_width(int(c_.width),quantization_.key_bits()):c_.width; }
+    int64_t value_width() const { return quantization_.enabled()?cuda_kv_packed_width(int(c_.width),quantization_.value_bits()):c_.width; }
+    tb::ScalarType cache_dtype() const { return quantization_.enabled()?tb::kInt32:tb::kFloat16; }
+    Tensor encode_key(const Tensor& x) const { return quantization_.enabled()?cuda_kv_encode(x,quantization_.key_bits(),false):x.to(tb::kFloat16); }
+    Tensor encode_value(const Tensor& x) const { return quantization_.enabled()?cuda_kv_encode(x,quantization_.value_bits(),true):x.to(tb::kFloat16); }
     struct Projection {Tensor gate,query,key,value,iq,raw;bool cache_written=false;};
     Tensor forward_offloaded(CudaExecutionContext& execution, const Tensor& hidden,
         const Tensor& positions, const Tensor& full_positions, std::vector<Tensor>* trace,
@@ -1049,14 +1078,14 @@ class Qsa {
         const auto offset = position(), tokens = hidden.size(1), length = offset + tokens;
         MFQ_RUNTIME_CHECK(hidden.size(0) == 1 && length <= c_.maximum && full_positions.size(-1) == length,
             "streamed QSA requires one sequence within its configured context");
-        const auto row_width = c_.kv_heads * c_.width;
+        const auto key_row = c_.kv_heads * key_width(), value_row = c_.kv_heads * value_width();
         const auto max_keys = std::min(length, c_.budget + c_.pool - 1);
-        const auto row_bytes = std::size_t(row_width) * 4;
-        MFQ_RUNTIME_CHECK(std::size_t(max_keys) * row_bytes <= offload_->config().buffer_bytes / 4,
-            "QSA I/O buffer cannot hold one selected context; increase the resident KV budget");
+        const auto row_bytes = std::size_t(key_row+value_row) * (quantization_.enabled()?4:2);
+        if (std::size_t(max_keys) * row_bytes > offload_->config().buffer_bytes / 4)
+            throw std::invalid_argument("QSA I/O buffer cannot hold one selected context; increase the resident KV budget");
         auto p = project(execution, hidden, positions, length > c_.budget,{},{},{},std::move(projections));
         try {
-            offloaded_kv_->append(tb::cat({p.key.reshape({tokens, row_width}), p.value.reshape({tokens, row_width})}, 1));
+            offloaded_kv_->append(tb::cat({encode_key(p.key).reshape({tokens,key_row}), encode_value(p.value).reshape({tokens,value_row})}, 1));
             offloaded_index_->append(p.raw.reshape({tokens, c_.index_width}));
             const auto first_pool = offloaded_pooled_->position(), new_pools = length / c_.pool - first_pool;
             if (new_pools) {
@@ -1066,6 +1095,26 @@ class Qsa {
                 auto starts = (tb::arange(new_pools, positions.options().dtype(tb::kInt64)) + first_pool) * c_.pool;
                 pooled = rotary_->forward(pooled.unsqueeze(1), full_positions.index_select(-1, starts)).squeeze(1);
                 offloaded_pooled_->append(pooled.reshape({new_pools, c_.index_width}));
+            }
+            // When one layer fits in staging, reuse that layer across the
+            // entire prefill tile instead of gathering the same rows per token.
+            // Other layers remain under the GPU/RAM/SSD eviction policy.
+            if (tokens > 8 && std::size_t(length) * row_bytes <= offload_->config().buffer_bytes / 2 &&
+                    std::size_t(length / c_.pool) * c_.index_width * 2 <= offload_->config().buffer_bytes / 4) {
+                auto packed = offloaded_kv_->range(0, length);
+                auto key = packed.narrow(1,0,key_row).reshape({1,length,c_.kv_heads,key_width()}).permute({0,2,1,3});
+                auto value = packed.narrow(1,key_row,value_row).reshape({1,length,c_.kv_heads,value_width()}).permute({0,2,1,3});
+                Tensor ids;
+                if (length > c_.budget) {
+                    auto pooled = offloaded_pooled_->range(0,length / c_.pool).reshape({1,length / c_.pool,c_.index_width});
+                    auto scores = mfq_qwen4_exp::block_scores(p.iq, pooled);
+                    ids = select_pooled_blocks(scores, offset, length, c_.pool, c_.budget, true);
+                    if (trace) *trace = {scores,ids,p.iq,pooled};
+                }
+                auto attended = attend(p.query, key, value, ids, offset);
+                auto gated = attended.to(tb::kFloat32) * tb::sigmoid(p.gate.to(tb::kFloat32));
+                auto result = gated.reshape({1,tokens,c_.heads*c_.width}).to(hidden.scalar_type());
+                return project_output ? w_.output(execution,result) : result;
             }
             const auto queries = std::max<int64_t>(1, std::min<int64_t>(32,
                 offload_->config().buffer_bytes / 4 / (std::size_t(max_keys) * row_bytes)));
@@ -1115,9 +1164,10 @@ class Qsa {
                 }
                 auto packed = offloaded_kv_->gather(requested);
                 const auto n = static_cast<int64_t>(requested.size());
-                auto key = packed.narrow(1, 0, row_width).reshape({1, n, c_.kv_heads, c_.width}).permute({0, 2, 1, 3}).contiguous();
-                auto value = packed.narrow(1, row_width, row_width).reshape({1, n, c_.kv_heads, c_.width}).permute({0, 2, 1, 3}).contiguous();
-                outputs.push_back(mfq_qwen4_exp::sparse_gqa_attention(p.query.narrow(2, begin, count), key, value, cpu_ids.to(selected.device())));
+                auto key = packed.narrow(1,0,key_row).reshape({1,n,c_.kv_heads,key_width()}).permute({0,2,1,3}).contiguous();
+                auto value = packed.narrow(1,key_row,value_row).reshape({1,n,c_.kv_heads,value_width()}).permute({0,2,1,3}).contiguous();
+                // IDs now address a compact union; selection already contains the causal mask.
+                outputs.push_back(attend(p.query.narrow(2,begin,count),key,value,cpu_ids.to(selected.device()),n));
             }
             auto attended = tb::cat(outputs, 1);
             auto gated = attended.to(tb::kFloat32) * tb::sigmoid(p.gate.to(tb::kFloat32));
@@ -1178,6 +1228,7 @@ class Qsa {
     }
     QsaWeights w_;
     QsaConfig c_;
+    KvQuantization quantization_=cuda_kv_quantization();
     std::shared_ptr<RotaryEmbedding> rotary_;
     bool fused_projection_;
     bool grouped_projection_;

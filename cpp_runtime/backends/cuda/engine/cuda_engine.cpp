@@ -14,8 +14,10 @@
 #include "mfq_weight_memory.h"
 
 #include <cuda_runtime_api.h>
+#include "mfq_cuda_kv_quantization.h"
 #include <algorithm>
 #include <variant>
+#include <set>
 
 namespace mfq::cuda {
 using namespace mfq::engine;
@@ -34,6 +36,12 @@ struct CudaEngineState {
     TextSessionCache cache;
     std::unique_ptr<ContinuousBatch<CudaBatchOperations<Model>>> batching;
     bool duplex_active = false;
+    std::size_t resident_budget=0, weight_budget=0, initial_expert_budget=0, allocation_ceiling=0;
+
+    bool online_budget_supported() const {
+        return execution->layer_placement.devices.size()<=1 && !execution->tensor_parallel.enabled()
+            && !execution->expert_parallel.enabled();
+    }
 
     CudaEngineState(std::shared_ptr<CudaExecutionContext> owner, Model loaded,
             RuntimeComponents<Model> optional, CudaRuntimeConfig runtime_config,
@@ -46,6 +54,10 @@ struct CudaEngineState {
                   language.supports_paged_text_session_state(), config.prefix_cache),
                 language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1,
                 cuda_has_separate_memory()) {
+        initial_expert_budget=moe_expert_cache_budget_bytes(execution->moe_expert_cache);
+        if (execution->qsa_kv_store)
+            execution->qsa_kv_store->set_ram_reservation([this](std::size_t bytes) { cache.reserve_ram(bytes); });
+        allocation_ceiling=mfq::cuda::default_context(execution->layer_placement.primary_device())->memory_stats().limit;
         if (config.continuous_batch.max_sequences) {
             if constexpr (std::is_same_v<Model, Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)
                 batching = std::make_unique<ContinuousBatch<CudaBatchOperations<Model>>>(
@@ -71,12 +83,77 @@ struct CudaEngineState {
             };
         }
 #endif
+        if(const auto bytes=runtime_options::resident_budget_bytes()) {
+            SessionCommand command;
+            command.kind=SessionCommand::Kind::memory_budget;
+            command.bytes=bytes;
+            session(command);
+        }
     }
     bool can_batch(const EngineRequest& request) const {
         if constexpr (std::is_same_v<Model,Qwen4CausalLm>)
             return batching && !request.input.media && request.input.cache_plan.session_id.empty() &&
                 !(request.input.sampling.enable_mtp && components.mtp);
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
+    }
+    ~CudaEngineState() {
+        if (execution->qsa_kv_store) execution->qsa_kv_store->set_ram_reservation({});
+    }
+    SessionResult session(const SessionCommand& command) {
+        if(command.kind!=SessionCommand::Kind::memory_budget)return control_session(cache,command);
+        if(!online_budget_supported())throw std::invalid_argument("online memory budgeting requires a single-device CUDA worker");
+        const auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
+        const auto dense=weight_memory->resident_bytes();
+        const auto minimum=moe_expert_cache_minimum_bytes(execution->moe_expert_cache);
+        const auto requested_weights=command.weight_bytes.value_or(weight_budget);
+        if(requested_weights && requested_weights<dense+minimum)
+            throw std::invalid_argument("weight budget is below dense weights and minimum expert working set");
+        auto limit=command.bytes ? allocation_ceiling ? std::min<std::size_t>(command.bytes,allocation_ceiling) : command.bytes : allocation_ceiling;
+        if(limit) {
+            std::size_t free=0,total=0;
+            MFQ_CUDA_CHECK(cudaMemGetInfo(&free,&total));
+            limit=std::min(limit,std::min(total,free+context->resident_memory_usage()));
+        }
+        if(limit && limit<dense+minimum)
+            throw std::invalid_argument("resident memory budget is below non-offloadable weights");
+        const auto previous_limit=context->memory_stats().limit;
+        const auto previous_experts=moe_expert_cache_budget_bytes(execution->moe_expert_cache);
+        const auto before=context->resident_memory_usage();
+        finish_moe_expert_exchanges(execution->moe_expert_cache);
+        graph.invalidate();
+        if(batching)batching->release_idle_buffers();
+        if(components.mtp)components.mtp->reset(1);
+        language.reset(1);
+        release_moe_decode_buffers(execution->moe_expert_cache);
+        context->reclaim_idle_memory();
+        auto target=requested_weights ? requested_weights-dense : initial_expert_budget;
+        std::size_t hot=0,expert_bytes=0;
+        for(const auto& [name,value]:cache.metrics())if(name=="prefix_cache_hot_bytes")hot=std::size_t(value);
+        for(const auto& [name,value]:moe_expert_memory_metrics(execution->moe_expert_cache))
+            if(name=="resident_expert_cache_bytes")expert_bytes=std::size_t(value);
+        auto used=context->resident_memory_usage();
+        if(limit && used>limit) {
+            cache.trim_hot(hot>used-limit ? hot-(used-limit) : 0);
+            context->reclaim_idle_memory();used=context->resident_memory_usage();
+        }
+        const auto fixed=used>expert_bytes?used-expert_bytes:0;
+        if(limit) {
+            if(fixed>limit || minimum>limit-fixed)throw std::invalid_argument("resident memory budget is below live KV and workspace requirements");
+            target=std::min(target,limit-fixed);
+        }
+        try {
+            if(!limit || limit>previous_limit)context->set_memory_limit(limit);
+            if(execution->moe_expert_cache)resize_moe_expert_cache(execution->moe_expert_cache,std::max(target,minimum));
+            context->set_memory_limit(limit);
+        } catch(...) {
+            context->set_memory_limit(0);
+            if(execution->moe_expert_cache)resize_moe_expert_cache(execution->moe_expert_cache,previous_experts);
+            context->set_memory_limit(previous_limit);
+            throw;
+        }
+        resident_budget=command.bytes;weight_budget=requested_weights;
+        const auto after=context->resident_memory_usage();
+        return {before>after?before-after:0,{}};
     }
     bool exclusive() const { return duplex_active; }
     bool mtp_available() const { return bool(components.mtp); }
@@ -114,13 +191,11 @@ struct CudaEngineState {
     }
     template <class T> ControlResult control(T value) {
         if constexpr (std::is_same_v<T, RuntimeMetrics>) {
-            size_t free = 0, total = 0;
-            MFQ_CUDA_CHECK(cudaMemGetInfo(&free, &total));
-            auto memory = mfq_cuda_memory_stats(mfq_current_cuda_device());
             const auto batch_metrics = batching ? batching->metrics() : Metrics{};
             const auto capabilities = components.state();
-            Metrics metrics{{"device_free_bytes", double(free)}, {"device_total_bytes", double(total)},
-                {"cuda_allocated_bytes", double(memory.allocated_bytes)}, {"cuda_reserved_bytes", double(memory.reserved_bytes)},
+            Metrics metrics{
+                {"kv_quantization_supported",(std::is_same_v<Model,Qwen4CausalLm>||std::is_same_v<Model,Qwen35CausalLm>)?1.0:0.0},
+                {"kv_quantization_bits",(std::is_same_v<Model,Qwen4CausalLm>||std::is_same_v<Model,Qwen35CausalLm>)?cuda_kv_quantization().bits:0.0},
                 {"vision_declared", double(capabilities.vision_declared)}, {"vision_supported", double(capabilities.vision_supported)},
                 {"vision_available", double(capabilities.vision_available)}, {"mtp_declared", double(capabilities.mtp_declared)},
                 {"mtp_supported", double(capabilities.mtp_supported)}, {"mtp_available", double(capabilities.mtp_available)}};
@@ -142,15 +217,53 @@ struct CudaEngineState {
                             value += batch_value;
                     }
                 metrics.insert(metrics.end(),cache_memory.begin(),cache_memory.end());
-                std::size_t kv_bytes=0,hot_bytes=0;
-                for(const auto& metric:cache_memory)
-                    if(metric.first=="kv_cache_bytes")kv_bytes=std::size_t(metric.second);
-                for(const auto& metric:cache.metrics())
-                    if(metric.first=="prefix_cache_hot_bytes")hot_bytes=std::size_t(metric.second);
-                const auto categorized=resident_weights+kv_bytes+hot_bytes;
-                const auto resident=std::max(memory.reserved_bytes,memory.allocated_bytes);
-                metrics.emplace_back("resident_buffer_bytes",double(resident>categorized?resident-categorized:0));
             }
+            const auto metric_bytes = [&](const std::string& key) {
+                for(const auto& [name,value]:metrics)if(name==key)return std::size_t(value);
+                return std::size_t(0);
+            };
+            std::set<int> devices(execution->layer_placement.devices.begin(),execution->layer_placement.devices.end());
+            devices.insert(execution->tensor_parallel.devices.begin(),execution->tensor_parallel.devices.end());
+            devices.insert(execution->expert_parallel.devices.begin(),execution->expert_parallel.devices.end());
+            const auto primary=execution->layer_placement.primary_device();
+            devices.insert(primary);
+            auto prefix_bytes=cache.device_hot_bytes();
+            std::size_t allocated=0,reserved=0,free_bytes=0,total_bytes=0,buffers=0;
+            for(const int device:devices) {
+                MfqCudaGuard guard(device);
+                size_t free=0,total=0;
+                MFQ_CUDA_CHECK(cudaMemGetInfo(&free,&total));
+                const auto memory=mfq_cuda_memory_stats(device);
+                const auto resident=std::max(memory.reserved_bytes,memory.allocated_bytes);
+                const auto stem="gpu_"+std::to_string(device)+"_";
+                auto weights=weight_memory->resident_bytes(device);
+                if(device==primary)weights+=metric_bytes("resident_expert_cache_bytes");
+                const auto hot=prefix_bytes[device];
+                auto live=metric_bytes(stem+"live_kv_bytes");
+                if(device==primary)for(const auto& [name,value]:batch_metrics)
+                    if(name=="continuous_batching_request_kv_bytes")live+=std::size_t(value);
+                metrics.insert(metrics.end(),{{stem+"resident_bytes",double(resident)},
+                    {stem+"resident_weight_bytes",double(weights)}, {stem+"prefix_cache_bytes",double(hot)},
+                    {stem+"memory_total_bytes",double(total)}, {stem+"memory_available_bytes",double(free)}});
+                if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                    const auto categorized=weights+live+hot;
+                    const auto buffer=resident>categorized?resident-categorized:0;
+                    metrics.emplace_back(stem+"resident_buffer_bytes",double(buffer));
+                    metrics.emplace_back(stem+"kv_bytes",double(live+hot));
+                    buffers+=buffer;
+                }
+                allocated+=memory.allocated_bytes;reserved+=memory.reserved_bytes;free_bytes+=free;total_bytes+=total;
+            }
+            metrics.insert(metrics.end(),{{"device_free_bytes",double(free_bytes)}, {"device_total_bytes",double(total_bytes)},
+                {"cuda_allocated_bytes",double(allocated)}, {"cuda_reserved_bytes",double(reserved)}});
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)metrics.emplace_back("resident_buffer_bytes",double(buffers));
+            const auto expert_bytes=metric_bytes("resident_expert_cache_bytes");
+            const auto minimum=moe_expert_cache_minimum_bytes(execution->moe_expert_cache);
+            metrics.insert(metrics.end(),{{"resident_memory_dynamic_budget",online_budget_supported()?1.0:0.0},
+                {"resident_weight_dynamic_budget",online_budget_supported()?1.0:0.0},
+                {"resident_memory_budget_bytes",double(resident_budget)}, {"resident_weight_budget_bytes",double(weight_budget)},
+                {"resident_memory_used_bytes",double(std::max(allocated,reserved))},
+                {"resident_reclaimable_weight_bytes",double(expert_bytes>minimum?expert_bytes-minimum:0)}});
             metrics.insert(metrics.end(), {{"ssd_expert_enabled", 0.0}, {"ssd_expert_payload_bytes", 0.0},
                 {"qsa_kv_offload_supported", std::is_same_v<Model, Qwen4CausalLm> ? 1.0 : 0.0}});
             if (execution->qsa_kv_store) {

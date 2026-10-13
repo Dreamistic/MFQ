@@ -326,7 +326,10 @@ void MoeResidencyManager::release_transfer_stages() {
     for(auto& stages:impl_->transfer_stages)for(auto& stage:stages)stage.arena=nullptr;
 }
 void MoeResidencyManager::before_layer(int layer) {
-    auto& s=*impl_;if(layer!=s.first)return;
+    auto& s=*impl_;if(layer!=s.first && layer>=0)return;
+    // Eager MTP enters the predictor before the next backbone layer zero.
+    // Finish backbone exchanges before predictor DMA reuses shared staging or
+    // acquires RAM leases held by the exchange worker.
     apply_pending();
     if(s.expert_done_host) {
         *static_cast<volatile uint32_t*>(s.expert_done_host->data())=0;
@@ -391,7 +394,11 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
     // Planning can proceed now; resident writes must follow its completion.
     s.pending_window=window_inflight;
     s.pending_expert_fence=window_inflight && s.expert_fence && bool(s.expert_done_host);
-    if(window_inflight){MFQ_CUDA_CHECK(cudaEventRecord(s.window_done,mfq_get_current_cuda_stream().stream()));++s.window_prepares;}
+    // Capture this transaction's producer fence now. compute_done_ is also
+    // recorded by later predictor calls and cannot be read asynchronously by
+    // the worker without risking a dependency on its own downstream DMA.
+    MFQ_CUDA_CHECK(cudaEventRecord(s.window_done,mfq_get_current_cuda_stream().stream()));
+    if(window_inflight)++s.window_prepares;
     if(!s.worker.joinable())s.worker=std::thread([this] {
         auto& state=*impl_;
         std::unique_lock<std::mutex> lock(state.worker_mutex);
@@ -585,7 +592,7 @@ void MoeResidencyManager::prepare() {
             ++s.expert_fence_waits;
         } else MFQ_CUDA_CHECK(cudaStreamWaitEvent(s.stream,s.window_done,0));
     }
-    else if(cache.compute_done_recorded_)MFQ_CUDA_CHECK(cudaStreamWaitEvent(s.stream,cache.compute_done_,0));
+    else MFQ_CUDA_CHECK(cudaStreamWaitEvent(s.stream,s.window_done,0));
     // Only fixed GPU routing without background CPU calibration uses this
     // path. The host-cache lock spans the exchange, so window completion must
     // never require a new host-cache lookup. Existing readers reject it.

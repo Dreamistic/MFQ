@@ -152,7 +152,11 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         }
 
         if (mtp.teacher_forced_prompt_prime()) {
-            const int64_t chunk_size = std::min<int64_t>(512, prefill_chunk_size);
+            const int64_t chunk_size = [&] {
+                if constexpr (requires { ops.predictor_prefill_chunk_size(prefill_chunk_size); })
+                    return ops.predictor_prefill_chunk_size(prefill_chunk_size);
+                return std::min<int64_t>(512, prefill_chunk_size);
+            }();
             Tensor prime_hidden;
             int64_t prime_ids_offset = 1;
             int64_t pairs = ops.size(raw, 1) - 1;
@@ -172,12 +176,15 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 if (output.result.cancelled)
                     co_return;
                 const auto chunk = mfq::engine::next_prefill_chunk(pairs, offset, chunk_size);
-                (void)ops.predictor_step(ops.slice(prime_hidden, 1, chunk.offset, chunk.count),
-                    ops.slice(input_ids, 1, prime_ids_offset + chunk.offset, chunk.count),
-                    transformed_prompt
-                        ? ops.slice(
-                              prepared->positions, -1, prime_ids_offset + chunk.offset, chunk.count)
-                        : Tensor{});
+                auto prime = ops.slice(prime_hidden, 1, chunk.offset, chunk.count);
+                auto ids = ops.slice(input_ids, 1, prime_ids_offset + chunk.offset, chunk.count);
+                auto positions = transformed_prompt
+                    ? ops.slice(prepared->positions, -1, prime_ids_offset + chunk.offset, chunk.count)
+                    : Tensor{};
+                if constexpr (requires { ops.predictor_prefill(prime, ids, positions); })
+                    prefill_ms += ops.predictor_prefill(std::move(prime), std::move(ids), std::move(positions));
+                else
+                    (void)ops.predictor_step(std::move(prime), std::move(ids), std::move(positions));
                 if (output.result.cancelled)
                     co_return;
                 offset += chunk.count;

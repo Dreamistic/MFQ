@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mfq_tensor_backend.h"
+#include "mfq/yarn.h"
 
 #include <cstdint>
 #include <mutex>
@@ -28,7 +29,8 @@ struct RopeCache {
         int64_t active_pairs = -1,
         mfq_tensor_backend::Device device =
             mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA),
-        bool official_reciprocal_frequencies = false);
+        bool official_reciprocal_frequencies = false,
+        mfq::models::YarnScaling yarn = {});
 
     void configure_mrope(
         const std::vector<int64_t>& configured_sections,
@@ -53,11 +55,11 @@ class RotaryEmbedding {
 public:
     RotaryEmbedding(int64_t dimension, int64_t maximum, double base,
                     std::vector<int64_t> sections = {}, bool interleaved = false,
-                    std::optional<bool> fused = std::nullopt);
+                    std::optional<bool> fused = std::nullopt, mfq::models::YarnScaling yarn = {});
     mfq_tensor_backend::Tensor forward(const mfq_tensor_backend::Tensor& value,
                                        const mfq_tensor_backend::Tensor& positions) const;
     // Switch only after execution and captured graphs using this module finish.
-    void set_fused(bool enabled) { fused_ = enabled; }
+    void set_fused(bool enabled) { fused_ = enabled && !yarn_.enabled(); }
     bool fused() const { return fused_; }
     mfq_tensor_backend::Tensor forward_normalized(
         const mfq_tensor_backend::Tensor& value, const mfq_tensor_backend::Tensor& weight,
@@ -80,6 +82,7 @@ private:
     std::vector<int64_t> sections_;
     bool interleaved_;
     bool fused_;
+    mfq::models::YarnScaling yarn_;
     struct Prepared { mfq_tensor_backend::Tensor frequencies, axes; };
     Prepared prepare_parameters(const mfq_tensor_backend::Tensor& value) const;
     mutable std::mutex prepared_mutex_;

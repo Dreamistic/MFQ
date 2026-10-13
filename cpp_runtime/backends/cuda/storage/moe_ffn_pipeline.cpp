@@ -9,6 +9,7 @@
 #include "runtime/decode_window.h"
 #include "runtime/dma_copy_batch.h"
 #include "mfq_cuda_context.h"
+#include "mfq/runtime.h"
 #include "mfe_ffn_runtime.h"
 #include "quant_linear.h"
 #include <cuda.h>
@@ -58,7 +59,7 @@ struct Mapped {
         const auto allocation=cudaHostAlloc(&host,n,cudaHostAllocMapped);
         if(allocation==cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
-            throw mfq::cuda::Error("CUDA pinned allocation failed: requested="+std::to_string(n)+
+            throw MfqResourceExhausted("CUDA pinned allocation failed: requested="+std::to_string(n)+
                 " host_allocated="+std::to_string(mfq::cuda::tensor_host_bytes.load()));
         }
         MFQ_CUDA_CHECK(allocation);
@@ -342,8 +343,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             cache_->pipeline_prefill_ring_=tb::empty({bytes},ids.options().dtype(tb::kUInt8));
         }
         std::array<std::vector<MoeGpuArena*>,3> stages;int64_t stage_offset=0;
-        for(int p=0;p<3;++p)for(auto& cohort:sources_[p]->cohorts_)
-            stages[p].push_back(&prefill_stage(p,cohort,stage_offset));
+        for(int p=0;p<3;++p) {
+            if(combined_gate_up_ && p==1) { stages[p]=stages[0]; continue; }
+            for(auto& cohort:sources_[p]->cohorts_)
+                stages[p].push_back(&prefill_stage(p,cohort,stage_offset));
+        }
         if(execution.config.moe_ffn_fused_activation && !cache_->pipeline_sigmoid_table_.defined())
             cache_->pipeline_sigmoid_table_=moe_swiglu_sigmoid_table_cuda();
         int map_count=0;
@@ -459,6 +463,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     token_indices[row]=position/routes;pair_indices[row]=position;group_ids[row]=q;++row;
                 }
                 for(int p=0;p<3;++p) {
+                    if(combined_gate_up_ && p==1)continue;
                     auto& source=*sources_[p];const int c=source.expert_to_cohort_[e];
                     const auto& cohort=source.cohorts_[c];
                     const int hot=cohort.arena->book->slot_for({source.id_,c,e});
@@ -530,8 +535,16 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                         auto* destination_base=static_cast<uint8_t*>(destination_fields[f].data_ptr());
                         for(std::size_t first=0;first<cohort_uploads.size();) {
                             const auto start=reinterpret_cast<std::uintptr_t>(cohort_uploads[first]->fields[f].data_ptr());
-                            if(start<ram_begin || start>ram_end || bytes>ram_end-start)
-                                throw std::logic_error("MFQ streamed prefill needs registered RAM fields");
+                            if(start<ram_begin || start>ram_end || bytes>ram_end-start) {
+                                // Predictor weights can remain pageable to leave
+                                // Windows pinned-memory headroom for decode.
+                                auto* destination=destination_base+std::size_t(cohort_uploads[first]->slot)*bytes;
+                                MFQ_CUDA_CHECK(cudaMemcpyAsync(destination,reinterpret_cast<const void*>(start),
+                                    bytes,cudaMemcpyHostToDevice,cache_->weight_stream_));
+                                stats.ram_pcie_bytes+=bytes;stats.pipeline_staged_ram_bytes+=bytes;
+                                if(p<2)stats.pipeline_gate_up_dma_bytes+=bytes;else stats.pipeline_down_dma_bytes+=bytes;
+                                ++stats.pipeline_dma_copies;++first;continue;
+                            }
                             std::size_t last=first+1,pitch=0;
                             if(last<cohort_uploads.size()) {
                                 const auto next=reinterpret_cast<std::uintptr_t>(cohort_uploads[last]->fields[f].data_ptr());
@@ -593,7 +606,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 runtime.nint_input_plans.clear();runtime.nvq_active_plans.clear();
                 runtime.activation_workspaces.clear();return output;
             };
-            auto gate=projection(0,x),up=projection(1,x);
+            auto gate=projection(0,x);
+            auto up=combined_gate_up_ ? gate.narrow(-1,ff_,ff_).contiguous() : projection(1,x);
+            if(combined_gate_up_)gate=gate.narrow(-1,0,ff_).contiguous();
             auto hidden=execution.config.moe_ffn_fused_activation
                 ? moe_swiglu_rounded_cuda(gate,up,cache_->pipeline_sigmoid_table_)
                 : (gate*tb::sigmoid(gate))*up;
@@ -655,9 +670,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         // partial prefill's scratch; its request state is discarded by the
         // scheduler. Driver and numerical failures still poison the session.
         try { std::rethrow_exception(std::current_exception()); }
-        catch(const mfq::cuda::Error& error) {
+        catch(const std::exception& error) {
             const std::string message=error.what();
-            if(message.starts_with("CUDA process VRAM limit exceeded:") ||
+            if(dynamic_cast<const MfqResourceExhausted*>(&error) ||
+                    message.starts_with("CUDA process VRAM limit exceeded:") ||
                     message.starts_with("CUDA VRAM limit exceeded:") ||
                     message.starts_with("CUDA pinned allocation failed:")) {
                 try {
@@ -676,6 +692,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(!cache_->pipeline_prefill_layer_layout_)
             throw std::logic_error("whole-layer prefill requires field-major preload");
         const auto layout=cache_->pipeline_prefill_layers_.at(sources_[0]->layer_id_);
+        // The predictor's combined NINT image can exceed the target's image.
+        // Retire all views before replacing the shared staging allocation.
+        if(cache_->pipeline_prefill_layer_buffer_.defined() && cache_->pipeline_prefill_layer_stride_<layout.second)
+            release_moe_prefill_buffers(cache_);
         if(!cache_->pipeline_prefill_layer_buffer_.defined()) {
             int64_t maximum=0;
             // Predictor images are separate from backbone prefill. Their
@@ -828,7 +848,16 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             (!reuse_option || *reuse_option!=0);
         if(!cache_->pipeline_prefill_layer_buffer_.defined() || !cache_->pipeline_prefill_layer_overlap_ ||
                 (!prefill_layer_async() && !same_layer))MFQ_CUDA_CHECK(cudaStreamSynchronize(stream_));
-        initialize_prefill_layer(execution,ids);
+        if(prefill_stream_)return streamed_prefill(execution,input,ids,weights);
+        try { initialize_prefill_layer(execution,ids); }
+        catch(const MfqResourceExhausted& error) {
+            // Retire an oversized whole-layer image before switching to the
+            // bounded expert-group ring. Keep that ring for subsequent chunks.
+            release_moe_prefill_buffers(cache_);
+            std::cerr<<"runtime_prefill_ring grouped_fallback=1 layer="<<sources_[0]->layer_id_
+                <<" reason="<<error.what()<<'\n';
+            return streamed_prefill(execution,input,ids,weights);
+        }
         auto& layer=*prefill_layer_;
         if(cache_->pipeline_prefill_layer_overlap_ && prefill_layer_async() && !same_layer &&
                 cache_->pipeline_prefill_layer_read_recorded_[layer.slot])
@@ -837,7 +866,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(cache_->pipeline_prefill_layer_overlap_) {
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(stream_,cache_->pipeline_prefill_layer_gate_up_ready_[layer.slot],0));
             const auto next=std::next(cache_->pipeline_prefill_layers_.find(layer.layer_id));
-            if(next!=cache_->pipeline_prefill_layers_.end())
+            if(next!=cache_->pipeline_prefill_layers_.end() && (next->first<0)==(layer.layer_id<0))
                 submit_prefill_layer_copy(execution,next->first,layer.slot^1);
         }
         ++cache_->stats_.pipeline_serves;
@@ -864,7 +893,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             });
             runtime.activation_workspaces.clear();return output;
         };
-        auto gate=projection(0,input),up=projection(1,input);
+        auto gate=projection(0,input);
+        auto up=combined_gate_up_ ? gate.narrow(-1,ff_,ff_).contiguous() : projection(1,input);
+        if(combined_gate_up_)gate=gate.narrow(-1,0,ff_).contiguous();
         auto hidden=execution.config.moe_ffn_fused_activation
             ? moe_swiglu_rounded_cuda(gate,up,cache_->pipeline_sigmoid_table_)
             : (gate*tb::sigmoid(gate))*up;
@@ -2615,7 +2646,7 @@ public:
         // allocation limits still apply, and decode restores the old threshold.
         if(!window && !batch_decode)retain_prefill_pool(ids);
         const auto layer_prefill=mfq::cuda::runtime_options::moe_prefill_layer();
-        if(!window && !batch_decode && layer_prefill && *layer_prefill!=0 &&
+        if(!window && !batch_decode && layer_prefill && *layer_prefill!=0 && cache_->pipeline_prefill_layer_layout_ &&
                 cache_->pipeline_ram_registered_bytes_>0 && execution.kl_mmq.mode==KlMmqMode::Default) {
             if(cache_->moe_residency_)cache_->moe_residency_->before_layer(sources_[0]->layer_id_);
             try {return whole_layer_prefill(execution,input,ids,weights);}
@@ -2748,8 +2779,8 @@ MoeFfnForward make_moe_ffn_pipeline(const std::vector<std::shared_ptr<MfeWeight>
     if((gate_up.size()!=1 && gate_up.size()!=2) || down.size()!=1)return {};
     const auto& up=gate_up.back();
     for(const auto& w:{gate_up[0],up,down[0]})if(!w || !w->cached_source)return {};
-    // Combined packed projections currently use the small-batch predictor
-    // path; preserve the existing large-prompt and tensor-parallel behavior.
+    // Combined predictor projections support short decode and the whole-layer
+    // prefill image; backbone/tensor-parallel dispatch remains unchanged.
     if(gate_up.size()==1 && (gate_up[0]->cached_source->layer_id()>=0 || down[0]->neuron_len%2))return {};
     if(gate_up.size()==1) {
         for(const auto& w:{gate_up[0],down[0]})if(!w->cached_source->two_stage_compatible())return {};

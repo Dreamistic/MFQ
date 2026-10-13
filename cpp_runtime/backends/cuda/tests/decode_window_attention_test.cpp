@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/model.h"
 #include "runtime/decode_window.h"
 #include "mfq_cuda_context.h"
+#include "mfq/runtime.h"
 #include "cuda_execution.h"
 #include <algorithm>
 #include <cmath>
@@ -160,10 +161,10 @@ void quota_recovery_case() {
         int calls=0;
         try {
             failed.capture([&] {
-                if(++calls==3)throw Error("CUDA VRAM limit exceeded: injected during graph recording");
+                if(++calls==3)throw MfqResourceExhausted("CUDA VRAM limit exceeded: injected during graph recording");
                 output=input+1;
             },[]{},[&]{output={};});
-        } catch(const Error& error) {
+        } catch(const MfqResourceExhausted& error) {
             rejected=std::string(error.what()).starts_with("CUDA VRAM limit exceeded:");
         }
         if(!rejected || failed.valid())throw std::runtime_error("graph recording lost the recoverable quota error");
@@ -1019,6 +1020,7 @@ void qsa_sparse_gate_benchmark(bool compare_query=false) {
 #include "qsa_prefill_test.h"
 #include "qsa_prefill_scores_test.h"
 #include "qsa_kv_offload_test.h"
+#include "kv_quantization_test.h"
 #include "gdn_prefill_columns_test.h"
 #include "gdn_prefill_pipeline_test.h"
 int main(int argc,char** argv)try {
@@ -1087,6 +1089,8 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-check")qsa_prefill_fusion_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-score-check")qsa_prefill_scores_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-kv-offload-check")qsa_kv_offload_case();
+    else if(argc==2 && std::string(argv[1])=="--turboquant-kv-check")kv_quantization_case();
+    else if(argc==2 && std::string(argv[1])=="--turboquant-qsa-check") {qsa_case(8,4,40);qsa_case(256,24,64);qsa_case(128,6,64,64);qsa_kv_offload_case();}
     else if(argc==2 && std::string(argv[1])=="--qsa-sparse-gate-check")qsa_sparse_gate_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-sparse-gate-bench")qsa_sparse_gate_benchmark();
     else if(argc==2 && std::string(argv[1])=="--qsa-sparse-query-bench")qsa_sparse_gate_benchmark(true);

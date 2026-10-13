@@ -692,6 +692,11 @@ int run_mfq_http_transport(
                 if (disk < 0) throw ApiError(400, "invalid_request_error", "disk_target_bytes must be non-negative");
                 command.disk_bytes = static_cast<uint64_t>(disk);
             }
+            if (kind == mfq::engine::SessionCommand::Kind::budget && body.contains("ram_target_bytes")) {
+                const auto ram = integer_field(body, "ram_target_bytes", 0);
+                if (ram < 0) throw ApiError(400, "invalid_request_error", "ram_target_bytes must be non-negative");
+                command.ram_bytes = static_cast<uint64_t>(ram);
+            }
             const auto released = scheduler.session(command).count;
             json result = {
                 {"status", "ok"},

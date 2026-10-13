@@ -29,6 +29,7 @@ struct KvOffloadStore::Block {
 };
 
 struct KvOffloadStore::Impl {
+    std::function<void(std::size_t)> reserve_ram;
     explicit Impl(KvOffloadConfig value) : config(std::move(value)) {
         if (config.buffer_bytes < 4096 || config.gpu_budget_bytes < config.buffer_bytes)
             throw std::invalid_argument("CUDA KV budget cannot hold its I/O staging buffer");
@@ -55,6 +56,7 @@ struct KvOffloadStore::Impl {
             auto block = found->second.block.lock();
             if (block) {
                 if (!block->cold) {
+                    if (reserve_ram) reserve_ram(block->bytes * 2);
                     auto cpu = block->gpu.to(tb::kCPU).contiguous();
                     std::vector<std::uint8_t> payload(block->bytes);
                     std::memcpy(payload.data(), cpu.data_ptr(), payload.size());
@@ -91,8 +93,8 @@ KvOffloadStore::~KvOffloadStore() = default;
 const KvOffloadConfig& KvOffloadStore::config() const { return impl_->config; }
 
 KvOffloadStore::BlockPtr KvOffloadStore::write(const tb::Tensor& rows) {
-    if (!rows.is_cuda() || rows.dim() != 2 || !rows.numel() || rows.scalar_type() != tb::kFloat16)
-        throw std::invalid_argument("CUDA KV microblock must contain nonempty FP16 GPU rows");
+    if (!rows.is_cuda() || rows.dim() != 2 || !rows.numel() || (rows.scalar_type() != tb::kFloat16 && rows.scalar_type() != tb::kInt32))
+        throw std::invalid_argument("CUDA KV microblock must contain nonempty FP16 or packed GPU rows");
     const auto bytes = static_cast<std::size_t>(rows.numel()) * rows.element_size();
     if (bytes > impl_->config.buffer_bytes / 2)
         throw std::invalid_argument("CUDA KV microblock exceeds its write staging buffer");
@@ -113,6 +115,7 @@ tb::Tensor KvOffloadStore::read(const BlockPtr& block) {
     if (!block) throw std::invalid_argument("missing CUDA KV block");
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     if (block->gpu.defined()) { ++impl_->hits; impl_->touch(block); return block->gpu; }
+    if (impl_->reserve_ram) impl_->reserve_ram(block->bytes * 2);
     auto payload = impl_->ram->read(block->cold);
     const auto options = block->options;
     auto cpu = tb::empty({block->rows, block->width}, options.device(tb::kCPU));
@@ -126,6 +129,9 @@ tb::Tensor KvOffloadStore::read(const BlockPtr& block) {
 }
 
 void KvOffloadStore::flush() { impl_->ram->flush(); }
+void KvOffloadStore::set_ram_reservation(std::function<void(std::size_t)> reserve) {
+    impl_->reserve_ram = std::move(reserve);
+}
 std::vector<std::pair<std::string, double>> KvOffloadStore::metrics() const {
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     const auto cold = impl_->ram->stats();
@@ -141,9 +147,10 @@ std::vector<std::pair<std::string, double>> KvOffloadStore::metrics() const {
         {"qsa_kv_gpu_evictions", double(impl_->evictions)}};
 }
 
-KvOffloadSequence::KvOffloadSequence(std::shared_ptr<KvOffloadStore> store, int64_t width, int64_t block_rows)
-    : store_(std::move(store)), width_(width), block_rows_(block_rows) {
-    if (!store_ || width <= 0 || block_rows <= 0 || std::size_t(width) * block_rows * 2 > store_->config().buffer_bytes / 2)
+KvOffloadSequence::KvOffloadSequence(std::shared_ptr<KvOffloadStore> store, int64_t width, int64_t block_rows, tb::ScalarType dtype)
+    : store_(std::move(store)), width_(width), block_rows_(block_rows), dtype_(dtype) {
+    if (!store_ || width <= 0 || block_rows <= 0 || (dtype != tb::kFloat16 && dtype != tb::kInt32) ||
+        std::size_t(width) * block_rows * (dtype == tb::kInt32 ? 4 : 2) > store_->config().buffer_bytes / 2)
         throw std::invalid_argument("invalid CUDA KV sequence geometry");
 }
 void KvOffloadSequence::reset() { blocks_.clear(); position_ = 0; }
@@ -154,7 +161,7 @@ void KvOffloadSequence::append(const tb::Tensor& source) {
     const auto previous_count = blocks_.size();
     const auto previous_tail = position_ % block_rows_ ? blocks_.back() : KvOffloadStore::BlockPtr{};
     try {
-        auto rows = source.to(tb::kFloat16);
+        auto rows = source.to(dtype_);
         if (position_ % block_rows_) {
             rows = tb::cat({store_->read(blocks_.back()), rows}, 0);
             blocks_.pop_back();
@@ -198,7 +205,14 @@ tb::Tensor KvOffloadSequence::gather(const std::vector<int64_t>& rows) const {
 tb::Tensor KvOffloadSequence::range(int64_t start, int64_t count) const {
     if (start < 0 || count <= 0 || start > position_ || count > position_ - start)
         throw std::out_of_range("CUDA KV range exceeds its sequence");
-    std::vector<int64_t> rows(count); std::iota(rows.begin(), rows.end(), start);
-    return gather(rows);
+    auto result = tb::empty({count, width_}, blocks_.front()->options);
+    for (int64_t written = 0; written < count;) {
+        const auto row = start + written, block = row / block_rows_, offset = row % block_rows_;
+        auto source = store_->read(blocks_.at(block));
+        const auto n = std::min(count-written,source.size(0)-offset);
+        result.narrow(0,written,n).copy_(source.narrow(0,offset,n));
+        written += n;
+    }
+    return result;
 }
 }

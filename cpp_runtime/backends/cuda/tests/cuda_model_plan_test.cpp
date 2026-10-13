@@ -84,6 +84,13 @@ int main() {
                 qwen, qwen_plan, qwen_unloaded, true, false),
             {true, false, false, false, false, false, false},
             "unloaded Qwen components were advertised by model name");
+        auto flash = qwen;
+        flash.backbone = "qwen4_exp";
+        const auto flash_plan = cuda_model_plan(flash);
+        require_capabilities(cuda_runtime_capabilities(flash, flash_plan,
+            cuda_component_state(flash, flash_plan, true, true), true, false),
+            {true, true, false, false, false, false, true},
+            "Qwen4 grid-ViT and MTP must be available together");
         const auto require_grid_rejected = [](const mfq::ModelGraph& graph) {
             require(
                 cuda_model_plan(graph).vision ==

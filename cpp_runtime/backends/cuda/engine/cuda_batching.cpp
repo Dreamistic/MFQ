@@ -481,9 +481,10 @@ void FlashNextBatchOperations::suspend_decode() { if (graph_) graph_->clear(); }
 void FlashNextBatchOperations::resume_decode(int64_t) {}
 static std::exception_ptr flash_next_prefill_failure(std::exception_ptr failure) {
     try {std::rethrow_exception(failure);}
-    catch(const Error& error) {
+    catch(const std::exception& error) {
         const std::string message=error.what();
-        if(message.starts_with("CUDA process VRAM limit exceeded:") ||
+        if(dynamic_cast<const MfqResourceExhausted*>(&error) ||
+           message.starts_with("CUDA process VRAM limit exceeded:") ||
            message.starts_with("CUDA VRAM limit exceeded:") ||
            message.starts_with("CUDA pinned allocation failed:"))
             return std::make_exception_ptr(mfq::engine::InferenceInputError(
@@ -669,9 +670,10 @@ FlashNextBatchOperations::Decoded FlashNextBatchOperations::decode(State& state)
     });
     std::optional<Tensor> captured;
     try { if(graph_)captured=graph_->run(caches,ids,host_ids,greedy); }
-    catch(const Error& error) {
+    catch(const std::exception& error) {
         const std::string message=error.what();
-        if(!message.starts_with("CUDA process VRAM limit exceeded:") &&
+        if(!dynamic_cast<const MfqResourceExhausted*>(&error) &&
+           !message.starts_with("CUDA process VRAM limit exceeded:") &&
            !message.starts_with("CUDA VRAM limit exceeded:") &&
            !message.starts_with("CUDA pinned allocation failed:"))throw;
         throw mfq::engine::InferenceInputError(mfq::engine::InferenceInputErrorCode::ContextLength,

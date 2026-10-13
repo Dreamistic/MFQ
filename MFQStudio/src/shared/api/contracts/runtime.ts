@@ -53,6 +53,8 @@ export interface RuntimeRequestMetrics {
 }
 
 export interface RuntimeStatus {
+  gpu_devices?: { id: string; name: string; memory_total_bytes?: number | null;
+    memory_available_bytes?: number | null; unified_memory?: boolean }[];
   memory_architecture?: 'unified' | 'discrete' | 'unknown';
   unified_memory?: boolean | null;
   host_memory_total_bytes?: number | null;
@@ -121,6 +123,12 @@ export interface RuntimeStatus {
   prefix_cache_mode?: string;
   prefix_cache_total_hot_bytes?: number;
   prefix_cache_total_hot_max_bytes?: number;
+  prefix_cache_ram_bytes?: number;
+  prefix_cache_ram_max_bytes?: number;
+  prefix_cache_ram_blocks?: number;
+  prefix_cache_ram_hits?: number;
+  prefix_cache_total_ram_bytes?: number;
+  prefix_cache_total_ram_max_bytes?: number;
   prefix_cache_total_disk_bytes?: number;
   prefix_cache_total_disk_blocks?: number;
   prefix_cache_total_disk_max_bytes?: number;
@@ -161,7 +169,7 @@ export interface RuntimeResources {
   cpu_name?: string | null;
   cpu_cores?: number | null;
   cpu_utilization_percent: number | null;
-  gpus: { name: string; core_count?: number | null; utilization_percent: number | null;
+  gpus: { id?: string | null; name: string; core_count?: number | null; utilization_percent: number | null;
     memory_total_bytes?: number | null; memory_used_bytes?: number | null; memory_available_bytes?: number | null }[];
   memory_total_bytes?: number | null;
   memory_used_bytes?: number | null;
@@ -184,6 +192,7 @@ export interface RuntimeModel {
 }
 
 export interface RuntimeMemoryResources {
+  devices?: RuntimeDeviceMemory[];
   ram_experts?: boolean | null;
   ram_expert_bytes?: number | null;
   ram_kv?: boolean | null;
@@ -199,6 +208,9 @@ export interface RuntimeMemoryResources {
   prefix_cache_blocks: number | null;
   prefix_cache_bytes?: number | null;
   prefix_cache_limit_bytes?: number | null;
+  prefix_cache_ram_bytes?: number | null;
+  prefix_cache_ram_limit_bytes?: number | null;
+  prefix_cache_ram_blocks?: number | null;
   ssd_experts: boolean | null;
   ssd_expert_bytes: number | null;
   ssd_ple: boolean | null;
@@ -212,6 +224,17 @@ export interface RuntimeMemoryResources {
   ssd_kv_written_bytes?: number | null;
   ssd_kv_reads?: number | null;
   ssd_kv_hits?: number | null;
+}
+
+export interface RuntimeDeviceMemory {
+  device_id: string;
+  resident_bytes?: number | null;
+  resident_weight_bytes?: number | null;
+  resident_buffer_bytes?: number | null;
+  kv_bytes?: number | null;
+  prefix_cache_bytes?: number | null;
+  memory_total_bytes?: number | null;
+  memory_available_bytes?: number | null;
 }
 
 export interface RuntimeInstance {

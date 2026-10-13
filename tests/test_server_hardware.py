@@ -122,7 +122,8 @@ def test_nvml_unsupported_optional_queries_do_not_discard_capacity(monkeypatch):
     library = _nvml_fixture("NVIDIA GPU", [])
     del library.nvmlDeviceGetMaxClockInfo, library.nvmlDeviceGetMemoryBusWidth
     monkeypatch.setattr(ctypes, "CDLL", lambda path: library)
-    assert hardware._nvidia_memory() == (hardware.GpuMemory("NVIDIA GPU", 32 << 30), hardware.GpuMemory("NVIDIA GPU", 24 << 30))
+    assert hardware._nvidia_memory() == (hardware.GpuMemory("NVIDIA GPU", 32 << 30, device_id="0", available_bytes=0),
+        hardware.GpuMemory("NVIDIA GPU", 24 << 30, device_id="1", available_bytes=0))
 
 
 @pytest.mark.parametrize("gpus,architecture,capacity,hot", [

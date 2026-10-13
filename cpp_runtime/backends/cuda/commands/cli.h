@@ -130,6 +130,7 @@ inline bool parse_cuda_load_option(
         CudaLoadOptions& result) {
     if (option == "--model") result.model_path = args.value(option);
     else if (option == "--config") result.config_path = args.value(option);
+    else if (option == "--yarn-context-extension") result.yarn_context_extension = true;
     else if (option == "--threads" || option == "-t") {
         result.cpu_threads = integer<int>(args.value(option), option);
         if (result.cpu_threads <= 0) usage_error("--threads must be positive");

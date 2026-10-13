@@ -92,8 +92,9 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
     if (!cache.defined()) {
         cache =
             KVCache(B, nkh, cache_capacity, hd, sliding, x.device(),
-                    official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16);
+                    official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16, kv_quantization);
     }
+    cache.quantization=kv_quantization;
     if (x.is_cuda()) {
         const int64_t total = B * nh;
         if (!decode_partial_o.defined() || decode_partial_o.size(0) < total ||
@@ -140,7 +141,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 B == 1 && cache_positions.has_value() && pos.dim() == 2 && pos.size(0) == 3;
             const bool fused_qk_rope_kv =
                 official_bf16 && x.is_cuda() && write_positions.dim() == 1 && pos.dim() == 1 &&
-                T == 1 && !cache.is_paged() && !cache.ring && !v_norm.defined() &&
+                T == 1 && !cache.is_paged() && !cache.ring && !cache.quantization.enabled() && !v_norm.defined() &&
                 q_norm.defined() && k_norm.defined() && active_rope.rotary_dim == 128 &&
                 active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 && hd == 128 &&
                 cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
@@ -390,6 +391,13 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         attention_scale > 0.0 ? attention_scale : 1.0 / std::sqrt((double)hd);
                     mfq_tensor_backend::Tensor a;
                     a = profiler.measure("full.attention", [&]() {
+                        if(cache.quantization.enabled()) {
+                            attention_token_major=true;
+                            const auto capacity=planned_kv_length>0?planned_kv_length:cache_pos+T;
+                            return mfq::cuda::cuda_kv_attention(q,cache.k,cache.v,cache.quantization,{},write_positions,
+                                cache_pos,cache.quantized_pages(),capacity,seq_len.value_or(mfq_tensor_backend::Tensor{}),
+                                attention_mask.value_or(mfq_tensor_backend::Tensor{}),attn_scale);
+                        }
                         if (!x.is_cuda()) {
                             MFQ_RUNTIME_CHECK(
                                 !sliding, "CPU dense offload does not support sliding attention");

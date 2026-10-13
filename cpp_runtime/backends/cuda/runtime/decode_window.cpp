@@ -1,6 +1,7 @@
 #include "decode_window.h"
 #include "execution_options.h"
 #include "mfq_cuda_context.h"
+#include "mfq/runtime.h"
 #include "mfq/cpu_expert_pool.h"
 #include <algorithm>
 #include <atomic>
@@ -264,7 +265,8 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
             // without marking the entire backend unhealthy.
             if(error.starts_with("CUDA process VRAM limit exceeded:") ||
                     error.starts_with("CUDA VRAM limit exceeded:") ||
-                    error.starts_with("CUDA pinned allocation failed:"))throw Error(error);
+                    error.starts_with("CUDA allocation failed:") ||
+                    error.starts_with("CUDA pinned allocation failed:"))throw MfqResourceExhausted(error);
             throw std::runtime_error(error);
         }
         if(tasks_.size()!=warm_tasks)throw std::logic_error("MFQ window task order changed during capture");
@@ -277,6 +279,7 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
         report_window_error("capture",phase);
         bool allocation_rejected=false;
         try {std::rethrow_exception(std::current_exception());}
+        catch(const MfqResourceExhausted&) {allocation_rejected=true;}
         catch(const Error& error) {
             const std::string message=error.what();
             allocation_rejected=message.starts_with("CUDA process VRAM limit exceeded:") ||

@@ -36,6 +36,7 @@ struct FullBlock : Block {
     QuantLinear o;
     FFN ffn;
     KVCache cache;
+    mfq::cuda::KvQuantization kv_quantization;
     mfq_tensor_backend::Tensor decode_partial_o;
     mfq_tensor_backend::Tensor decode_partial_m;
     mfq_tensor_backend::Tensor decode_partial_l;

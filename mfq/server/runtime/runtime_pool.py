@@ -75,7 +75,7 @@ from mfq.server.runtime.native import (
     native_tokenizer_arguments,
     supports_cuda_ram_expert_pipeline,
 )
-from mfq.server.services.hardware import hardware_identity, host_memory_capacity, memory_topology
+from mfq.server.services.hardware import hardware_identity, host_memory_capacity, memory_topology, gpu_memory_status
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +162,7 @@ class _Runtime(BaseModel):
     resident_bytes: int | None = None
     kv_bytes: int | None = None
     memory: RuntimeMemoryResources | None = None
+    device_ids: list[str] = Field(default_factory=list)
     usage_refreshed_at: float = 0.0
     load_progress: float = 0.02
     context_capacity: int | None = None
@@ -170,6 +171,7 @@ class _Runtime(BaseModel):
     prefix_concurrent_maintenance: bool = False
     prefix_disk_capacity: int | None = None
     prefix_pressure_bytes: int = 0
+    prefix_ram_pressure_bytes: int = 0
     prefix_pending_writes: int = 0
     resident_dynamic_budget: bool = False
     resident_budget_limit: int = 0
@@ -492,6 +494,7 @@ class RuntimePool:
             backend=backend,
             port=port,
             context_size=canonical_request.context_size,
+            device_ids=self._cuda_device_ids(canonical_request) if self.backend == "cuda" else [],
             sampling_defaults=canonical_request.sampling_defaults,
             state=RuntimeInstanceState.READY,
             last_used_at=datetime.now(timezone.utc),
@@ -531,6 +534,12 @@ class RuntimePool:
             raise _job_error("unsupported_device", "the Metal runtime accepts device 'metal'")
         if self.backend == "cuda" and any(not value.isdecimal() for value in request.device_ids):
             raise _job_error("unsupported_device", "CUDA device IDs must be non-negative integers")
+        if self.backend == "cuda" and len(set(request.device_ids)) != len(request.device_ids):
+            raise _job_error("unsupported_device", "CUDA device IDs must be unique")
+        if self.backend == "cuda" and request.device_ids:
+            known = {device.device_id or str(index) for index, device in enumerate(hardware_identity().gpu_memory)}
+            if known and any(device not in known for device in request.device_ids):
+                raise _job_error("unsupported_device", "a selected CUDA GPU is unavailable")
         try:
             artifact = await self.catalog.resolve(request.model, request.artifact_uri)
         except ModelArtifactNotFoundError as error:
@@ -554,10 +563,10 @@ class RuntimePool:
             saved_quantization = self.context_policy.model_kv_quantization.get(artifact.resource.name)
             if saved_quantization is not None:
                 request = request.model_copy(update={"kv_quantization": saved_quantization})
-        if request.kv_quantization.enabled and (self.backend != "metal" or not artifact.resource.architecture.casefold().startswith(
+        if request.kv_quantization.enabled and (self.backend not in {"cuda", "metal"} or not artifact.resource.architecture.casefold().startswith(
             ("qwen4_exp", "qwen3.5", "qwen3_5", "qwen35"))):
             raise _job_error("kv_quantization_unsupported", "TurboQuant KV is not supported by this model/backend")
-        if request.yarn_enabled and (self.backend != "metal" or artifact.resource.yarn_context_capacity is None):
+        if request.yarn_enabled and (self.backend not in {"cuda", "metal"} or artifact.resource.yarn_context_capacity is None):
             raise _job_error("yarn_unsupported", "YaRN extension is not supported by this model/backend")
         resolved = self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled)
         request = request.model_copy(update={"context_size": resolved,
@@ -814,6 +823,9 @@ class RuntimePool:
                 raise
 
         try:
+            if self.backend == "cuda" and memory_topology()["memory_architecture"] == "discrete":
+                # Disposable prefixes yield before admitting new model weights.
+                await self._rebalance_prefix_cache_budget(reclaim_ram=True)
             command, process_environment = self._launch_configuration(
                 artifact,
                 request,
@@ -877,6 +889,7 @@ class RuntimePool:
             backend=backend,
             port=port,
             context_size=request.context_size,
+            device_ids=self._cuda_device_ids(request) if self.backend == "cuda" else [],
             sampling_defaults=request.sampling_defaults,
             idle_ttl_seconds=(
                 request.idle_ttl_seconds
@@ -1109,7 +1122,8 @@ class RuntimePool:
         return {**memory_topology(), **self.memory_policy.model_dump(), "actual_prefix_directory": str(self._prefix_cache_directory()),
             "effective_total_limit_bytes": self._effective_runtime_memory_budget_locked(),
             "total_capacity_limit_bytes": self._resident_total_limit(),
-            "effective_prefix_limit_bytes": self._prefix_total_limit(), **self._prefix_disk_status}
+            "effective_prefix_limit_bytes": self._prefix_total_limit(),
+            "effective_prefix_ram_limit_bytes": self._prefix_ram_total_limit(), **self._prefix_disk_status}
 
     def _resident_total_limit(self, policy: RuntimeMemoryPolicy | None = None) -> int | None:
         requested = (policy or self.memory_policy).total_limit_bytes
@@ -1124,6 +1138,7 @@ class RuntimePool:
             return None
         if not wait and self._resident_budget_lock.locked():
             return None
+        devices = await asyncio.to_thread(gpu_memory_status) if self.backend == "cuda" else []
         async with self._resident_budget_lock:
             async with self._lock:
                 current = [item for item in self._instances.values() if item.state != RuntimeInstanceState.FAILED]
@@ -1183,6 +1198,25 @@ class RuntimePool:
                     targets[ordered[-1].id] += max(0, available - sum(targets.values()))
                 elif prospective_model is not None:
                     additional_bytes += max(0, available - sum(targets.values()))
+                # A global VRAM policy is an upper bound, not a shared physical
+                # heap. Each single-device worker must stay within its own GPU.
+                for device in devices:
+                    free = device.get("memory_available_bytes")
+                    if free is None:
+                        continue
+                    assigned = [item for item in idle if getattr(item, "device_ids", []) == [device["id"]]]
+                    occupied = [item for item in current if item not in idle
+                        and getattr(item, "device_ids", []) == [device["id"]]]
+                    room = free + sum(item.resident_memory_used for item in assigned)
+                    room -= sum(max(0, getattr(item, "resident_budget_limit", 0) - item.resident_memory_used)
+                        for item in occupied)
+                    for item in ordered:
+                        if item in assigned:
+                            target = min(targets[item.id], max(0, room))
+                            if target <= 0:
+                                raise BackendError("resident_budget_exhausted", "selected GPU has no free resident capacity", status_code=413)
+                            targets[item.id] = target
+                            room -= target
                 if prospective_model is not None:
                     self._resident_load_limits[prospective_model] = additional_bytes
                     self._resident_load_owners[prospective_model] = asyncio.current_task()
@@ -1317,6 +1351,12 @@ class RuntimePool:
     def _prefix_total_limit(self) -> int:
         return self.memory_policy.prefix_limit_bytes if self.memory_policy.prefix_limit_bytes is not None else 2 << 30
 
+    def _prefix_ram_total_limit(self) -> int:
+        if self.backend != "cuda" or memory_topology()["memory_architecture"] != "discrete":
+            return 0
+        limit = self.memory_policy.prefix_ram_limit_bytes
+        return limit if limit is not None else 2 << 30
+
     def _prefix_reserved_capacity_locked(self, excluded_ids: set[UUID] | None = None) -> int:
         current = [item for item in self._instances.values() if item.state != RuntimeInstanceState.FAILED
             and item.id not in (excluded_ids or set())]
@@ -1365,7 +1405,8 @@ class RuntimePool:
             self._prefix_disk_status = {key: value for key, value in result.items() if key.startswith("prefix_cache_")}
             self._prefix_disk_checked_at = time.monotonic()
 
-    async def _rebalance_prefix_cache_budget(self, preferred: UUID | None = None, *, wait: bool = True) -> None:
+    async def _rebalance_prefix_cache_budget(self, preferred: UUID | None = None, *, wait: bool = True,
+                                          reclaim_ram: bool = False) -> None:
         if not wait and self._prefix_budget_lock.locked():
             return
         async with self._prefix_budget_lock:
@@ -1390,13 +1431,38 @@ class RuntimePool:
                 if disk_limit is None:
                     disk_limit = self._prefix_disk_status.get("prefix_cache_total_disk_max_bytes", 100 << 30)
                 disk_targets = {}
+                ram_candidates = [item for item in candidates if item.memory.prefix_cache_ram_limit_bytes is not None]
+                ram_reserved = sum(item.memory.prefix_cache_ram_limit_bytes or 0 for item in current
+                    if item.id not in candidate_ids and item.memory)
+                ram_remaining = max(0, self._prefix_ram_total_limit() - ram_reserved)
+                _, available_ram = host_memory_capacity()
+                if available_ram is not None:
+                    ram_used = sum(item.memory.prefix_cache_ram_bytes or 0 for item in ram_candidates)
+                    ram_remaining = min(ram_remaining, max(0, available_ram + ram_used - (512 << 20)))
+                if reclaim_ram or self._loading_model_names:
+                    ram_remaining = 0
+                ram_targets = {}
+                ram_caps = {}
+                for item in ram_candidates:
+                    request = self._load_requests.get(item.artifact.resource.name)
+                    per_model_ram = request.prefix_cache_ram_bytes if request else None
+                    ram_caps[item.id] = per_model_ram if per_model_ram is not None else self._prefix_ram_total_limit()
+                    wanted = max(item.memory.prefix_cache_ram_bytes or 0, getattr(item, "prefix_ram_pressure_bytes", 0))
+                    ram_targets[item.id] = min(ram_remaining, wanted, ram_caps[item.id])
+                    ram_remaining -= ram_targets[item.id]
+                for item in ram_candidates:
+                    extra = min(ram_remaining, ram_caps[item.id] - ram_targets[item.id])
+                    ram_targets[item.id] += extra
+                    ram_remaining -= extra
                 for item in candidates:
                     request = self._load_requests.get(item.artifact.resource.name)
                     per_model = request.prefix_cache_disk_bytes if request else None
                     disk_targets[item.id] = min(disk_limit, per_model) if per_model is not None else disk_limit
                 changes = [item for item in candidates if item.memory.prefix_cache_limit_bytes != targets[item.id]
-                    or getattr(item, "prefix_disk_capacity", None) is not None and item.prefix_disk_capacity != disk_targets[item.id]]
-                changes.sort(key=lambda item: targets[item.id] > (item.memory.prefix_cache_limit_bytes or 0))
+                    or getattr(item, "prefix_disk_capacity", None) is not None and item.prefix_disk_capacity != disk_targets[item.id]
+                    or item.id in ram_targets and item.memory.prefix_cache_ram_limit_bytes != ram_targets[item.id]]
+                changes.sort(key=lambda item: (ram_targets.get(item.id, 0) > (item.memory.prefix_cache_ram_limit_bytes or 0),
+                    targets[item.id] > (item.memory.prefix_cache_limit_bytes or 0)))
                 concurrent = {item.id: getattr(item, "prefix_concurrent_maintenance", False) for item in changes}
                 for item in changes:
                     item.control_leases += 1
@@ -1405,6 +1471,8 @@ class RuntimePool:
             try:
                 for item in changes:
                     disk_args = {"disk_target_bytes": disk_targets[item.id]} if getattr(item, "prefix_disk_capacity", None) is not None and item.prefix_disk_capacity != disk_targets[item.id] else {}
+                    if item.id in ram_targets:
+                        disk_args["ram_target_bytes"] = ram_targets[item.id]
                     result = await asyncio.wait_for(item.backend.set_prefix_cache_budget(targets[item.id], **disk_args), timeout=30.0)
                     if result.get("status") != "ok":
                         raise RuntimeError("native prefix budget was not applied")
@@ -1412,8 +1480,11 @@ class RuntimePool:
                         if self._instances.get(item.id) is item:
                             self._policy_prefix_limits[item.artifact.resource.name] = targets[item.id]
                             item.memory = item.memory.model_copy(update={"prefix_cache_limit_bytes": targets[item.id]})
+                            if item.id in ram_targets:
+                                item.memory = item.memory.model_copy(update={"prefix_cache_ram_limit_bytes": ram_targets[item.id]})
                             item.prefix_pressure_bytes = 0
-                            if disk_args:
+                            item.prefix_ram_pressure_bytes = 0
+                            if "disk_target_bytes" in disk_args:
                                 item.prefix_disk_capacity = disk_targets[item.id]
             finally:
                 for item in changes:
@@ -1586,7 +1657,7 @@ class RuntimePool:
                     id=item.id,
                     model=item.artifact.resource.name,
                     state=item.state,
-                    devices=[self.backend],
+                    devices=[f"cuda:{device}" for device in item.device_ids] if item.device_ids else [self.backend],
                     active_sessions=route_counts.get(item.id, 0),
                     queued_requests=item.queued_requests,
                     resident_bytes=item.resident_bytes,
@@ -1654,7 +1725,7 @@ class RuntimePool:
                 id=instance.id,
                 model=model_name,
                 state=instance.state,
-                devices=[self.backend],
+                devices=[f"cuda:{device}" for device in instance.device_ids] if instance.device_ids else [self.backend],
                 active_sessions=active_sessions,
                 queued_requests=instance.queued_requests,
                 resident_bytes=instance.resident_bytes,
@@ -1978,6 +2049,7 @@ class RuntimePool:
         instance_id: UUID | None = None,
     ) -> dict[str, Any]:
         await self._maintain_prefix_disk_budget()
+        gpu_devices = await asyncio.to_thread(gpu_memory_status) if self.backend == "cuda" else []
         async with self._lock:
             (
                 memory_pressure_level,
@@ -2017,9 +2089,15 @@ class RuntimePool:
                 ),
                 "prefix_cache_total_hot_bytes": sum(item.memory.prefix_cache_bytes or 0 for item in self._instances.values() if item.memory),
                 "prefix_cache_total_hot_max_bytes": self._prefix_total_limit(),
+                "prefix_cache_total_ram_bytes": sum(item.memory.prefix_cache_ram_bytes or 0 for item in self._instances.values() if item.memory),
+                "prefix_cache_total_ram_max_bytes": sum(item.memory.prefix_cache_ram_limit_bytes or 0 for item in self._instances.values() if item.memory),
                 "prefix_cache_budget_failures": self._prefix_budget_failures,
                 **self._prefix_disk_status,
             }
+            if gpu_devices:
+                memory_status["gpu_devices"] = gpu_devices
+                if all(item.get("memory_available_bytes") is not None for item in gpu_devices):
+                    memory_status["device_free_bytes"] = sum(item["memory_available_bytes"] for item in gpu_devices)
         async with self._runtime_control_lease(
             instance_id,
             allow_unready=True,
@@ -2090,6 +2168,7 @@ class RuntimePool:
                 observed_resident_bytes = self._observed_runtime_bytes(
                     resident_bytes,
                     status,
+                    separate_memory=self.backend == "cuda" and memory_topology()["memory_architecture"] == "discrete",
                 )
                 async with self._lock:
                     if self._instances.get(instance.id) is instance:
@@ -2097,7 +2176,7 @@ class RuntimePool:
                             instance.resident_bytes = observed_resident_bytes
                         if isinstance(kv_value, (int, float)) and kv_value >= 0:
                             instance.kv_bytes = int(kv_value)
-                        instance.memory = self._memory_resources(status, instance.memory)
+                        instance.memory = self._memory_resources(status, instance.memory, device_ids=getattr(instance, "device_ids", ()))
                         capacity = status.get("context_capacity")
                         if isinstance(capacity, int) and capacity > 0:
                             instance.context_capacity = instance.artifact.resource.context_capacity or capacity
@@ -2248,7 +2327,7 @@ class RuntimePool:
     def _context_limit(self, artifact: DiscoveredModel, yarn_enabled: bool | None = None) -> int | None:
         if yarn_enabled is None:
             yarn_enabled = self.context_policy.model_yarn_enabled.get(artifact.resource.name, False)
-        if yarn_enabled and self.backend == "metal" and artifact.resource.yarn_context_capacity is not None:
+        if yarn_enabled and self.backend in {"cuda", "metal"} and artifact.resource.yarn_context_capacity is not None:
             return artifact.resource.yarn_context_capacity
         return artifact.resource.context_capacity
 
@@ -2258,7 +2337,7 @@ class RuntimePool:
             if instance is None:
                 raise BackendError("model_not_loaded", "model is not loaded", status_code=404)
             resource = instance.artifact.resource
-            supported = self.backend == "metal" and resource.yarn_context_capacity is not None
+            supported = self.backend in {"cuda", "metal"} and resource.yarn_context_capacity is not None
             return {"supported": supported, "native_context": resource.context_capacity,
                 "maximum_context": resource.yarn_context_capacity if supported else resource.context_capacity,
                 "maximum_factor": resource.yarn_max_factor if supported else None,
@@ -2310,7 +2389,7 @@ class RuntimePool:
             previous = self._load_requests[instance.artifact.resource.name].model_copy(deep=True)
             name = instance.artifact.resource.name
             enabled = self.context_policy.model_yarn_enabled.get(name, False) if settings.yarn_enabled is None else settings.yarn_enabled
-        if enabled and (self.backend != "metal" or instance.artifact.resource.yarn_context_capacity is None):
+        if enabled and (self.backend not in {"cuda", "metal"} or instance.artifact.resource.yarn_context_capacity is None):
             raise _job_error("yarn_unsupported", "YaRN extension is not supported by this model/backend")
         target = self.resolve_context_size(instance.artifact, settings.context_size, ignore_override=True, yarn_enabled=enabled)
         warning = None if settings.context_size is None or target == settings.context_size else (
@@ -2386,7 +2465,7 @@ class RuntimePool:
             warning = None
             if instance is not None:
                 enabled = self.context_policy.model_yarn_enabled.get(instance.artifact.resource.name, False) if yarn_enabled is None else yarn_enabled
-                if enabled and (self.backend != "metal" or instance.artifact.resource.yarn_context_capacity is None):
+                if enabled and (self.backend not in {"cuda", "metal"} or instance.artifact.resource.yarn_context_capacity is None):
                     raise BackendError("yarn_unsupported", "YaRN extension is not supported by this model/backend", status_code=400)
                 context_size = requested if requested is not None else self.resolve_context_size(instance.artifact, ignore_override=True)
                 limit = self._context_limit(instance.artifact, enabled) or instance.context_capacity
@@ -3390,18 +3469,23 @@ class RuntimePool:
         resident_expert_bytes = min(streamed_bytes, cache_bytes)
         return total_bytes - streamed_bytes + resident_expert_bytes
 
-    @staticmethod
-    def _cuda_discrete_device_capacity(request: ModelLoadRequest) -> int | None:
+    def _cuda_device_ids(self, request: ModelLoadRequest) -> list[str]:
+        if request.device_ids:
+            return request.device_ids[:1]
+        # Without explicit model parallelism the worker only uses visible GPU 0.
+        visible = self.runtime_environment.get("CUDA_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
+        return [visible.split(",")[0].strip()]
+
+    def _cuda_discrete_device_capacity(self, request: ModelLoadRequest) -> int | None:
         hardware = hardware_identity()
-        visible = request.device_ids or os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
-        first = visible[0].strip()
-        if hardware.memory_architecture != "discrete" or not first.isdecimal():
+        visible = self._cuda_device_ids(request)
+        if hardware.memory_architecture != "discrete" or any(not value.isdecimal() for value in visible):
             return None
-        index = int(first)
-        if index >= len(hardware.gpu_memory):
+        devices = {device.device_id or str(index): device for index, device in enumerate(hardware.gpu_memory)}
+        selected = [devices.get(value) for value in visible]
+        if any(device is None or device.unified or device.capacity_bytes is None for device in selected):
             return None
-        device = hardware.gpu_memory[index]
-        return device.capacity_bytes if not device.unified else None
+        return sum(device.capacity_bytes for device in selected if device is not None)
 
     def _apply_automatic_expert_residency(
         self,
@@ -3918,7 +4002,7 @@ class RuntimePool:
             if kv_bytes is not None:
                 instance.kv_bytes = kv_bytes
             if status is not None:
-                instance.memory = self._memory_resources(status, instance.memory)
+                instance.memory = self._memory_resources(status, instance.memory, device_ids=getattr(instance, "device_ids", ()))
                 instance.prefix_dynamic_budget = status.get("prefix_cache_dynamic_budget") == 1
                 instance.prefix_concurrent_maintenance = status.get("prefix_cache_concurrent_maintenance") == 1
                 instance.resident_dynamic_budget = status.get("resident_memory_dynamic_budget") == 1
@@ -3926,7 +4010,7 @@ class RuntimePool:
                 if "qsa_kv_offload_supported" in status:
                     instance.qsa_kv_offload_supported = self.backend in {"metal", "cuda"} and status["qsa_kv_offload_supported"] == 1
                 if "kv_quantization_supported" in status:
-                    instance.kv_quantization_supported = self.backend == "metal" and status["kv_quantization_supported"] == 1
+                    instance.kv_quantization_supported = self.backend in {"cuda", "metal"} and status["kv_quantization_supported"] == 1
                 for field, metric in (("resident_budget_limit", "resident_memory_budget_bytes"),
                     ("resident_weight_budget_limit", "resident_weight_budget_bytes"),
                     ("resident_memory_used", "resident_memory_used_bytes"), ("reclaimable_weight_bytes", "resident_reclaimable_weight_bytes")):
@@ -3942,6 +4026,9 @@ class RuntimePool:
                 pressure = status.get("prefix_cache_hot_pressure_bytes")
                 if isinstance(pressure, (int, float)) and not isinstance(pressure, bool) and math.isfinite(pressure) and pressure >= 0:
                     instance.prefix_pressure_bytes = int(pressure)
+                ram_pressure = status.get("prefix_cache_ram_pressure_bytes")
+                if isinstance(ram_pressure, (int, float)) and not isinstance(ram_pressure, bool) and math.isfinite(ram_pressure) and ram_pressure >= 0:
+                    instance.prefix_ram_pressure_bytes = int(ram_pressure)
                 capacity = status.get("context_capacity")
                 if isinstance(capacity, int) and capacity > 0:
                     instance.context_capacity = instance.artifact.resource.context_capacity or capacity
@@ -3949,6 +4036,7 @@ class RuntimePool:
     @staticmethod
     def _memory_resources(
         status: dict[str, Any], previous: RuntimeMemoryResources | None = None,
+        *, device_ids: Sequence[str] = (),
     ) -> RuntimeMemoryResources:
         """Retain last telemetry when a busy native worker skips its try-lock.
 
@@ -3962,6 +4050,9 @@ class RuntimePool:
             ("ram_expert_bytes", "ram_expert_payload_bytes"),
             ("ram_kv_bytes", "qsa_kv_ram_bytes"),
             ("ram_kv_limit_bytes", "qsa_kv_ram_limit_bytes"),
+            ("prefix_cache_ram_bytes", "prefix_cache_ram_bytes"),
+            ("prefix_cache_ram_limit_bytes", "prefix_cache_ram_max_bytes"),
+            ("prefix_cache_ram_blocks", "prefix_cache_ram_blocks"),
             ("wired_bytes", "metal_wired_bytes"),
             ("wired_limit_bytes", "metal_wired_limit_bytes"),
             ("ssd_expert_bytes", "ssd_expert_payload_bytes"),
@@ -4010,6 +4101,16 @@ class RuntimePool:
                 values["context_count"] = None
         if measured(blocks):
             values["prefix_cache_blocks"] = int(blocks)
+        indices = sorted({int(match[1]) for key in status if (match := re.fullmatch(r"gpu_(\d+)_resident_bytes", key))})
+        if indices:
+            devices = []
+            for index in indices:
+                fields = {field: int(status[f"gpu_{index}_{field}"])
+                    for field in ("resident_bytes", "resident_weight_bytes", "resident_buffer_bytes", "kv_bytes",
+                        "prefix_cache_bytes", "memory_total_bytes", "memory_available_bytes")
+                    if measured(status.get(f"gpu_{index}_{field}"))}
+                devices.append({"device_id": device_ids[index] if index < len(device_ids) else str(index), **fields})
+            values["devices"] = devices
         return RuntimeMemoryResources(**values)
 
     async def _stop_process(self, instance: _Runtime) -> None:
@@ -4017,6 +4118,13 @@ class RuntimePool:
         instance.realtime_gateway = None
         process = instance.process
         first_error: Exception | None = None
+        if (instance.memory and instance.memory.prefix_cache_ram_limit_bytes is not None
+                and getattr(instance, "prefix_dynamic_budget", False)):
+            # Finish RAM -> SSD demotion while the native worker can still
+            # process controls; Windows terminate does not run destructors.
+            with suppress(Exception):
+                await asyncio.wait_for(instance.backend.set_prefix_cache_budget(
+                    0, ram_target_bytes=0), timeout=30.0)
         try:
             if isinstance(process, subprocess.Popen):
                 await asyncio.to_thread(self._stop_popen, process)
@@ -4176,7 +4284,7 @@ class RuntimePool:
         ])
         append_native_prefill_chunk_override(command, request.prefill_chunk_size)
         yarn_enabled = self.context_policy.model_yarn_enabled.get(artifact.resource.name, False) if request.yarn_enabled is None else request.yarn_enabled
-        if (self.backend == "metal" and yarn_enabled
+        if (self.backend in {"cuda", "metal"} and yarn_enabled
             and artifact.resource.yarn_context_capacity is not None):
             command.append("--yarn-context-extension")
         if self.backend in {"cuda", "metal"} and request_capacity > 1:
@@ -4250,7 +4358,7 @@ class RuntimePool:
                     _, available = host_memory_capacity()
                     ram_budget = min(4 << 30, max(0, available // 4)) if available is not None else 0
                 process_environment["MFQ_QSA_KV_RAM_BUDGET_BYTES"] = str(ram_budget)
-        if self.backend == "metal" and artifact.resource.name in self._resident_load_limits:
+        if self.backend in {"cuda", "metal"} and artifact.resource.name in self._resident_load_limits:
             process_environment["MFQ_SERVER_RESIDENT_BUDGET_BYTES"] = str(self._resident_load_limits[artifact.resource.name])
         cache_directory = str(self._prefix_cache_directory())
         process_environment["MFQ_RUNTIME_PREFIX_CACHE_DIR"] = cache_directory
@@ -4274,6 +4382,9 @@ class RuntimePool:
                 else request.prefix_cache_max_bytes
             ),
             "MFQ_RUNTIME_PREFIX_CACHE_BLOCK_TOKENS": request.prefix_cache_block_tokens,
+            "MFQ_RUNTIME_PREFIX_CACHE_RAM_BYTES": min(max(0, self._prefix_ram_total_limit() - sum(
+                item.memory.prefix_cache_ram_limit_bytes or 0 for item in self._instances.values() if item.memory)),
+                request.prefix_cache_ram_bytes if request.prefix_cache_ram_bytes is not None else self._prefix_ram_total_limit()),
             "MFQ_RUNTIME_PREFIX_CACHE_PENDING_BYTES": request.prefix_cache_pending_bytes,
         }
         for name, value in cache_environment.items():

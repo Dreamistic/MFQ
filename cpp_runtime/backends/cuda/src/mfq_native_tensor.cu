@@ -28,9 +28,10 @@ void WeightMemoryLedger::observe(const std::shared_ptr<TensorStorage>& storage) 
 void WeightMemoryLedger::observe_ple(const std::shared_ptr<void>& owner,std::size_t bytes) {
     ple_.push_back({owner,bytes});
 }
-std::size_t WeightMemoryLedger::resident_bytes() const {
+std::size_t WeightMemoryLedger::resident_bytes(int device) const {
     std::size_t bytes=0;
-    for(const auto& weak:weights_)if(auto storage=weak.lock())bytes+=storage->bytes;
+    for(const auto& weak:weights_)if(auto storage=weak.lock())
+        if(device < 0 || storage->device.index == device)bytes+=storage->bytes;
     return bytes;
 }
 std::size_t WeightMemoryLedger::ple_bytes() const {

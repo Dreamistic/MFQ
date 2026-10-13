@@ -24,6 +24,13 @@ struct FullBlockSessionState {
     bool ring = false;
 };
 
+inline bool session_kv_geometry_matches(const mfq_tensor_backend::Tensor& k,
+        const mfq_tensor_backend::Tensor& v) {
+    if(!k.defined()||!v.defined()||k.dim()!=4||v.dim()!=4||k.scalar_type()!=v.scalar_type())return false;
+    for(int axis=0;axis<3;++axis)if(k.size(axis)!=v.size(axis))return false;
+    return k.scalar_type()==mfq_tensor_backend::kInt32 || k.size(3)==v.size(3);
+}
+
 class CudaSessionStateError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;

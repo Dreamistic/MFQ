@@ -19,7 +19,7 @@ export function MemorySettingsPanel() {
           <div className="setting-list">
             <MemoryBudgetControls residency={memory > 0 ? `${missing ? '≥ ' : ''}${residency}` : '--'}>
             {separate && <SettingRow title={tr('流式 KV 层级', 'Streamed KV hierarchy')}
-              detail={tr('显存中的冷 KV 先卸载至 RAM；RAM 层按 LRU 淘汰到 SSD。前缀缓存单独使用显存与 SSD 两层。', 'Cold VRAM KV first offloads to RAM; the RAM tier evicts to SSD by LRU. Prefix caching separately uses VRAM and SSD.')}
+              detail={tr('显存中的冷 KV 先卸载至 RAM；RAM 层按 LRU 淘汰到 SSD。RAM 前缀缓存优先让出内存。', 'Cold VRAM KV first offloads to RAM; the RAM tier evicts to SSD by LRU. RAM prefix caches yield memory first.')}
               trailing={<span className="server-managed-value">VRAM → RAM → SSD</span>} />}
             <SettingRow
               title={tr('启动时预热专家缓存', 'Warm expert cache on launch')}

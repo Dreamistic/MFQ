@@ -2,6 +2,7 @@
 #include "mfq_cuda_moe_ops.h"
 #include "mfq_cuda_shared_gate.h"
 #include "mfq_cuda_sampling_ops.h"
+#include "mfq/runtime.h"
 #include "ops.h"
 #include "model.h"
 #include "mtp.h"
@@ -357,7 +358,12 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
     return [gate_up, down, router, shared, pipeline, c](CudaExecutionContext &execution,
                                                                const Tensor &x) {
         auto source = x.reshape({-1, c.hidden}).to(tb::kFloat16);
+        const auto layer_prefill = mfq::cuda::runtime_options::moe_prefill_layer();
+        const bool combined_prefill = source.size(0)>8 && layer_prefill && *layer_prefill!=0 &&
+            execution.kl_mmq.mode==KlMmqMode::Default &&
+            moe_expert_cache_layer_prefill_ready(execution.moe_expert_cache);
         const bool use_pipeline=pipeline && (gate_up.projections.size()!=1 ||
+            combined_prefill ||
             ((source.size(0)<=8 || (source.size(0)<=32 && execution.continuous_batch_cache_serial)) &&
              execution.config.moe_two_stage_ffn &&
              execution.kl_mmq.mode==KlMmqMode::Default));
@@ -393,7 +399,7 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
                     });
             },
             [&](Tensor routed, Tensor shared_output, const auto &) {
-                if(pipeline)return routed.reshape(x.sizes());
+                if(use_pipeline)return routed.reshape(x.sizes());
                 return (routed + shared_output).reshape(x.sizes());
             });
     };
@@ -501,7 +507,7 @@ struct BlockLoader : weight_loader::Loader {
         weights.value=std::move(projections[2]);weights.index_query_key=std::move(projections[3]);
         QsaConfig geometry{c.heads, c.kv_heads, c.width, c.index_heads, c.index_width,
                            c.pool, c.budget, c.maximum, c.eps};
-        auto rotary = std::make_shared<RotaryEmbedding>(c.rotary, c.maximum, c.rope_base, c.sections, c.interleaved);
+        auto rotary = std::make_shared<RotaryEmbedding>(c.rotary, c.maximum, c.rope_base, c.sections, c.interleaved,std::nullopt,execution.yarn);
         return std::make_unique<Qsa>(std::move(weights), geometry, std::move(rotary), true, true, execution.qsa_kv_store);
     }
     auto moe(weight_loader::Routed gate_up, weight_loader::Routed down, Linear router,
@@ -744,7 +750,8 @@ struct Qwen4MtpGraph {
     void restore_legacy(Qwen4ExpMtp& predictor) {
         cells.clear();predictor.layers[0]->qsa->leave_graph();
     }
-    MtpStep run(Qwen4ExpMtp& predictor,const MtpTarget& target,const Tensor& hidden,const Tensor& ids) {
+    MtpStep run(Qwen4ExpMtp& predictor,const MtpTarget& target,const Tensor& hidden,const Tensor& ids,
+               const Tensor& positions = {}) {
         MFQ_RUNTIME_CHECK(!failed && stream.stream()==mfq_current_cuda_stream(),"MTP predictor graph is unavailable");
         auto& execution=*predictor.execution;auto& block=*predictor.layers[0];
         const int64_t tokens=ids.size(1),start=predictor.lengths[0],required=start+tokens;
@@ -758,6 +765,7 @@ struct Qwen4MtpGraph {
         auto& owner=cells[key];if(!owner)owner=std::make_unique<Cell>(hidden,ids,stream.stream());
         auto& cell=*owner;cell.hidden.copy_(hidden);cell.ids.copy_(ids);
         mfq_qwen4_exp::fill_decode_positions(cell.cache_positions,cell.positions,start);
+        if (positions.defined()) cell.positions.copy_(positions);
         try {
             finish_moe_expert_exchanges(execution.moe_expert_cache);
             if(!cell.window.valid()) {
@@ -900,17 +908,28 @@ Tensor Qwen4ExpMtp::forward(const MtpTarget &target, Tensor hidden, Tensor ids) 
 }
 
 MtpStep Qwen4ExpMtp::step(const MtpTarget &target, Tensor hidden, Tensor ids) {
+    return step_positioned(target,std::move(hidden),std::move(ids),{});
+}
+
+MtpStep Qwen4ExpMtp::step_positioned(const MtpTarget &target, Tensor hidden, Tensor ids, Tensor positions) {
+    if (positions.defined()) {
+        if (positions.dim()==1) positions=positions.reshape({1,1,-1}).expand({3,ids.size(0),ids.size(1)});
+        else if (positions.dim()==2) positions=positions.unsqueeze(1);
+        if (positions.dim()!=3 || positions.size(0)!=3 || positions.size(1)!=ids.size(0) || positions.size(2)!=ids.size(1))
+            throw std::invalid_argument("Qwen4 MTP positions require [T]/[3,T]/[3,B,T]");
+        positions=positions.to(tb::kInt32).contiguous();
+    }
     const auto graph=mfq::cuda::runtime_options::mtp_predictor_graph();
     if((!graph || *graph) && execution->config.moe_pipeline && execution->config.moe_two_stage_ffn &&
         execution->kl_mmq.mode==KlMmqMode::Default && execution->moe_expert_cache &&
         !execution->qsa_kv_store && batch==1 && ids.dim()==2 && ids.size(0)==1 && ids.size(1)>0 && ids.size(1)<=8 &&
         hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)==ids.size(1) && hidden.size(2)==hidden_norm.numel() &&
         ids.is_cuda() && hidden.is_cuda() && !lengths.empty() && lengths[0]>0 &&
-        layers[0]->qsa && layers[0]->prefetch && positions[0].dim()==3 && positions[0].size(1)==1) {
+        layers[0]->qsa && layers[0]->prefetch && this->positions[0].dim()==3 && this->positions[0].size(1)==1) {
         if(!graph_registry)graph_registry=std::make_unique<Qwen4MtpGraph>();
-        return graph_registry->run(*this,target,hidden,ids);
+        return graph_registry->run(*this,target,hidden,ids,positions);
     }
-    auto result = evaluate(target, hidden, ids);
+    auto result = evaluate(target, hidden, ids, 0, true, positions);
     return {std::move(result.first), std::move(result.second)};
 }
 
@@ -1354,12 +1373,18 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
         if(predictor->graph_registry)add(predictor->graph_registry->position_storage);
     }
     std::size_t bytes=0;
-    for(const auto& [address,size]:allocations)bytes+=size;
+    std::map<int,std::size_t> devices;
+    for(const auto& [address,size]:allocations) { bytes+=size; devices[address.first]+=size; }
     if(model.execution->qsa_kv_store)
         for(const auto& metric:model.execution->qsa_kv_store->metrics())
-            if(metric.first=="qsa_kv_resident_bytes")bytes+=std::size_t(metric.second);
-    return {{"kv_cache_bytes",double(bytes)},
+            if(metric.first=="qsa_kv_resident_bytes") {
+                bytes+=std::size_t(metric.second);
+                devices[model.execution->layer_placement.primary_device()]+=std::size_t(metric.second);
+            }
+    std::vector<std::pair<std::string,double>> result{{"kv_cache_bytes",double(bytes)},
         {"kv_cache_contexts",model.cache_pos>0?double(model.batch):0.0}};
+    for(const auto& [device,size]:devices)result.emplace_back("gpu_"+std::to_string(device)+"_live_kv_bytes",double(size));
+    return result;
 }
 
 Qwen4Model::Qwen4Model() = default;
@@ -1678,9 +1703,10 @@ std::optional<mfq_tensor_backend::Tensor> Qwen4BatchDecodeGraph::run(
             graph.window->mark(-1,"window_end");
         },[&] { for (const auto& saved : recurrent) saved.tensor->copy_(saved.snapshot); },
         [&] { graph.logits = {}; }); }
-        catch(const Error& error) {
+        catch(const std::exception& error) {
             const std::string message=error.what();
-            if(!message.starts_with("CUDA process VRAM limit exceeded:") &&
+            if(!dynamic_cast<const MfqResourceExhausted*>(&error) &&
+               !message.starts_with("CUDA process VRAM limit exceeded:") &&
                !message.starts_with("CUDA VRAM limit exceeded:") &&
                !message.starts_with("CUDA pinned allocation failed:"))throw;
             // Capture has not accepted a token. Retire its consumers before

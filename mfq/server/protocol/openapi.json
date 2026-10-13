@@ -1020,12 +1020,10 @@
             "type": "string"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
           "parameters": {
-            "additionalProperties": true,
             "title": "Parameters",
             "type": "object"
           },
@@ -1220,7 +1218,6 @@
             "type": "string"
           },
           "graph": {
-            "additionalProperties": true,
             "title": "Graph",
             "type": "object"
           },
@@ -1512,7 +1509,6 @@
             "type": "string"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -1592,7 +1588,6 @@
             "title": "Context Size"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -1626,7 +1621,7 @@
             "type": "string"
           },
           "settings": {
-            "$ref": "#/components/schemas/ResponseRequestSettings"
+            "$ref": "#/components/schemas/ResponseRequestSettings-Input"
           }
         },
         "required": [
@@ -1645,7 +1640,6 @@
             "type": "string"
           },
           "payload": {
-            "additionalProperties": true,
             "title": "Payload",
             "type": "object"
           }
@@ -1875,7 +1869,6 @@
         "additionalProperties": false,
         "properties": {
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -1956,7 +1949,6 @@
             "type": "string"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -2107,7 +2099,6 @@
             "type": "string"
           },
           "details": {
-            "additionalProperties": true,
             "title": "Details",
             "type": "object"
           },
@@ -2281,12 +2272,10 @@
             "title": "Dataset Id"
           },
           "dataset_manifest": {
-            "additionalProperties": true,
             "title": "Dataset Manifest",
             "type": "object"
           },
           "hardware_identity": {
-            "additionalProperties": true,
             "title": "Hardware Identity",
             "type": "object"
           },
@@ -2311,7 +2300,6 @@
             "type": "string"
           },
           "metrics": {
-            "additionalProperties": true,
             "title": "Metrics",
             "type": "object"
           },
@@ -2322,12 +2310,10 @@
             "type": "string"
           },
           "parameters": {
-            "additionalProperties": true,
             "title": "Parameters",
             "type": "object"
           },
           "runtime_identity": {
-            "additionalProperties": true,
             "title": "Runtime Identity",
             "type": "object"
           }
@@ -2370,7 +2356,6 @@
           },
           "task_benchmarks": {
             "additionalProperties": {
-              "additionalProperties": true,
               "type": "object"
             },
             "title": "Task Benchmarks",
@@ -2532,7 +2517,6 @@
             "type": "string"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -2562,7 +2546,7 @@
             "type": "string"
           },
           "settings": {
-            "$ref": "#/components/schemas/ResponseRequestSettings"
+            "$ref": "#/components/schemas/ResponseRequestSettings-Output"
           },
           "updated_at": {
             "format": "date-time",
@@ -3488,7 +3472,6 @@
             "type": "string"
           },
           "data": {
-            "additionalProperties": true,
             "title": "Data",
             "type": "object"
           },
@@ -3579,7 +3562,6 @@
             "type": "string"
           },
           "payload_schema": {
-            "additionalProperties": true,
             "title": "Payload Schema",
             "type": "object"
           }
@@ -3653,7 +3635,6 @@
             "type": "string"
           },
           "payload": {
-            "additionalProperties": true,
             "title": "Payload",
             "type": "object"
           },
@@ -3664,14 +3645,12 @@
             "type": "number"
           },
           "progress_data": {
-            "additionalProperties": true,
             "title": "Progress Data",
             "type": "object"
           },
           "result": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -3760,7 +3739,6 @@
             "type": "string"
           },
           "schema": {
-            "additionalProperties": true,
             "title": "Schema",
             "type": "object"
           },
@@ -4831,6 +4809,18 @@
             ],
             "title": "Prefix Cache Pending Bytes"
           },
+          "prefix_cache_ram_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Ram Bytes"
+          },
           "qsa_kv_offload": {
             "$ref": "#/components/schemas/QsaKvOffloadPolicy"
           },
@@ -5416,7 +5406,6 @@
           "document": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -5445,7 +5434,81 @@
         "title": "PortableMedia",
         "type": "object"
       },
-      "PortableMessage": {
+      "PortableMessage-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "parts": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "audio": "#/components/schemas/AudioPart",
+                  "document": "#/components/schemas/DocumentPart",
+                  "generated_audio": "#/components/schemas/GeneratedAudioPart",
+                  "image": "#/components/schemas/ImagePart",
+                  "reasoning": "#/components/schemas/ReasoningPart",
+                  "text": "#/components/schemas/TextPart",
+                  "tool_call": "#/components/schemas/ToolCallPart",
+                  "tool_result": "#/components/schemas/ToolResultPart",
+                  "transcript": "#/components/schemas/TranscriptPart",
+                  "video": "#/components/schemas/VideoPart"
+                },
+                "propertyName": "type"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/TextPart"
+                },
+                {
+                  "$ref": "#/components/schemas/ReasoningPart"
+                },
+                {
+                  "$ref": "#/components/schemas/ImagePart"
+                },
+                {
+                  "$ref": "#/components/schemas/VideoPart"
+                },
+                {
+                  "$ref": "#/components/schemas/AudioPart"
+                },
+                {
+                  "$ref": "#/components/schemas/TranscriptPart"
+                },
+                {
+                  "$ref": "#/components/schemas/DocumentPart"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolCallPart"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolResultPart"
+                },
+                {
+                  "$ref": "#/components/schemas/GeneratedAudioPart"
+                }
+              ]
+            },
+            "minItems": 1,
+            "title": "Parts",
+            "type": "array"
+          },
+          "role": {
+            "$ref": "#/components/schemas/MessageRole"
+          }
+        },
+        "required": [
+          "role",
+          "parts",
+          "created_at"
+        ],
+        "title": "PortableMessage",
+        "type": "object"
+      },
+      "PortableMessage-Output": {
         "additionalProperties": false,
         "properties": {
           "created_at": {
@@ -6141,7 +6204,6 @@
             "title": "Last Checked At"
           },
           "metrics": {
-            "additionalProperties": true,
             "title": "Metrics",
             "type": "object"
           },
@@ -6622,7 +6684,91 @@
         "title": "ResponseReasoningDelta",
         "type": "object"
       },
-      "ResponseRequestSettings": {
+      "ResponseRequestSettings-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "include_reasoning_history": {
+            "default": true,
+            "title": "Include Reasoning History",
+            "type": "boolean"
+          },
+          "input_role": {
+            "default": "user",
+            "enum": [
+              "user",
+              "tool"
+            ],
+            "title": "Input Role",
+            "type": "string"
+          },
+          "response_format": {
+            "discriminator": {
+              "mapping": {
+                "json_object": "#/components/schemas/JsonObjectResponseFormat",
+                "json_schema": "#/components/schemas/JsonSchemaResponseFormat",
+                "text": "#/components/schemas/TextResponseFormat"
+              },
+              "propertyName": "type"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TextResponseFormat"
+              },
+              {
+                "$ref": "#/components/schemas/JsonObjectResponseFormat"
+              },
+              {
+                "$ref": "#/components/schemas/JsonSchemaResponseFormat"
+              }
+            ],
+            "title": "Response Format"
+          },
+          "sampling": {
+            "$ref": "#/components/schemas/SamplingParams"
+          },
+          "system_prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "System Prompt"
+          },
+          "tool_choice": {
+            "anyOf": [
+              {
+                "enum": [
+                  "auto",
+                  "none",
+                  "required"
+                ],
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/NamedToolChoice"
+              }
+            ],
+            "default": "auto",
+            "title": "Tool Choice"
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/ToolDefinition"
+            },
+            "title": "Tools",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sampling"
+        ],
+        "title": "ResponseRequestSettings",
+        "type": "object"
+      },
+      "ResponseRequestSettings-Output": {
         "additionalProperties": false,
         "properties": {
           "include_reasoning_history": {
@@ -6840,7 +6986,7 @@
           "settings": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/ResponseRequestSettings"
+                "$ref": "#/components/schemas/ResponseRequestSettings-Output"
               },
               {
                 "type": "null"
@@ -7133,6 +7279,104 @@
         "title": "RuntimeContextPolicy",
         "type": "object"
       },
+      "RuntimeDeviceMemory": {
+        "additionalProperties": false,
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "kv_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kv Bytes"
+          },
+          "memory_available_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Available Bytes"
+          },
+          "memory_total_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Total Bytes"
+          },
+          "prefix_cache_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Bytes"
+          },
+          "resident_buffer_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resident Buffer Bytes"
+          },
+          "resident_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resident Bytes"
+          },
+          "resident_weight_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resident Weight Bytes"
+          }
+        },
+        "required": [
+          "device_id"
+        ],
+        "title": "RuntimeDeviceMemory",
+        "type": "object"
+      },
       "RuntimeDiskTraffic": {
         "additionalProperties": false,
         "properties": {
@@ -7211,6 +7455,17 @@
               }
             ],
             "title": "Core Count"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
           },
           "memory_available_bytes": {
             "anyOf": [
@@ -7596,7 +7851,6 @@
             "type": "string"
           },
           "fields": {
-            "additionalProperties": true,
             "title": "Fields",
             "type": "object"
           },
@@ -7713,6 +7967,18 @@
             ],
             "title": "Prefix Limit Bytes"
           },
+          "prefix_ram_limit_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Ram Limit Bytes"
+          },
           "total_limit_bytes": {
             "anyOf": [
               {
@@ -7744,6 +8010,13 @@
               }
             ],
             "title": "Context Count"
+          },
+          "devices": {
+            "items": {
+              "$ref": "#/components/schemas/RuntimeDeviceMemory"
+            },
+            "title": "Devices",
+            "type": "array"
           },
           "kv_bytes": {
             "anyOf": [
@@ -7792,6 +8065,42 @@
               }
             ],
             "title": "Prefix Cache Limit Bytes"
+          },
+          "prefix_cache_ram_blocks": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Ram Blocks"
+          },
+          "prefix_cache_ram_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Ram Bytes"
+          },
+          "prefix_cache_ram_limit_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Ram Limit Bytes"
           },
           "ram_expert_bytes": {
             "anyOf": [
@@ -7850,6 +8159,18 @@
               }
             ],
             "title": "Ram Kv Limit Bytes"
+          },
+          "resident_buffer_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resident Buffer Bytes"
           },
           "resident_weight_bytes": {
             "anyOf": [
@@ -8110,7 +8431,6 @@
             "type": "integer"
           },
           "values": {
-            "additionalProperties": true,
             "title": "Values",
             "type": "object"
           }
@@ -8723,7 +9043,7 @@
         "title": "SamplingParams",
         "type": "object"
       },
-      "SessionArchive": {
+      "SessionArchive-Input": {
         "additionalProperties": false,
         "properties": {
           "format": {
@@ -8741,7 +9061,41 @@
           },
           "messages": {
             "items": {
-              "$ref": "#/components/schemas/PortableMessage"
+              "$ref": "#/components/schemas/PortableMessage-Input"
+            },
+            "title": "Messages",
+            "type": "array"
+          },
+          "session": {
+            "$ref": "#/components/schemas/SessionResource"
+          }
+        },
+        "required": [
+          "session",
+          "messages"
+        ],
+        "title": "SessionArchive",
+        "type": "object"
+      },
+      "SessionArchive-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "const": "mfq-session-v1",
+            "default": "mfq-session-v1",
+            "title": "Format",
+            "type": "string"
+          },
+          "media": {
+            "items": {
+              "$ref": "#/components/schemas/PortableMedia"
+            },
+            "title": "Media",
+            "type": "array"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/PortableMessage-Output"
             },
             "title": "Messages",
             "type": "array"
@@ -8822,7 +9176,6 @@
             "type": "string"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -9073,7 +9426,6 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "additionalProperties": true,
             "title": "Arguments",
             "type": "object"
           },
@@ -9143,7 +9495,6 @@
             "type": "string"
           },
           "parameters": {
-            "additionalProperties": true,
             "title": "Parameters",
             "type": "object"
           },
@@ -9270,7 +9621,6 @@
             "title": "Context Size"
           },
           "metadata": {
-            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -9304,7 +9654,7 @@
             "type": "string"
           },
           "settings": {
-            "$ref": "#/components/schemas/ResponseRequestSettings"
+            "$ref": "#/components/schemas/ResponseRequestSettings-Input"
           }
         },
         "required": [
@@ -9408,7 +9758,6 @@
           "metadata": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -9687,7 +10036,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Delete Workspace Artifact Api V1 Artifacts Remove Post",
                   "type": "object"
                 }
@@ -11223,7 +11571,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Voice Output Component Status Api V1 Components Voice Output Get",
                   "type": "object"
                 }
@@ -11356,7 +11703,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Activate Voice Output Component Api V1 Components Voice Output Activate Post",
                   "type": "object"
                 }
@@ -18479,7 +18825,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Clear Runtime Cache Api V1 Runtime Cache Clear Post",
                   "type": "object"
                 }
@@ -18726,7 +19071,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Prefix Cache Entries Api V1 Runtime Cache Entries Get",
                   "type": "object"
                 }
@@ -18902,7 +19246,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Prefix Cache Text Api V1 Runtime Cache Entries  Namespace   Block  Text Get",
                   "type": "object"
                 }
@@ -19045,7 +19388,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Purge Prefix Cache Api V1 Runtime Cache Purge Post",
                   "type": "object"
                 }
@@ -19195,7 +19537,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Trim Runtime Cache Api V1 Runtime Cache Trim Post",
                   "type": "object"
                 }
@@ -20443,7 +20784,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Runtime Listener Api V1 Runtime Listener Get",
                   "type": "object"
                 }
@@ -20584,7 +20924,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Configure Runtime Listener Api V1 Runtime Listener Put",
                   "type": "object"
                 }
@@ -20912,7 +21251,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Memory Policy Api V1 Runtime Memory Policy Get",
                   "type": "object"
                 }
@@ -21633,7 +21971,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Runtime Models Api V1 Runtime Models Get",
                   "type": "object"
                 }
@@ -22788,7 +23125,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Qsa Kv Offload Info Api V1 Runtime Qsa Kv  Instance Id  Get",
                   "type": "object"
                 }
@@ -22921,7 +23257,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Realtime Capabilities Api V1 Runtime Realtime Capabilities Get",
                   "type": "object"
                 }
@@ -23064,7 +23399,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Reload Runtime Api V1 Runtime Reload Post",
                   "type": "object"
                 }
@@ -23347,7 +23681,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Runtime Status Api V1 Runtime Status Get",
                   "type": "object"
                 }
@@ -23492,7 +23825,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Yarn Context Info Api V1 Runtime Yarn  Instance Id  Get",
                   "type": "object"
                 }
@@ -23919,7 +24251,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SessionArchive"
+                "$ref": "#/components/schemas/SessionArchive-Input"
               }
             }
           },
@@ -24501,7 +24833,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SessionArchive"
+                  "$ref": "#/components/schemas/SessionArchive-Output"
                 }
               }
             },

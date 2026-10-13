@@ -1,5 +1,6 @@
 #include "mfq_cuda_context.h"
 #include "mfq_cuda_resident_allocations.h"
+#include "mfq/runtime.h"
 
 #include <cuda_runtime_api.h>
 
@@ -23,7 +24,7 @@ int memory_limit_cases() {
         {
             mfq::cuda::Buffer cache(second,16*mib);
             bool rejected=false;
-            try {mfq::cuda::Buffer overflow(first,first->memory_stats().limit);}catch(const mfq::cuda::Error& error) {
+            try {mfq::cuda::Buffer overflow(first,first->memory_stats().limit);}catch(const MfqResourceExhausted& error) {
                 rejected=std::string(error.what()).find("VRAM limit exceeded")!=std::string::npos;
             }
             assert(rejected && second->memory_stats().allocated==64*mib);
@@ -44,7 +45,7 @@ int memory_limit_cases() {
         }
         first->end_graph_capture(stream);
         bool retained_rejected=false;
-        try {mfq::cuda::Buffer overflow(second,second->memory_stats().limit);}catch(const mfq::cuda::Error&) {retained_rejected=true;}
+        try {mfq::cuda::Buffer overflow(second,second->memory_stats().limit);}catch(const MfqResourceExhausted&) {retained_rejected=true;}
         assert(retained_rejected && first->memory_stats().allocated==64*mib);
         first->end_graph_pool(stream);
         assert(second->memory_stats().allocated==48*mib);

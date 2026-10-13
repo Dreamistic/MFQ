@@ -39,6 +39,19 @@ def test_busy_worker_retains_last_breakdown_instead_of_resetting_to_zero():
     assert RuntimePool._memory_resources({"mlx_active_bytes": 2048}, previous) == previous
 
 
+def test_gpu_memory_maps_visible_ordinals_and_keeps_each_device_separate():
+    status = {f"gpu_{index}_{name}": value for index, fields in enumerate([
+        {"resident_bytes": 100, "resident_weight_bytes": 60, "resident_buffer_bytes": 20, "kv_bytes": 20,
+         "memory_total_bytes": 200, "memory_available_bytes": 40},
+        {"resident_bytes": 80, "resident_weight_bytes": 50, "resident_buffer_bytes": 10, "kv_bytes": 20,
+         "memory_total_bytes": 400, "memory_available_bytes": 240}]) for name, value in fields.items()}
+    memory = RuntimePool._memory_resources(status, device_ids=["3", "1"])
+    assert [device.device_id for device in memory.devices] == ["3", "1"]
+    assert [device.resident_weight_bytes for device in memory.devices] == [60, 50]
+    assert [device.memory_available_bytes for device in memory.devices] == [40, 240]
+    assert RuntimePool._memory_resources({}, memory, device_ids=["3", "1"]).devices == memory.devices
+
+
 def test_model_buffers_remain_separate_from_weights_kv_and_device_global_usage():
     previous = RuntimePool._memory_resources({"resident_weight_bytes": 1024,
         "resident_buffer_bytes": 512, "kv_cache_bytes": 200, "prefix_cache_hot_bytes": 100,
