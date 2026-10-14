@@ -138,10 +138,16 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
             progress && !use_mtp && caching &&
             progress->timing.prompt_tokens + restored.tokens == plan.stable_prefix_tokens)
             snapshot();
+        if (auto *progress = event ? std::get_if<PrefillProgress>(&*event) : nullptr;
+            progress && progress->session_boundary && use_mtp && caching &&
+            !initial_snapshot_attempted) {
+            initial_snapshot_attempted = true;
+            snapshot();
+        }
         if (auto *delta = event ? std::get_if<OutputDelta>(&*event) : nullptr) {
             history.insert(history.end(), delta->token_ids.begin(), delta->token_ids.end());
-            // The first MTP token is yielded after predictor prompt priming,
-            // while the target still holds the complete prompt boundary.
+            // Compatibility with speculative producers lacking an explicit
+            // pre-token prompt boundary event.
             if (use_mtp && caching && !initial_snapshot_attempted) {
                 initial_snapshot_attempted = true;
                 snapshot();

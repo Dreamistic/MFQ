@@ -209,6 +209,14 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         raw = Tensor{};
         hidden = Tensor{};
         logits = Tensor{};
+        if(session_last_hidden != nullptr) {
+            *session_last_hidden = committed_last_hidden;
+            // Initial prompt caching precedes token-one publication. Charge it
+            // to TTFT rather than the interval between generated tokens.
+            co_yield PrefillProgress{
+                {prompt.size()-reused_tokens,prefill_ms,0.0,prefill_ms},true};
+            if(output.stopped())co_return;
+        }
         auto first = output.append(std::vector<int64_t>{pending});
         accept(first);
         finish();

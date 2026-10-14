@@ -34,7 +34,11 @@ struct EngineRequest {
     std::vector<std::int64_t> token_ids;
 };
 
-struct PrefillProgress { MfqPrefillTiming timing; };
+struct PrefillProgress {
+    MfqPrefillTiming timing;
+    // Prompt state is ready for caching before decode timing starts.
+    bool session_boundary = false;
+};
 using OutputDelta = TokenOutput;
 struct UsageUpdate { std::size_t prompt_tokens = 0, completion_tokens = 0; };
 // Text/tool output travels only in deltas, so terminals have a bounded size.

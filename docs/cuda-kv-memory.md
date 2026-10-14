@@ -191,6 +191,10 @@ and rollback.
 Prefix snapshot admission counts occupied KV rows and recurrent state, excluding
 unused KV capacity and speculative graph checkpoints. An unsuccessful initial
 MTP snapshot is retried at request completion, rather than after every token.
+MTP emits a prompt-state boundary after predictor priming and before appending
+the first generated token. Initial prefix snapshots run at this boundary, so
+their latency is included in TTFT and excluded from the decode interval.
+This corrects timing attribution; it does not by itself reduce inference time.
 Parser-held trailing text is flushed before the final prefix snapshot. Cache
 storage and cleanup still finish before the terminal event; they no longer hold
 back the last visible characters of an otherwise completed response.
