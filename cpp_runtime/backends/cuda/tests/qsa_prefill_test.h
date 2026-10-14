@@ -1,4 +1,5 @@
 #pragma once
+#include <filesystem>
 
 void qsa_history_prime_case() {
     int cases=0;
@@ -15,7 +16,7 @@ void qsa_history_prime_case() {
             KvMemoryOptions policy;policy.placement=mode==1?"auto":"auto_ssd";policy.budget_policy=true;
             policy.gpu_budget=(maximum+maximum/pool)*iw*2+(mode==1?maximum:4)*kv*width*4;
             policy.ram_limit_set=true;policy.ram_limit=mode==1?maximum*kv*width*4:256;
-            policy.directory="workspace/qsa-history-prime-test";
+            policy.directory=(std::filesystem::current_path()/"qsa-history-prime-test").string();
             memory=std::make_shared<KvMemoryManager>(policy);
         }
         Qsa actual(weights,cfg,rotary,true,true,{},memory),oracle(weights,cfg,rotary);
