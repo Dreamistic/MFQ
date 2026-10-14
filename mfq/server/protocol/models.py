@@ -536,6 +536,15 @@ class QsaKvStorageSettings(ProtocolModel):
 class KvMemorySettings(ProtocolModel):
     placement: Literal["auto", "auto_ssd", "vram", "ram"] = "auto"
     allocation: Literal["preallocated", "dynamic"] = "preallocated"
+    gpu_budget_bytes: int | None = Field(default=None, ge=1, le=1 << 50)
+    ram_preallocated: bool = Field(default=True, strict=True)
+    ram_budget_bytes: int | None = Field(default=None, ge=0, le=1 << 50)
+
+    @model_validator(mode="after")
+    def validate_ram_storage(self) -> "KvMemorySettings":
+        if not self.ram_preallocated and self.placement != "auto_ssd":
+            raise ValueError("kv_ssd_required: disabling RAM preallocation requires SSD KV")
+        return self
 
 
 class KvQuantizationSettings(ProtocolModel):
@@ -581,6 +590,14 @@ class ConfigureQsaKvOffloadRequest(ProtocolModel):
     ram_budget_bytes: int | None = Field(default=None, ge=0, le=1 << 50)
 
 
+class ModelLoadContextSettings(ProtocolModel):
+    automatic: bool = Field(default=True, strict=True)
+    ssd_kv: bool = Field(default=False, strict=True)
+    ram_preallocated: bool = Field(default=True, strict=True)
+    vram_preallocated: bool = Field(default=True, strict=True)
+    kv_quantization: KvQuantizationSettings = Field(default_factory=KvQuantizationSettings)
+
+
 class ModelLoadRequest(ProtocolModel):
     model: str = Field(min_length=1, max_length=255)
     artifact_uri: str | None = Field(default=None, min_length=1)
@@ -609,6 +626,7 @@ class ModelLoadRequest(ProtocolModel):
     qsa_kv_offload: QsaKvOffloadPolicy = Field(default_factory=QsaKvOffloadPolicy)
     kv_quantization: KvQuantizationSettings = Field(default_factory=KvQuantizationSettings)
     kv_memory: KvMemorySettings = Field(default_factory=KvMemorySettings)
+    context_management: ModelLoadContextSettings | None = None
 
 class CreateRuntimeProfileRequest(ProtocolModel):
     name: str = Field(min_length=1, max_length=64)
