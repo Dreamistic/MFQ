@@ -1321,6 +1321,8 @@ def test_empty_runtime_pool_reports_idle_state(tmp_path: Path, monkeypatch) -> N
             "mtp_service_enabled": True,
             "prefix_cache_total_hot_bytes": 0,
             "prefix_cache_total_hot_max_bytes": 2 << 30,
+            "prefix_cache_total_ram_bytes": 0,
+            "prefix_cache_total_ram_max_bytes": 0,
             "prefix_cache_total_disk_bytes": 0,
             "prefix_cache_total_disk_blocks": 0,
             "prefix_cache_budget_failures": 0,
