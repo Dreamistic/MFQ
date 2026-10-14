@@ -1388,6 +1388,17 @@
               }
             ],
             "title": "Directory Id"
+          },
+          "evict_prefix_cache": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evict Prefix Cache"
           }
         },
         "title": "ConfigureDownloadDirectoryRequest",
@@ -2710,6 +2721,16 @@
             "title": "Architectures",
             "type": "array"
           },
+          "attention_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelAttentionProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "author": {
             "anyOf": [
               {
@@ -2731,6 +2752,11 @@
                 "type": "null"
               }
             ]
+          },
+          "config_inspected": {
+            "default": false,
+            "title": "Config Inspected",
+            "type": "boolean"
           },
           "description": {
             "anyOf": [
@@ -4171,6 +4197,30 @@
         "title": "ModelArtifactResource",
         "type": "object"
       },
+      "ModelAttentionProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "compressed": {
+            "title": "Compressed",
+            "type": "boolean"
+          },
+          "hybrid": {
+            "title": "Hybrid",
+            "type": "boolean"
+          },
+          "sparse": {
+            "title": "Sparse",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "sparse",
+          "compressed",
+          "hybrid"
+        ],
+        "title": "ModelAttentionProfile",
+        "type": "object"
+      },
       "ModelCacheComponent": {
         "additionalProperties": false,
         "properties": {
@@ -5082,6 +5132,16 @@
             "minLength": 1,
             "title": "Architecture",
             "type": "string"
+          },
+          "attention_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelAttentionProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "cache_profile": {
             "anyOf": [
@@ -13390,6 +13450,12 @@
                         "type": "string"
                       },
                       {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "boolean"
+                      },
+                      {
                         "type": "null"
                       }
                     ]
@@ -13538,6 +13604,12 @@
                     "anyOf": [
                       {
                         "type": "string"
+                      },
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "boolean"
                       },
                       {
                         "type": "null"

@@ -11,12 +11,27 @@ import type {
 } from '../types';
 import { request } from '../client';
 
+export interface DownloadDirectoryStatus {
+  directory: string | null;
+  actual_directory: string;
+  default_directory: string;
+  disk_total_bytes?: number | null;
+  disk_free_bytes?: number | null;
+  disk_available_bytes?: number | null;
+  download_reserved_bytes?: number;
+  reclaimable_prefix_bytes?: number;
+  evict_prefix_cache?: boolean;
+}
+
 export const modelsApi = {
-  downloadDirectory(): Promise<{ directory: string | null; actual_directory: string; default_directory: string }> {
+  downloadDirectory(): Promise<DownloadDirectoryStatus> {
     return request('/api/v1/hub/download-directory');
   },
-  configureDownloadDirectory(directoryId: string | null): Promise<{ directory: string | null; actual_directory: string; default_directory: string }> {
+  configureDownloadDirectory(directoryId: string | null): Promise<DownloadDirectoryStatus> {
     return request('/api/v1/hub/download-directory', { method: 'PUT', body: JSON.stringify({ directory_id: directoryId }) });
+  },
+  configureDownloadReclaim(evictPrefixCache: boolean): Promise<DownloadDirectoryStatus> {
+    return request('/api/v1/hub/download-directory', { method: 'PUT', body: JSON.stringify({ evict_prefix_cache: evictPrefixCache }) });
   },
   /** 列出模型资产；refresh 为真时要求服务重新扫描。 */
   async modelArtifacts(refresh = false): Promise<ModelArtifact[]> {

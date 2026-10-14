@@ -10,6 +10,7 @@ import type {
   JobResource,
   ModelConfigurationStatus,
   ModelParameterBreakdown,
+  ModelAttentionProfile,
   OfficialModelInfo,
   OfficialModelList,
   OfficialModelSource,
@@ -25,6 +26,12 @@ import { RepositoryFiles } from './RepositoryFiles';
 import { estimateCacheBytes, KvCachePlanner, plannedConfiguration, withCacheMemory } from './KvCachePlanner';
 
 type Translate = (chinese: string, english: string) => string;
+function attentionLabel(profile: ModelAttentionProfile | null | undefined, tr: Translate): string {
+  if (!profile) return '--';
+  return [profile.sparse ? tr('稀疏', 'Sparse') : tr('稠密', 'Dense'),
+    ...(profile.compressed ? [tr('压缩', 'Compressed')] : []),
+    profile.hybrid ? tr('混合', 'Hybrid') : tr('非混合', 'Non-hybrid')].join('·');
+}
 export type ModelBrowserTab = 'official' | 'community' | 'downloads';
 export type DownloadOrigin = { x: number; y: number };
 
@@ -240,7 +247,7 @@ function VariantList({
           <div className="model-variant" key={variant.id}>
             <div>
               <strong>{variant.label}</strong>
-              <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)}{(variant.ssd_ple_bytes ?? 0) > 0 && ` · SSD PLE ${formatBytes(variant.ssd_ple_bytes)}`}</small>
+              <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)}{(variant.ssd_ple_bytes ?? 0) > 0 && ` · ${tr("常驻", "resident")} ${formatBytes(Math.max(0, variant.byte_size - (variant.ssd_ple_bytes ?? 0)))} · SSD PLE ${formatBytes(variant.ssd_ple_bytes)}`}</small>
               {cacheBytes > 0 && <small>{tr('规划 KV/递推状态', 'Planned KV/recurrent state')} {formatBytes(cacheBytes)} · {tr('预计总常驻', 'Est. total residency')} {formatBytes(variant.configuration.required_memory_bytes)}</small>}
             </div>
             <ModelPressureBars weights={variant.estimated_resident_weight_bytes ?? variant.resident_weight_bytes
@@ -506,7 +513,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                   <div><dt>{tr("激活参数", "Active parameters")}</dt><dd title={tr("主干每 token 的逻辑激活参数，不含词嵌入、输出词表、视觉编码器与 PLE 查表。", "Logical backbone parameters active per token; excludes vocabulary embeddings/output, vision encoder and PLE lookups.")}>{parameters?.active != null ? formatParameters(parameters.active) : selectedOfficial.active_parameter_label || "—"}</dd></div>
                   <div><dt>{tr("模态", "Modalities")}</dt><dd>{modalityLabels(selectedMetadata?.modalities?.length ? selectedMetadata.modalities : selectedOfficial.modalities, tr)}</dd></div>
                   <MtpSupport supported={mtpSupported} tr={tr} />
-                  <div><dt>{tr("许可", "License")}</dt><dd>{selectedOfficial.license || tr("查看模型卡", "See model card")}</dd></div>
+                  <div><dt>{tr("注意力类型", "Attention type")}</dt><dd>{attentionLabel(selectedMetadata?.attention_profile, tr)}</dd></div>
                   <div><dt>{tr("下载", "Downloads")}</dt><dd>{formatCount(selectedOfficial.downloads)}</dd></div>
                   <div><dt>{tr("收藏", "Likes")}</dt><dd>{formatCount(selectedOfficial.likes)}</dd></div>
                   <div><dt>{tr("发布时间", "Published")}</dt><dd>{formatDate(selectedOfficial.published_at || selectedOfficial.updated_at)}</dd></div>
@@ -514,6 +521,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                 <KvCachePlanner key={`kv:${officialPlanKey}`} profile={selectedMetadata?.cache_profile} appliedContext={officialContext} onApply={(context) => applyPlan(officialPlanKey, context)} tr={tr} />
                 <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => { const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source); }} value={String(Math.max(0, selectedOfficial.sources.findIndex((item) => item.provider === selectedSource.provider && item.repo_id === selectedSource.repo_id)))}>{selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
                 <div className="repository-line"><button onClick={() => void openStudioExternal(selectedSource.url).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{selectedSource.repo_id}</button><span>{officialVariants.length} {tr("个精度版本", "variants")}</span></div>
+                <p className="model-weight-pressure-note">{tr('下方压力条与百分比表示常驻权重对当前剩余显存、内存或统一内存推理预算的压力，不是磁盘占用。', 'The bars and percentages below show resident-weight pressure on the currently available VRAM, RAM or unified-memory inference budget, not disk usage.')}</p>
                 <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={plannedOfficialVariants} cacheBytes={officialCacheBytes} system={official?.system} moe={(parameters?.routed_experts ?? 0) > 0 || selectedOfficial.capabilities.includes('MoE')} />
                 {sourceInfoMatches && <RepositoryFiles key={`${selectedSource.provider}:${selectedSource.repo_id}:${officialSourceInfo!.revision}`}
                   files={officialSourceInfo!.files} disabled={officialLoading || !canDownload(selectedSource.provider) || downloading !== null} tr={tr}
@@ -548,7 +556,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                   <div><dt>{tr('激活参数', 'Active parameters')}</dt><dd>{communityModel.parameter_breakdown?.active != null ? formatParameters(communityModel.parameter_breakdown.active) : '—'}</dd></div>
                   <div><dt>{tr("模态", "Modalities")}</dt><dd>{modalityLabels(communityModel.modalities.length ? communityModel.modalities : ['text'], tr)}</dd></div>
                   <MtpSupport supported={communityModel.mtp_supported} tr={tr} />
-                  <div><dt>{tr("许可", "License")}</dt><dd>{communityModel.license || tr("未声明", "Not declared")}</dd></div>
+                  <div><dt>{tr("注意力类型", "Attention type")}</dt><dd>{attentionLabel(communityModel.attention_profile, tr)}</dd></div>
                   <div><dt>{tr("下载", "Downloads")}</dt><dd>{formatCount(communityModel.downloads)}</dd></div>
                   <div><dt>{tr("收藏", "Likes")}</dt><dd>{formatCount(communityModel.likes)}</dd></div>
                   <div><dt>{tr("发布时间", "Published")}</dt><dd>{formatDate(communityModel.published_at || communityModel.updated_at)}</dd></div>
