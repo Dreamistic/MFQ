@@ -81,7 +81,7 @@ template <typename Model>
 Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::string &model_path,
                                 const std::string &config_path, int64_t context_size_override,
                                 bool load_blocks, bool defer_moe_cache_finalize,
-                                std::shared_ptr<const mfq::ModelSource> model_source) {
+                                std::shared_ptr<const mfq::ModelSource> model_source, bool load_input_output) {
     Model model;
     model.execution = &execution;
     model.source = model_source ? std::move(model_source) : mfq::open_model_source(model_path);
@@ -173,7 +173,13 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
     }
 
     CudaWeightLoader<Model> weights{model, source};
-    model.load_weights(weights, load_blocks);
+    if (load_input_output) {
+        model.load_weights(weights, load_blocks);
+    } else {
+        if (load_blocks) throw std::invalid_argument("streamed model setup requires deferred blocks");
+        model.adapter_load_final_state(source, model.output_norm);
+        model.adapter_prepare_blocks(source);
+    }
 
     execution.loading_cpu_layer = false;
     execution.layer_placement.load_device = execution.layer_placement.primary_device();
@@ -187,7 +193,7 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
 #define MFQ_INSTANTIATE_CAUSAL_LM(TYPE)                                                            \
     template TYPE mfq::cuda::load_causal_lm<TYPE>(CudaExecutionContext &, const std::string &,     \
                                                   const std::string &, int64_t, bool, bool,        \
-                                                  std::shared_ptr<const mfq::ModelSource>)
+                                                  std::shared_ptr<const mfq::ModelSource>, bool)
 
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Qwen35CausalLm);
 MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::MiniCPMO45CausalLm);

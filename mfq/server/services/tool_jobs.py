@@ -919,7 +919,7 @@ class ToolJobHandlers:
 
     async def wikitext_reference(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         request = Wt2ReferencePayload.model_validate(payload)
-        source = await asyncio.to_thread(self.quantization_workbench.source, request.model)
+        source = await asyncio.to_thread(self.quantization_workbench.source, request.model, reference=True)
         if source.format != 'hf' or not source.imatrix_supported:
             raise self._failure('reference_architecture_unsupported', 'WT2 source generation currently supports original Qwen3.5 and Gemma4 HF architectures, including supported native QAT weights')
         dataset = await asyncio.to_thread(context.store.get_dataset, request.dataset_id)
@@ -936,6 +936,8 @@ class ToolJobHandlers:
             '--backend', backend, '--device', 'mps' if backend == 'metal' else 'cuda:0')
         if not request.layerwise:
             argv.append('--resident')
+        if backend == 'cuda':
+            argv.extend(['--runtime', str(self._required_executable(self.paths.runtime, 'MFQ native CUDA runtime'))])
 
         loading_data = {}
         def progress(line):

@@ -50,7 +50,7 @@ export function useModelCatalog() {
   const modelBrowserTriggerRef = useRef<HTMLElement | null>(null);
   const canUseNativeModelPicker = isStudio() && studio?.config.mode !== 'remote';
   const availableModelNames = runtimeModelNames(models, instances);
-  const openStudioPage = (_view: string, page: 'models' | 'quantization') =>
+  const openStudioPage = (_view: string, page: 'models') =>
     navigate(labPath(page));
   const artifactRevision = jobs.map((job) => job.id + ':' + job.status).join(',');
   function setModelBrowserOpen(open: boolean) {

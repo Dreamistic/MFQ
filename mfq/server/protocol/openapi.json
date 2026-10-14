@@ -5984,6 +5984,11 @@
             "minLength": 1,
             "title": "Path",
             "type": "string"
+          },
+          "reference": {
+            "default": false,
+            "title": "Reference",
+            "type": "boolean"
           }
         },
         "required": [
@@ -9414,6 +9419,11 @@
             ],
             "title": "Purpose",
             "type": "string"
+          },
+          "reference": {
+            "default": false,
+            "title": "Reference",
+            "type": "boolean"
           }
         },
         "required": [
