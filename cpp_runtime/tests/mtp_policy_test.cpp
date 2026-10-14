@@ -108,33 +108,50 @@ int main() {
         DepthController latency(3,nullptr,7.0,1.15,true,60.0);
         require(latency.depth()==1);
         latency.observe(1,1,45.0); // Projected three-row window is still cold.
-        require(latency.depth()==1);
-        latency.observe(1,1,35.0,false); // Maintenance cannot permit widening.
+        require(latency.depth()==0);
+        latency.observe(0,0,1.0,false); // Maintenance cannot advance calibration.
+        require(latency.depth()==0 && !latency.measured_cycle_ms(0));
+        for(int i=0;i<3;++i)latency.observe(0,0,30.0);
         require(latency.depth()==1);
         latency.observe(1,1,39.0);
         require(latency.depth()==2);
         latency.observe(2,2,51.0);
         require(latency.depth()==2);
         latency.observe(2,2,44.0);
+        latency.observe(1,1,39.0);
         require(latency.depth()==3);
-        DepthController bounded(3,nullptr,7.0,1.15,true,60.0);
-        for(int i=0;i<48;++i)bounded.observe(bounded.depth(),0,100.0);
-        require(bounded.depth()>1); // Slow devices must still complete calibration.
+        DepthController sampled(3,nullptr,7.0,1.15,true,60.0);
+        int calibration=0;
+        while(sampled.warming_up() && calibration<20) {
+            const auto depth=sampled.depth();
+            sampled.observe(depth,0,depth?38.0:25.0);
+            ++calibration;
+        }
+        require(calibration<12 && !sampled.warming_up() && sampled.depth()==0);
+        require(!sampled.measured_cycle_ms(2) && !sampled.measured_cycle_ms(3));
+        // Deferred widths remain eligible for exploration when conditions change.
+        bool revisited=false;
+        for(int i=0;i<400;++i) {
+            const int depth=sampled.depth();
+            if(depth>1){revisited=true;break;}
+            sampled.observe(depth,depth,depth?28.0:25.0);
+        }
+        require(revisited);
         DepthController gradual(3,nullptr,7.0,1.15,true);
-        const std::array<int,12> sweep{1,2,3,0,0,0,3,2,1,3,2,1};
+        const std::array<int,13> sweep{1,0,0,0,1,2,3,3,2,1,3,2,1};
         int step=0;
         for(int depth:sweep) {
             require(gradual.depth()==depth);
             gradual.observe(depth,depth,1000.0,false);
             require(gradual.depth()==depth && gradual.warming_up());
-            const double ms=step<3?30.0+40.0*depth:step<9?20.0+20.0*depth:20.0+5.0*depth;
+            const double ms=step==0?70.0:20.0+5.0*depth;
             gradual.observe(depth,depth,ms);
             if(++step==9)require(gradual.warming_up());
         }
         require(!gradual.warming_up() && gradual.depth()>1);
         require(*gradual.measured_cycle_ms(3)==35.0);
         DepthController continuation(3,&gradual,7.0,1.15,true);
-        for(int depth:std::array<int,9>{1,2,3,0,0,0,3,2,1}) {
+        for(int depth:std::array<int,10>{1,0,0,0,1,2,3,3,2,1}) {
             require(continuation.depth()==depth);
             continuation.observe(depth,depth,20.0+5.0*depth);
         }

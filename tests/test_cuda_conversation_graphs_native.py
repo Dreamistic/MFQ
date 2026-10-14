@@ -58,7 +58,7 @@ def test_conversation_graph_reuse(tmp_path, allocation):
                 await client.status()
                 initial_log = log_path.read_text(errors="replace")
                 if reuse:
-                    assert "runtime_qwen4_graph_warmup target_captures=6 predictor_captures=4" in initial_log
+                    assert "runtime_qwen4_graph_warmup target_captures=6 predictor_captures=8" in initial_log
                     assert "runtime_qwen4_mtp_warmup tokens=64" in initial_log
                 captures = initial_log.count("runtime_qwen4_graph_capture")
                 outputs = []

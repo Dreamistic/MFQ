@@ -217,7 +217,40 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 {prompt.size()-reused_tokens,prefill_ms,0.0,prefill_ms},true};
             if(output.stopped())co_return;
         }
-        auto first = output.append(std::vector<int64_t>{pending});
+        auto initial_hidden = committed_last_hidden;
+        auto bootstrap = [&](Tensor token_counts,const MfqTokenConstraintPtr& cursor) {
+            if(mtp.teacher_forced_prompt_prime()) {
+                (void)ops.predictor_step(initial_hidden,ops.ids_for({pending}),
+                    transformed_prompt ? ops.decode_positions(model.cache_pos,1) : Tensor{});
+            }
+            auto next_hidden=ops.target_forward(ops.ids_for({pending}),&raw);
+            committed_last_hidden=ops.slice(raw,1,ops.size(raw,1)-1,1);
+            pending=ops.sample_constrained(ops.logits_for(next_hidden),token_counts,cursor);
+            if(cursor)cursor->accept(pending);
+            initial_hidden=committed_last_hidden;
+        };
+        std::vector<int64_t> first_tokens{pending};
+        bool bootstrapped=false;
+        if constexpr(requires { ops.bootstrap_before_publication(); }) {
+            if(ops.bootstrap_before_publication() && mtp.target_bootstrap_decode() && limit>1) {
+                // Inspect EOS, stop strings and parser boundaries on a copy.
+                // The initial prompt snapshot above still belongs to the prompt
+                // alone, and no output timestamp is recorded until publication.
+                auto preview=output;
+                (void)preview.append(first_tokens);
+                if(!preview.stopped()) {
+                    auto prospective_counts=penalties?ops.clone(counts):Tensor{};
+                    if(penalties)ops.add_counts(prospective_counts,ops.ids_for(first_tokens));
+                    auto cursor=token_constraint?token_constraint->clone():MfqTokenConstraintPtr{};
+                    require_execution(!token_constraint || cursor,"MTP bootstrap constraint cursor is incomplete");
+                    if(cursor)cursor->accept(pending);
+                    bootstrap(std::move(prospective_counts),cursor);
+                    first_tokens.push_back(pending);bootstrapped=true;
+                }
+            }
+        }
+        if(output.result.cancelled)co_return;
+        auto first = output.append(first_tokens);
         accept(first);
         finish();
         co_yield std::move(first);
@@ -228,28 +261,14 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         require_execution(
             !token_constraint || constraint_cursor, "MTP token constraint cursor is incomplete");
 
-        auto initial_hidden = committed_last_hidden;
-        if (mtp.target_bootstrap_decode()) {
-            if (mtp.teacher_forced_prompt_prime()) {
-                // Some recurrent predictors consume the prompt/first-token
-                // seam before the target advances to hidden(first_token).
-                (void)ops.predictor_step(initial_hidden,
-                    ops.ids_for({pending}),
-                    transformed_prompt ? ops.decode_positions(model.cache_pos, 1) : Tensor{});
-            }
-            auto next_hidden = ops.target_forward(ops.ids_for({pending}), &raw);
-            committed_last_hidden = ops.slice(raw, 1, ops.size(raw, 1) - 1, 1);
-            pending =
-                ops.sample_constrained(ops.logits_for(next_hidden), counts, constraint_cursor);
-            if (constraint_cursor)
-                constraint_cursor->accept(pending);
+        if (mtp.target_bootstrap_decode() && !bootstrapped) {
+            bootstrap(counts,constraint_cursor);
             auto delta = output.append(std::vector<int64_t>{pending});
             accept(delta);
             finish();
             co_yield std::move(delta);
             if (output.stopped())
                 co_return;
-            initial_hidden = committed_last_hidden;
         }
 
         int64_t predictor_history_position = mtp.cache_position();
@@ -268,9 +287,12 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             if (pending_ids.empty()) return;
             auto rows = pending_hidden.size() == 1 ? pending_hidden.front()
                 : ops.concatenate(pending_hidden, 1);
-            (void)ops.predictor_step(rows, ops.ids_for(pending_ids),
-                transformed_prompt ? ops.decode_positions(predictor_history_position + 1,
-                    static_cast<int64_t>(pending_ids.size())) : Tensor{});
+            auto ids=ops.ids_for(pending_ids);
+            auto positions=transformed_prompt ? ops.decode_positions(predictor_history_position + 1,
+                static_cast<int64_t>(pending_ids.size())) : Tensor{};
+            if constexpr(requires {ops.predictor_history_step(rows,ids,positions);})
+                ops.predictor_history_step(std::move(rows),std::move(ids),std::move(positions));
+            else (void)ops.predictor_step(std::move(rows),std::move(ids),std::move(positions));
             predictor_history_position += static_cast<int64_t>(pending_ids.size());
             pending_hidden.clear();
             pending_ids.clear();
@@ -338,7 +360,9 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 pending_ids.insert(pending_ids.end(), next_ids.begin(), next_ids.end());
                 std::size_t threshold=512;
                 if constexpr(requires { ops.predictor_history_flush_threshold(); })
-                    if(!depth_controller.parked())threshold=ops.predictor_history_flush_threshold();
+                    threshold=ops.predictor_history_flush_threshold();
+                if constexpr(requires { ops.predictor_parked_history_flush_threshold(); })
+                    if(depth_controller.parked())threshold=ops.predictor_parked_history_flush_threshold();
                 if (pending_ids.size() >= threshold) { maintenance = true; flush_history(); }
                 return result;
             }
@@ -579,7 +603,11 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 if (emitted_accepted == draft_count) {
                     model.commit_speculative();
                 } else {
-                    const bool retained = mtp.retains_partial_target_prefix();
+                    const bool retained = [&] {
+                        if constexpr(requires { ops.retains_partial_target_prefix(emitted_accepted); })
+                            return ops.retains_partial_target_prefix(emitted_accepted);
+                        return mtp.retains_partial_target_prefix();
+                    }();
                     model.rollback_speculative(retained ? emitted_accepted : 0);
                     if (!retained && emitted_accepted > 0) {
                         std::vector<int64_t> replay(

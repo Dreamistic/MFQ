@@ -27,12 +27,13 @@ struct Predictor {
     uint64_t last_cycles = 0, last_accepted = 0, last_rejected = 0;
     int64_t position = 0;
     bool legacy = false;
+    bool bootstrap = false;
     int maximum_draft_depth() const { return 3; }
     bool dspark_policy() const { return legacy; }
     bool blockwise_drafting() const { return false; }
     bool supports_session_state() const { return true; }
     bool teacher_forced_prompt_prime() const { return true; }
-    bool target_bootstrap_decode() const { return false; }
+    bool target_bootstrap_decode() const { return bootstrap; }
     bool split_target_verification() const { return false; }
     bool retains_partial_target_prefix() const { return true; }
     int64_t cache_position() const { return position; }
@@ -188,6 +189,39 @@ void run_prompt_snapshot_boundary() {
         throw std::runtime_error("prompt snapshot changed generation history");
 }
 
+void run_bootstrap_publication() {
+    struct BootstrapOps : Ops {
+        bool early;
+        bool bootstrap_before_publication() const {return early;}
+    };
+    const auto run_bootstrap=[](bool early,int limit) {
+        Model model;Predictor mtp;mtp.bootstrap=true;
+        InferenceRequest request;request.chat=false;request.prompt={0,0,0};
+        request.sampling.max_tokens=limit;request.sampling.mtp_max_draft_tokens=3;
+        InferenceOutput output(request,nullptr,"mtp-bootstrap-publication-test");
+        Tensor last_hidden;
+        auto generation=speculative_sequence(BootstrapOps{{model,mtp},early},request,output,512,0,Tensor{},&last_hidden);
+        std::vector<int64_t> tokens;bool boundary=false;
+        while(auto step=generation.next())if(step.value) {
+            if(const auto* progress=std::get_if<PrefillProgress>(&*step.value);progress && progress->session_boundary) {
+                if(model.cache_pos!=3 || mtp.cache_position()!=2 || output.metrics.saw_token)
+                    throw std::runtime_error("bootstrap changed prompt snapshot boundary");
+                boundary=true;
+            }
+            if(const auto* delta=std::get_if<TokenOutput>(&*step.value)) {
+                if(tokens.empty() && (!boundary || delta->token_ids.size()!=(early && limit>1?2:1)))
+                    throw std::runtime_error("bootstrap publication emitted an incomplete first batch");
+                tokens.insert(tokens.end(),delta->token_ids.begin(),delta->token_ids.end());
+            }
+        }
+        if(tokens.size()!=std::size_t(limit) || model.cache_pos!=limit+2 || !Ops::defined(last_hidden))
+            throw std::runtime_error("bootstrap publication changed output/cache length");
+        return tokens;
+    };
+    if(run_bootstrap(false,8)!=run_bootstrap(true,8) || run_bootstrap(false,1)!=run_bootstrap(true,1))
+        throw std::runtime_error("bootstrap publication changed sampled tokens");
+}
+
 void run_target_initialization() {
     struct InitializingOps : Ops {
         int* observations;
@@ -245,29 +279,39 @@ void run_streaming_publication(bool accepted) {
 void run_history_batching() {
     struct HistoryOps : Ops {
         std::vector<int64_t>* widths;
+        int* history_calls;
         bool gradual_mtp_warmup() const {return true;}
         std::size_t predictor_history_merge_limit() const {return 128;}
         std::size_t predictor_history_flush_threshold() const {return 4;}
+        std::size_t predictor_parked_history_flush_threshold() const {return 16;}
         Head predictor_step(Tensor hidden,Tensor ids,Tensor positions) {
             if(size(hidden,1)!=size(ids,1))throw std::runtime_error("merged MTP history lost token alignment");
-            // A parked predictor intentionally defers long history until
-            // request completion; only active calibration has the short bound.
-            if(!mtp.last_stats.standard_tokens)widths->push_back(size(ids,1));
+            widths->push_back(size(ids,1));
             return Ops::predictor_step(hidden,ids,positions);
+        }
+        void predictor_history_step(Tensor hidden,Tensor ids,Tensor positions) {
+            if(size(hidden,1)!=size(ids,1))throw std::runtime_error("headless history lost token alignment");
+            ++*history_calls;
+            for(int64_t offset=0;offset<size(ids,1);offset+=4) {
+                const auto rows=std::min<int64_t>(4,size(ids,1)-offset);
+                widths->push_back(rows);
+                (void)Ops::predictor_step(slice(hidden,1,offset,rows),slice(ids,1,offset,rows),positions);
+            }
         }
         std::vector<int32_t> greedy_tokens(Tensor logits) {return std::vector<int32_t>(size(logits,0),1);}
     };
-    Model model;Predictor mtp;std::vector<int64_t> widths;
+    Model model;Predictor mtp;std::vector<int64_t> widths;int history_calls=0;
     InferenceRequest request;request.chat=false;request.prompt={0,0,0};
     request.sampling.max_tokens=96;request.sampling.mtp_max_draft_tokens=3;
     InferenceOutput output(request,nullptr,"mtp-history-test");
-    auto generation=speculative_sequence(HistoryOps{{model,mtp},&widths},request,output,512,0,Tensor{},nullptr);
+    auto generation=speculative_sequence(HistoryOps{{model,mtp},&widths,&history_calls},request,output,512,0,Tensor{},nullptr);
     std::vector<int64_t> tokens;
     while(auto step=generation.next())if(step.value)
         if(const auto* delta=std::get_if<TokenOutput>(&*step.value))
             tokens.insert(tokens.end(),delta->token_ids.begin(),delta->token_ids.end());
     if(tokens.size()!=96 || tokens.front()!=0 || model.cache_pos!=98 || mtp.cache_position()!=98 ||
-            output.metrics.mtp.depth_cycles[0]<3 || std::find(widths.begin(),widths.end(),4)==widths.end() ||
+            output.metrics.mtp.depth_cycles[0]<3 || history_calls==0 ||
+            std::find(widths.begin(),widths.end(),4)==widths.end() ||
             std::any_of(widths.begin(),widths.end(),[](auto n){return n>4;})) {
         std::cerr<<"history tokens="<<tokens.size()<<" model="<<model.cache_pos<<" predictor="<<mtp.cache_position()
             <<" baseline="<<output.metrics.mtp.depth_cycles[0]<<" widths=";
@@ -364,6 +408,7 @@ int main() {
     run(false);
     run(true);
     run_prompt_snapshot_boundary();
+    run_bootstrap_publication();
     run_target_initialization();
     run_streaming_publication(false);
     run_streaming_publication(true);

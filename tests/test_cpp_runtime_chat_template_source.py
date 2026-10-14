@@ -153,7 +153,7 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
     assert "masked.to(logits.device())" in DECODE
     assert "constraint->clone()" in DECODE
     assert "restored.tokens, restored.mtp_last_target_hidden" in DECODE
-    assert "if(constraint_cursor)constraint_cursor->accept(pending);" in "".join(DECODE.split())
+    assert "if(cursor)cursor->accept(pending);" in "".join(DECODE.split())
     assert "constraint_cursor->accept(result.next_token);" in DECODE
 
 

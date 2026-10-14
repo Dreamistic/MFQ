@@ -14,6 +14,7 @@
 #include "models/minicpmo45/ops.h"
 #include "models/qwen35/ops.h"
 #include "models/qwen4_exp/ops.h"
+#include "models/qwen4_exp/mtp.h"
 #include "moe_expert_cache.h"
 
 #include <cuda_runtime_api.h>
@@ -68,6 +69,15 @@ template <class Model> struct CudaMtpOps {
   std::uint64_t target_transfer_bytes=0;
   bool take_target_maintenance() { return std::exchange(target_maintenance,false); }
   bool gradual_mtp_warmup() const {return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>;}
+  bool bootstrap_before_publication() const {
+    const auto* option=std::getenv("MFQ_MTP_EARLY_BOOTSTRAP");
+    return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm> && (!option || option[0]!='0');
+  }
+  bool retains_partial_target_prefix(int accepted) const {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+      if(model.speculative_prefix_retention && accepted>=0)return true;
+    return mtp.retains_partial_target_prefix();
+  }
   std::size_t predictor_history_merge_limit() const {
     return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>?128:0;
   }
@@ -77,6 +87,12 @@ template <class Model> struct CudaMtpOps {
     // history replays immediately before drafting and target verification.
     const auto* option=std::getenv("MFQ_MTP_HISTORY_EARLY_FLUSH");
     return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm> && (!option || option[0]!='0')?4:512;
+  }
+  std::size_t predictor_parked_history_flush_threshold() const {
+    // Amortize the target/predictor expert-exchange boundary while bounding
+    // final and re-entry maintenance by four warmed, headless graph tiles.
+    const auto* option=std::getenv("MFQ_MTP_HISTORY_EARLY_FLUSH");
+    return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm> && (!option || option[0]!='0')?16:512;
   }
   void trace_cycle(uint64_t cycle,int depth,int accepted,double draft_ms,double verify_ms,double commit_ms) {
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
@@ -226,8 +242,10 @@ template <class Model> struct CudaMtpOps {
         MtpStep last;
         for(int64_t offset=0;offset<ids.size(1);offset+=4) {
           const auto rows=std::min<int64_t>(4,ids.size(1)-offset);
-          last=predictor_step(hidden.narrow(1,offset,rows),ids.narrow(1,offset,rows),
-              positions.defined()?positions.narrow(-1,offset,rows):Tensor{});
+          auto part_positions=positions.defined()?positions.narrow(-1,offset,rows):Tensor{};
+          if(offset+rows<ids.size(1))
+            predictor_history_step(hidden.narrow(1,offset,rows),ids.narrow(1,offset,rows),part_positions);
+          else last=predictor_step(hidden.narrow(1,offset,rows),ids.narrow(1,offset,rows),part_positions);
         }
         return last;
       }
@@ -243,6 +261,21 @@ template <class Model> struct CudaMtpOps {
     projected_predictor_hidden = result.sample_logits.defined()
         ? result.sample_hidden.narrow(1, result.sample_hidden.size(1)-1, 1).contiguous() : Tensor{};
     return result;
+  }
+  void predictor_history_step(Tensor hidden, Tensor ids, Tensor positions) {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(auto* predictor=dynamic_cast<mfq::cuda::qwen4_exp::Qwen4ExpMtp*>(&mtp);
+          predictor && model.reuse_decode_graphs && model.graph_registry && ids.size(1)<=128) {
+        for(int64_t offset=0;offset<ids.size(1);offset+=4) {
+          const auto rows=std::min<int64_t>(4,ids.size(1)-offset);
+          predictor->history_step(target,hidden.narrow(1,offset,rows),ids.narrow(1,offset,rows),
+              positions.defined()?positions.narrow(-1,offset,rows):Tensor{});
+        }
+        target_maintenance=mtp.take_graph_initialization() || target_maintenance;
+        return;
+      }
+    }
+    (void)predictor_step(std::move(hidden),std::move(ids),std::move(positions));
   }
   int64_t predictor_prefill_chunk_size(int64_t requested) const {
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
@@ -277,7 +310,7 @@ template <class Model> struct CudaMtpOps {
         end_predictor_prefill();
         for(int64_t offset=0;offset<ids.size(1);offset+=4) {
           const auto rows=std::min<int64_t>(4,ids.size(1)-offset);
-          (void)predictor_step(hidden.narrow(1,offset,rows),ids.narrow(1,offset,rows),
+          predictor_history_step(hidden.narrow(1,offset,rows),ids.narrow(1,offset,rows),
               positions.defined()?positions.narrow(-1,offset,rows):Tensor{});
         }
       } else (void)predictor_step(std::move(hidden),std::move(ids),std::move(positions));

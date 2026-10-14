@@ -95,6 +95,7 @@ struct Qwen4Model : CausalResources {
     uint64_t decode_graph_captures=0;
     // Bounded request lookahead, independent of the configured context ceiling.
     int64_t decode_reserve_until=0;
+    bool speculative_prefix_retention=false;
     std::function<void(std::size_t)> reserve_kv_workspace;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model& model,mfq_tensor_backend::Tensor ids,int kind) {
@@ -132,6 +133,7 @@ struct Qwen4Model : CausalResources {
     mfq_tensor_backend::Tensor adapter_next_token(const QuantLinear &lm_head,
                                                   mfq_tensor_backend::Tensor hidden) const;
     void adapter_rollback_speculative(int64_t keep);
+    void adapter_commit_speculative() { speculative_prefix_retention=false; }
 };
 
 template <> struct CudaSessionCodec<Qwen4Model> {

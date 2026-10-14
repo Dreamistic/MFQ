@@ -21,6 +21,7 @@ public:
             bool gradual_warmup = false, double cold_window_ms = 0.0)
         : maximum_depth_(std::clamp(maximum_depth, 1, 5)),
           current_depth_(maximum_depth_),
+          gradual_warmup_(gradual_warmup),
           marginal_ms_(marginal_ms > 0.0 ? marginal_ms : 7.0),
           exit_margin_(std::clamp(exit_margin, 1.0, 1.5)),
           acceptance_(static_cast<std::size_t>(maximum_depth_)),
@@ -30,11 +31,16 @@ public:
             cold_window_ms_=cold_window_ms;cold_tokens_left_=48;cold_maximum_depth_=1;
         }
         acceptance_.front() = 0.6;
-        for (int index = 1; index <= maximum_depth_; ++index)
-            warmup_.push_back(gradual_warmup?index:maximum_depth_+1-index);
+        if(gradual_warmup) {
+            // Establish ordinary-decode cost before wider speculation. A
+            // fresh width cap must not postpone the baseline for 48 tokens.
+            warmup_={1,0,0,0,1};
+            for(int depth=2;depth<=maximum_depth_;++depth)warmup_.push_back(depth);
+        } else for (int index = 1; index <= maximum_depth_; ++index)
+            warmup_.push_back(maximum_depth_+1-index);
         current_depth_=warmup_.front();
         if (maximum_depth_ > 1) {
-            warmup_.insert(warmup_.end(), {0, 0, 0});
+            if(!gradual_warmup)warmup_.insert(warmup_.end(), {0, 0, 0});
             // The initial sweep follows prefill and can include several cold
             // transfer/cache cycles even when graphs were captured at load.
             // Revisit every speculative width after the baseline has run;
@@ -101,6 +107,7 @@ public:
         }
         cycle_ms = std::max(0.0, cycle_ms);
         if (time_sample) update_time(used_depth, cycle_ms);
+        if(time_sample && used_depth==1 && cycle_ms_.front())post_baseline_shallow_=true;
         for (auto& age : cycle_age_ms_) if (age) *age += cycle_ms;
         if (time_sample) cycle_age_ms_[static_cast<std::size_t>(used_depth)] = 0.0;
         milliseconds_since_probe_ += cycle_ms;
@@ -109,6 +116,19 @@ public:
         if (!warmup_.empty()) {
             if (!time_sample || used_depth != warmup_.front()) return;
             warmup_.erase(warmup_.begin());
+            // A valid shallow replay after baseline calibration supplies the
+            // current marginal cost. Defer predicted losing wider windows to
+            // periodic exploration instead of forcing them into every short
+            // response. Cold latency limits also skip blocked warmup entries.
+            if(gradual_warmup_ && post_baseline_shallow_) {
+                while(!warmup_.empty() && warmup_.front()>1) {
+                    const int next=warmup_.front();
+                    const bool cold_blocked=cold_tokens_left_>0 && next>cold_maximum_depth_ &&
+                        time_estimate(next)>cold_window_ms_;
+                    if(!cold_blocked && score(next)>=score(0))break;
+                    warmup_.erase(warmup_.begin());
+                }
+            }
             if (!warmup_.empty()) {
                 current_depth_ = warmup_.front();
                 return;
@@ -213,7 +233,8 @@ private:
     int best_depth() const {
         int best = current_depth_;
         double best_score = -1.0;
-        for (int depth = cycle_ms_.front() ? 0 : 1; depth <= maximum_depth_; ++depth) {
+        const int maximum=cold_tokens_left_>0?cold_maximum_depth_:maximum_depth_;
+        for (int depth = cycle_ms_.front() ? 0 : 1; depth <= maximum; ++depth) {
             const double candidate = score(depth);
             if (candidate > best_score) { best = depth; best_score = candidate; }
         }
@@ -252,6 +273,7 @@ private:
 
     int maximum_depth_;
     int current_depth_;
+    bool gradual_warmup_=false,post_baseline_shallow_=false;
     int probe_left_ = 0;
     int exit_streak_ = 0;
     int cold_tokens_left_=0,cold_maximum_depth_=1;
