@@ -56,6 +56,10 @@ public:
             if(gradual_warmup && (!seed || seed->measurement_order_.empty()))
                 for(int depth=maximum_depth_;depth>0;--depth)warmup_.push_back(depth);
         }
+        // The first scalar samples can retain cold residency costs even after
+        // a shallow replay becomes faster. Refresh the baseline at the end as
+        // well, so that cheap ordinary decode is compared at the same stage.
+        if(gradual_warmup)warmup_.insert(warmup_.end(),{0,0,0});
         if (seed && !seed->measurement_order_.empty()) {
             for (int position = 0; position < std::min(maximum_depth_, seed->maximum_depth_); ++position)
                 acceptance_[static_cast<std::size_t>(position)] = seed->acceptance_[static_cast<std::size_t>(position)];
@@ -73,7 +77,7 @@ public:
     int depth() const noexcept { return cold_tokens_left_>0?std::min(current_depth_,cold_maximum_depth_):current_depth_; }
     int maximum_depth() const noexcept { return maximum_depth_; }
     bool warming_up() const noexcept { return !warmup_.empty(); }
-    bool should_exit() const noexcept { return exit_streak_ >= 16; }
+    bool should_exit() const noexcept { return exit_streak_ >= (gradual_warmup_?6:16); }
     bool speculation_losing() const {
         if (!warmup_.empty() || !cycle_ms_.front()) return false;
         const double baseline = score(0);

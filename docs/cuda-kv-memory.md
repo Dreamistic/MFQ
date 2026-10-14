@@ -104,6 +104,11 @@ can still select ordinary decoding. After the post-baseline shallow replay,
 CUDA defers wider warmup entries whose estimated throughput cannot beat the
 baseline, or whose cold projected cost exceeds the startup latency budget.
 Deferred widths remain eligible for subsequent exploration.
+CUDA parks speculation after six valid consecutive losing cycles following
+calibration, avoiding another costly narrow probe in a short response. Other
+backends retain the sixteen-cycle exit threshold. Maintenance remains excluded.
+Three final scalar samples refresh the baseline after residency adaptation, so
+width selection does not compare warm speculation with a cold ordinary step.
 
 A fresh CUDA policy initially caps verification at one draft token. During the
 first 48 emitted tokens, widening requires the observed cycle time, scaled by

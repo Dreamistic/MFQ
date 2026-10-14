@@ -129,6 +129,11 @@ int main() {
         }
         require(calibration<12 && !sampled.warming_up() && sampled.depth()==0);
         require(!sampled.measured_cycle_ms(2) && !sampled.measured_cycle_ms(3));
+        for(int i=0;i<5;++i) {
+            require(!sampled.should_exit());sampled.observe(0,0,25.0);
+        }
+        require(!sampled.should_exit());sampled.observe(0,0,25.0);
+        require(sampled.should_exit());
         // Deferred widths remain eligible for exploration when conditions change.
         bool revisited=false;
         for(int i=0;i<400;++i) {
@@ -137,8 +142,16 @@ int main() {
             sampled.observe(depth,depth,depth?28.0:25.0);
         }
         require(revisited);
+        DepthController refreshed(3,nullptr,7.0,1.15,true);
+        int baselines=0;
+        while(refreshed.warming_up()) {
+            const int depth=refreshed.depth();
+            const double ms=depth?50.0+depth*5.0:(++baselines<=3?60.0:25.0);
+            refreshed.observe(depth,0,ms);
+        }
+        require(baselines==6 && *refreshed.measured_cycle_ms(0)==25.0 && refreshed.depth()==0);
         DepthController gradual(3,nullptr,7.0,1.15,true);
-        const std::array<int,13> sweep{1,0,0,0,1,2,3,3,2,1,3,2,1};
+        const std::array<int,16> sweep{1,0,0,0,1,2,3,3,2,1,3,2,1,0,0,0};
         int step=0;
         for(int depth:sweep) {
             require(gradual.depth()==depth);
@@ -151,7 +164,7 @@ int main() {
         require(!gradual.warming_up() && gradual.depth()>1);
         require(*gradual.measured_cycle_ms(3)==35.0);
         DepthController continuation(3,&gradual,7.0,1.15,true);
-        for(int depth:std::array<int,10>{1,0,0,0,1,2,3,3,2,1}) {
+        for(int depth:std::array<int,13>{1,0,0,0,1,2,3,3,2,1,0,0,0}) {
             require(continuation.depth()==depth);
             continuation.observe(depth,depth,20.0+5.0*depth);
         }
