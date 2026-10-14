@@ -59,6 +59,7 @@ _PRECISION_PATTERN = re.compile(
 _METADATA_TIMEOUT = 8.0
 _METADATA_DEADLINE = 12.0
 _OFFICIAL_CACHE_TTL = 900
+_MFQ_DETAIL_RETRY_TTL = 30
 
 
 class HubError(RuntimeError):
@@ -602,6 +603,7 @@ class HubCatalog:
         self._discovered_sources: set[tuple[HubProvider, str]] = set()
         self._official_cache_time = 0.0
         self._source_cache_times: dict[tuple[HubProvider, str], float] = {}
+        self._detail_attempt_times: dict[tuple[HubProvider, str], float] = {}
         self._cache_path = cache_path
         self._refresh_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -711,6 +713,7 @@ class HubCatalog:
                 (provider, repo_id), self._official_cache_time
             ) < _OFFICIAL_CACHE_TTL
         ):
+            self._start_detail_refresh(profile)
             return cached.model_copy(update={
                 "variants": _model_variants(
                     cached.files, profile, runtime_compatible=cached.runtime_compatible
@@ -724,25 +727,135 @@ class HubCatalog:
     ) -> HubModelInfo:
         async def fetch() -> HubModelInfo:
             if provider == "huggingface":
-                info = await self._info_huggingface(repo_id, revision, profile)
-            else:
-                info = await self._info_modelscope(repo_id, revision, profile)
-            return await self._inspect_mfq_files(info, profile)
+                return await self._info_huggingface(repo_id, revision, profile)
+            return await self._info_modelscope(repo_id, revision, profile)
         try:
-            return await asyncio.wait_for(fetch(), timeout=_METADATA_DEADLINE)
+            info = await asyncio.wait_for(fetch(), timeout=_METADATA_DEADLINE)
         except asyncio.TimeoutError as error:
             raise HubError("Model repository metadata request timed out.") from error
+        info = self._reuse_mfq_files(info)
+        key = (provider, repo_id)
+        publish = revision is None and self._is_official_repo(repo_id)
+        if publish:
+            self._official_cache[key] = info
+        try:
+            return await self._inspect_mfq_files(info, profile, publish=publish)
+        finally:
+            if publish:
+                self._detail_attempt_times[key] = time.monotonic()
 
     @staticmethod
-    async def _inspect_mfq_files(info: HubModelInfo, profile: HubSystemProfile) -> HubModelInfo:
-        candidates = [(index, item) for index, item in enumerate(info.files) if item.name.lower().endswith('.mfq') and item.byte_size >= 64]
+    def _mfq_file_identity(info: HubModelInfo, item: HubModelFile) -> tuple | None:
+        if item.sha256:
+            return ('sha256', item.sha256, item.byte_size)
+        if re.fullmatch(r'[0-9a-fA-F]{40,64}', info.revision):
+            return (info.provider, info.repo_id, info.revision, item.name, item.byte_size)
+        return None
+
+    def _reuse_mfq_files(self, info: HubModelInfo) -> HubModelInfo:
+        known = {}
+        identities = {self._mfq_file_identity(info, item) for item in info.files if item.name.lower().endswith('.mfq')}
+        update = {}
+        for cached in self._official_cache.values():
+            if cached is None:
+                continue
+            cached_identities = {self._mfq_file_identity(cached, item) for item in cached.files if item.name.lower().endswith('.mfq')}
+            if identities and None not in identities and identities == cached_identities:
+                for field in ('architectures', 'modalities', 'parameter_count', 'parameter_breakdown',
+                              'mtp_supported', 'cache_profile', 'ple_parameter_count', 'runtime_compatible'):
+                    if field not in update and (getattr(info, field) is None or getattr(info, field) == []):
+                        update[field] = getattr(cached, field)
+            for item in cached.files:
+                identity = self._mfq_file_identity(cached, item)
+                if identity is not None and item.weight_bytes is not None and item.ssd_ple_bytes is not None:
+                    if identity not in known or item.estimated_weight_bytes_by_role:
+                        known[identity] = item
+        files = []
+        for item in info.files:
+            cached = known.get(self._mfq_file_identity(info, item))
+            files.append(item.model_copy(update={field: getattr(cached, field) for field in (
+                'weight_bytes', 'weight_bytes_by_dtype', 'ssd_ple_bytes', 'estimated_weight_bytes_by_role',
+            )}) if cached is not None else item)
+        return info.model_copy(update={**update, 'files': files})
+
+    @staticmethod
+    def _missing_mfq_files(info: HubModelInfo) -> list[tuple[int, HubModelFile]]:
+        return [(index, item) for index, item in enumerate(info.files)
+                if item.name.lower().endswith('.mfq') and item.byte_size >= 64
+                and (item.weight_bytes is None or item.ssd_ple_bytes is None)]
+
+    def _start_detail_refresh(self, profile: HubSystemProfile) -> bool:
+        if self._closed or self._refresh_task is not None and not self._refresh_task.done():
+            return False
+        now = time.monotonic()
+        keys = [key for key, info in self._official_cache.items() if info is not None and self._missing_mfq_files(info)
+                and now - self._detail_attempt_times.get(key, float('-inf')) >= _MFQ_DETAIL_RETRY_TTL]
+        if not keys:
+            return False
+        self._refresh_task = asyncio.create_task(self._refresh_mfq_details(keys, profile))
+        return True
+
+    async def _refresh_mfq_details(self, keys: list[tuple[HubProvider, str]], profile: HubSystemProfile) -> None:
+        semaphore = asyncio.Semaphore(4)
+        async def inspect(key: tuple[HubProvider, str]) -> None:
+            async with semaphore:
+                info = self._official_cache.get(key)
+                if info is None:
+                    return
+                try:
+                    await self._inspect_mfq_files(self._reuse_mfq_files(info), profile, publish=True)
+                finally:
+                    self._detail_attempt_times[key] = time.monotonic()
+        try:
+            await asyncio.gather(*(inspect(key) for key in keys))
+        finally:
+            self._save_cache()
+
+    async def _inspect_mfq_files(self, info: HubModelInfo, profile: HubSystemProfile, *, publish: bool = False) -> HubModelInfo:
+        candidates = self._missing_mfq_files(info)
         if not candidates:
+            info = info.model_copy(update={'variants': _model_variants(info.files, profile, runtime_compatible=info.runtime_compatible)})
+            if publish:
+                self._official_cache[(info.provider, info.repo_id)] = info
             return info
         files = list(info.files)
         configs = []
         architectures = []
         predictors = []
         legacy_blocks = []
+        file_count = sum(item.name.lower().endswith('.mfq') and item.byte_size >= 64 for item in files)
+        def result() -> HubModelInfo:
+            config = configs[0] if configs else {}
+            text = config.get('text_config', config)
+            ple_parameters = info.ple_parameter_count
+            if isinstance(text, dict) and any(item.ssd_ple_bytes for item in files):
+                vocab, width, layers = text.get('ngram_vocab_size_base'), text.get('ple_embed_dim'), text.get('ple_layer_ids')
+                if isinstance(vocab, int) and vocab > 0 and isinstance(width, int) and width > 0 and isinstance(layers, list):
+                    ple_parameters = vocab * width * len(layers)
+            declared = config.get('architectures') or architectures or info.architectures
+            if isinstance(declared, str):
+                declared = [declared]
+            parameters = parameter_breakdown(config) if config else info.parameter_breakdown
+            layer_count = text.get('num_hidden_layers') if isinstance(text, dict) else None
+            legacy_predictor = isinstance(layer_count, int) and layer_count > 0 and any(block >= layer_count for block in legacy_blocks)
+            has_predictor = any(predictors) or legacy_predictor
+            mtp_supported = True if has_predictor else info.mtp_supported
+            if mtp_supported is None and len(predictors) == file_count:
+                mtp_supported = False
+            modalities = list(info.modalities) or ['text']
+            if config.get('vision_config') and not config.get('language_model_only', False):
+                modalities = list(dict.fromkeys([*modalities, 'image', 'video']))
+            return info.model_copy(update={
+                'files': list(files), 'architectures': list(dict.fromkeys(declared)),
+                'runtime_compatible': tensor_schema_for_config(config) is not None if config else info.runtime_compatible,
+                'ple_parameter_count': ple_parameters,
+                'parameter_breakdown': parameters,
+                'cache_profile': cache_profile(config) if config else info.cache_profile,
+                'parameter_count': parameters.total if parameters else info.parameter_count,
+                'modalities': modalities,
+                'mtp_supported': mtp_supported,
+                'variants': _model_variants(files, profile, runtime_compatible=tensor_schema_for_config(config) is not None if config else info.runtime_compatible),
+            })
         semaphore = asyncio.Semaphore(8)
         endpoint = os.environ.get('HF_ENDPOINT', 'https://huggingface.co').rstrip('/') if info.provider == 'huggingface' else 'https://modelscope.cn'
         async with _metadata_client(endpoint) as client:
@@ -751,7 +864,7 @@ class HubCatalog:
                 params = None if info.provider == 'huggingface' else {'Revision': info.revision, 'FilePath': item.name}
                 try:
                     async with semaphore:
-                        metadata = await read_mfq_metadata(client, url, params, item.byte_size)
+                        metadata = await asyncio.wait_for(read_mfq_metadata(client, url, params, item.byte_size), timeout=_METADATA_DEADLINE)
                     files[index] = item.model_copy(update={'weight_bytes': metadata.weight_bytes,
                         'weight_bytes_by_dtype': metadata.weight_bytes_by_dtype, 'ssd_ple_bytes': metadata.ssd_ple_bytes,
                         'estimated_weight_bytes_by_role': metadata.estimated_weight_bytes_by_role})
@@ -761,40 +874,12 @@ class HubCatalog:
                         architectures.append(metadata.architecture)
                     predictors.append(metadata.has_mtp_weights)
                     legacy_blocks.append(metadata.last_legacy_block)
-                except (httpx.HTTPError, ValueError, UnicodeError):
+                    if publish:
+                        self._official_cache[(info.provider, info.repo_id)] = result()
+                except (httpx.HTTPError, ValueError, UnicodeError, asyncio.TimeoutError):
                     pass
-            try:
-                await asyncio.wait_for(asyncio.gather(*(inspect(index, item) for index, item in candidates[:256])), timeout=6)
-            except asyncio.TimeoutError:
-                pass
-        config = configs[0] if configs else {}
-        text = config.get('text_config', config)
-        ple_parameters = None
-        if isinstance(text, dict) and any(item.ssd_ple_bytes for item in files):
-            vocab, width, layers = text.get('ngram_vocab_size_base'), text.get('ple_embed_dim'), text.get('ple_layer_ids')
-            if isinstance(vocab, int) and vocab > 0 and isinstance(width, int) and width > 0 and isinstance(layers, list):
-                ple_parameters = vocab * width * len(layers)
-        declared = config.get('architectures') or architectures or info.architectures
-        if isinstance(declared, str):
-            declared = [declared]
-        parameters = parameter_breakdown(config)
-        layer_count = text.get('num_hidden_layers') if isinstance(text, dict) else None
-        legacy_predictor = isinstance(layer_count, int) and layer_count > 0 and any(block >= layer_count for block in legacy_blocks)
-        has_predictor = any(predictors) or legacy_predictor
-        modalities = list(info.modalities) or ['text']
-        if config.get('vision_config') and not config.get('language_model_only', False):
-            modalities = list(dict.fromkeys([*modalities, 'image', 'video']))
-        return info.model_copy(update={
-            'files': files, 'architectures': list(dict.fromkeys(declared)),
-            'runtime_compatible': tensor_schema_for_config(config) is not None if config else info.runtime_compatible,
-            'ple_parameter_count': ple_parameters,
-            'parameter_breakdown': parameters,
-            'cache_profile': cache_profile(config),
-            'parameter_count': parameters.total if parameters else info.parameter_count,
-            'modalities': modalities,
-            'mtp_supported': has_predictor if len(predictors) == len(candidates) or has_predictor else None,
-            'variants': _model_variants(files, profile, runtime_compatible=tensor_schema_for_config(config) is not None if config else info.runtime_compatible),
-        })
+            await asyncio.gather(*(inspect(index, item) for index, item in candidates))
+        return result()
 
     async def resolve(
         self,
@@ -818,6 +903,8 @@ class HubCatalog:
         if not self._closed and not refreshing and (refresh or stale):
             self._refresh_task = asyncio.create_task(self._refresh_official_cache(profile))
             refreshing = True
+        elif not refreshing:
+            refreshing = self._start_detail_refresh(profile)
         models = [self._official_model(spec, profile) for spec in self._official_specs()]
         models.sort(key=lambda model: model.published_at or model.updated_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
         return OfficialModelList(system=profile, data=models, refreshing=refreshing)
@@ -852,9 +939,11 @@ class HubCatalog:
             self._discovered_sources.update(additions)
             await asyncio.gather(*(inspect(*key) for key in sorted(additions)))
 
-        await asyncio.gather(*(inspect(*key) for key in sorted(sources)), discover("huggingface"), discover("modelscope"))
-        self._official_cache_time = time.monotonic()
-        self._save_cache()
+        try:
+            await asyncio.gather(*(inspect(*key) for key in sorted(sources)), discover("huggingface"), discover("modelscope"))
+            self._official_cache_time = time.monotonic()
+        finally:
+            self._save_cache()
 
     @staticmethod
     def _is_official_repo(repo_id: str) -> bool:
