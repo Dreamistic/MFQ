@@ -24,7 +24,7 @@ for (const moe of [true, false]) {
     catalog.system = { platform: 'Windows', machine: 'AMD64', backend: 'cuda', physical_memory_bytes: 64 * GiB,
       memory_pools: [{ kind: 'vram', capacity_bytes: 24 * GiB }, { kind: 'ram', capacity_bytes: 64 * GiB }] };
     catalog.data = [{ ...catalog.data[0], name: '压力测试模型', capabilities: moe ? ['MoE'] : [],
-      variants: [{ ...catalog.data[0].variants[0], estimated_resident_weight_bytes: weights,
+      variants: [{ ...catalog.data[0].variants[0], byte_size: weights + 50 * GiB, estimated_resident_weight_bytes: weights,
         estimated_weight_bytes_by_role: roles, ssd_ple_bytes: 50 * GiB }] }];
     await page.route('**/api/v1/hub/official*', route => route.fulfill({ json: catalog }));
     for (const path of ['/models', '/model-hub']) {
@@ -34,6 +34,8 @@ for (const moe of [true, false]) {
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
       await page.getByRole('progressbar', { name: moe ? '显存压力: 8.3%' : '显存压力: 116.7%' }).scrollIntoViewIfNeeded();
       if (path === '/model-hub') {
+        await expect(page.locator('.model-variant small').first()).toContainText(
+          `文件 ${moe ? '133.0' : '78.0'} GiB · 常驻 ${moe ? '83.0' : '28.0'} GiB · SSD PLE 50.0 GiB`);
         const bounds = await page.locator('.model-variant').evaluate(element => ({
           pressureRight: element.querySelector('.variant-memory-tiers')!.getBoundingClientRect().right,
           buttonLeft: element.querySelector('button')!.getBoundingClientRect().left,

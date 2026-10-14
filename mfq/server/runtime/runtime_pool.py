@@ -1424,6 +1424,67 @@ class RuntimePool:
             self._prefix_disk_status = {key: value for key, value in result.items() if key.startswith("prefix_cache_")}
             self._prefix_disk_checked_at = time.monotonic()
 
+    async def reclaim_prefix_disk_for_download(self, destination: Path) -> None:
+        from mfq.server.runtime.disk_budget import DiskBudget, volume
+        from mfq.server.runtime.prefix_disk_budget import _scan_blocks, _remove_block
+        import shutil
+        directory = self._prefix_cache_directory()
+        if volume(directory) != volume(destination):
+            return
+        async with self._prefix_budget_lock:
+            blocks = await asyncio.to_thread(_scan_blocks, directory)
+            used = sum(block.size for block in blocks)
+            deficit = await asyncio.to_thread(lambda: DiskBudget().reserved(destination) - shutil.disk_usage(destination).free)
+            target = max(0, used - deficit)
+            if target >= used:
+                self._prefix_disk_checked_at = 0.0
+                return
+            identities = {name: await asyncio.to_thread(prefix_cache_identity, directory, name)
+                for name in {block.namespace for block in blocks}}
+            async with self._lock:
+                if self._loading_model_names or self._memory_configuration_job is not None:
+                    raise _job_error("cache_reclaim_busy", "Wait for model loading or cache configuration before reclaiming SSD prefix space")
+                current = [item for item in self._instances.values() if item.state != RuntimeInstanceState.FAILED]
+                if any(not getattr(item, "prefix_concurrent_maintenance", False) and
+                    (item.active_requests or item.queued_requests or item.control_leases) for item in current):
+                    raise _job_error("cache_reclaim_busy", "This runtime must finish its current request before reclaiming SSD prefix space")
+                for item in current:
+                    item.control_leases += 1
+                    item.read_control_leases += 1
+            try:
+                loaded_paths = {str(item.artifact.path) for item in current}
+                active = {name for name, identity in identities.items()
+                    if identity.get('model_path') in loaded_paths or current and not identity.get('model_path')}
+                active_used = sum(block.size for block in blocks if block.namespace in active)
+                active_target = target * active_used // max(1, used)
+                for item in current:
+                    share = active_target // len(current)
+                    hot = item.memory.prefix_cache_limit_bytes if item.memory and item.memory.prefix_cache_limit_bytes is not None else 0
+                    result = await item.backend.set_prefix_cache_budget(hot, disk_target_bytes=share)
+                    if result.get('status') != 'ok':
+                        raise _job_error("cache_reclaim_failed", "Could not reduce the SSD prefix cache budget")
+                    item.prefix_disk_capacity = share
+                offline_target = target - active_target
+                def evict_offline():
+                    offline = [block for block in blocks if block.namespace not in active]
+                    remaining = sum(block.size for block in offline)
+                    for block in sorted(offline, key=lambda block: block.stat.st_mtime_ns):
+                        if remaining <= offline_target:
+                            break
+                        removed = _remove_block(block)
+                        if removed:
+                            remaining -= removed[0]
+                await asyncio.to_thread(evict_offline)
+                deadline = time.monotonic() + 30
+                while await asyncio.to_thread(lambda: shutil.disk_usage(destination).free < DiskBudget().reserved(destination)):
+                    if time.monotonic() >= deadline:
+                        raise _job_error("cache_reclaim_busy", "Some SSD prefix blocks are still in use; retry the download after the current request")
+                    await asyncio.sleep(.05)
+                self._prefix_disk_checked_at = 0.0
+            finally:
+                for item in current:
+                    await self._release_control_lease(item, read_only=True)
+
     async def _rebalance_prefix_cache_budget(self, preferred: UUID | None = None, *, wait: bool = True,
                                           reclaim_ram: bool = False) -> None:
         if not wait and self._prefix_budget_lock.locked():
@@ -1449,6 +1510,8 @@ class RuntimePool:
                 disk_limit = self.memory_policy.prefix_disk_limit_bytes
                 if disk_limit is None:
                     disk_limit = self._prefix_disk_status.get("prefix_cache_total_disk_max_bytes", 100 << 30)
+                else:
+                    disk_limit = min(disk_limit, self._prefix_disk_status.get("prefix_cache_total_disk_max_bytes", disk_limit))
                 disk_targets = {}
                 ram_candidates = [item for item in candidates if item.memory.prefix_cache_ram_limit_bytes is not None]
                 ram_reserved = sum(item.memory.prefix_cache_ram_limit_bytes or 0 for item in current
@@ -4349,6 +4412,8 @@ class RuntimePool:
             self.executable, self.backend, model=artifact.path
         )
         process_environment.update(self.runtime_environment)
+        from mfq.server.runtime.disk_budget import DiskBudget
+        process_environment['MFQ_DISK_BUDGET_DIR'] = str(DiskBudget().root)
         if (self.backend == "cuda" and artifact.resource.format == "mfq"
                 and request.moe_gpu_cache_gb is not None and request.moe_gpu_cache_gb > 0
                 and memory_topology()["memory_architecture"] == "discrete"):

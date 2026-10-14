@@ -965,6 +965,7 @@ class RegisterModelDirectoryRequest(ProtocolModel):
 
 class ConfigureDownloadDirectoryRequest(ProtocolModel):
     directory_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    evict_prefix_cache: bool | None = None
 
 
 class HubModelSummary(ProtocolModel):
@@ -1081,6 +1082,12 @@ class ModelCacheProfile(ProtocolModel):
     components: list[ModelCacheComponent] = Field(default_factory=list)
 
 
+class ModelAttentionProfile(ProtocolModel):
+    sparse: bool
+    compressed: bool
+    hybrid: bool
+
+
 class HubModelInfo(HubModelSummary):
     revision: str
     files: list[HubModelFile]
@@ -1089,6 +1096,8 @@ class HubModelInfo(HubModelSummary):
     library: str | None = Field(default=None, max_length=255)
     pipeline_tag: str | None = Field(default=None, max_length=255)
     architectures: list[str] = Field(default_factory=list)
+    attention_profile: ModelAttentionProfile | None = None
+    config_inspected: bool = False
     modalities: list[str] = Field(default_factory=list)
     parameter_count: int | None = Field(default=None, ge=0)
     parameter_breakdown: ModelParameterBreakdown | None = None
@@ -1119,6 +1128,7 @@ class OfficialModelInfo(ProtocolModel):
     name: str = Field(min_length=1, max_length=255)
     family: str = Field(min_length=1, max_length=255)
     architecture: str = Field(min_length=1, max_length=128)
+    attention_profile: ModelAttentionProfile | None = None
     description: str = Field(min_length=1, max_length=2048)
     description_zh: str = Field(min_length=1, max_length=2048)
     parameter_label: str | None = Field(default=None, max_length=128)
