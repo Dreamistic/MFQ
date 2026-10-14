@@ -162,6 +162,32 @@ void run(bool dspark) {
         throw std::runtime_error("shared MTP policy dispatch mismatch");
 }
 
+void run_prompt_snapshot_boundary() {
+    Model model;Predictor mtp;
+    InferenceRequest request;request.chat=false;request.prompt={0,0,0};
+    request.sampling.max_tokens=8;request.sampling.mtp_max_draft_tokens=3;
+    InferenceOutput output(request,nullptr,"mtp-snapshot-timing-test");
+    Tensor last_hidden;
+    auto generation=speculative_sequence(Ops{model,mtp},request,output,512,0,Tensor{},&last_hidden);
+    bool saw_boundary=false;
+    InferenceMetrics::Clock::time_point cache_finished;
+    while(auto step=generation.next())if(step.value) {
+        if(const auto* progress=std::get_if<PrefillProgress>(&*step.value);progress && progress->session_boundary) {
+            if(saw_boundary || output.metrics.saw_token || model.cache_pos!=3 ||
+                    mtp.cache_position()!=2 || !Ops::defined(last_hidden))
+                throw std::runtime_error("MTP prompt snapshot boundary is incomplete");
+            saw_boundary=true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            cache_finished=InferenceMetrics::Clock::now();
+        }
+        if(std::holds_alternative<TokenOutput>(*step.value) &&
+                (!saw_boundary || output.metrics.first_token<cache_finished))
+            throw std::runtime_error("initial snapshot entered decode timing");
+    }
+    if(!saw_boundary || output.result.completion_tokens!=8 || model.cache_pos!=10)
+        throw std::runtime_error("prompt snapshot changed generation history");
+}
+
 void run_target_initialization() {
     struct InitializingOps : Ops {
         int* observations;
@@ -337,6 +363,7 @@ void batch_policy() {
 int main() {
     run(false);
     run(true);
+    run_prompt_snapshot_boundary();
     run_target_initialization();
     run_streaming_publication(false);
     run_streaming_publication(true);
