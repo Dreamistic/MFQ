@@ -198,10 +198,13 @@ function downloadPatterns(variant: HubModelVariant | null): string[] {
 function ConfigurationDetails({ status, planned = false, rows, tr }: { status: ModelConfigurationStatus; planned?: boolean; rows?: PressureRow[]; tr: Translate }) {
   if (rows && rows.some(row => row.kind !== 'shared')) {
     return <div className="configuration-details">{rows.map(row => <div key={row.kind}>
-      <span>{row.kind === 'vram' ? tr('最低档预计显存常驻 / 显存容量', 'Smallest tier VRAM residency / capacity')
+      <span>{row.kind === 'combined' ? tr('最低档预计常驻 / 显存 + 内存容量', 'Smallest tier residency / VRAM + RAM capacity')
+        : row.kind === 'vram' ? tr('最低档预计显存常驻 / 显存容量', 'Smallest tier VRAM residency / capacity')
         : tr('最低档预计 RAM 常驻 / RAM 容量', 'Smallest tier RAM residency / capacity')}</span>
       <strong>{formatBytes(row.required)} / {formatBytes(row.available)}</strong>
-    </div>)}<p>{rows.length > 1
+    </div>)}<p>{rows.some(row => row.kind === 'combined')
+      ? tr('常驻权重和已应用的 KV 按显存 + 内存合计容量计算，已扣除 SSD PLE。', 'Resident weights and applied KV use the combined VRAM + RAM capacity, excluding SSD PLE.')
+      : rows.length > 1
       ? tr('显存按稠密权重和已应用的 KV 计算；RAM 按路由专家和 Embedding 计算。SSD PLE 单独计算。', 'VRAM includes dense weights and applied KV; RAM includes routed experts and embedding. SSD PLE is separate.')
       : tr('显存按整模权重和已应用的 KV 计算，已扣除 SSD PLE。', 'VRAM includes model weights and applied KV, excluding SSD PLE.')}</p></div>;
   }
@@ -252,7 +255,7 @@ function VariantList({
             </div>
             <ModelPressureBars weights={variant.estimated_resident_weight_bytes ?? variant.resident_weight_bytes
                 ?? (variant.configuration.required_memory_bytes == null ? null : variant.configuration.required_memory_bytes - cacheBytes)}
-              roles={variant.estimated_weight_bytes_by_role} system={system} cacheBytes={cacheBytes} moe={moe}
+              roles={variant.estimated_weight_bytes_by_role} system={system} cacheBytes={cacheBytes} moe={moe} combineMoe showDetails={false}
               available={variant.configuration.available_memory_bytes}
               label={tr("预计占当前推理预算", "Estimated share of runtime budget")}
               tr={tr} />

@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import { mockStudioServer, officialCatalog } from './mockServer';
 
 for (const moe of [true, false]) {
-  test(`local and download ${moe ? 'MoE' : 'dense PLE'} memory pressure agree`, async ({ page }, testInfo) => {
+  test(`local and download ${moe ? 'MoE' : 'dense PLE'} memory pressure use their page budgets`, async ({ page }, testInfo) => {
     await mockStudioServer(page, { language: 'zh-CN' });
     const GiB = 2 ** 30;
     const roles = moe ? { dense: 2 * GiB, experts: 80 * GiB, embedding: GiB }
@@ -29,11 +29,14 @@ for (const moe of [true, false]) {
     await page.route('**/api/v1/hub/official*', route => route.fulfill({ json: catalog }));
     for (const path of ['/models', '/model-hub']) {
       await page.goto(path);
-      await expect(page.getByRole('progressbar', { name: moe ? '显存压力: 8.3%' : '显存压力: 116.7%' })).toBeVisible();
-      await expect(page.getByRole('progressbar', { name: 'RAM 压力: 126.6%' })).toHaveCount(moe ? 1 : 0);
+      const combined = moe && path === '/model-hub';
+      const label = combined ? '显存 + 内存压力: 94.3%' : moe ? '显存压力: 8.3%' : '显存压力: 116.7%';
+      await expect(page.getByRole('progressbar', { name: label })).toBeVisible();
+      await expect(page.getByRole('progressbar', { name: 'RAM 压力: 126.6%' })).toHaveCount(moe && !combined ? 1 : 0);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-      await page.getByRole('progressbar', { name: moe ? '显存压力: 8.3%' : '显存压力: 116.7%' }).scrollIntoViewIfNeeded();
+      await page.getByRole('progressbar', { name: label }).scrollIntoViewIfNeeded();
       if (path === '/model-hub') {
+        await expect(page.locator('.model-variant .variant-memory-pressure')).toHaveCount(1);
         await expect(page.locator('.model-variant small').first()).toContainText(
           `文件 ${moe ? '133.0' : '78.0'} GiB · 常驻 ${moe ? '83.0' : '28.0'} GiB · SSD PLE 50.0 GiB`);
         const bounds = await page.locator('.model-variant').evaluate(element => ({

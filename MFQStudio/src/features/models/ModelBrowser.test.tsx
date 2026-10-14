@@ -12,7 +12,7 @@ const configuration = {
   status: 'unknown' as const, recommendation: 'unknown' as const, reasons: [],
 };
 
-it('uses separate MoE pressure bars and applies the KV calculator only to VRAM', async () => {
+it('uses one combined MoE pressure bar and includes applied KV in its total', async () => {
   const data = catalog(false, true);
   const GiB = 2 ** 30;
   data.system = { ...data.system, backend: 'cuda', physical_memory_bytes: 64 * GiB,
@@ -25,14 +25,15 @@ it('uses separate MoE pressure bars and applies the KV calculator only to VRAM',
     estimated_weight_bytes_by_role: { dense: 2 * GiB, experts: 80 * GiB, embedding: GiB } };
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
   render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
-  expect(await screen.findByRole('progressbar', { name: 'VRAM pressure: 8.3%' })).toBeInTheDocument();
-  expect(screen.getByRole('progressbar', { name: 'RAM pressure: 126.6%' })).toBeInTheDocument();
+  expect(await screen.findByRole('progressbar', { name: 'VRAM + RAM pressure: 94.3%' })).toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+  expect(screen.getByText('83.0 GiB / 88.0 GiB')).toBeInTheDocument();
   fireEvent.click(screen.getByText('KV Cache curve & calculator'));
   fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
-  expect(screen.getByRole('progressbar', { name: 'VRAM pressure: 25.0%' })).toBeInTheDocument();
-  expect(screen.getByRole('progressbar', { name: 'RAM pressure: 126.6%' })).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'VRAM + RAM pressure: 98.9%' })).toBeInTheDocument();
+  expect(screen.getByText('87.0 GiB / 88.0 GiB')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
-  expect(screen.getByRole('progressbar', { name: 'VRAM pressure: 8.3%' })).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'VRAM + RAM pressure: 94.3%' })).toBeInTheDocument();
 });
 
 function catalog(refreshing: boolean, available: boolean): OfficialModelList {
