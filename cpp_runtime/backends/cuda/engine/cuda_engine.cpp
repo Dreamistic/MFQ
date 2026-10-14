@@ -120,7 +120,10 @@ struct CudaEngineState {
                 const auto start=std::chrono::steady_clock::now();
                 InferenceRequest request;
                 request.chat=false;
-                request.sampling.temperature=0;
+                request.sampling.temperature=0.7;
+                request.sampling.top_p=0.8;
+                request.sampling.top_k=20;
+                request.sampling.seed=1234;
                 request.sampling.max_tokens=static_cast<int32_t>(
                     std::min<int64_t>(64,language.max_position_embeddings()-16));
                 request.sampling.mtp_max_draft_tokens=3;

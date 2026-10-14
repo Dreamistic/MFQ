@@ -554,7 +554,7 @@ struct BlockLoader : weight_loader::Loader {
 };
 
 struct RecurrentGraphCheckpoint {
-    Tensor gdn_conv,gdn_state,ple_conv;
+    std::vector<Tensor> gdn_conv,gdn_state,ple_conv;
 };
 
 struct Qwen4Block final : Block {
@@ -616,11 +616,11 @@ struct Qwen4Block final : Block {
     }
     void rollback_speculative(int64_t keep) override {
         if (gdn)
-            gdn->rollback();
+            gdn->rollback(keep);
         if (qsa)
             qsa->truncate(keep);
         if (ple)
-            ple->rollback();
+            ple->rollback(keep);
     }
     Tensor execute(CudaExecutionContext &execution, Tensor x, const Tensor &ids,
                    const Tensor &positions, const Tensor &full_positions, int64_t confirmed = 0,const Tensor& host_ids = {}) {
@@ -745,7 +745,7 @@ struct Qwen4MtpGraph {
         }
     };
     MfqCudaStream stream=mfq_get_current_cuda_stream();
-    std::map<std::pair<int,int>,std::unique_ptr<Cell>> cells;
+    std::map<std::tuple<int,int,bool>,std::unique_ptr<Cell>> cells;
     Tensor position_storage;
     int64_t capacity=0;
     bool failed=false;
@@ -757,7 +757,7 @@ struct Qwen4MtpGraph {
         cells.clear();predictor.layers[0]->qsa->leave_graph();
     }
     MtpStep run(Qwen4ExpMtp& predictor,const MtpTarget& target,const Tensor& hidden,const Tensor& ids,
-               const Tensor& positions = {}) {
+               const Tensor& positions = {},bool history_only=false) {
         MFQ_RUNTIME_CHECK(!failed && stream.stream()==mfq_current_cuda_stream(),"MTP predictor graph is unavailable");
         auto& execution=*predictor.execution;auto& block=*predictor.layers[0];
         // Predictor prefill may retain a multi-GiB expert image. Retire it
@@ -774,9 +774,10 @@ struct Qwen4MtpGraph {
             capacity=std::min<int64_t>(predictor.config.maximum,std::max<int64_t>(2048,capacity));
             while(capacity<required)capacity=std::min(predictor.config.maximum,capacity*2);
         }
-        const auto key=std::make_pair(int(tokens),int(hidden.scalar_type()));
+        const auto key=std::make_tuple(int(tokens),int(hidden.scalar_type()),history_only);
         auto& owner=cells[key];if(!owner)owner=std::make_unique<Cell>(hidden,ids,stream.stream());
         auto& cell=*owner;cell.hidden.copy_(hidden);cell.ids.copy_(ids);
+        cell.window.set_profile_geometry(history_only?"mtp_history":"mtp_predictor",int(tokens));
         predictor.graph_initialized=predictor.graph_initialized || !cell.used_in_request;
         mfq_qwen4_exp::fill_decode_positions(cell.cache_positions,cell.positions,start);
         if (positions.defined()) cell.positions.copy_(positions);
@@ -795,16 +796,19 @@ struct Qwen4MtpGraph {
                         .reshape({1,tokens,predictor.config.streams,predictor.config.hidden}));
                     auto input=(h+e.unsqueeze(-2)).reshape({1,tokens,predictor.config.streams*predictor.config.hidden});
                     cell.multi=block.execute_graph(execution,std::move(input),cell.ids,cell.positions,cell.cache_positions,{},0);
-                    cell.window.mark(-1,"head_begin");
-                    cell.normalized=predictor.final_mixer->pre(execution,cell.multi)[0];
-                    cell.logits=target.logits(cell.normalized.narrow(1,tokens-1,1).contiguous());
-                    auto greedy=sample_greedy_cuda(cell.logits.reshape({1,-1}).contiguous());
-                    MFQ_CUDA_CHECK(cudaMemcpyAsync(cell.greedy_host.data_ptr(),greedy.data_ptr(),sizeof(int64_t),
-                        cudaMemcpyDeviceToHost,stream.stream()));
+                    if(!history_only) {
+                        cell.window.mark(-1,"head_begin");
+                        cell.normalized=predictor.final_mixer->pre(execution,cell.multi)[0];
+                        cell.logits=target.logits(cell.normalized.narrow(1,tokens-1,1).contiguous());
+                        auto greedy=sample_greedy_cuda(cell.logits.reshape({1,-1}).contiguous());
+                        MFQ_CUDA_CHECK(cudaMemcpyAsync(cell.greedy_host.data_ptr(),greedy.data_ptr(),sizeof(int64_t),
+                            cudaMemcpyDeviceToHost,stream.stream()));
+                    }
                     cell.window.mark(-1,"window_end");
                 },[]{},[&]{cell.multi={};cell.normalized={};cell.logits={};});
                 ++predictor.graph_captures;
                 std::cerr<<"runtime_qwen4_graph_capture role=predictor rows="<<tokens
+                    <<" history_only="<<history_only
                     <<" count="<<predictor.graph_captures<<" ms="
                     <<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-capture_started).count()<<'\n';
             }
@@ -812,6 +816,7 @@ struct Qwen4MtpGraph {
             predictor.positions[0]=append_decode_positions(predictor.positions[0],cell.positions,
                 position_storage,predictor.config.maximum,"MFQ_MTP_POSITION_BUFFER");
             predictor.lengths[0]=required;predictor.batch=1;
+            if(history_only)return {};
             return {cell.normalized.clone(),cell.multi.clone(),cell.logits.clone(),
                 static_cast<int32_t>(*cell.greedy_host.data_ptr<int64_t>())};
         } catch(...) {failed=true;throw;}
@@ -962,6 +967,29 @@ MtpStep Qwen4ExpMtp::step_positioned(const MtpTarget &target, Tensor hidden, Ten
     return {std::move(result.first), std::move(result.second)};
 }
 
+void Qwen4ExpMtp::history_step(const MtpTarget& target,Tensor hidden,Tensor ids,Tensor positions) {
+    if(ids.dim()==1)ids=ids.unsqueeze(0);
+    if(positions.defined()) {
+        if(positions.dim()==1)positions=positions.reshape({1,1,-1}).expand({3,ids.size(0),ids.size(1)});
+        else if(positions.dim()==2)positions=positions.unsqueeze(1);
+        MFQ_RUNTIME_CHECK(positions.dim()==3 && positions.size(0)==3 &&
+            positions.size(1)==ids.size(0) && positions.size(2)==ids.size(1),"invalid MTP history positions");
+        positions=positions.to(tb::kInt32).contiguous();
+    }
+    const auto graph=mfq::cuda::runtime_options::mtp_predictor_graph();
+    if(reuse_decode_graphs && (!graph || *graph) && execution->config.moe_pipeline &&
+            execution->config.moe_two_stage_ffn && execution->kl_mmq.mode==KlMmqMode::Default &&
+            execution->moe_expert_cache && !execution->qsa_kv_store && layers.size()==1 && batch==1 &&
+            ids.dim()==2 && ids.size(0)==1 && ids.size(1)>0 && ids.size(1)<=8 &&
+            hidden.dim()==3 && hidden.size(0)==1 && hidden.size(1)==ids.size(1) &&
+            hidden.size(2)==hidden_norm.numel() && ids.is_cuda() && hidden.is_cuda() &&
+            !lengths.empty() && lengths[0]>0 && layers[0]->qsa && layers[0]->prefetch &&
+            this->positions[0].dim()==3 && this->positions[0].size(1)==1) {
+        if(!graph_registry)graph_registry=std::make_unique<Qwen4MtpGraph>();
+        (void)graph_registry->run(*this,target,hidden,ids,positions,true);
+    } else (void)step_positioned(target,std::move(hidden),std::move(ids),std::move(positions));
+}
+
 int64_t Qwen4ExpMtp::cache_position() const noexcept {
     return lengths.empty() ? 0 : lengths.front();
 }
@@ -1053,7 +1081,7 @@ struct Qwen4DecodeGraph {
         qwen4_exp::Ple* ple;
         mfq_tensor_backend::Tensor rows;
         std::shared_ptr<NintRowStage> transfer;
-        qwen4_exp::NgramEmbedding::Context prefix_context;
+        std::vector<qwen4_exp::NgramEmbedding::Context> prefix_context;
         HostBuffer flags{128,true};
         uint32_t* device=nullptr;
         bool profile=false;
@@ -1093,9 +1121,13 @@ struct Qwen4DecodeGraph {
                     qwen4_exp::RecurrentGraphCheckpoint checkpoint;
                     if(b.gdn) {
                         const auto state=b.gdn->graph_state();
-                        checkpoint.gdn_conv=tb::empty_like(*state[0]);checkpoint.gdn_state=tb::empty_like(*state[1]);
+                        for(int i=confirmed;i<tokens;++i) {
+                            checkpoint.gdn_conv.push_back(tb::empty_like(*state[0]));
+                            checkpoint.gdn_state.push_back(tb::empty_like(*state[1]));
+                        }
                     }
-                    if(b.ple)checkpoint.ple_conv=tb::empty_like(b.ple->conv_state());
+                    if(b.ple)for(int i=confirmed;i<tokens;++i)
+                        checkpoint.ple_conv.push_back(tb::empty_like(b.ple->conv_state()));
                     checkpoints.push_back(std::move(checkpoint));
                 }
             }
@@ -1222,7 +1254,11 @@ struct Qwen4DecodeGraph {
                                     wait_route_publication(stage->host(),stream.stream());
                                     sample(stage->route_wait_ns);
                                     MfqCudaStreamGuard guard(ple_stream);
-                                    if(confirmed)stage->prefix_context=stage->ple->graph_prefix_context(cell.host_ids,confirmed);
+                                    if(confirmed) {
+                                        stage->prefix_context.clear();
+                                        for(int i=confirmed;i<cell.ids.size(1);++i)
+                                            stage->prefix_context.push_back(stage->ple->graph_prefix_context(cell.host_ids,i));
+                                    }
                                     stage->ple->upload_graph(cell.host_ids,*stage->transfer);
                                     sample(stage->upload_ns);
                                     if(stage->transfer->mapped_rows())publish_mapped_flag(stage->host()+16);
@@ -1282,10 +1318,12 @@ struct Qwen4DecodeGraph {
                 for(const auto& block:model.blocks) {
                     auto& b=static_cast<qwen4_exp::Qwen4Block&>(*block);
                     const auto& checkpoint=cell.checkpoints[layer++];
-                    if(b.gdn)b.gdn->bind_graph_checkpoint(checkpoint.gdn_conv,checkpoint.gdn_state);
-                    if(b.ple)b.ple->bind_graph_checkpoint(checkpoint.ple_conv,cell.ple[ple_index++]->prefix_context);
+                    const auto position=model.cache_pos+confirmed;
+                    if(b.gdn)b.gdn->bind_graph_checkpoint(checkpoint.gdn_conv,checkpoint.gdn_state,position);
+                    if(b.ple)b.ple->bind_graph_checkpoint(checkpoint.ple_conv,cell.ple[ple_index++]->prefix_context,position);
                 }
                 model.speculative_start=model.cache_pos;model.speculative_confirmed=confirmed;
+                model.speculative_prefix_retention=true;
             }
             for(const auto& block:model.blocks) {
                 auto& b=static_cast<qwen4_exp::Qwen4Block&>(*block);if(b.qsa)b.qsa->advance_graph(tokens);
@@ -1395,6 +1433,10 @@ void qwen4_warmup_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp) {
         for(int rows=4;rows>=1;--rows) {
             predictor->trim_cache_to(16);
             (void)predictor->step(target,raw.narrow(1,0,rows),ids.narrow(1,0,rows));
+        }
+        for(int rows=4;rows>=1;--rows) {
+            predictor->trim_cache_to(16);
+            predictor->history_step(target,raw.narrow(1,0,rows),ids.narrow(1,0,rows));
         }
         for(int rows=4;rows>=1;--rows) {
             tb::Tensor hidden,logits;
@@ -1519,7 +1561,9 @@ std::vector<std::pair<std::string,double>> qwen4_cache_memory_metrics(
     if(model.graph_registry)add(model.graph_registry->position_storage);
     if(model.graph_registry)for(const auto& [key,cell]:model.graph_registry->cells)
         for(const auto& checkpoint:cell->checkpoints) {
-            add(checkpoint.gdn_conv);add(checkpoint.gdn_state);add(checkpoint.ple_conv);
+            for(const auto& tensor:checkpoint.gdn_conv)add(tensor);
+            for(const auto& tensor:checkpoint.gdn_state)add(tensor);
+            for(const auto& tensor:checkpoint.ple_conv)add(tensor);
         }
     if(const auto* predictor=dynamic_cast<const qwen4_exp::Qwen4ExpMtp*>(mtp)) {
         for(const auto& block:predictor->layers)block_cache(*block);
@@ -2039,6 +2083,7 @@ std::unique_ptr<Block> Qwen4Model::adapter_load_block(const mfq::ModelSource &so
 }
 
 void Qwen4Model::adapter_reset(int64_t new_batch) {
+    speculative_prefix_retention=false;
     if(execution && execution->moe_expert_cache)finish_moe_expert_exchanges(execution->moe_expert_cache);
     const bool retain=reuse_decode_graphs && new_batch==1 && graph_registry && graph_registry->reusable();
     if(graph_registry)for(auto* block:graph_registry->blocks)block->retain_graph_storage=retain;
@@ -2411,6 +2456,7 @@ mfq_tensor_backend::Tensor Qwen4Model::adapter_next_token(const QuantLinear &lm_
 }
 
 void Qwen4Model::adapter_rollback_speculative(int64_t keep) {
+    speculative_prefix_retention=false;
     if (positions.defined())
         positions = positions.narrow(-1, 0, keep);
 }

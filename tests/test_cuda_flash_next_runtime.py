@@ -698,10 +698,10 @@ def test_qwen_ple_equation_eos_chunks_and_transactions(native,action,packed):
     for actual,expected in zip(got,ref):np.testing.assert_allclose(actual,expected,atol=1e-3,rtol=1e-3)
 
 
-def qwen_model_fixture(interval=2,silu_gate=False,ple=True):
+def qwen_model_fixture(interval=2,silu_gate=False,ple=True,hidden=16):
     from mfq.architectures.flash_next import Qwen4ExpConfig
     rng=np.random.default_rng(3805);rand=lambda shape,s=.05:rng.normal(scale=s,size=shape).astype(np.float32)
-    h,streams,d,heads,kv,ih=16,2,32,2,1,8
+    h,streams,d,heads,kv,ih=hidden,2,32,2,1,8
     kinds=["full_attention" if (i+1)%interval==0 else "linear_attention" for i in range(2)]
     ple_layers=[i+1 for i,kind in enumerate(kinds) if kind=="linear_attention"] if ple else []
     c=dict(model_type="qwen4_exp_text",vocab_size=32,hidden_size=h,num_hidden_layers=2,
@@ -738,7 +738,7 @@ def qwen_model_fixture(interval=2,silu_gate=False,ple=True):
             for key in ["query_norm","key_norm","indexer.query_norm","indexer.key_norm"]:w[a+f".{key}.weight"]=rand((d,),.02)
         if i+1 in ple_layers:
             a=p+".position_embedding"
-            for shard in range(4):w[a+f".ngram.shard.{shard}.weight"]=rand((8,4),.2)
+            for shard in range(4):w[a+f".ngram.shard.{shard}.weight"]=rand((8,h//4),.2)
             w[a+".ngram.layer_multipliers"]=np.array([-7046029254386353131,6364136223846793005,-4658895280553007687],np.int64)
             w[a+".ngram.head_offsets"]=np.array([0,8,16,24],np.int64);w[a+".ngram.head_vocab_sizes"]=np.array([5,7,5,7],np.int64)
             w[a+".key.weight"]=rand((streams*h,h));w[a+".value.weight"]=rand((h,h))
@@ -863,14 +863,15 @@ def test_qwen_native_complete_graph(tmp_path,interval,ple,silu_gate,independent)
 
 
 @pytest.mark.parametrize("interval,ple",[(1,False),(2,True),(3,True)])
-@pytest.mark.parametrize("quantized_gr",[False,True,"shared-q8","shared-nint","shared-up"])
-def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interval,ple,quantized_gr):
+@pytest.mark.parametrize("quantized_gr,hidden",[(False,16),(True,16),("shared-q8",16),
+    ("shared-nint",16),("shared-up",16),(False,160)])
+def test_qwen_decode_graph_retains_mtp_hidden_and_resumes_eager(tmp_path,interval,ple,quantized_gr,hidden):
     from mfq.formats.nint import NintSpec
     from mfq.formats.mfe import MfePool,MfeTensor
     from mfq.quantize.nint_quant import quantize
     bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
     if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
-    config,weights=qwen_model_fixture(interval,True,ple)
+    config,weights=qwen_model_fixture(interval,True,ple,hidden)
     if isinstance(quantized_gr,str):
         from mfq.formats.io import BFloat16Array
         config["text_config"]["hc_lowrank"]=16

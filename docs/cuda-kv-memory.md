@@ -69,7 +69,8 @@ execution retires prefill expert images before replay. First replay costs after
 each request's prefill are excluded from adaptive draft-depth timing.
 
 CUDA Flash-Next also runs up to 64 synthetic output tokens through the complete
-MTP generation loop after graph capture. This exercises sampling, draft-history
+MTP generation loop after graph capture, using temperature 0.7, top-p 0.8 and
+top-k 20. This exercises stochastic sampling, draft-history
 replay and commit/rollback paths before accepting requests. It clears synthetic
 KV, generation metrics and adaptive-depth policy afterwards. The extra loading
 work is bounded by the model context; `MFQ_QWEN4_WARMUP_MTP=0` disables it.
@@ -88,8 +89,9 @@ reported prefill time. `MFQ_MOE_PREFILL_RESIDENCY=0` disables the observation, a
 `runtime_moe_prefill_residency` reports its exchanged projections and elapsed time.
 
 Adaptive MTP calibration revisits speculative widths after the ordinary-decode
-baseline. CUDA Flash-Next visits shallow widths before wider verification in its
-initial sweep, including re-entry after ordinary decoding. Other backends retain
+baseline. CUDA Flash-Next starts with one draft, three baseline cycles and a
+second shallow replay before trying wider verification, including re-entry after
+ordinary decoding. Other backends retain
 their existing initial order. A fresh CUDA policy repeats the width sweep once
 more after initial residency adaptation; inherited continuation policies keep
 the shorter calibration. Several cold transfer/cache cycles can survive graph warmup; a single
@@ -98,7 +100,15 @@ interval. Calibration uses the fastest valid sample for each width, followed by
 the existing steady-state estimator. Maintenance cycles and widths shortened by
 the output/context limit do not consume calibration or probe samples. Acceptance
 measurements still include those cycles, and consistently costly speculation
-can still select ordinary decoding.
+can still select ordinary decoding. After the post-baseline shallow replay,
+CUDA defers wider warmup entries whose estimated throughput cannot beat the
+baseline, or whose cold projected cost exceeds the startup latency budget.
+Deferred widths remain eligible for subsequent exploration.
+CUDA parks speculation after six valid consecutive losing cycles following
+calibration, avoiding another costly narrow probe in a short response. Other
+backends retain the sixteen-cycle exit threshold. Maintenance remains excluded.
+Three final scalar samples refresh the baseline after residency adaptation, so
+width selection does not compare warm speculation with a cold ordinary step.
 
 A fresh CUDA policy initially caps verification at one draft token. During the
 first 48 emitted tokens, widening requires the observed cycle time, scaled by
@@ -108,12 +118,42 @@ can change between windows. Inherited continuation policies keep throughput
 selection without this cold-start cap. Maintenance samples cannot authorize
 widening, and the bounded startup period prevents permanent under-calibration.
 
-During active ordinary-decode calibration, predictor history is replayed every
-four tokens through the already captured four-row graph. Parked speculation
-retains the larger history batch. Re-entry combines at most 128 pending history
+During ordinary-decode calibration, predictor history is replayed every four
+tokens. Parked speculation uses sixteen-row batches, split into four-row tiles
+to amortize expert-exchange boundaries without accumulating a long replay at
+request completion. These captured graphs omit final mixing, the
+vocabulary projection and token selection. These history-only widths 1–4 are
+also captured at load. Only the final tile of a history merge computes the
+draft output head. Re-entry combines at most 128 pending history
 rows with the current row, avoiding a separate one-row predictor launch while
 preserving token positions and committed KV history.
 `MFQ_MTP_HISTORY_EARLY_FLUSH=0` restores the previous 512-row flush threshold.
+
+CUDA verification graphs preserve GDN recurrent/convolution state and PLE
+convolution/ngram context at every speculative prefix. Partial rejection selects
+the accepted checkpoint and truncates QSA KV. Accepted draft tokens do not run
+through the target model a second time. Eager execution keeps its existing
+rollback/replay behavior. Additional recurrent checkpoints are included in the
+runtime's cache memory accounting; packed expert weights retain their layout.
+
+For conversational measurements, `bench/cuda_mtp_conversation_sampling.py`
+uses open-ended Chinese questions and stochastic target/draft sampling
+(temperature 0.7, top-p 0.8, top-k 20 by default). It refuses temperature zero,
+saves the generated text, per-delta timestamps, acceptance/depth/parking metrics,
+and the sampling parameters. Load the model afresh before measuring a cold first
+turn. `--rounds 2` includes the continuation in the same conversation.
+The default background is synthetic repeated English text of roughly 8K tokens;
+`--background` selects a document instead. Counting and near-100% acceptance
+measurements do not represent this conversational workload.
+
+CUDA Flash-Next completes its one-token target bootstrap before publishing the
+initial two-token batch. It preserves the prompt-only prefix snapshot before
+bootstrap and previews the first token's EOS/stop behavior without changing the
+real output or sampling state. Penalties and constraints use prospective copies.
+This moves necessary startup work into actual TTFT and avoids a cold bootstrap
+stall immediately after the first text; it does not remove that compute cost.
+`MFQ_MTP_EARLY_BOOTSTRAP=0` restores separate first-token publication. Other
+backends retain their publication order.
 
 Fresh single-device, layer-major Flash-Next prefill can borrow expert-cache tails
 while retaining decode graphs. This follows local Strata's `plan_lend` / `lend`

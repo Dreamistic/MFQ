@@ -1203,11 +1203,8 @@ static int run_qwen4_decode_hidden_check(mfq::cuda::Qwen4CausalLm& model) {
                     MFQ_RUNTIME_CHECK(greedy[row]==tokens.data_ptr<int64_t>()[row],"graph returned stale greedy tokens");
             }
             if(actions[i]<0)model.commit_speculative();else {
-                model.rollback_speculative();
-                if(actions[i]) {
-                    auto replay=qwen4_decode_graph_hidden(model,input.narrow(1,1,actions[i]),nullptr);
-                    MFQ_RUNTIME_CHECK(replay.has_value(),"MTP graph could not replay accepted draft tokens");
-                }
+                MFQ_RUNTIME_CHECK(model.speculative_prefix_retention,"MTP graph omitted prefix checkpoints");
+                model.rollback_speculative(actions[i]);
             }
             auto next=qwen4_decode_graph_hidden(model,ids_for(0),nullptr);
             MFQ_RUNTIME_CHECK(next.has_value(),"MTP graph did not resume after commit/rollback");
