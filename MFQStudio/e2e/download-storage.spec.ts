@@ -19,6 +19,8 @@ for (const language of ['zh-CN', 'en'] as const) {
     if (testInfo.project.name === 'desktop') expect(storage!.x).toBeGreaterThanOrEqual(directory!.x + directory!.width);
     const note = page.locator('.model-weight-pressure-note');
     await expect(note).toContainText(language === 'zh-CN' ? '不是磁盘占用' : 'not disk usage');
+    await expect(note).toContainText(language === 'zh-CN' ? 'MoE 模型的推理预算统计内存 + 显存，Dense 模型的推理预算仅统计显存。' : 'MoE inference budgets include RAM + VRAM, while Dense inference budgets include only VRAM.');
+    await expect(note.locator('br')).toHaveCount(1);
     expect(await note.evaluate(node => node.previousElementSibling?.className)).toBe('repository-line');
     expect(await note.evaluate(node => node.nextElementSibling?.className)).toBe('model-variant-list');
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
