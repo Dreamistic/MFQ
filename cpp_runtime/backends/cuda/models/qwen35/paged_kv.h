@@ -3,6 +3,7 @@
 #include "paged_kv_allocator.h"
 #include "batch_state.h"
 #include "core/full_block.h"
+#include "runtime/execution_options.h"
 
 #include <cuda_runtime_api.h>
 
@@ -85,8 +86,7 @@ public:
         }
         MFQ_RUNTIME_CHECK(!layers_.empty(),
             "Paged KV requires at least one full-attention layer");
-        const char* preallocated = std::getenv("MFQ_KV_VRAM_PREALLOCATED");
-        if (preallocated && preallocated[0] == '1') {
+        if (runtime_options::kv_vram_preallocated()) {
             // Replace startup contiguous caches with one context's shared page
             // capacity. Extra concurrent requests can grow this pool on demand.
             for (auto& layer : layers_) layer.block->cache = KVCache();

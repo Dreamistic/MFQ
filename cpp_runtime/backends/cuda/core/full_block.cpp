@@ -1,4 +1,5 @@
 #include "full_block.h"
+#include "runtime/execution_options.h"
 #include "models/common/attention.h"
 #include "models/common/gated_mlp.h"
 #include "models/common/transformer_layer.h"
@@ -28,8 +29,7 @@ mfq_tensor_backend::Tensor Block::forward_context(CudaExecutionContext &executio
 }
 
 void FullBlock::preallocate_kv() {
-    const char* option = std::getenv("MFQ_KV_VRAM_PREALLOCATED");
-    if (!option || option[0] != '1' || cpu_offloaded || cache.defined()) return;
+    if (!mfq::cuda::runtime_options::kv_vram_preallocated() || cpu_offloaded || cache.defined()) return;
     MfqCudaGuard guard(cuda_device);
     cache = KVCache(1, kv_heads, sliding ? attention_window : max_position_embeddings,
         attention_head_dim, sliding, mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, cuda_device),

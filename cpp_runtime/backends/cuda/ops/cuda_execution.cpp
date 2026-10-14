@@ -87,6 +87,14 @@ bool enabled_unless_disabled(const char* name) {
 } // namespace
 
 namespace mfq::cuda::runtime_options {
+bool kv_vram_preallocated() {
+    const auto* value = std::getenv("MFQ_KV_VRAM_PREALLOCATED");
+    return value && value[0] == '1';
+}
+bool vision_resident() {
+    const auto* value = std::getenv("MFQ_CUDA_VISION_RESIDENT");
+    return value && value[0] == '1';
+}
 namespace {
 bool exact_one(const char* name, bool fallback = false) {
     const auto* value = std::getenv(name);

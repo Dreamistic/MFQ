@@ -1,6 +1,7 @@
 #pragma once
 
 #include "storage/weight_loader.h"
+#include "runtime/execution_options.h"
 #include "storage/moe_expert_cache.h"
 #include "models/common/grid_vision_model.h"
 #include <array>
@@ -421,8 +422,7 @@ class CudaGridVisionPromptComponent {
             explicit LoadingScope(bool& flag,bool host):value(flag),previous(flag){value=host;}
             ~LoadingScope(){value=previous;}
         };
-        const auto* resident=std::getenv("MFQ_CUDA_VISION_RESIDENT");
-        const bool host=!(resident && resident[0]=='1') && !execution.tensor_parallel.enabled();
+        const bool host=!runtime_options::vision_resident() && !execution.tensor_parallel.enabled();
         LoadingScope loading(execution.loading_cpu_layer,host);
         const int64_t unit = vision.spatial_merge_size * vision.spatial_merge_size;
         auto merger_norm = detail::LayerNorm::load(
