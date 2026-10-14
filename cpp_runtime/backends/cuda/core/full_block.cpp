@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -24,6 +25,15 @@ mfq_tensor_backend::Tensor Block::forward_context(CudaExecutionContext &executio
                       "block does not support speculative verification");
     return forward(execution, std::move(x), context.positions, context.cache_position,
                    context.sequence_lengths, rope, context.cache_positions, context.attention_mask);
+}
+
+void FullBlock::preallocate_kv() {
+    const char* option = std::getenv("MFQ_KV_VRAM_PREALLOCATED");
+    if (!option || option[0] != '1' || cpu_offloaded || cache.defined()) return;
+    MfqCudaGuard guard(cuda_device);
+    cache = KVCache(1, kv_heads, sliding ? attention_window : max_position_embeddings,
+        attention_head_dim, sliding, mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, cuda_device),
+        official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16, kv_quantization);
 }
 
 void FullBlock::reset(int64_t B) {

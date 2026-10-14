@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -84,6 +85,13 @@ public:
         }
         MFQ_RUNTIME_CHECK(!layers_.empty(),
             "Paged KV requires at least one full-attention layer");
+        const char* preallocated = std::getenv("MFQ_KV_VRAM_PREALLOCATED");
+        if (preallocated && preallocated[0] == '1') {
+            // Replace startup contiguous caches with one context's shared page
+            // capacity. Extra concurrent requests can grow this pool on demand.
+            for (auto& layer : layers_) layer.block->cache = KVCache();
+            ensure_storage(static_cast<size_t>(logical_pages_per_sequence_));
+        }
     }
 
     bool ensure_tokens(

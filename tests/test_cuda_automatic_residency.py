@@ -47,7 +47,8 @@ def test_cuda_auto_expert_budget_uses_selected_physical_device(tmp_path, monkeyp
     else:
         capacity = hardware.gpu_memory[int(device)].capacity_bytes
         assert selected.moe_gpu_cache_gb is not None and selected.moe_gpu_cache_gb > 0
-        assert pool._estimated_load_bytes(model, selected) < capacity - capacity // 3
+        # Native admission prices actual allocations; no extra third for PP.
+        assert pool._estimated_load_bytes(model, selected) == capacity - max(GIB, capacity // 16)
     explicit = request.model_copy(update={"moe_gpu_cache_gb": 7})
     assert pool._apply_automatic_expert_residency(model, explicit).moe_gpu_cache_gb == 7
 

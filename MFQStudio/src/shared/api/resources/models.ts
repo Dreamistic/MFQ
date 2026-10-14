@@ -10,6 +10,15 @@ import type {
   ArtifactLineage,
 } from '../types';
 import { request } from '../client';
+import type { KvQuantizationSettings } from './runtime';
+
+export interface ModelLoadContextSettings {
+  automatic: boolean;
+  ssd_kv: boolean;
+  ram_preallocated: boolean;
+  vram_preallocated: boolean;
+  kv_quantization: KvQuantizationSettings;
+}
 
 export interface DownloadDirectoryStatus {
   directory: string | null;
@@ -82,7 +91,7 @@ export const modelsApi = {
     model: string,
     contextSize: number | null = null,
     prefillChunkSize = 2048,
-    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[] } = {},
+    policy: { pin?: boolean; idle_ttl_seconds?: number | null; device_ids?: string[]; context_management?: ModelLoadContextSettings } = {},
   ): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/v1/models/load', {
       method: 'POST',
@@ -91,6 +100,11 @@ export const modelsApi = {
         context_size: contextSize,
         prefill_chunk_size: prefillChunkSize,
         pin: policy.pin ?? false,
+        ...(policy.context_management ? { context_management: {
+          automatic: policy.context_management.automatic, ssd_kv: policy.context_management.ssd_kv,
+          ram_preallocated: policy.context_management.ram_preallocated, vram_preallocated: policy.context_management.vram_preallocated,
+          kv_quantization: policy.context_management.kv_quantization,
+        } } : {}),
         ...(policy.device_ids?.length ? { device_ids: policy.device_ids } : {}),
         idle_ttl_seconds: policy.pin ? null : (policy.idle_ttl_seconds ?? null),
       }),

@@ -144,4 +144,5 @@ std::optional<char> gr_up_group_coefficients();
 std::optional<bool> gr_dense_bf16_direct();
 std::optional<int> mfe_token_group_capacity();
 std::optional<std::int64_t> moe_ram_pin_bytes();
+std::optional<std::int64_t> moe_ram_pin_reserve_bytes();
 } // namespace mfq::cuda::runtime_options

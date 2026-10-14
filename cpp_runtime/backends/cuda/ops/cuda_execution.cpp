@@ -1275,4 +1275,14 @@ std::optional<std::int64_t> moe_ram_pin_bytes() {
     }
     return std::nullopt;
 }
+std::optional<std::int64_t> moe_ram_pin_reserve_bytes() {
+    if (const auto* value = std::getenv("MFQ_MOE_RAM_PIN_RESERVE_GIB")) {
+        char* end=nullptr;
+        const double gib=std::strtod(value,&end);
+        if(end==value || *end || !std::isfinite(gib) || gib<0 || gib>=double(INT64_MAX)/(1ull<<30))
+            throw std::invalid_argument("MFQ_MOE_RAM_PIN_RESERVE_GIB must be finite and non-negative");
+        return std::int64_t(gib*(1ull<<30));
+    }
+    return std::nullopt;
+}
 } // namespace mfq::cuda::runtime_options
