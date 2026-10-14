@@ -653,15 +653,13 @@ class Ple {
     Tensor forward_graph(CudaExecutionContext& execution,const Tensor& x,const Tensor& ids,
                          const Tensor& rows,int64_t confirmed,std::vector<Tensor>& checkpoint_conv) {
         if(!confirmed)return forward_chunk(execution,x,ids,true,{},rows);
-        std::vector<Tensor> outputs;
-        for(int64_t begin=0;begin<x.size(1);) {
-            const auto count=begin==0?confirmed:1;
-            outputs.push_back(forward_chunk(execution,x.narrow(1,begin,count),ids.narrow(1,begin,count),
-                true,{},rows.narrow(1,begin,count)));
-            begin+=count;
-            if(begin<x.size(1))checkpoint_conv[begin-confirmed].copy_(conv_);
-        }
-        return tb::cat(outputs,1);
+        auto prefix=forward_chunk(execution,x.narrow(1,0,confirmed),ids.narrow(1,0,confirmed),
+            true,{},rows.narrow(1,0,confirmed));
+        checkpoint_conv.front().copy_(conv_);
+        auto suffix=forward_chunk(execution,x.narrow(1,confirmed,x.size(1)-confirmed),
+            ids.narrow(1,confirmed,x.size(1)-confirmed),true,{},
+            rows.narrow(1,confirmed,x.size(1)-confirmed),&checkpoint_conv,1);
+        return tb::cat({prefix,suffix},1);
     }
     void prefetch_tokens(const Tensor& ids) { embedding_.prefetch(ids); }
     Tensor forward(CudaExecutionContext &execution, const Tensor &x, const Tensor &ids, bool cache,
@@ -686,9 +684,25 @@ class Ple {
             [](Tensor first, Tensor second) { return tb::cat({first, second}, 1); });
     }
     Tensor forward_chunk(CudaExecutionContext &execution, const Tensor &x, const Tensor &ids,
-                         bool cache,const Tensor& host_ids = {},const Tensor& graph_embeddings = {}) {
+                         bool cache,const Tensor& host_ids = {},const Tensor& graph_embeddings = {},
+                         std::vector<Tensor>* checkpoints=nullptr,std::size_t checkpoint_offset=0) {
         auto context = embedding_.context();
         const auto b = x.size(0), t = x.size(1);
+        const auto save_prefixes=[&](const Tensor& normalized) {
+            if(!checkpoints)return;
+            MFQ_RUNTIME_CHECK(cache && conv_.defined(),"PLE prefix history is unavailable");
+            const auto lookback=conv_.size(1);
+            // The FIR state is a tail of normalized inputs. Recover every
+            // intermediate tail while keeping key/value projections batched.
+            for(int64_t count=1;count<t;++count) {
+                auto& saved=checkpoints->at(checkpoint_offset+std::size_t(count-1));
+                if(count>=lookback)saved.copy_(normalized.narrow(1,count-lookback,lookback));
+                else {
+                    saved.narrow(1,0,lookback-count).copy_(conv_.narrow(1,count,lookback-count));
+                    saved.narrow(1,lookback-count,count).copy_(normalized.narrow(1,0,count));
+                }
+            }
+        };
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         const auto native=mfq::cuda::runtime_options::ple_native_fusion();
         if((!native || *native) && x.is_contiguous() && t<=32 && hidden_>128 && hidden_<=8192 &&
@@ -701,6 +715,7 @@ class Ple {
                 auto value=w_.value(execution,embeddings);
                 auto prepared=mfq_qwen4_exp::ple_gate_norm_cuda(key,query,value,
                     w_.conv_norm.to(tb::kFloat32).contiguous(),hidden_,streams_,eps_);
+                save_prefixes(prepared[1]);
                 auto output=mfq_qwen4_exp::ple_conv_add_cuda(prepared[1],w_.conv,
                     cache && conv_.defined()?std::optional<Tensor>(conv_):std::nullopt,dilation_,prepared[0],
                     x.scalar_type()==tb::kFloat16);
@@ -736,6 +751,7 @@ class Ple {
                 return mfq_qwen4_exp::grouped_rms_norm(gated, w_.conv_norm, hidden_, eps_);
             },
             [&](Tensor normalized) {
+                save_prefixes(normalized);
                 return mfq_qwen4_exp::ple_dilated_conv_silu(
                     normalized, w_.conv,
                     cache && conv_.defined() ? std::optional<Tensor>(conv_) : std::nullopt,
