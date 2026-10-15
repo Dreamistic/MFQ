@@ -2193,7 +2193,7 @@ void Qwen4Model::adapter_finish_forward(const mfq_tensor_backend::Tensor &full_p
 bool qwen4_layer_major_prefill_eligible(const Qwen4CausalLm& model, int64_t tokens) {
     const auto enabled=mfq::cuda::runtime_options::moe_prefill_layer_major();
     const auto whole=mfq::cuda::runtime_options::moe_prefill_layer();
-    if((enabled && *enabled==0) || !whole || *whole==0 || tokens<=1024 ||
+    if((enabled && *enabled==0) || !whole || *whole==0 || tokens<=128 ||
        tokens>16384 || model.speculative_start>=0 || !model.execution ||
        !model.execution->config.moe_pipeline || !model.execution->moe_expert_cache ||
        model.execution->dense_cpu_layer_count || model.execution->tensor_parallel.enabled() ||
