@@ -1012,6 +1012,10 @@ struct NintProjectionConfig {
     std::vector<int> output_widths;
     bool swiglu;
     float limit;
+
+    int outputs_per_simd(int width) const {
+        return rows == 1 && input_width > width ? 1 : 2;
+    }
 };
 
 class NintProjectionPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
@@ -1031,6 +1035,10 @@ public:
         for (int width : config_.output_widths) {
             kernel_name_ += "_" + std::to_string(width);
         }
+        if (!config_.swiglu && config_.rows > 1 &&
+            std::any_of(config_.output_widths.begin(), config_.output_widths.end(),
+                [&](int width) { return config_.input_width > width; }))
+            kernel_name_ += "_multirow";
     }
 
     std::string preparation_key() const override { return kernel_name_; }
@@ -1065,7 +1073,7 @@ public:
         int output_groups = 0;
         for (int width : config_.output_widths) {
             const int outputs_per_group =
-                !config_.swiglu && config_.input_width > width ? 8 : 16;
+                config_.swiglu ? 16 : 8 * config_.outputs_per_simd(width);
             const int groups = (width + outputs_per_group - 1) / outputs_per_group;
             output_groups = config_.swiglu
                 ? std::max(output_groups, groups) : output_groups + groups;
@@ -1175,7 +1183,7 @@ private:
              projection < config_.output_widths.size(); ++projection) {
             const auto suffix = std::to_string(projection);
             const int width = config_.output_widths[projection];
-            const int outputs_per_group = config_.input_width > width ? 8 : 16;
+            const int outputs_per_group = 8 * config_.outputs_per_simd(width);
             const int tiles = (width + outputs_per_group - 1) / outputs_per_group;
             source += "if (dispatch_position.x >= " + std::to_string(tile_offset)
                 + "u && dispatch_position.x < " + std::to_string(tile_offset + tiles) + "u) {\n"
@@ -1189,7 +1197,7 @@ private:
                 "const auto expert_map = expert_ids;\n"
                 "#define OUT " + std::to_string(width) + "\n"
                 "#define LOGICAL_OUT OUT\n"
-                "#define OPS_PER_SIMD " + std::to_string(config_.input_width > width ? 1 : 2) + "\n"
+                "#define OPS_PER_SIMD " + std::to_string(config_.outputs_per_simd(width)) + "\n"
                 "#define MFQ_NINT_STORE_OUTPUT(index, value) "
                 "y[row * uint(TOTAL_OUT) + " + std::to_string(offset) + "u + output] = T(value)\n";
             source += detail::nint_matmul_metal_body();
