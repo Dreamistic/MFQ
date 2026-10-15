@@ -321,6 +321,8 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
     if(!cache || !cache->complete_residency_ || cache->pipeline_bundles_.empty())
         throw std::invalid_argument("adaptive tier requires resident expert bundles");
     auto& s=*impl_;s.first=std::numeric_limits<int>::max();s.last=std::numeric_limits<int>::min();
+    std::cerr<<"moe_residency_policy retention="<<s.heat_retention<<" interval="<<s.interval
+        <<" projection_heat="<<(cache->config_.moe_residency_warm && cache->config_.moe_residency_projection_heat)<<'\n';
     s.transfer_stages.resize(cache->sources_.size());
     for(const auto& bundle:cache->pipeline_bundles_) {
         const auto& source=cache->sources_.at(bundle[0]);s.heat.emplace_back(std::size_t(source->n_experts()),0.0f);
