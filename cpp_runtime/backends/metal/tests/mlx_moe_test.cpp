@@ -2729,11 +2729,12 @@ void test_two_stage_nint_shared_decode(
     int experts = 32,
     bool check_folded_topk = false,
     int fixed_q = 0,
-    int shared_up_group_size = 0) {
+    int shared_up_group_size = 0,
+    bool mixed_expert_q = false) {
     constexpr int routes = 10;
     const std::vector<std::string> profiles(experts, "NINTv2");
     const auto make_fixture = [&](int output, int input, int salt) {
-        if (!nvq3jl && routed_group_size != 48 && fixed_q == 0)
+        if (!nvq3jl && routed_group_size != 48 && fixed_q == 0 && !mixed_expert_q)
             return make_moe_fixture(profiles, output, input, salt, routed_group_size);
         std::vector<PoolFixture> pools;
         std::vector<float> dense(experts * output * input);
@@ -2746,7 +2747,8 @@ void test_two_stage_nint_shared_decode(
                 tensor = {std::move(vq.blob), std::move(vq.dense), output, input};
             } else {
                 profile = "NINT";
-                tensor = make_nint_v2_tensor(output, input, salt + expert, nvq3jl ? 28 : routed_group_size, true, fixed_q);
+                const int bits = mixed_expert_q ? std::array{4, 5, 6, 8}[expert % 4] : fixed_q;
+                tensor = make_nint_v2_tensor(output, input, salt + expert, nvq3jl ? 28 : routed_group_size, true, bits);
             }
             std::copy(tensor.dense.begin(), tensor.dense.end(),
                 dense.begin() + expert * output * input);
@@ -2770,12 +2772,12 @@ void test_two_stage_nint_shared_decode(
         down_fixture.blob);
 
     const auto shared_gate_fixture = make_nint_v2_tensor(
-        intermediate, hidden, 43, shared_group_size, true, fixed_q != 0 ? 8 : 0);
+        intermediate, hidden, 43, shared_group_size, true, fixed_q);
     const auto shared_up_fixture = make_nint_v2_tensor(
         intermediate, hidden, 47, shared_up_group_size > 0 ? shared_up_group_size : shared_group_size,
-        true, fixed_q != 0 ? 8 : 0);
+        true, fixed_q);
     const auto shared_down_fixture = make_nint_v2_tensor(
-        hidden, intermediate, 53, shared_group_size, true, fixed_q != 0 ? 8 : 0);
+        hidden, intermediate, 53, shared_group_size, true, fixed_q);
     const auto shared_gate = mfq::metal::MlxNintWeight::from_blob(
         shared_gate_fixture.blob);
     const auto shared_up = mfq::metal::MlxNintWeight::from_blob(
@@ -2850,7 +2852,8 @@ void test_two_stage_nint_shared_decode(
     if (shared_up_group_size > 0)
         mixed_shared_activation = mlx::core::slice(fused->inputs().at(22),
             {0, routes * intermediate}, {tokens, (routes + 1) * intermediate});
-    const auto expected_dispatch = fixed_q != 0 ? "_rowq_auto1s1" : "_rowq_auto0s0";
+    const auto expected_dispatch = std::string("_rowq_auto")
+        + (fixed_q != 0 || mixed_expert_q ? "1" : "0") + (fixed_q != 0 ? "s1" : "s0");
     for (const auto* node : {&*fused, &fused->inputs().at(22)}) {
         const auto* kernel = dynamic_cast<const mfq::metal::MlxPreparableKernel*>(&node->primitive());
         require(kernel != nullptr && kernel->preparation_key().find(expected_dispatch) != std::string::npos,
@@ -2985,9 +2988,11 @@ void test_two_stage_nint_shared_decode(
         routed_output = dense_routed(down_fixture, routed_intermediate);
     }
     auto shared_gate_output = dense_shared_matmul(shared_gate_fixture, input);
-    auto shared_intermediate =
-        shared_gate_output * mlx::core::sigmoid(shared_gate_output) *
-        dense_shared_matmul(shared_up_fixture, input);
+    auto shared_gate_fp32 = mlx::core::astype(shared_gate_output, mlx::core::float32);
+    auto shared_intermediate = mlx::core::astype(
+        shared_gate_fp32 * mlx::core::sigmoid(shared_gate_fp32) *
+        mlx::core::astype(dense_shared_matmul(shared_up_fixture, input), mlx::core::float32),
+        mlx::core::float16);
     auto shared_output = dense_shared_matmul(
         shared_down_fixture, shared_intermediate);
     if (shared_up_group_size > 0) {
@@ -3042,6 +3047,20 @@ void test_two_stage_nint_shared_decode(
                 require_close(values[index], reference_values[index], 3e-2f);
         }
     }
+}
+
+void test_uniform_nint_multirow_decode() {
+    for (const int bits : {4, 5, 6, 8}) {
+        for (const int rows : {1, 3, 6}) {
+            test_two_stage_nint_shared_decode(24, 128, 64, true, rows,
+                false, false, 24, true, 32, false, bits);
+            test_two_stage_nint_shared_decode(48, 64, 128, true, rows,
+                false, true, 48, true, 32, false, bits);
+        }
+    }
+    for (const int rows : {1, 3, 6})
+        test_two_stage_nint_shared_decode(28, 128, 64, true, rows,
+            false, false, 28, true, 32, false, 8, 24, true);
 }
 
 void test_mxfp4_mfe_and_projection_offsets() {
@@ -8580,6 +8599,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--test-route-groups") {
+            test_uniform_nint_multirow_decode();
             for (const auto [gate_gs, up_gs] : {std::pair{24, 28}, {28, 24}, {7, 24}, {48, 28}}) {
                 for (const int tokens : {1, 2, 6}) {
                     test_two_stage_nint_shared_decode(gate_gs, 65, 41, false, tokens,
@@ -8650,6 +8670,7 @@ int main(int argc, char** argv) {
         test_all_families_and_projections();
         test_swiglu_ffn();
         test_two_stage_nint_shared_decode();
+        test_uniform_nint_multirow_decode();
         test_two_stage_nint_shared_decode(28, 65, 41);
         test_two_stage_nint_shared_decode(23, 65, 41);
         test_two_stage_nint_shared_decode(28, 256, 68, true);
