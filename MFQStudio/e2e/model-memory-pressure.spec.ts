@@ -13,7 +13,7 @@ for (const moe of [true, false]) {
       device_memory_total_bytes: 24 * GiB, host_memory_total_bytes: 64 * GiB,
       active_requests: 0, sampling_defaults: {},
     } }));
-    await page.route('**/api/v1/models', route => route.fulfill({ json: { data: [{
+    await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{
       id: 'a'.repeat(32), name: '压力测试模型', architecture: moe ? 'qwen4_exp' : 'qwen35', format: 'mfq',
       shard_count: 1, total_bytes: weights + 50 * GiB, estimated_resident_weight_bytes: weights,
       estimated_weight_bytes_by_role: roles, ssd_ple_bytes: 50 * GiB,
