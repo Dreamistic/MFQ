@@ -155,19 +155,14 @@ Our calibration method is open source; see
 
 ### Inference
 
-- **Precision Virtualization.** Operators use a common quantized-tensor
-  interface rather than assuming one bit-width per layer. Experts and
-  projections retain their own formats while participating in fused expert
-  execution and grouped projection dispatch.
+- **Resource-Constrained Inference.** CUDA combines VRAM, system RAM and SSD
+  to run models beyond GPU memory capacity. Metal supports SSD Streaming for
+  MoE experts and PLE tables, loading weights on demand to reduce unified-memory
+  residency.
 
-- **Tensor Containers & JIT Specialization.** Containers describe each
-  tensor's format, grouping and storage layout, driving format-aware kernel
-  selection. On Metal, JIT specializes kernels for fixed weight shapes,
-  group sizes and device capabilities, then caches them for reuse.
-
-- **Production Inference & Serving.** Continuous Batching, multi-model loading
-  with LRU management, tiered RAM/SSD Prefix and KV caches, and SSD-streamed
-  experts let you serve multiple models and run MoE models beyond memory capacity.
+- **Production Serving.** Continuous Batching, LRU-managed multi-model loading,
+  and tiered RAM/SSD Prefix and KV caches serve applications and agents through
+  OpenAI- and Anthropic-compatible APIs.
 
 - **High-Performance CUDA, ROCm & Metal Backends.** Optimized packed-weight,
   attention, cache, and I/O kernels for CUDA and Metal, with early ROCm/HIP
