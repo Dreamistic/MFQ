@@ -90,5 +90,11 @@
     "cpp_runtime/backends/cuda/CMakeLists.txt": "14bf68f4e2cb3456f79fe5d23ce8960f3fecf4b197ac5e127d6074710dba39cc",
     "build/cuda-parity/mfq-runtime.exe": "090c2415d7121fedd1024cdb98b827721effd2fb0aacbf81c42908347163f6d7"
   },
-  "limitations": "One measurement per new configuration; saved references reused without repeating baseline runs."
+  "limitations": "One measurement per new configuration; saved references reused without repeating baseline runs.",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 3090 Ti",
+    "vram_mib": 24564,
+    "nvidia_driver": "581.57",
+    "os": "Windows"
+  }
 }
