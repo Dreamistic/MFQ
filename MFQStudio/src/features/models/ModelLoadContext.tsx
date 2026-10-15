@@ -4,10 +4,13 @@ import { SettingRow } from '../../app/display';
 import { useSettings } from '../settings/SettingsProvider';
 import type { LoadContextDefaults } from './loadContextDefaults';
 import type { KvQuantizationSettings } from '../../shared/api/resources/runtime';
+import type { ModelArtifact, RuntimeStatus } from '../../shared/api/types';
+import { ModelLoadMemoryEstimate } from './ModelLoadMemoryEstimate';
 import './model-load-context.css';
 
-export function ModelLoadContext({ value, onChange, disabled = false }: {
+export function ModelLoadContext({ value, onChange, disabled = false, models = [], runtime, deviceIds = [] }: {
   value: LoadContextDefaults; onChange: (value: LoadContextDefaults) => void; disabled?: boolean;
+  models?: ModelArtifact[]; runtime?: RuntimeStatus | null; deviceIds?: string[];
 }) {
   const { tr } = useSettings();
   const id = useId();
@@ -33,6 +36,8 @@ export function ModelLoadContext({ value, onChange, disabled = false }: {
             patch({ context_size: text === '' ? null : Number(text) });
         }} onBlur={() => { if (!valid) setContextDraft(null); }} />} />
     {!valid && <p role="alert">{tr('请输入 512～2147483647 的整数，或留空使用 32768。', 'Enter an integer from 512 to 2147483647, or leave empty for 32768.')}</p>}
+    <ModelLoadMemoryEstimate models={models} runtime={runtime} deviceIds={deviceIds}
+      value={value} valid={valid} disabled={disabled} />
     <div className="model-load-advanced-heading">
       <button type="button" className="model-load-advanced-toggle" aria-expanded={expanded} aria-controls={id}
         onClick={() => setExpanded(open => !open)}>

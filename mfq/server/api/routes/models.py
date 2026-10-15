@@ -204,8 +204,9 @@ async def model_artifact_directory(service: ServiceDependency, model_id: str) ->
 
 @router.get("/api/v1/models/{model_id}/cache-profile", response_model=ModelCacheProfile | None,
             responses=ERROR_RESPONSES, tags=["models"])
-async def model_cache_profile(service: ServiceDependency, model_id: str) -> ModelCacheProfile | None:
-    return await service.model_cache_profile(model_id)
+async def model_cache_profile(service: ServiceDependency, model_id: str,
+    include_recurrent: bool = False) -> ModelCacheProfile | None:
+    return await service.model_cache_profile(model_id, include_recurrent=include_recurrent)
 
 
 @router.get("/api/v1/models/{model_id}/analysis", response_model=CheckpointAnalysis,
