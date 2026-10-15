@@ -133,7 +133,7 @@ sharded output. See
 
 ### Quantization
 
-- **Fine-Grained Quantization & Precision Virtualization.** Assign precision
+- **Fine-Grained Quantization.** Assign precision
   to individual experts, projections, chunks, or neurons within unified MFQ
   formats, retaining higher precision where the model needs it most.
 
@@ -155,6 +155,16 @@ Our calibration method is open source; see
 
 ### Inference
 
+- **Precision Virtualization.** Operators use a common quantized-tensor
+  interface rather than assuming one bit-width per layer. Experts and
+  projections retain their own formats while participating in fused expert
+  execution and grouped projection dispatch.
+
+- **Tensor Containers & JIT Specialization.** Containers describe each
+  tensor's format, grouping and storage layout, driving format-aware kernel
+  selection. On Metal, JIT specializes kernels for fixed weight shapes,
+  group sizes and device capabilities, then caches them for reuse.
+
 - **Production Inference & Serving.** Continuous Batching, multi-model loading
   with LRU management, tiered RAM/SSD Prefix and KV caches, and SSD-streamed
   experts let you serve multiple models and run MoE models beyond memory capacity.
@@ -162,13 +172,6 @@ Our calibration method is open source; see
 - **High-Performance CUDA, ROCm & Metal Backends.** Optimized packed-weight,
   attention, cache, and I/O kernels for CUDA and Metal, with early ROCm/HIP
   support for dense Qwen3.5–3.8 models on MI300X. Optimized CPU backends are planned.
-
-- **Efficient Fine-Grained Execution.** Heterogeneous expert fusion, grouped
-  projection dispatch and format-aware kernels preserve fast inference when
-  experts and projections use different formats and precisions.
-
-- **Native Safetensors Loading.** Run supported raw-HF checkpoints directly,
-  including DeepSeek V4.1 Flash, without first converting them to `.mfq`.
 
 ## Models
 
@@ -195,32 +198,6 @@ Supported architecture groups:
 | Gemma 4 | CUDA C++; Metal reference runtime |
 
 See the [runtime support matrix](./docs/runtime-support.md) for details.
-
-## Tools and APIs
-
-| Surface | Purpose |
-| --- | --- |
-| **MFQ Studio** | Model downloads and loading, API and memory configuration, quantization analysis, benchmarks, and resource monitoring |
-| `mfq build` | Detect the platform and compile the optimized CUDA or Metal C++ worker |
-| `mfq quantize` | Apply uniform or mixed precision to HF, GGUF, or full-precision MFQ sources and write packed `.mfq` models |
-| `mfq calibrate` / `mfq solve-ew` | Collect activation and loss-sensitivity data, score and validate packed candidates, and allocate precision to exact serialized-byte budgets |
-| `mfq serve` | Run MFQ Server, Studio/Web UI, model workers, caches, and persistence |
-| `mfq inspect` / `mfq optimize-layout` | Inspect containers and repack tensors into backend-optimized layouts |
-
-MFQ exposes several interfaces for applications and tooling:
-
-- **HTTP control API** under `/api/v1` for models, sessions, responses, jobs,
-  datasets, evaluations, caches, and runtime state;
-- **Server-Sent Events** for token and job streaming;
-- **WebSocket realtime APIs** for audio and full-duplex sessions;
-- **OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints** from
-  managed C++ workers and runtime adapters;
-- **Anthropic-compatible `/v1/messages` endpoint** for applications and agents;
-- **Function-tool calling** through the inference API; clients execute tools and return results.
-
-Start with the [HTTP API](./docs/api/http.md),
-[WebSocket API](./docs/api/websocket.md), or
-[`mfq serve` reference](./docs/cli/serve.md).
 
 ## Benchmarks
 
@@ -272,6 +249,8 @@ for the full comparison and tier selection guide.
 - [Build the C++ runtime](./docs/cli/build.md)
 - [Quantize a model](./docs/cli/quantize.md)
 - [Run MFQ Server](./docs/cli/serve.md)
+- [HTTP API](./docs/api/http.md)
+- [WebSocket and realtime API](./docs/api/websocket.md)
 - [Runtime support](./docs/runtime-support.md)
 - [MiniCPM-o 4.5 multimodal runtime](./docs/minicpmo45.md)
 - [Contributing and architecture rules](./CONTRIBUTING.md)

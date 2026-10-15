@@ -125,7 +125,7 @@ MFQ 还可以量化满精度 MFQ 和 GGUF 源模型，读取逐张量或逐专�
 
 ### 量化
 
-- **细粒度量化与精度虚拟化。** 在统一的 MFQ 格式中，按专家、投影、Chunk 或
+- **细粒度量化。** 在统一的 MFQ 格式中，按专家、投影、Chunk 或
   神经元分配精度，让敏感权重保留更高精度。
 
 - **高质量校准模型与新架构支持。** 提供可直接使用的混合精度模型，并持续
@@ -144,18 +144,19 @@ MFQ 还可以量化满精度 MFQ 和 GGUF 源模型，读取逐张量或逐专�
 
 ### 推理
 
+- **精度虚拟化。** 算子通过统一的量化张量接口执行，不要求整层使用同一种
+  位宽。专家与投影保留各自的格式，同时参与异构专家融合和分组投影调度。
+
+- **张量容器与 JIT 特化。** 容器描述张量的格式、分组和存储布局，驱动
+  格式感知的内核选择。Metal 根据固定的权重形状、分组大小和设备能力进行
+  JIT 特化，并缓存生成的内核供后续复用。
+
 - **生产级推理与服务。** 支持连续批处理、带 LRU 的多模型管理、RAM/SSD 分级
   前缀缓存与 KV Cache，并通过 SSD 流式专家执行运行超出内存容量的 MoE 模型。
 
 - **高性能 CUDA、ROCm 与 Metal 后端。** 为 CUDA 与 Metal 优化打包权重、
   注意力、缓存与 I/O 内核；ROCm/HIP 已初步支持 MI300X 上的 Qwen3.5–3.8
   稠密模型。优化的 CPU 后端正在规划中。
-
-- **高效的细粒度异构执行。** 通过异构专家融合、分组投影调度和格式优化内核，
-  在专家与投影使用不同格式、不同精度时仍保持高效推理。
-
-- **原生 Safetensors 加载。** 支持直接运行 DeepSeek V4.1 Flash 等受支持的
-  raw-HF 检查点，无需先转换为 `.mfq`。
 
 ## 模型
 
@@ -182,32 +183,6 @@ MFQ 还可以量化满精度 MFQ 和 GGUF 源模型，读取逐张量或逐专�
 | Gemma 4 | CUDA C++；Metal 参考运行时 |
 
 详细支持范围见[运行时支持矩阵](./docs/runtime-support.md)。
-
-## 工具与 API
-
-| 接口 | 用途 |
-| --- | --- |
-| **MFQ Studio** | 模型下载与加载、API 与内存配置、量化分析、测评和资源监控 |
-| `mfq build` | 检测平台并编译优化的 CUDA 或 Metal C++ worker |
-| `mfq quantize` | 对 HF、GGUF 或满精度 MFQ 源模型应用统一或混合精度，并写出打包 `.mfq` 模型 |
-| `mfq calibrate` / `mfq solve-ew` | 收集激活与损失敏感度数据，评估并验证打包候选格式，并按精确序列化字节预算分配精度 |
-| `mfq serve` | 运行 MFQ Server、Studio/Web UI、模型 worker、Cache 与持久化服务 |
-| `mfq inspect` / `mfq optimize-layout` | 检查容器，并将张量重新打包为针对后端优化的布局 |
-
-MFQ 为应用与工具提供多种接口：
-
-- `/api/v1` 下的 **HTTP 控制 API**，用于管理模型、Session、Response、任务、
-  数据集、评测、Cache 和运行时状态；
-- 用于 token 与任务流式传输的 **Server-Sent Events**；
-- 用于音频与全双工 Session 的 **WebSocket 实时 API**；
-- 由受管 C++ worker 和运行时适配器提供的
-  **OpenAI 兼容 `/v1/models` 与 `/v1/chat/completions` 接口**；
-- 面向应用与 Agent 的 **Anthropic 兼容 `/v1/messages` 接口**；
-- 通过推理 API 提供**函数工具调用**；工具由客户端执行并回传结果。
-
-可以从 [HTTP API](./docs/api/http.md)、
-[WebSocket API](./docs/api/websocket.md) 或
-[`mfq serve` 参考](./docs/cli/serve.md)开始。
 
 ## 性能与质量
 
@@ -256,6 +231,8 @@ Top1 一致率提高 5.03 个百分点**。
 - [构建 C++ 运行时](./docs/cli/build.md)
 - [量化模型](./docs/cli/quantize.md)
 - [运行 MFQ Server](./docs/cli/serve.md)
+- [HTTP API](./docs/api/http.md)
+- [WebSocket 与实时 API](./docs/api/websocket.md)
 - [运行时支持范围](./docs/runtime-support.md)
 - [MiniCPM-o 4.5 多模态运行时](./docs/minicpmo45.md)
 - [贡献指南与架构规范](./CONTRIBUTING.md)
