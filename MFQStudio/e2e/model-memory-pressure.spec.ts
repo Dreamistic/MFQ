@@ -29,10 +29,14 @@ for (const moe of [true, false]) {
     await page.route('**/api/v1/hub/official*', route => route.fulfill({ json: catalog }));
     for (const path of ['/models', '/model-hub']) {
       await page.goto(path);
-      const combined = moe && path === '/model-hub';
+      const combined = moe;
       const label = combined ? '显存 + 内存压力: 94.3%' : moe ? '显存压力: 8.3%' : '显存压力: 116.7%';
       await expect(page.getByRole('progressbar', { name: label })).toBeVisible();
       await expect(page.getByRole('progressbar', { name: 'RAM 压力: 126.6%' })).toHaveCount(moe && !combined ? 1 : 0);
+      if (moe) {
+        await expect(page.locator(path === '/models' ? '.local-checkpoint-memory .variant-memory-pressure' : '.model-variant .variant-memory-pressure')).toHaveCount(1);
+        await expect(page.locator('.variant-memory-caption')).toHaveCount(0);
+      }
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
       await page.getByRole('progressbar', { name: label }).scrollIntoViewIfNeeded();
       if (path === '/model-hub') {
