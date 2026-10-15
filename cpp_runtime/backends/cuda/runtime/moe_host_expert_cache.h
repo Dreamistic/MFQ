@@ -29,6 +29,8 @@ struct MoeHostExpertCacheStats {
 // Engine-wide, byte-bounded LRU for immutable CPU expert fields. CPU leases
 // and GPU-upload leases share one source key. GPU residents are removed from
 // this cache; their eviction can publish a copy without rereading the source.
+// Negative source IDs hold optional prefill backups, evictable even when the
+// last copies of ordinary experts must remain resident.
 class MoeHostExpertCache {
 public:
     using Lease=std::shared_ptr<const MoeHostExpert>;

@@ -1081,6 +1081,9 @@ static void check_workspace_loan() {
           "prefill did not borrow expert storage");
     check(context->memory_stats().allocated==charged,"loaned bytes were charged twice");
     a.zero_();b.zero_();a={};b={};
+    const auto touched=context->workspace_touched_regions();
+    check(touched.size()==1 && touched[0].first==address && touched[0].second==2048,
+          "prefill restore included unused expert storage or lost a freed slice");
     auto whole=empty({4096},arena.options());
     check(whole.data_ptr()==address,"workspace slices did not coalesce for the next phase");
     bool rejected=false;
@@ -1241,6 +1244,10 @@ void check_dma_copy_buckets() {
 int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    if(argc==2 && std::string(argv[1])=="--workspace-loan-check") {
+        check_workspace_loan();check_graph_workspace_reuse();
+        std::cout<<"CUDA workspace loan ranges and graph reuse checks passed\n";return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--kv-expert-loan-check") {
         const auto context=default_context();check_kv_expert_loan();check_kv_projection_loan();return 0;
     }

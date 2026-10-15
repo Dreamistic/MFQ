@@ -719,7 +719,12 @@ public:
 
 private:
     struct PrefillLoan {
-        struct Arena {MoeGpuArena* arena;int first;std::vector<mfq_tensor_backend::Tensor> saved;};
+        struct Arena {
+            MoeGpuArena* arena;int first;std::vector<mfq_tensor_backend::Tensor> saved;
+            MoeHostExpertCache::Lease owner;
+            mfq_tensor_backend::Tensor keys;
+            std::vector<std::pair<int,int>> refresh;
+        };
         struct Cohort {std::vector<int32_t> experts;std::vector<int64_t> fields;};
         struct Copy {const uint8_t* source;std::size_t offset,bytes;};
         struct Layer {std::size_t bytes=0;std::vector<Copy> copies;};

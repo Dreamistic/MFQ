@@ -15,6 +15,7 @@
 #include "runtime/router_lookahead_audit.h"
 #include <fstream>
 #include <iostream>
+#include <atomic>
 #include "models/common/gated_mlp.h"
 #include "models/common/moe.h"
 #include "models/common/transformer_layer.h"
@@ -2207,6 +2208,14 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         Qwen4CausalLm& model,mfq_tensor_backend::Tensor ids,int64_t compute_chunk,
         bool last_only,const std::function<bool()>& cancelled,mfq_tensor_backend::Tensor* raw_hidden,
         bool raw_hidden_host) {
+    return qwen4_layer_major_prefill_hidden(model,std::move(ids),compute_chunk,last_only,
+        cancelled,raw_hidden,raw_hidden_host,{});
+}
+
+mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
+        Qwen4CausalLm& model,mfq_tensor_backend::Tensor ids,int64_t compute_chunk,
+        bool last_only,const std::function<bool()>& cancelled,mfq_tensor_backend::Tensor* raw_hidden,
+        bool raw_hidden_host,const std::function<void()>& computation_finished) {
     namespace tb=mfq_tensor_backend;
     using Tensor=tb::Tensor;
     MFQ_RUNTIME_CHECK(ids.dim()==2 && ids.size(0)==1 &&
@@ -2217,6 +2226,22 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     ids=model.device_ids(std::move(ids));
     const auto tokens=ids.size(1);
     const auto cache_start=model.cache_pos;
+    auto& profiler=model.execution->profiler;
+    const auto* profile_once=std::getenv("MFQ_PROFILE_PREFILL_ONCE");
+    static std::atomic<bool> profiled{false};
+    const bool collect=profile_once && profile_once[0]=='1' && !profiled.exchange(true);
+    const bool previous_profile=profiler.enabled;
+    if(collect){profiler.reset();profiler.enabled=true;}
+    struct ProfileRestore {
+        CudaProfiler& profiler;bool enabled,previous,collect;
+        ~ProfileRestore() {
+            if(collect && std::uncaught_exceptions()==0) {
+                try {profiler.report("prefill_regression_once");profiler.reset();}
+                catch(const std::exception& error){std::cerr<<"prefill_profile_error "<<error.what()<<'\n';}
+            }
+            profiler.enabled=previous;
+        }
+    } restore{profiler,profiler.enabled,previous_profile,collect};
     compute_chunk=std::min(compute_chunk,tokens);
     MoePrefillWorkspaceLoan workspace_loan(model.execution->moe_expert_cache);
     bool borrowed_workspace=false;
@@ -2263,11 +2288,6 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
             input.size(-1)==hidden.size(-1),"layer-major embedding geometry changed");
         hidden.narrow(1,begin,count).copy_(input);
     }
-    auto& profiler=model.execution->profiler;
-    struct ProfileRestore {
-        CudaProfiler& profiler;bool enabled;
-        ~ProfileRestore(){profiler.enabled=enabled;}
-    } restore{profiler,profiler.enabled};
     const auto trace_option=mfq::cuda::runtime_options::prefill_layer_major_trace();
     const bool trace=trace_option && *trace_option!=0;
     const auto batch_option=mfq::cuda::runtime_options::moe_prefill_expert_batch();
@@ -2490,6 +2510,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
             auto finalized=model.finalize_hidden(hidden.narrow(1,begin,tokens-begin),1,tokens-begin);
             result=model.last_hidden(std::move(finalized)).unsqueeze(1);
         }
+        if(computation_finished)computation_finished();
         if(borrowed_workspace) {
             workspace_loan.suspend();
             result=result.clone();
@@ -2515,6 +2536,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
         }
     }
     if(raw_hidden && raw_hidden_host)hidden=hidden.to(tb::kCPU);
+    if(computation_finished)computation_finished();
     if(borrowed_workspace) {
         // The final mixer also needs sequence-sized scratch. Finish it inside
         // the loan, then retain only the outputs consumed by MTP/the caller.

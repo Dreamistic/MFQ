@@ -415,6 +415,7 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
     if((option && option[0]=='0') || !complete_residency_ || !layer_prefill_ready())return 0;
     const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     if(!force && context->available_memory()>=workspace_bytes)return 0;
+    const auto loan_started=std::chrono::steady_clock::now();
     finish_pipeline_exchanges();
     release_moe_prefill_buffers(this);
     MFQ_CUDA_CHECK(cudaDeviceSynchronize());
@@ -424,8 +425,14 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
     // Cover the extra streamed expert rows as well as allocator alignment.
     const auto needed=workspace_bytes>available?workspace_bytes-available:std::size_t(1);
     const auto desired=force?std::size_t(allocated_bytes_)/3:needed+needed/8+(std::size_t(64)<<20);
-    if(reserve_ram_workspace_)reserve_ram_workspace_(desired);
     auto loan=std::make_unique<PrefillLoan>();
+    const auto* cache_option=std::getenv("MFQ_PREFILL_BACKUP_CACHE");
+    const bool cache_backups=!cache_option || cache_option[0]!='0';
+    const auto* backup_option=std::getenv("MFQ_PREFILL_BACKUP_PINNED");
+    auto backup_budget=mfq::cuda::shared_memory_available(mfq_current_cuda_device()).value_or(0);
+    backup_budget=backup_budget>(std::size_t(512)<<20)?backup_budget-(std::size_t(512)<<20):0;
+    if(backup_option && backup_option[0]=='0')backup_budget=0;
+    std::size_t backup_pinned_bytes=0,backup_bytes=0,reused_bytes=0,cached_arenas=0;
     std::vector<MoeGpuArena*> candidates;
     for(auto& [key,arena]:arenas_)if(arena->slots>arena->minimum_slots)candidates.push_back(arena.get());
     std::sort(candidates.begin(),candidates.end(),[](auto* a,auto* b) {
@@ -437,11 +444,78 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
         const auto slots=std::min<std::size_t>(arena->slots-arena->minimum_slots,
             (desired-loan->bytes+arena->slot_bytes-1)/arena->slot_bytes);
         if(!slots)continue;
-        PrefillLoan::Arena saved{arena,arena->slots-int(slots),{}};
+        PrefillLoan::Arena saved{arena,arena->slots-int(slots),{},{},{},{}};
+        mfq::MoeCacheKey backup_key{};
+        MixedMoePool prototype;
+        bool found_owner=false;
+        for(const auto& source:sources_) {
+            for(const auto& cohort:source->cohorts_)if(cohort.arena==arena) {
+                backup_key={-2-source->id_,cohort.index,0};
+                prototype=*cohort.cpu;found_owner=true;break;
+            }
+            if(found_owner)break;
+        }
+        if(!found_owner)throw std::logic_error("prefill backup arena has no source");
+        const auto image_slots=std::min<std::size_t>(arena->slots,(slots+63)/64*64);
+        std::size_t image_bytes=image_slots*3*sizeof(int32_t);
+        for(std::size_t f=0;f<arena->fields.size();++f)
+            image_bytes+=arena->fields[f].nbytes()/arena->slots*image_slots;
+        bool created=false;
+        const auto allocate_image=[&] {
+            created=true;
+            if(reserve_ram_workspace_)reserve_ram_workspace_(image_bytes);
+            std::vector<mfq_tensor_backend::Tensor> fields;
+            for(std::size_t f=0;f<arena->fields.size();++f) {
+                const auto rows=arena->layouts[f].slot_shape[0];
+                const auto tail=arena->fields[f].narrow(0,(arena->slots-int64_t(image_slots))*rows,int64_t(image_slots)*rows);
+                auto options=tail.options().device(mfq_tensor_backend::kCPU).pinned_memory(false);
+                mfq_tensor_backend::Tensor backup;
+                if(tail.nbytes()<=backup_budget) {
+                    try {
+                        backup=mfq_tensor_backend::empty(tail.sizes(),options.pinned_memory(true));
+                        backup_budget-=tail.nbytes();
+                    } catch(const mfq::cuda::Error& error) {
+                        if(!std::string_view(error.what()).starts_with("CUDA pinned allocation failed:"))throw;
+                        backup_budget=0;
+                    }
+                }
+                if(!backup.defined())backup=mfq_tensor_backend::empty(tail.sizes(),options);
+                fields.push_back(std::move(backup));
+            }
+            auto image=moe_replace_quant_fields(prototype,fields);
+            image.expert_local=mfq_tensor_backend::empty({int64_t(image_slots),3},
+                mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kInt32));
+            std::fill_n(image.expert_local.data_ptr<int32_t>(),image_slots*3,-1);
+            return image;
+        };
+        saved.owner=host_experts_->acquire(backup_key,image_bytes,allocate_image,cache_backups);
+        if(saved.owner->weights.expert_local.size(0)<int64_t(slots)) {
+            // Keep one growable image per arena. A small change in free VRAM
+            // must reuse its common rows, rather than allocate another image.
+            host_experts_->erase(backup_key);saved.owner.reset();
+            saved.owner=host_experts_->acquire(backup_key,image_bytes,allocate_image,cache_backups);
+        }
+        if(!created)++cached_arenas;
+        saved.saved=moe_cache_fields(saved.owner->weights);
+        const auto skip=saved.owner->weights.expert_local.size(0)-int64_t(slots);
+        for(std::size_t f=0;f<saved.saved.size();++f) {
+            const auto rows=arena->layouts[f].slot_shape[0];
+            saved.saved[f]=saved.saved[f].narrow(0,skip*rows,int64_t(slots)*rows);
+        }
+        saved.keys=saved.owner->weights.expert_local.narrow(0,skip,int64_t(slots));
+        const auto* keys=saved.keys.data_ptr<int32_t>();
+        for(int slot=0;slot<int(slots);++slot) {
+            const auto& key=arena->book->key_for(saved.first+slot);
+            const bool valid=key ? keys[slot*3]==key->source && keys[slot*3+1]==key->cohort && keys[slot*3+2]==key->expert
+                                 : keys[slot*3]==-1;
+            if(valid)continue;
+            if(!saved.refresh.empty() && saved.refresh.back().second==slot)++saved.refresh.back().second;
+            else saved.refresh.emplace_back(slot,slot+1);
+        }
         for(std::size_t f=0;f<arena->fields.size();++f) {
             const auto rows=arena->layouts[f].slot_shape[0];
-            auto tail=arena->fields[f].narrow(0,saved.first*rows,int64_t(slots)*rows);
-            saved.saved.push_back(tail.to(mfq_tensor_backend::kCPU));
+            const auto tail=arena->fields[f].narrow(0,saved.first*rows,int64_t(slots)*rows);
+            if(saved.saved[f].options().pinned())backup_pinned_bytes+=tail.nbytes();
             regions.emplace_back(tail.data_ptr(),tail.nbytes());
         }
         loan->bytes+=slots*arena->slot_bytes;
@@ -451,6 +525,35 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
     // Keep a partial loan when the requested peak exceeds all lendable experts;
     // discarding it would leave only the much smaller unallocated VRAM budget.
     if(!loan->bytes)return 0;
+    const auto backup_allocated=std::chrono::steady_clock::now();
+    // Keep every host destination alive before enqueueing the first copy. A
+    // failed submission must drain that stream before these buffers unwind.
+    // One fence covers all fields instead of a CPU round trip per field.
+    try {
+        for(const auto& saved:loan->arenas)for(std::size_t f=0;f<saved.saved.size();++f) {
+            const auto rows=saved.arena->layouts[f].slot_shape[0];
+            std::size_t copied=0;
+            for(const auto& [first,end]:saved.refresh) {
+                const auto tail=saved.arena->fields[f].narrow(0,(saved.first+first)*rows,(end-first)*rows);
+                const auto backup=saved.saved[f].narrow(0,first*rows,(end-first)*rows);
+                MFQ_CUDA_CHECK(cudaMemcpyAsync(backup.data_ptr(),tail.data_ptr(),tail.nbytes(),
+                    cudaMemcpyDeviceToHost,mfq_current_cuda_stream()));
+                copied+=tail.nbytes();
+            }
+            backup_bytes+=copied;reused_bytes+=saved.saved[f].nbytes()-copied;
+        }
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
+    } catch(...) {
+        (void)cudaStreamSynchronize(mfq_current_cuda_stream());throw;
+    }
+    for(const auto& saved:loan->arenas) {
+        auto* keys=saved.keys.data_ptr<int32_t>();
+        for(const auto& [first,end]:saved.refresh)for(int slot=first;slot<end;++slot) {
+            const auto& key=saved.arena->book->key_for(saved.first+slot);
+            keys[slot*3]=key?key->source:-1;keys[slot*3+1]=key?key->cohort:-1;keys[slot*3+2]=key?key->expert:-1;
+        }
+    }
+    const auto backup_complete=std::chrono::steady_clock::now();
     // Append temporary cold pools to each immutable layer image. Original
     // books, GPU pointers and the fixed RAM layer layout stay unchanged.
     std::map<int,std::size_t> sizes;
@@ -502,6 +605,12 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
     prefill_loan_=std::move(loan);
     std::cerr<<"runtime_prefill_loan action=borrow requested_bytes="<<workspace_bytes
         <<" available_bytes="<<available<<" borrowed_bytes="<<prefill_loan_->bytes
+        <<" backup_pinned_bytes="<<backup_pinned_bytes
+        <<" backup_bytes="<<backup_bytes<<" reused_bytes="<<reused_bytes<<" cached_arenas="<<cached_arenas
+        <<" setup_ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-loan_started).count()
+        <<" allocation_ms="<<std::chrono::duration<double,std::milli>(backup_allocated-loan_started).count()
+        <<" backup_ms="<<std::chrono::duration<double,std::milli>(backup_complete-backup_allocated).count()
+        <<" metadata_ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-backup_complete).count()
         <<" transfer_bytes="<<prefill_transfer_bytes()<<'\n';
     return prefill_loan_->bytes;
 #else
@@ -517,17 +626,44 @@ void MoeExpertCache::suspend_prefill_loan() {
 void MoeExpertCache::end_prefill_loan() {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
     if(!prefill_loan_)return;
+    const auto restore_started=std::chrono::steady_clock::now();
     suspend_prefill_loan();
     release_moe_prefill_buffers(this);
     MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
-    mfq::cuda::default_context(mfq_current_cuda_device())->end_workspace_loan();
+    const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    std::vector<std::pair<void*,std::size_t>> touched;
+    const auto* restore_all_option=std::getenv("MFQ_PREFILL_RESTORE_ALL");
+    bool restore_all=restore_all_option && restore_all_option[0]=='1';
+    if(!restore_all)try {touched=context->workspace_touched_regions();}
+        catch(const std::bad_alloc&) {restore_all=true;}
+    context->end_workspace_loan();
+    std::size_t restore_bytes=0;
     for(const auto& saved:prefill_loan_->arenas)for(std::size_t f=0;f<saved.saved.size();++f) {
         const auto rows=saved.arena->layouts[f].slot_shape[0];
-        saved.arena->fields[f].narrow(0,saved.first*rows,saved.saved[f].size(0)).copy_(saved.saved[f]);
+        const auto tail=saved.arena->fields[f].narrow(0,saved.first*rows,saved.saved[f].size(0));
+        const auto base=reinterpret_cast<std::uintptr_t>(tail.data_ptr());
+        const auto copy=[&](std::size_t offset,std::size_t bytes) {
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(static_cast<uint8_t*>(tail.data_ptr())+offset,
+                static_cast<const uint8_t*>(saved.saved[f].data_ptr())+offset,bytes,
+                cudaMemcpyHostToDevice,mfq_current_cuda_stream()));
+            restore_bytes+=bytes;
+        };
+        if(restore_all)copy(0,tail.nbytes());
+        else for(const auto& [pointer,bytes]:touched) {
+            const auto begin=std::max(base,reinterpret_cast<std::uintptr_t>(pointer));
+            const auto end=std::min(base+tail.nbytes(),reinterpret_cast<std::uintptr_t>(pointer)+bytes);
+            if(begin<end)copy(begin-base,end-begin);
+        }
     }
     MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
-    std::cerr<<"runtime_prefill_loan action=return restored_bytes="<<prefill_loan_->bytes<<'\n';
+    const auto restored_bytes=prefill_loan_->bytes;
+    const auto copies_restored=std::chrono::steady_clock::now();
     prefill_loan_.reset();
+    std::cerr<<"runtime_prefill_loan action=return restored_bytes="<<restored_bytes
+        <<" restore_bytes="<<restore_bytes<<" selective="<<!restore_all
+        <<" restore_ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-restore_started).count()
+        <<" restore_copy_ms="<<std::chrono::duration<double,std::milli>(copies_restored-restore_started).count()
+        <<" cleanup_ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-copies_restored).count()<<'\n';
 #endif
 }
 

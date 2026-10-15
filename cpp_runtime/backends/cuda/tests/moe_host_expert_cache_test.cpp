@@ -167,6 +167,19 @@ int main() try {
         check(outgoing->weights.nint.q_packed.data_ptr()==before && cache.stats().managed_bytes==64 &&
             cache.stats().managed_peak_bytes==64 && !cache.contains(key(0)),"tier exchange grew or copied the RAM allocation");
     }
+    {
+        MoeHostExpertCache cache(192);cache.preserve_resident_experts();
+        cache.acquire(key(0),128,[]{return weight(128,1);});
+        auto shadow=cache.acquire(key(0,-2),64,[]{return weight(64,7);});
+        int copies=0;
+        check(!cache.demote(key(1),64,[&]{++copies;return weight(64,2);}) && copies==0,
+            "active prefill backup lost its only CPU copy");
+        shadow.reset();
+        check(cache.demote(key(1),64,[&]{++copies;return weight(64,2);}) && copies==1,
+            "optional prefill backup blocked an expert demotion");
+        check(cache.contains(key(0)) && cache.contains(key(1)) && !cache.contains(key(0,-2)) &&
+            cache.stats().managed_peak_bytes<=192,"prefill backup evicted a last expert copy or exceeded RAM budget");
+    }
     int batch_cases=0;
     for(bool bulk:{false,true})for(int fail_at:{-2,0,1,2,3,-1}) {
         if(!bulk && fail_at==-2)continue;
