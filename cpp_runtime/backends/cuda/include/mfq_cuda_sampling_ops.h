@@ -11,6 +11,8 @@ mfq_tensor_backend::Tensor sample_greedy_cuda(mfq_tensor_backend::Tensor logits)
 mfq_tensor_backend::Tensor sample_softmax_cuda(mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor random, double temperature);
 mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
     mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor random, double temperature, int64_t top_k, double top_p);
+// [B,top_k] int64 packets: high 32 bits original f32 logit, low 32 bits token ID.
+mfq_tensor_backend::Tensor sample_top_k_compact_cuda(mfq_tensor_backend::Tensor logits,int64_t top_k);
 void sample_token_counts_add_cuda(mfq_tensor_backend::Tensor counts, mfq_tensor_backend::Tensor tokens);
 mfq_tensor_backend::Tensor sample_apply_penalties_cuda(
     mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor counts,

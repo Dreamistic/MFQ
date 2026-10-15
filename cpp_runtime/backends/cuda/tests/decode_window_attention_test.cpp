@@ -1090,6 +1090,7 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--qsa-history-prime-check")qsa_history_prime_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-score-check")qsa_prefill_scores_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-live-score-check")qsa_live_scores_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-pool-write-check")qsa_live_pool_write_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-kv-offload-check")qsa_kv_offload_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-stream-graph-check")qsa_streamed_graph_case();
     else if(argc==2 && std::string(argv[1])=="--turboquant-kv-check")kv_quantization_case();

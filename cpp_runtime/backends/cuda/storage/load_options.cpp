@@ -2,6 +2,7 @@
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 #include "moe_cache_profile.h"
+#include "moe_cache_profile_path.h"
 #include "mfq_tensor_backend.h"
 #include "quant_linear.h"
 #include "tensor_parallel.h"
@@ -419,7 +420,10 @@ void setup_cuda_load(
             "--moe-gpu-cache-gb cannot be combined with "
             "tensor/expert parallelism");
     }
-    if (!options.moe_cache_profile_path.empty() &&
+    const auto* auto_profile=std::getenv("MFQ_MOE_AUTO_CACHE_PROFILE");
+    const auto profile_path=mfq::resolve_moe_cache_profile_path(options.moe_cache_profile_path,
+        options.moe_gpu_cache_gb>0.0?options.model_path:std::string{},!auto_profile || auto_profile[0]!='0');
+    if (!profile_path.empty() &&
             options.moe_gpu_cache_gb <= 0.0) {
         throw std::runtime_error(
             "--moe-cache-profile requires --moe-gpu-cache-gb");
@@ -438,11 +442,10 @@ void setup_cuda_load(
         execution.moe_expert_cache =
             make_moe_expert_cache(
                 static_cast<int64_t>(bytes), execution.config);
-        if (!options.moe_cache_profile_path.empty()) {
-            set_moe_expert_cache_profile(
-                *execution.moe_expert_cache,
-                mfq::load_moe_cache_profile(
-                    options.moe_cache_profile_path));
+        if (!profile_path.empty()) {
+            set_moe_expert_cache_profile(*execution.moe_expert_cache,mfq::load_moe_cache_profile(profile_path));
+            std::cerr<<"moe_cache_profile source="<<(options.moe_cache_profile_path.empty()?"sidecar":"explicit")
+                <<" path="<<profile_path<<std::endl;
         }
         execution.drop_file_cache = true;
     }

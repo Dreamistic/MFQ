@@ -321,6 +321,17 @@ RotaryEmbedding::Prepared RotaryEmbedding::prepare_parameters(const Tensor& valu
     return cached;
 }
 
+bool RotaryEmbedding::pool_normalized_into(const Tensor& index,const Tensor& weight,const Tensor& positions,
+        const Tensor& cache_positions,const Tensor& output,int64_t pool,int64_t maximum,double eps) const {
+    if(!fused_ || index.dim()!=3 || index.size(0)!=1 || index.size(2)>256 || index.size(2)<dimension_ ||
+        cache_positions.numel()>32 || (index.scalar_type()!=tb::kFloat16 && index.scalar_type()!=tb::kFloat32) ||
+        (positions.scalar_type()!=tb::kInt32 && positions.scalar_type()!=tb::kInt64))return false;
+    const auto prepared=prepare_parameters(index);
+    qsa_pool_rotary_cache_cuda(index,weight.to(tb::kFloat32).contiguous(),positions.contiguous(),cache_positions,
+        prepared.frequencies,prepared.axes,output,pool,maximum,maximum_,eps);
+    return true;
+}
+
 Tensor RotaryEmbedding::forward_normalized(const Tensor& value, const Tensor& weight,
         const Tensor& positions, double eps, const Tensor& key_cache,
         const Tensor& cache_positions, const Tensor& projected_value, const Tensor& value_cache) const {

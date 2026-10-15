@@ -3,6 +3,7 @@
 #include <memory>
 #include <functional>
 #include <vector>
+#include <iosfwd>
 class MoeExpertCache;
 class MoeResidencyManager {
 public:
@@ -27,6 +28,8 @@ public:
         std::uint64_t direct_exchange_rounds=0,direct_exchange_bytes=0,direct_exchange_ns=0;
         std::uint64_t cached_copy_descriptors=0,cached_copy_blocks=0;
         std::uint64_t exchange_defaults=0;
+        std::uint64_t kv_refill_bytes=0;
+        std::uint64_t native_dma_batches=0,native_dma_copies=0,native_dma_fallbacks=0;
     };
     using Observer=std::function<void(const char*,std::size_t)>;
     using MemoryProbe=std::function<MemorySample()>;
@@ -42,6 +45,7 @@ public:
     void prepare_decode();
     void release_transfer_stages();
     Stats stats() const noexcept;
+    void trace_rank_summary(std::ostream&) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

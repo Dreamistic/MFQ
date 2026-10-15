@@ -25,6 +25,14 @@ struct HotKvCache {
     void set_cold_storage(const mfq_tensor_backend::Tensor& keys, const mfq_tensor_backend::Tensor& values);
     void append(const mfq_tensor_backend::Tensor& keys, const mfq_tensor_backend::Tensor& values,
         const mfq_tensor_backend::Tensor& positions);
+    // Short contiguous appends: reserve/evict/write in one CTA, optionally
+    // publishing the indexer rows in the same launch. False leaves state alone.
+    // begin_prepare initializes the next prepare(..., skip_small_prefix=true,
+    // epoch_ready=true); both calls must use the same positions and stream.
+    bool append_decode(const mfq_tensor_backend::Tensor& keys, const mfq_tensor_backend::Tensor& values,
+        const mfq_tensor_backend::Tensor& positions,
+        const mfq_tensor_backend::Tensor& index_rows = {}, const mfq_tensor_backend::Tensor& index_storage = {},
+        bool begin_prepare = false);
     std::pair<mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor> gather(int64_t count) const;
     HotKvView view() const;
     std::size_t bytes() const;
@@ -36,6 +44,6 @@ struct HotKvCache {
         const mfq_tensor_backend::Tensor& positions);
     void prepare(const mfq_tensor_backend::Tensor& source_keys, const mfq_tensor_backend::Tensor& source_values,
         const mfq_tensor_backend::Tensor& selected, const mfq_tensor_backend::Tensor& positions = {}, int64_t columns = 0,
-        bool skip_small_prefix = false);
+        bool skip_small_prefix = false, bool epoch_ready = false);
 };
 }

@@ -27,6 +27,8 @@ std::vector<Tensor> gated_residual_post_norm(
 Tensor block_scores(const Tensor&, const Tensor&);
 Tensor live_block_scores(const Tensor& query, const Tensor& pooled,
     const Tensor& cache_positions, int64_t pool);
+std::vector<Tensor> live_index_pool(const Tensor& index, const Tensor& positions,
+    const Tensor& cache_positions, int64_t pool, int64_t maximum);
 Tensor live_topk_blocks(const Tensor& scores, const Tensor& cache_positions,
     int64_t pool, int64_t count);
 std::vector<Tensor> ple_dilated_conv_silu(

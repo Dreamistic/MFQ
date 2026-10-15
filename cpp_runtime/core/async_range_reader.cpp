@@ -10,18 +10,18 @@ struct AsyncRangeReader::Impl {
     FileRangeReader file;
     std::uint64_t size;
     mutable std::atomic<std::uint64_t> logical{0}, staging{0}, peak{0};
-    explicit Impl(const std::filesystem::path& path)
-        : file(path, FileReadMode::Direct), size(std::filesystem::file_size(path)) {}
+    explicit Impl(const std::filesystem::path& path,FileReadMode mode)
+        : file(path, mode), size(std::filesystem::file_size(path)) {}
 };
-AsyncRangeReader::AsyncRangeReader(const std::filesystem::path& path)
-    : impl_(std::make_unique<Impl>(path)) {}
+AsyncRangeReader::AsyncRangeReader(const std::filesystem::path& path,FileReadMode mode)
+    : impl_(std::make_unique<Impl>(path,mode)) {}
 AsyncRangeReader::~AsyncRangeReader() = default;
 
 void AsyncRangeReader::read(const std::vector<ReadSpan>& spans) const {
     struct Interval { std::uint64_t first, last; };
     auto& state = *impl_;
     const auto alignment = state.file.alignment();
-    std::vector<Interval> intervals;
+    std::vector<Interval> intervals;intervals.reserve(spans.size());
     for (const auto& span : spans) {
         if (span.offset > state.size || span.size > state.size - span.offset)
             throw std::out_of_range("batched range exceeds model shard");
@@ -48,6 +48,14 @@ void AsyncRangeReader::read(const std::vector<ReadSpan>& spans) const {
         if (count > std::numeric_limits<std::size_t>::max() - bytes)
             throw std::overflow_error("batched range storage exceeds address space");
         bytes += count;
+    }
+    // Disjoint buffered ranges already accept the caller's exact destinations.
+    // Typical PLE misses are five disjoint streams: no aligned bounce storage
+    // or copy-back is needed. Retain coalescing for overlapping/adjacent ranges.
+    if(alignment==1 && merged.size()==intervals.size()) {
+        state.file.read_batch(spans);
+        state.logical.fetch_add(bytes,std::memory_order_relaxed);
+        return;
     }
     std::vector<std::byte> storage(static_cast<std::size_t>(bytes));
     struct StorageCharge {

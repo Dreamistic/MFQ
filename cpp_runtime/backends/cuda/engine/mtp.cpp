@@ -20,6 +20,9 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <array>
+#include <cstring>
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -434,6 +437,29 @@ template <class Model> struct CudaMtpOps {
         std::span<const float>(host.template data_ptr<float>(), host.numel()),
         parameters.temperature, parameters.top_k, parameters.top_p);
   }
+  bool compact_radix_enabled(const Tensor& logits) const {
+    const auto* option=std::getenv("MFQ_MTP_RADIX_TOPK");
+    return option && option[0]=='1' && logits.size(0)<=32;
+  }
+  std::vector<mfq::engine::mtp::CompactDistribution>
+  compact_radix_rows(Tensor logits,const MfqSamplingParams& parameters) {
+    const auto host=sample_top_k_compact_cuda(logits,parameters.top_k).cpu().contiguous();
+    const auto* packets=host.template data_ptr<int64_t>();
+    std::array<float,64> values;
+    std::array<int64_t,64> indices;
+    std::vector<mfq::engine::mtp::CompactDistribution> result;
+    result.reserve(std::size_t(host.size(0)));
+    for(int64_t row=0;row<host.size(0);++row) {
+      for(int i=0;i<parameters.top_k;++i) {
+        const auto packet=uint64_t(packets[row*parameters.top_k+i]);
+        const uint32_t raw=uint32_t(packet>>32);
+        std::memcpy(&values[i],&raw,sizeof(raw));indices[i]=uint32_t(packet);
+      }
+      result.push_back(mfq::engine::mtp::compact_distribution_from_topk(values.data(),indices.data(),
+          int(parameters.top_k),parameters.temperature,parameters.top_p));
+    }
+    return result;
+  }
   mfq::engine::mtp::CompactDistribution
   compact_probabilities(Tensor logits, Tensor token_counts,
                         const MfqSamplingParams &parameters) {
@@ -447,6 +473,7 @@ template <class Model> struct CudaMtpOps {
           logits, token_counts, parameters.presence_penalty,
           parameters.frequency_penalty, parameters.repetition_penalty);
     }
+    if(compact_radix_enabled(logits))return std::move(compact_radix_rows(logits,parameters).front());
     auto selected =
         mfq_tensor_backend::topk(logits, parameters.top_k, -1, true, true);
     auto values =
@@ -470,6 +497,7 @@ template <class Model> struct CudaMtpOps {
                           parameters.temperature > 0.0,
                       "batched compact CUDA MTP sampling geometry is invalid");
     logits = logits.contiguous();
+    if(compact_radix_enabled(logits))return compact_radix_rows(logits,parameters);
     auto selected =
         mfq_tensor_backend::topk(logits, parameters.top_k, -1, true, true);
     auto values =

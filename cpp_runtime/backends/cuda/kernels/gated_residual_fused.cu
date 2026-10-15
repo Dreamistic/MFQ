@@ -247,6 +247,8 @@ __global__ void gated_residual_norm_kernel(MhcInput input,void* updated,void* no
 
 #include "gr_norm_quant.cuh"
 #include "gr_norm_wide.cuh"
+#include "gr_norm_vector_stats.cuh"
+#include "gr_norm_replicated.cuh"
 // Strata's GR staging uses cp.async for aligned float tiles. Keep the
 // activation bytes and lane arithmetic unchanged; unaligned slices use scalar
 // copies. Only Float normalization output uses the asynchronous path.
@@ -1210,6 +1212,11 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
     const bool norm_quant_fused=two_plane && norm_quant_mode!=0 &&
         hidden==2560 && streams==4 && rows<=6;
     const bool packed_down_s16=s16_down_requested && norm_quant_fused && plane_count==4;
+    const auto* replicated_norm_option=std::getenv("MFQ_GR_NORM_REPLICATED");
+    const int replicated_norm_groups=replicated_norm_option?std::atoi(replicated_norm_option):8;
+    const bool replicated_norm=(replicated_norm_groups==4 || replicated_norm_groups==8) &&
+        norm_quant_fused && !packed_down_s16 && rows<=6 && half && input.residual_half &&
+        (plane_count==3 || plane_count==4) && (down.gs==24 || down.gs==48) && !promoted_normalized.defined();
     bool norm_group_quant=two_plane && !norm_quant_fused &&
         norm_group_mode!=0 &&
         (!wide_norm_option || wide_norm_option[0]!='0') && (!cached_norm_option || cached_norm_option[0]!='0') &&
@@ -1232,9 +1239,33 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
         global_quantized={plane_values.data_ptr<int8_t>(),plane_count==3?plane_values.data_ptr<int8_t>()+elements:nullptr,
             plane_values.data_ptr<int8_t>()+(storage_planes-1)*elements,
             reinterpret_cast<float2*>(plane_scales.data_ptr<float>()),reinterpret_cast<int4*>(plane_sums.data_ptr<int32_t>())};
-        if(norm_quant_fused) {
+        if(norm_quant_fused && !replicated_norm) {
             norm_inverses=tb::empty({rows,streams},options.dtype(tb::kFloat32));
-            if(norm_quant_mode==2 || norm_quant_mode==3) {
+            const auto* vector_stats_option=std::getenv("MFQ_GR_NORM_VECTOR_STATS");
+            // M5 Float-before did not improve in the interleaved real-weight
+            // probe. Keep its existing statistics kernel unless requested.
+            const bool vector_stats=(vector_stats_option?vector_stats_option[0]!='0':
+                !(rows==5 && !half && !after)) &&
+                input.residual_half==input.output_half &&
+                (reinterpret_cast<uintptr_t>(input.residual)%(half?8:16))==0 &&
+                (!after || (reinterpret_cast<uintptr_t>(input.branch)%(bh?8:16))==0);
+            if(vector_stats) {
+                const auto launch=[&](auto half_type,auto after_type,auto branch_type) {
+                    gated_residual_norm_vector_stats_kernel<decltype(half_type)::value,decltype(after_type)::value,decltype(branch_type)::value><<<
+                        dim3(unsigned(streams),unsigned(rows)),256,0,mfq_current_cuda_stream()>>>(
+                        input,updated.data_ptr(),norm_inverses.data_ptr<float>(),float(eps));
+                    if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
+                        "gr_norm_stats_vector",reinterpret_cast<const void*>(gated_residual_norm_vector_stats_kernel<
+                            decltype(half_type)::value,decltype(after_type)::value,decltype(branch_type)::value>),
+                        "M="+std::to_string(rows)+" half="+std::to_string(half)+" after="+std::to_string(after));
+                };
+                const auto select=[&](auto half_type) {
+                    if(!after)launch(half_type,std::false_type{},std::false_type{});
+                    else if(bh)launch(half_type,std::true_type{},std::true_type{});
+                    else launch(half_type,std::true_type{},std::false_type{});
+                };
+                if(half)select(std::true_type{});else select(std::false_type{});
+            }else if(norm_quant_mode==2 || norm_quant_mode==3) {
                 const auto launch_stats=[&](auto threads) {
                 const auto run=[&](auto kind) {
                     gated_residual_norm_wide_kernel<0,0,false,decltype(threads)::value,true,1,decltype(kind)::value><<<dim3(unsigned(streams),unsigned(rows)),decltype(threads)::value,0,mfq_current_cuda_stream()>>>(
@@ -1308,6 +1339,27 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
             return;
         }
         if(norm_quant_fused) {
+            if(replicated_norm) {
+                const auto launch_replicated=[&](auto groups,auto after_type,auto branch_type) {
+                    constexpr int gs=decltype(group)::value,groups_per_cta=decltype(groups)::value*48/gs;
+                    constexpr bool triple_plane=decltype(triple)::value;
+                    gated_residual_norm_replicated_kernel<gs,decltype(groups)::value,triple_plane,decltype(after_type)::value,decltype(branch_type)::value><<<
+                        dim3(unsigned((down.ng+groups_per_cta-1)/groups_per_cta),unsigned(rows)),256,0,mfq_current_cuda_stream()>>>(
+                        input,updated.data_ptr(),normalized.data_ptr(),global_quantized,float(eps));
+                    if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(mfq_current_cuda_stream(),
+                        "gr_norm_quant_replicated",reinterpret_cast<const void*>(gated_residual_norm_replicated_kernel<
+                            gs,decltype(groups)::value,triple_plane,decltype(after_type)::value,decltype(branch_type)::value>),
+                        "M="+std::to_string(rows)+" half=1 gs="+std::to_string(gs)+" groups="+std::to_string(groups_per_cta));
+                };
+                const auto select=[&](auto groups) {
+                    if(!after)launch_replicated(groups,std::false_type{},std::false_type{});
+                    else if(bh)launch_replicated(groups,std::true_type{},std::true_type{});
+                    else launch_replicated(groups,std::true_type{},std::false_type{});
+                };
+                if(replicated_norm_groups==4)select(std::integral_constant<int,4>{});
+                else select(std::integral_constant<int,8>{});
+                return;
+            }
             if(packed_down_s16) {
                 const auto launch_s16=[&](auto half_input) {
                     gated_residual_finish_norm_quant_s16_kernel<decltype(half_input)::value><<<

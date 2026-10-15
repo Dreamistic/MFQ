@@ -987,6 +987,9 @@ class Qsa {
     Tensor forward_graph(CudaExecutionContext& execution,const Tensor& hidden,
                          const Tensor& positions,const Tensor& cache_positions,
                          std::vector<Tensor> projections={},bool project_output=true,bool history_only=false) {
+        const auto mark=[](const char* phase) {
+            if(auto* window=DecodeWindow::recording())window->mark_current(phase);
+        };
         const bool streamed=bool(offload_);
         MFQ_RUNTIME_CHECK((graph_keys_.defined() || (streamed && managed_memory())) && hidden.size(0)==1 && cache_positions.dim()==1,
             "QSA graph cache is not prepared");
@@ -997,17 +1000,28 @@ class Qsa {
             project(execution,hidden,positions,!dense_capacity,cache_positions,
                        quantization_.enabled() || exclusive || streamed?Tensor{}:graph_keys_,quantization_.enabled() || exclusive || streamed?Tensor{}:graph_values_,
                        std::move(projections));
+        mark("qsa_input_end");
         const auto finish=[&](Tensor output) {
+            mark("qsa_attention_end");
             output=output.reshape({1,t,c_.heads*c_.width});
             return project_output?w_.output(execution,output):output;
         };
-        if(exclusive)memory_->hot.append(encode_key(p.key).permute({0,2,1,3}),encode_value(p.value).permute({0,2,1,3}),cache_positions);
+        bool index_written=false;
+        const auto* prepare_option=std::getenv("MFQ_KV_PREPARE_FUSED");
+        const bool begin_prepare=!prepare_option || prepare_option[0]!='0';
+        if(exclusive) {
+            const auto keys=(quantization_.enabled()?encode_key(p.key):p.key).permute({0,2,1,3});
+            const auto values=(quantization_.enabled()?encode_value(p.value):p.value).permute({0,2,1,3});
+            index_written=memory_->hot.append_decode(keys,values,cache_positions,p.raw,index_.storage(),begin_prepare);
+            if(!index_written)memory_->hot.append(keys.to(cache_dtype()),values.to(cache_dtype()),cache_positions);
+        }
         else if (!p.cache_written && !streamed) {
             graph_keys_.index_copy_(2,cache_positions,encode_key(p.key).permute({0,2,1,3}));
             graph_values_.index_copy_(2,cache_positions,encode_value(p.value).permute({0,2,1,3}));
         }
         if(managed_memory() && !exclusive && !streamed)memory_->hot.publish(graph_keys_,graph_values_,cache_positions);
-        index_.append_fixed(p.raw,cache_positions);
+        if(!index_written)index_.append_fixed(p.raw,cache_positions);
+        mark("qsa_cache_end");
         if(history_only && streamed) {
             auto* window=DecodeWindow::recording();
             MFQ_RUNTIME_CHECK(window,"streamed QSA history requires a decode window");
@@ -1030,7 +1044,7 @@ class Qsa {
                 return finish(streamed_graph_attention(p,ids,hidden.scalar_type()));
             }
             const auto columns=std::min(graph_keys_.size(2),c_.budget+c_.pool-1);
-            const auto hot=prepare_hot({},cache_positions,columns);
+            const auto hot=prepare_hot({},cache_positions,columns,index_written && begin_prepare);
             if(quantization_.enabled()) {
                 auto attended=cuda_kv_attention(p.query,graph_keys_,graph_values_,quantization_,{},cache_positions,0,{},0,{},{},0,hot);
                 return finish((attended*tb::sigmoid(p.gate.to(tb::kFloat32))).to(hidden.scalar_type()));
@@ -1048,19 +1062,34 @@ class Qsa {
             auto gated=attended.to(tb::kFloat32)*tb::sigmoid(p.gate.to(tb::kFloat32));
             return finish(gated.to(hidden.scalar_type()));
         }
-        auto block=(cache_positions/c_.pool).to(tb::kInt64);
-        auto row=(block.unsqueeze(-1)*c_.pool+tb::arange(c_.pool,block.options())).clamp(0,c_.maximum-1);
-        auto pooled=index_.storage().index_select(1,row.reshape({-1})).reshape({1,t,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
-        pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
-        auto delta=positions-cache_positions;
-        auto block_positions=block*c_.pool+delta;
-        pooled=rotary_->forward(pooled.unsqueeze(1),block_positions).squeeze(1);
-        graph_pooled_.index_copy_(1,block,pooled);
+        Tensor block,pooled;
+        const auto* pool_fusion=std::getenv("MFQ_QSA_POOL_FUSED");
+        const auto* pool_write=std::getenv("MFQ_QSA_POOL_WRITE_FUSED");
+        const bool pool_written=(!pool_fusion || pool_fusion[0]!='0') && (!pool_write || pool_write[0]!='0') &&
+            index_.storage().size(1)>=c_.maximum && rotary_->pool_normalized_into(index_.storage(),w_.index_key_norm,
+                positions,cache_positions,graph_pooled_,c_.pool,c_.maximum,c_.eps);
+        if(!pool_written && rotary_->fused() && (!pool_fusion || pool_fusion[0]!='0') && index_.storage().size(1)>=c_.maximum) {
+            auto prepared=mfq_qwen4_exp::live_index_pool(index_.storage(),positions,cache_positions,c_.pool,c_.maximum);
+            block=prepared[1];
+            pooled=rotary_->forward_normalized(prepared[0].unsqueeze(2),w_.index_key_norm,prepared[2],c_.eps).squeeze(1);
+        }else if(!pool_written) {
+            block=(cache_positions/c_.pool).to(tb::kInt64);
+            auto row=(block.unsqueeze(-1)*c_.pool+tb::arange(c_.pool,block.options())).clamp(0,c_.maximum-1);
+            pooled=index_.storage().index_select(1,row.reshape({-1})).reshape({1,t,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
+            pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
+            auto delta=positions-cache_positions;
+            auto block_positions=block*c_.pool+delta;
+            pooled=rotary_->forward(pooled.unsqueeze(1),block_positions).squeeze(1);
+        }
+        if(!pool_written)graph_pooled_.index_copy_(1,block,pooled);
+        mark("qsa_pool_end");
         if(history_only)return {};
         auto ranked=mfq_qwen4_exp::live_block_scores(p.iq,graph_pooled_,cache_positions,c_.pool);
+        mark("qsa_scores_end");
         auto absolute=cache_positions.reshape({1,t,1});
         const auto count=std::min(c_.budget/c_.pool,pools),columns=c_.budget+c_.pool-1;
         auto indices=mfq_qwen4_exp::live_topk_blocks(ranked,cache_positions,c_.pool,count);
+        mark("qsa_topk_end");
         Tensor selected;
         const auto fused_selection=mfq::cuda::runtime_options::qsa_select_fused();
         if(!fused_selection || *fused_selection) {
@@ -1086,9 +1115,11 @@ class Qsa {
         dense=tb::where(dense<=absolute,dense,tb::full_like(dense,-1));
         selected=tb::where(absolute+1<=c_.budget,dense,selected).to(tb::kInt32).contiguous();
         }
+        mark("qsa_select_end");
         if(streamed)return finish(streamed_graph_attention(p,selected,hidden.scalar_type()));
         Tensor gated;
-        const auto hot=prepare_hot(selected,cache_positions);
+        const auto hot=prepare_hot(selected,cache_positions,0,index_written && begin_prepare);
+        mark("qsa_hot_end");
         if(quantization_.enabled()) {
             auto attended=cuda_kv_attention(p.query,graph_keys_,graph_values_,quantization_,selected,cache_positions,0,{},0,{},{},0,hot);
             gated=(attended*tb::sigmoid(p.gate.to(tb::kFloat32))).to(hidden.scalar_type());
@@ -1266,9 +1297,9 @@ class Qsa {
     }
 
   private:
-    HotKvView prepare_hot(const Tensor& selected,const Tensor& positions={},int64_t columns=0) const {
+    HotKvView prepare_hot(const Tensor& selected,const Tensor& positions={},int64_t columns=0,bool epoch_ready=false) const {
         if(!managed_memory() || !memory_->hot.defined())return {};
-        memory_->hot.prepare(graph_keys_,graph_values_,selected,positions,columns,true);
+        memory_->hot.prepare(graph_keys_,graph_values_,selected,positions,columns,true,epoch_ready);
         return memory_->hot.view();
     }
     Tensor attend(const Tensor& query, Tensor keys, Tensor values, const Tensor& selected, int64_t offset) const {

@@ -16,6 +16,7 @@
 #include "runtime/execution_options.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 
 namespace mfq::cuda::internal {
@@ -286,7 +287,19 @@ template <class Model> struct CudaGenerationContext {
     std::string request_id;
 
     bool batched() const { return batching != nullptr; }
+    void trace_expert_cache(const char* boundary) {
+        // Request boundaries only: these existing counters need no events or
+        // extra per-token synchronization. Diagnostic output drains exchanges.
+        static const bool enabled=[] {
+            const char* value=std::getenv("MFQ_TRACE_MOE_SUMMARY");
+            return value && value[0] && value[0]!='0';
+        }();
+        if (!enabled || batching || std::uncaught_exceptions()) return;
+        std::cerr << "moe_request_cache_stats boundary=" << boundary << '\n';
+        print_moe_expert_cache_stats(model.execution->moe_expert_cache,std::cerr);
+    }
     void prepare_request(const mfq::engine::InferenceRequest& input) {
+        trace_expert_cache("begin");
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
             model.decode_reserve_until=std::min<int64_t>(model.max_position_embeddings(),
@@ -359,6 +372,7 @@ template <class Model> struct CudaGenerationContext {
     }
     void release() {
         if (batching) return; // Each row owns its slot cleanup.
+        trace_expert_cache("end");
         try { reset(); }
         catch (...) { graph.invalidate(); throw; }
         if (std::uncaught_exceptions()) graph.invalidate();

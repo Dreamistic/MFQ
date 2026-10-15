@@ -13,6 +13,61 @@ namespace mfq_qwen4_exp {
 namespace tb = mfq_tensor_backend;
 
 namespace {
+template<class Value,class Position>
+__global__ void live_index_pool_kernel(const Value* index,const Position* positions,
+        const int64_t* cache,Value* pooled,int64_t* blocks,Position* block_positions,
+        int tokens,int width,int pool,int64_t maximum,int64_t position_entries,
+        int64_t row_stride,int64_t column_stride) {
+    const int token=blockIdx.x;
+    const int64_t block=cache[token]/pool,start=block*pool;
+    if(threadIdx.x==0)blocks[token]=block;
+    for(int64_t i=threadIdx.x;i<position_entries/tokens;i+=blockDim.x) {
+        const int64_t at=i*tokens+token;
+        block_positions[at]=Position(int64_t(positions[at])-cache[token]+start);
+    }
+    for(int column=threadIdx.x;column<width;column+=blockDim.x) {
+        float sum=0;
+        for(int i=0;i<pool;++i) {
+            const auto row=min(max(int64_t(0),start+i),maximum-1);
+            sum=__fadd_rn(sum,float(index[row*row_stride+column*column_stride]));
+        }
+        pooled[int64_t(token)*width+column]=Value(__fdiv_rn(sum,float(pool)));
+    }
+}
+}
+
+std::vector<Tensor> live_index_pool(const Tensor& index,const Tensor& positions,
+        const Tensor& cache_positions,int64_t pool,int64_t maximum) {
+    MFQ_RUNTIME_CHECK(index.is_cuda() && index.dim()==3 && index.size(0)==1 &&
+        (index.scalar_type()==tb::kFloat16 || index.scalar_type()==tb::kFloat32) &&
+        positions.device()==index.device() && cache_positions.device()==index.device() &&
+        positions.dim()>=1 && positions.dim()<=3 &&
+        (positions.scalar_type()==tb::kInt32 || positions.scalar_type()==tb::kInt64) &&
+        cache_positions.dim()==1 && cache_positions.numel()>0 && cache_positions.is_contiguous() &&
+        cache_positions.scalar_type()==tb::kInt64 && positions.size(-1)==cache_positions.numel() &&
+        pool>0 && pool<=INT_MAX && maximum>0 && maximum<=index.size(1) &&
+        index.size(2)>0 && index.size(2)<=INT_MAX && cache_positions.numel()<=INT_MAX,
+        "live QSA pool has incompatible index/position geometry");
+    const MfqCudaGuard guard(index.device());
+    auto pos=positions.contiguous();
+    auto pooled=tb::empty({1,cache_positions.numel(),index.size(2)},index.options());
+    auto blocks=tb::empty_like(cache_positions),block_positions=tb::empty_like(pos);
+    const auto launch=[&](auto* source,auto* output,auto* p,auto* bp) {
+        live_index_pool_kernel<<<unsigned(cache_positions.numel()),128,0,mfq_current_cuda_stream()>>>(
+            source,p,cache_positions.data_ptr<int64_t>(),output,blocks.data_ptr<int64_t>(),bp,
+            int(cache_positions.numel()),int(index.size(2)),int(pool),maximum,pos.numel(),index.stride(1),index.stride(2));
+    };
+    const auto typed=[&](auto* source,auto* output) {
+        if(pos.scalar_type()==tb::kInt64)launch(source,output,pos.data_ptr<int64_t>(),block_positions.data_ptr<int64_t>());
+        else launch(source,output,pos.data_ptr<int32_t>(),block_positions.data_ptr<int32_t>());
+    };
+    if(index.scalar_type()==tb::kFloat16)typed(index.data_ptr<mfq_half>(),pooled.data_ptr<mfq_half>());
+    else typed(index.data_ptr<float>(),pooled.data_ptr<float>());
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return {pooled,blocks,block_positions};
+}
+
+namespace {
 template<class Position>
 __global__ void fill_decode_positions_kernel(int64_t* cache,Position* positions,
     int64_t tokens,int64_t entries,int64_t start,int64_t delta) {
@@ -377,11 +432,29 @@ Tensor live_block_scores(const Tensor& query,const Tensor& pooled,const Tensor& 
 }
 
 namespace {
+template<int Items>
+__device__ void live_topk_sort(const float* source,const int64_t* ids,float* output,int64_t* out_ids,
+        int row,int columns,int begin,int live,int pools,int count,int64_t out,unsigned char* temporary) {
+    using Sort=cub::BlockRadixSort<float,256,Items,int64_t>;
+    float keys[Items];int64_t indices[Items];
+#pragma unroll
+    for(int i=0;i<Items;++i) {
+        const int column=begin+threadIdx.x*Items+i;
+        const auto at=int64_t(row)*columns+column;
+        keys[i]=column<live?source[at]:-1e30f;
+        indices[i]=column<live?(ids?ids[at]:column):pools;
+    }
+    Sort(*reinterpret_cast<typename Sort::TempStorage*>(temporary)).SortDescending(keys,indices);
+#pragma unroll
+    for(int i=0;i<Items;++i) {
+        const int rank=threadIdx.x*Items+i;
+        if(rank<count){output[out+rank]=keys[i];out_ids[out+rank]=indices[i];}
+    }
+}
 __global__ void live_topk_blocks_kernel(const float* source,const int64_t* ids,
         float* output,int64_t* out_ids,const int64_t* positions,int columns,
-        int pools,int pool,int count,int stage) {
-    constexpr int tile=4096,items=16;
-    using Sort=cub::BlockRadixSort<float,256,items,int64_t>;
+        int pools,int pool,int count,int stage,bool compact) {
+    constexpr int tile=4096;
     extern __shared__ __align__(16) unsigned char temporary[];
     const int row=blockIdx.y,begin=int(blockIdx.x)*tile,tiles=(columns+tile-1)/tile;
     int live=int(min(int64_t(pools),max(int64_t(0),(positions[row]+1)/pool)));
@@ -397,20 +470,15 @@ __global__ void live_topk_blocks_kernel(const float* source,const int64_t* ids,
         }
         return;
     }
-    float keys[items];int64_t indices[items];
-#pragma unroll
-    for(int i=0;i<items;++i) {
-        const int column=begin+threadIdx.x*items+i;
-        const auto at=int64_t(row)*columns+column;
-        keys[i]=column<live?source[at]:-1e30f;
-        indices[i]=column<live?(ids?ids[at]:column):pools;
-    }
-    Sort(*reinterpret_cast<Sort::TempStorage*>(temporary)).SortDescending(keys,indices);
-#pragma unroll
-    for(int i=0;i<items;++i) {
-        const int rank=threadIdx.x*items+i;
-        if(rank<count){output[out+rank]=keys[i];out_ids[out+rank]=indices[i];}
-    }
+    // The graph reserves the maximum context, while each replay has a much
+    // shorter live prefix. Keep the reduction tiles and output layout fixed,
+    // but sort only the power-of-two range containing this tile's live rows.
+    // CUB's stable ordering is unchanged because input column order is kept.
+    if(compact && available<=1024)
+        live_topk_sort<4>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
+    else if(compact && available<=2048)
+        live_topk_sort<8>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
+    else live_topk_sort<16>(source,ids,output,out_ids,row,columns,begin,live,pools,count,out,temporary);
 }
 }
 
@@ -424,6 +492,8 @@ Tensor live_topk_blocks(const Tensor& scores,const Tensor& positions,int64_t poo
         count>0 && count<=scores.size(2),"invalid live QSA top-k geometry");
     MfqCudaGuard guard(scores.device());
     const int rows=int(scores.size(1)),pools=int(scores.size(2));
+    const auto* compact_option=std::getenv("MFQ_QSA_TOPK_LIVE_TILE");
+    const bool compact=!compact_option || compact_option[0]!='0';
     int columns=pools,stage=0;
     auto keys=scores;Tensor ids;
     constexpr auto bytes=sizeof(cub::BlockRadixSort<float,256,16,int64_t>::TempStorage);
@@ -436,7 +506,7 @@ Tensor live_topk_blocks(const Tensor& scores,const Tensor& positions,int64_t poo
         live_topk_blocks_kernel<<<dim3(tiles,rows),256,bytes,mfq_current_cuda_stream()>>>(
             keys.data_ptr<float>(),ids.defined()?ids.data_ptr<int64_t>():nullptr,
             next.data_ptr<float>(),next_ids.data_ptr<int64_t>(),positions.data_ptr<int64_t>(),
-            columns,pools,int(pool),int(count),stage++);
+            columns,pools,int(pool),int(count),stage++,compact);
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();keys=std::move(next);ids=std::move(next_ids);columns=tiles*int(count);
     } while(columns>count);
     return ids;
