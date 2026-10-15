@@ -12,13 +12,14 @@
 **每一比特，极致保真。**
 
 MFQ 将面向实用率失真前沿设计的神经网络感知 SQ/VQ 格式、高质量的
-细粒度混合精度校准量化，以及高效的 CUDA、ROCm（HIP）和 Metal 推理融为一体。我们的
-目标是在内存、存储和延迟约束内，让现有硬件运行尽可能高质量的模型。
+细粒度混合精度校准量化，以及高效的 CUDA 和 Metal 推理融为一体。
+ROCm（HIP）支持仍在开发中。我们的目标是在内存、存储和延迟约束内，
+让现有硬件运行尽可能高质量的模型。
 
 <p>
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache 2.0 许可证">
   <img src="https://img.shields.io/badge/runtime-C%2B%2B-black" alt="C++ 运行时">
-  <img src="https://img.shields.io/badge/backends-CUDA%20%7C%20ROCm%20%7C%20Metal-6b57ff" alt="CUDA、ROCm 和 Metal">
+  <img src="https://img.shields.io/badge/backends-CUDA%20%7C%20Metal%20%7C%20ROCm%20%28in%20development%29-6b57ff" alt="CUDA 和 Metal；ROCm 开发中">
 </p>
 
 <p>
@@ -61,7 +62,8 @@ uv run mfq serve \
 ### 从源码构建
 
 MFQ 需要 Git、[uv](https://docs.astral.sh/uv/)、CMake 3.26+ 和 C++ 工具链。
-NVIDIA 平台使用 CUDA 12+，AMD 平台使用 ROCm 6+，Apple 芯片使用 Metal。
+NVIDIA 平台使用 CUDA 12+，Apple 芯片使用 Metal。ROCm/HIP 支持仍在开发中，
+AMD 平台的实验性构建需要 ROCm 6+。
 
 ```bash
 git clone https://github.com/Tylogi/MFQ.git MFQ
@@ -71,7 +73,7 @@ cd MFQ
 uv sync
 uv run mfq build --backend cuda
 
-# AMD / ROCm（HIP）
+# AMD / ROCm（HIP，开发中）
 uv sync
 uv run mfq build --backend hip
 
@@ -152,9 +154,8 @@ MFQ 还可以量化满精度 MFQ 和 GGUF 源模型，读取逐张量或逐专�
   前缀缓存与 KV Cache，通过 OpenAI 和 Anthropic 兼容 API 为应用与 Agent
   提供服务。
 
-- **高性能 CUDA、ROCm 与 Metal 后端。** 为 CUDA 与 Metal 优化打包权重、
-  注意力、缓存与 I/O 内核；ROCm/HIP 已初步支持 MI300X 上的 Qwen3.5–3.8
-  稠密模型。优化的 CPU 后端正在规划中。
+- **高性能 CUDA 与 Metal 后端。** 为 CUDA 与 Metal 优化打包权重、
+  注意力、缓存与 I/O 内核。ROCm/HIP 支持仍在开发中，优化的 CPU 后端正在规划中。
 
 ## 模型
 
@@ -173,7 +174,7 @@ MFQ 还可以量化满精度 MFQ 和 GGUF 源模型，读取逐张量或逐专�
 
 | 架构系列 | 后端 |
 | --- | --- |
-| Qwen3.5–3.8 | CUDA C++、Metal C++、HIP C++（稠密模型） |
+| Qwen3.5–3.8 | CUDA C++、Metal C++、HIP C++（稠密模型，开发中） |
 | Qwen Flash-Next / Qwen4 风格 | CUDA C++、Metal C++ |
 | DeepSeek-V4-Flash Series | CUDA C++、Metal C++ |
 | MiniCPM-o 4.5 | CUDA C++、Metal C++ |

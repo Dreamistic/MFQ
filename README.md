@@ -13,15 +13,15 @@
 
 MFQ combines neural-network-aware SQ and VQ formats designed to approach the
 practical rate-distortion frontier, high-quality, fine-grained mixed-precision
-calibration and quantization, and efficient CUDA, ROCm (HIP), and Metal
-inference. The goal is
+calibration and quantization, and efficient CUDA and Metal inference.
+ROCm (HIP) support is in development. The goal is
 to deliver the best model quality possible on existing hardware within its
 memory, storage, and latency limits.
 
 <p>
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache 2.0 license">
   <img src="https://img.shields.io/badge/runtime-C%2B%2B-black" alt="C++ runtime">
-  <img src="https://img.shields.io/badge/backends-CUDA%20%7C%20ROCm%20%7C%20Metal-6b57ff" alt="CUDA, ROCm and Metal">
+  <img src="https://img.shields.io/badge/backends-CUDA%20%7C%20Metal%20%7C%20ROCm%20%28in%20development%29-6b57ff" alt="CUDA and Metal; ROCm in development">
 </p>
 
 <p>
@@ -66,8 +66,8 @@ uv run mfq serve \
 ### Build from source
 
 MFQ requires Git, [uv](https://docs.astral.sh/uv/), CMake 3.26+, and a
-C++ toolchain. Use CUDA 12+ on NVIDIA systems, ROCm 6+ on AMD systems, or
-Metal on Apple silicon.
+C++ toolchain. Use CUDA 12+ on NVIDIA systems or Metal on Apple silicon.
+ROCm/HIP support is in development; experimental AMD builds require ROCm 6+.
 
 ```bash
 git clone https://github.com/Tylogi/MFQ.git MFQ
@@ -77,7 +77,7 @@ cd MFQ
 uv sync
 uv run mfq build --backend cuda
 
-# AMD / ROCm (HIP)
+# AMD / ROCm (HIP, in development)
 uv sync
 uv run mfq build --backend hip
 
@@ -164,9 +164,9 @@ Our calibration method is open source; see
   and tiered RAM/SSD Prefix and KV caches serve applications and agents through
   OpenAI- and Anthropic-compatible APIs.
 
-- **High-Performance CUDA, ROCm & Metal Backends.** Optimized packed-weight,
-  attention, cache, and I/O kernels for CUDA and Metal, with early ROCm/HIP
-  support for dense Qwen3.5–3.8 models on MI300X. Optimized CPU backends are planned.
+- **High-Performance CUDA & Metal Backends.** Optimized packed-weight,
+  attention, cache, and I/O kernels for CUDA and Metal. ROCm/HIP support is
+  in development; optimized CPU backends are planned.
 
 ## Models
 
@@ -185,7 +185,7 @@ Supported architecture groups:
 
 | Architecture group | Backends |
 | --- | --- |
-| Qwen3.5–3.8 | CUDA C++, Metal C++, HIP C++ (dense models) |
+| Qwen3.5–3.8 | CUDA C++, Metal C++, HIP C++ (dense models; in development) |
 | Qwen Flash-Next / Qwen4-style | CUDA C++, Metal C++ |
 | DeepSeek-V4-Flash Series | CUDA C++, Metal C++ |
 | MiniCPM-o 4.5 | CUDA C++, Metal C++ |
