@@ -437,7 +437,7 @@ inline void mfq_nvq_banked_bits(
         cursors[row] = uint4(indices_offset + index.x, auxiliary_offset + sign.x,
             state_offset + (state >> 1u), index.y | (sign.y << 3u) | ((state & 1u) << 6u));
     }
-    #pragma clang loop unroll_count(2)
+    #pragma clang loop unroll_count(MATRIX_ROWS > 1u || (INPUT_ROWS > 1u && !EXPANSION) ? 1 : 2)
     for (uint work = k_lane; work < WORK; work += K_LANES) {
         uint group = FLAT_RECORDS ? work / 3u : work;
         float weight_scales[MATRIX_ROWS];
