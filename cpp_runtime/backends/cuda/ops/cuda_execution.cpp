@@ -135,7 +135,11 @@ bool dma_graph_batch() { return exact_one("MFQ_MOE_DMA_GRAPH_BATCH"); }
 bool warp_multi_sum() { return exact_one("MFQ_CUDA_WARP_MULTI_SUM"); }
 float residency_heat_retention() {
     const auto* setting=std::getenv("MFQ_MOE_RESIDENCY_HEAT_RETENTION");
-    if(!setting)return 0.7f;
+    // A four-token adaptation interval needs to remember experts reused every
+    // dozen tokens. With 0.7 decay their score never reaches the admission
+    // threshold; 0.9 retains that evidence across roughly 26 tokens. Prefill
+    // still replaces the heat seed when a new request changes the working set.
+    if(!setting)return 0.9f;
     char* end=nullptr;const float value=std::strtof(setting,&end);
     if(end==setting || *end || !std::isfinite(value) || value<0.0f || value>1.0f)
         throw std::invalid_argument("MFQ_MOE_RESIDENCY_HEAT_RETENTION must be between zero and one");
