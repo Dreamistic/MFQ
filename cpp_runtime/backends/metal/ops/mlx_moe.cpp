@@ -3419,6 +3419,7 @@ struct MfeNintDecodeConfig {
     Dtype dtype;
     Dtype shared_gate_dtype;
     bool shared_gate_is_logits = false;
+    int shared_router_group_size = 0;
     bool packed_gate_up = false;
     bool route_groups = false;
     bool folded_topk = false;
@@ -3490,7 +3491,8 @@ std::string mfe_decode_kernel_name(
              {"_ggs", config.shared_gate_group_size}, {"_gg", config.shared_gate_groups},
              {"_dgs", config.shared_down_group_size}, {"_dg", config.shared_down_groups},
              {"_kl", config.k_lanes}, {"_dr", config.down_rows_per_simd},
-             {"_gt", static_cast<int>(config.shared_gate_dtype.val())}}}) {
+             {"_gt", static_cast<int>((stage == 2 && config.shared_router_group_size
+                 ? mlx::core::float16 : config.shared_gate_dtype).val())}}}) {
         name.append(field.first);
         integer(field.second);
     }
@@ -3508,6 +3510,8 @@ std::string mfe_decode_kernel_name(
     name.append("_vls").append(std::to_string(stage == 1 ? config.gate_vq_layouts : config.down_vq_layouts));
     if (stage == 1 && config.route_groups) name.append("_rg1");
     if (config.shared_gate_is_logits) name.append("_gate_logits");
+    if (stage == 1 && config.shared_router_group_size)
+        name.append("_srg").append(std::to_string(config.shared_router_group_size));
     if (config.packed_gate_up) name.append("_packed_gu");
     if (config.folded_topk) name.append("_folded_topk");
     if (stage == 2 && mfe_paired_nint_down(config)) name.append("_nint_pair");
@@ -3730,13 +3734,38 @@ std::string make_mfe_nint_gate_up_source(
         << "#include <metal_stdlib>\nusing namespace metal;\n"
         << "using T = " << metal_activation_type(config.dtype) << ";\n"
         << "using SharedGateT = "
-        << metal_activation_type(config.shared_gate_dtype) << ";\n"
+        << (config.shared_router_group_size ? "uchar" : metal_activation_type(config.shared_gate_dtype)) << ";\n"
         << nint_group_specialization(config.gate_nint_group_sizes)
         << "#define MFQ_NINT_Q_DISPATCH " << config.gate_q_dispatch << "\n"
         << "#define MFQ_MOE_VQ_LAYOUTS " << config.gate_vq_layouts << "ul\n"
         << kMoeHeader
-        << (config.folded_topk ? kFoldedTopKHeader : "")
-        << "kernel void " << kernel_name << "(\n";
+        << (config.folded_topk ? kFoldedTopKHeader : "");
+    if (config.shared_router_group_size) {
+        source << detail::nint_matmul_metal_header().substr(sizeof(detail::kNintMetadataSource) - 1)
+            << "struct MfqSharedRouterInput { device const T* base; uint offset; T operator[](uint index) const { return base[offset + index]; } };\n"
+            << "inline float4 mfq_nint_load_input4(MfqSharedRouterInput input, uint offset) { return mfq_nint_load_input4(input.base, input.offset + offset); }\n"
+            << "template <bool SMALL> inline void mfq_shared_router(device const uchar* packed, device const T* values, device T* y, uint thread_index_in_simdgroup, uint input_offset) {\n"
+            << "MfqSharedRouterInput x{values - input_offset, input_offset};\n"
+            << "device const uint* header = reinterpret_cast<device const uint*>(packed);\n"
+            << "device const uchar* q_packed = packed + header[0];\n"
+            << "device const uchar* sub_scale = packed + header[1];\n"
+            << "device const uchar* sub_min = packed + header[2];\n"
+            << "device const uint* row_metadata = header + 4u;\n"
+            << "device const int* expert_ids = reinterpret_cast<device const int*>(row_metadata);\n"
+            << "device const int* expert_map = expert_ids;\n"
+            << "uint simdgroup_index_in_threadgroup = 0u; uint3 threadgroup_position_in_grid = uint3(0u);\n";
+        for (const auto& [name, value] : std::array<std::pair<const char*, int>, 14>{{
+                 {"GS", config.shared_router_group_size},
+                 {"NG", (config.hidden + config.shared_router_group_size - 1) / config.shared_router_group_size},
+                 {"K", config.hidden}, {"OUT", 1}, {"M", 1}, {"TILE_M", 1}, {"OPS_PER_SIMD", 1},
+                 {"ROUTED", 0}, {"ROUTES", 1}, {"SHARED_INPUT", 0}, {"EXPERT_MAP_SIZE", 1},
+                 {"LOCAL_EXPERTS", 1}, {"OUT_PER_EXPERT", 1}, {"LOGICAL_OUT", 1}}})
+            source << "#define " << name << " " << value << "\n";
+        source << "#define SMALL_M SMALL\n#define MFQ_NINT_STORE_OUTPUT(index, value) y[index] = T(value)\n"
+            << detail::nint_matmul_metal_body()
+            << "\n#undef MFQ_NINT_STORE_OUTPUT\n#undef SMALL_M\n#undef GS\n#undef NG\n#undef K\n#undef OUT\n#undef M\n#undef TILE_M\n#undef OPS_PER_SIMD\n#undef ROUTED\n#undef ROUTES\n#undef SHARED_INPUT\n#undef EXPERT_MAP_SIZE\n#undef LOCAL_EXPERTS\n#undef OUT_PER_EXPERT\n#undef LOGICAL_OUT\n}\n";
+    }
+    source << "kernel void " << kernel_name << "(\n";
     append_mfe_pool_arguments(source);
     source
         << "device const T* x [[buffer(22)]],\n"
@@ -3752,7 +3781,8 @@ std::string make_mfe_nint_gate_up_source(
         << (config.folded_topk ? "device float* routing [[buffer(30)]],\n" : "")
         << "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],\n"
         << "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],\n"
-        << "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
+        << "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],\n"
+        << "uint3 group_count [[threadgroups_per_grid]]) {\n";
     append_mfe_decode_constants(source, config, true);
     if (config.route_groups)
         source << "device const T* batch_x = x; device T* batch_y = y;\n";
@@ -3787,7 +3817,12 @@ std::string make_mfe_nint_gate_up_source(
         << "if (workgroup == 0u) {\n"
         << (config.folded_topk ? "  if (simd_group == 1u) mfq_topk_write<uint(EXPERTS), uint(ROUTES)>(router_logits, lane, routing);\n" : "")
         << "  if (simd_group == 0u) {\n";
-    if (config.shared_gate_is_logits) {
+    if (config.shared_router_group_size) {
+        if (config.tokens == 1)
+            source << "    mfq_shared_router<true>(shared_gate_weight, x, y + GATE_OFFSET, lane, 0u);\n";
+        else source << "    if (group_count.x <= 5u) mfq_shared_router<true>(shared_gate_weight, x, y + GATE_OFFSET, lane, token_row * uint(K));\n"
+                    << "    else mfq_shared_router<false>(shared_gate_weight, x, y + GATE_OFFSET, lane, token_row * uint(K));\n";
+    } else if (config.shared_gate_is_logits) {
         source << "    if (lane == 0u) y[GATE_OFFSET] = T(shared_gate_weight["
                << (config.tokens > 1 ? "token_row" : "0u") << "]);\n";
     } else {
@@ -11185,17 +11220,19 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
     const bool activation16 =
         input.dtype() == mlx::core::float16 ||
         input.dtype() == mlx::core::bfloat16;
-    const bool shared_gate_dtype_supported =
+    const bool packed_shared_router = shared_gate_weight.dtype() == mlx::core::uint8 &&
+        shared_gate_weight.ndim() == 1 && shared_gate_weight.size() >= 36;
+    const bool shared_gate_dtype_supported = packed_shared_router ||
         shared_gate_weight.dtype() == mlx::core::float16 ||
         shared_gate_weight.dtype() == mlx::core::bfloat16 ||
         (shared_gate_is_logits && shared_gate_weight.dtype() == mlx::core::float32);
     const int routes = expert_ids.ndim() == 2
         ? expert_ids.shape(1) : 0;
     const int tokens = input.ndim() == 2 ? input.shape(0) : 0;
-    const bool shared_gate_shape_supported = shared_gate_is_logits
+    const bool shared_gate_shape_supported = packed_shared_router || (shared_gate_is_logits
         ? shared_gate_weight.size() == static_cast<std::size_t>(tokens)
         : shared_gate_weight.ndim() == 2 && shared_gate_weight.shape(0) == 1 &&
-            shared_gate_weight.shape(1) == impl_->neuron_len;
+            shared_gate_weight.shape(1) == impl_->neuron_len);
     const bool packed_gate_up = impl_->projections == 1;
     const int intermediate = down.impl_->neuron_len;
     const bool supported = !mlx_reference_enabled() &&
@@ -11225,6 +11262,27 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
         shared_gate_weight.flags().row_contiguous && shared_gate_dtype_supported;
     if (!supported) {
         return std::nullopt;
+    }
+    int shared_router_group_size = 0;
+    if (packed_shared_router) {
+        auto packed = shared_gate_weight;
+        packed.eval();
+        std::array<std::uint32_t, 9> header{};
+        std::memcpy(header.data(), packed.data<std::uint8_t>(), sizeof(header));
+        shared_router_group_size = static_cast<int>(header[3]);
+        const auto q = header[4] & 15u, k = (header[4] >> 8u) & 15u;
+        if (shared_router_group_size <= 0 || header[8] != std::uint32_t(impl_->neuron_len) ||
+            q < 1 || q > 8 || k < 1 || k > 8 ||
+            header[0] != sizeof(header) || header[1] < header[0] ||
+            header[2] < header[1] || header[2] > packed.size() ||
+            (header[6] & 0x7c00u) == 0x7c00u || ((header[6] >> 16u) & 0x7c00u) == 0x7c00u)
+            throw std::invalid_argument("invalid packed NINT router header");
+        const auto groups = (std::uint64_t(impl_->neuron_len) + header[3] - 1) / header[3];
+        const auto q_bytes = header[5] + (((header[4] >> 4u) & 7u) + groups * header[3] * q + 7) / 8;
+        const auto sub_bytes = header[7] + (((header[4] >> 12u) & 7u) + groups * k + 7) / 8;
+        if (q_bytes >= header[1] - header[0] || sub_bytes >= header[2] - header[1] ||
+            sub_bytes >= packed.size() - header[2])
+            throw std::invalid_argument("truncated packed NINT router streams");
     }
     const bool folded = router_logits != nullptr && tokens == 1 && route_groups == nullptr &&
         impl_->experts <= 4096 && router_logits->dtype() == mlx::core::float16 &&
@@ -11270,6 +11328,7 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
         .dtype = mlx::core::float16,
         .shared_gate_dtype = shared_gate.dtype(),
         .shared_gate_is_logits = shared_gate_is_logits,
+        .shared_router_group_size = shared_router_group_size,
         .packed_gate_up = packed_gate_up,
         .route_groups = route_groups != nullptr,
         .folded_topk = folded,

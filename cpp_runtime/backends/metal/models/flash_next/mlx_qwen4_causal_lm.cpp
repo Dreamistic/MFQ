@@ -868,7 +868,7 @@ public:
                 shared_gate_.dense_weight_ref();
             if (gate_up != nullptr && down != nullptr &&
                 shared_gate_up != nullptr && shared_down != nullptr) {
-                auto shared_gate_input = shared_gate_weight != nullptr
+                auto shared_gate_input = packed_shared_gate_ ? *packed_shared_gate_ : shared_gate_weight != nullptr
                     ? *shared_gate_weight
                     : shared_gate_logits.emplace(shared_gate_(source));
                 if (auto fused = gate_up->decode_nint_shared(
@@ -1198,6 +1198,9 @@ private:
           expert_cache_layer_(expert_cache_layer) {
         const bool cached = static_cast<bool>(ssd_expert_cache_)
             || static_cast<bool>(mfe_offload_cache_);
+        if (shared_.nint_gate_up_pair_ref())
+            if (const auto* weight = shared_gate_.nint_weight_ref())
+                packed_shared_gate_ = pack_nint_single_row(*weight);
         if (gate_up_.has_value() != down_.has_value() ||
             gate_up_.has_value() == cached
             || (ssd_expert_cache_ && mfe_offload_cache_)) {
@@ -1250,6 +1253,7 @@ private:
     MlxLinear router_;
     DenseFfn shared_;
     MlxLinear shared_gate_;
+    std::optional<array> packed_shared_gate_;
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache_;
     std::string gate_name_;
