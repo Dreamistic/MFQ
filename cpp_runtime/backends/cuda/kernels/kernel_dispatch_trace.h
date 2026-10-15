@@ -18,7 +18,14 @@ inline void record(cudaStream_t stream,const char* label,const void* expected,co
     if(!enabled())return;
     cudaStreamCaptureStatus status{};unsigned long long id=0;cudaGraph_t graph=nullptr;
     const cudaGraphNode_t* dependencies=nullptr;size_t count=0;
-    if(cudaStreamGetCaptureInfo_v2(stream,&status,&id,&graph,&dependencies,&count)!=cudaSuccess ||
+    // CUDA 13 folded the versioned capture queries into the unversioned API
+    // and added an edge-data output before the dependency count.
+#if CUDART_VERSION >= 13000
+    const auto capture_result=cudaStreamGetCaptureInfo(stream,&status,&id,&graph,&dependencies,nullptr,&count);
+#else
+    const auto capture_result=cudaStreamGetCaptureInfo_v2(stream,&status,&id,&graph,&dependencies,&count);
+#endif
+    if(capture_result!=cudaSuccess ||
         status!=cudaStreamCaptureStatusActive || count!=1)return;
     cudaGraphNodeType kind{};
     if(cudaGraphNodeGetType(dependencies[0],&kind)!=cudaSuccess || kind!=cudaGraphNodeTypeKernel)return;

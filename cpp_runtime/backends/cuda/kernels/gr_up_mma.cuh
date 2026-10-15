@@ -45,12 +45,12 @@ __global__ void __launch_bounds__(128,6) gated_residual_up_mma_kernel(
             mhc_write(injection,tid,mhc_activated(sum,injection_half,Streams,true),injection_half);
         }
     }
-    __shared__ float local_low[LocalPrepare?Rank:1];
-    __shared__ __align__(16) int8_t local_planes[LocalPrepare?3*Elements:1];
-    __shared__ float2 local_scales[LocalPrepare?Groups:1];
-    __shared__ int4 local_sums[LocalPrepare?Groups:1];
     GrTwoPlane q=prepared;
     if constexpr(LocalPrepare) {
+        __shared__ float local_low[Rank];
+        __shared__ __align__(16) int8_t local_planes[3*Elements];
+        __shared__ float2 local_scales[Groups];
+        __shared__ int4 local_sums[Groups];
         static_assert(Rows==1);
         for(int row=tid;row<Rank;row+=128) {
             float sum=down_splits==1?parts[row]:0.f;

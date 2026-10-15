@@ -11,6 +11,7 @@
 // Canonical NINT routed projection reuses nint_matmul_kernel from
 // nint_matmul.cu; q/k metadata does not create an MFE-specific compute kernel.
 
+#include <math_constants.h>
 #include <cuda_fp16.h>
 #include "mfq_tensor_backend.h"
 #include <cuda_runtime.h>
@@ -177,7 +178,7 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
     }
 
     const scalar_t * row_logits = logits + static_cast<size_t>(row) * experts;
-    float softmax_max = -INFINITY;
+    float softmax_max = -CUDART_INF_F;
     if (!use_sigmoid && !use_sqrt_softplus && !delayed_softmax) {
         for (int expert = lane; expert < experts; expert += kWarpSize) {
             float value = load_float(row_logits, expert);
@@ -205,8 +206,8 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
     }
 
     for (int rank = 0; rank < top_k; ++rank) {
-        float best_score = -INFINITY;
-        float best_weight = -INFINITY;
+        float best_score = -CUDART_INF_F;
+        float best_weight = -CUDART_INF_F;
         int best_expert = INT_MAX;
 
         for (int expert = lane; expert < experts; expert += kWarpSize) {
@@ -267,7 +268,7 @@ __global__ void __launch_bounds__(128) moe_topk_kernel(
         ? weights[static_cast<size_t>(row) * top_k + lane]
         : 0.0f;
     if (delayed_softmax) {
-        float selected_max = lane < top_k ? value : -INFINITY;
+        float selected_max = lane < top_k ? value : -CUDART_INF_F;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             selected_max = fmaxf(
@@ -318,7 +319,7 @@ __global__ void __launch_bounds__(128) moe_topk_cached_kernel(
     }
 
     const scalar_t * row_logits = logits + static_cast<size_t>(row) * experts;
-    float softmax_max = -INFINITY;
+    float softmax_max = -CUDART_INF_F;
     if (!use_sigmoid && !use_sqrt_softplus && !delayed_softmax) {
         for (int expert = lane; expert < experts; expert += kWarpSize) {
             float value = load_float(row_logits, expert);
@@ -365,8 +366,8 @@ __global__ void __launch_bounds__(128) moe_topk_cached_kernel(
     }
 
     for (int rank = 0; rank < top_k; ++rank) {
-        float best_score = -INFINITY;
-        float best_weight = -INFINITY;
+        float best_score = -CUDART_INF_F;
+        float best_weight = -CUDART_INF_F;
         int best_expert = INT_MAX;
 
 #pragma unroll
@@ -412,7 +413,7 @@ __global__ void __launch_bounds__(128) moe_topk_cached_kernel(
         ? weights[static_cast<size_t>(row) * top_k + lane]
         : 0.0f;
     if (delayed_softmax) {
-        float selected_max = lane < top_k ? value : -INFINITY;
+        float selected_max = lane < top_k ? value : -CUDART_INF_F;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             selected_max = fmaxf(
@@ -483,7 +484,7 @@ __global__ void __launch_bounds__(32) moe_topk_1x128_8_kernel(
             }
         }
         if (lane == (best_expert & 31)) {
-            values[best_expert >> 5] = -INFINITY;
+            values[best_expert >> 5] = -CUDART_INF_F;
         }
         if (lane == rank) {
             selected = best;
@@ -491,7 +492,7 @@ __global__ void __launch_bounds__(32) moe_topk_1x128_8_kernel(
         }
     }
 
-    float selected_max = lane < 8 ? selected : -INFINITY;
+    float selected_max = lane < 8 ? selected : -CUDART_INF_F;
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         selected_max = fmaxf(
@@ -544,7 +545,7 @@ __global__ void __launch_bounds__(256) moe_topk_1x256_8_kernel(
 
     if (tid < 32) {
         float value = tid < 8 ? scores[tid] : 0.0f;
-        float selected_max = tid < 8 ? value : -INFINITY;
+        float selected_max = tid < 8 ? value : -CUDART_INF_F;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             selected_max = fmaxf(

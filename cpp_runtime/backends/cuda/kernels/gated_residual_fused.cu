@@ -222,26 +222,26 @@ __global__ void gated_residual_norm_kernel(MhcInput input,void* updated,void* no
     }
     if constexpr(StatsOnly) {
         if(tid==0)saved_inverse[size_t(sample)*input.streams+blockIdx.x]=inverse[blockIdx.x];
-        return;
-    }
-    for(int s=int(blockIdx.x);s<=int(blockIdx.x);++s) {
-    #pragma unroll unroll_columns
-    for(int item=0;item<(CacheUpdated?10:(input.hidden+255-tid)/256);++item) {
-        const int column=tid+256*item;
-        const size_t at=(size_t(sample)*input.streams+s)*input.hidden+column;
-        const float value=CacheUpdated?cached[item]:mhc_updated(input,sample,s,column);
-        mhc_write(updated,at,value,input.output_half);
-        const float norm_value=mhc_round(__fmul_rn(__fmul_rn(value,inverse[s]),__fadd_rn(input.norm[s*input.hidden+column],1.f)),input.output_half);
-        mhc_write(normalized,at,norm_value,input.output_half);
-        if(promoted_normalized)promoted_normalized[at]=norm_value;
-    }
-    }
+    }else {
+        for(int s=int(blockIdx.x);s<=int(blockIdx.x);++s) {
+        #pragma unroll unroll_columns
+        for(int item=0;item<(CacheUpdated?10:(input.hidden+255-tid)/256);++item) {
+            const int column=tid+256*item;
+            const size_t at=(size_t(sample)*input.streams+s)*input.hidden+column;
+            const float value=CacheUpdated?cached[item]:mhc_updated(input,sample,s,column);
+            mhc_write(updated,at,value,input.output_half);
+            const float norm_value=mhc_round(__fmul_rn(__fmul_rn(value,inverse[s]),__fadd_rn(input.norm[s*input.hidden+column],1.f)),input.output_half);
+            mhc_write(normalized,at,norm_value,input.output_half);
+            if(promoted_normalized)promoted_normalized[at]=norm_value;
+        }
+        }
 
-    if(prepared_right && blockIdx.x==0 && blockIdx.y==0) {
-        const char* address=reinterpret_cast<const char*>(prepared_right);
-        const size_t bytes=size_t(input.hidden)*input.streams*input.streams*sizeof(float);
-        for(size_t at=size_t(tid)*128;at<bytes;at+=size_t(blockDim.x)*128)
-            asm volatile("prefetch.global.L2 [%0];" :: "l"(address+at));
+        if(prepared_right && blockIdx.x==0 && blockIdx.y==0) {
+            const char* address=reinterpret_cast<const char*>(prepared_right);
+            const size_t bytes=size_t(input.hidden)*input.streams*input.streams*sizeof(float);
+            for(size_t at=size_t(tid)*128;at<bytes;at+=size_t(blockDim.x)*128)
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(address+at));
+        }
     }
 }
 
@@ -434,9 +434,6 @@ __global__ void __launch_bounds__(256,PlaneCount>0?4:1) gated_residual_down_kern
         if(promoted_normalized)promoted_normalized[at]=norm_value;
     }
     const size_t base=size_t(sample)*(down.outputs*down_splits+inject.outputs*injection_splits);
-    __shared__ __align__(16) int8_t activation_codes[PlaneCount?2*32*48:1];
-    __shared__ float2 activation_scales[PlaneCount?32:1];
-    __shared__ int4 activation_sums[PlaneCount?32:1];
     {
         if constexpr(PlaneCount>0) {
             for(int column=begin_column+tid;column<end_column;column+=256) {
@@ -455,6 +452,9 @@ __global__ void __launch_bounds__(256,PlaneCount>0?4:1) gated_residual_down_kern
         __syncthreads();
         GrTwoPlane q{};
         if constexpr(PlaneCount>0) {
+            __shared__ __align__(16) int8_t activation_codes[2*32*48];
+            __shared__ float2 activation_scales[32];
+            __shared__ int4 activation_sums[32];
             static_assert(FixedGroup==48 && PlaneCount==8);
             q={activation_codes,nullptr,activation_codes+32*48,activation_scales,activation_sums};
             MhcMatrix local{};local.width=end_column-begin_column;local.groups=last-first;

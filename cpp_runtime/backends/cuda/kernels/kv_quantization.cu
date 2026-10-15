@@ -1,3 +1,4 @@
+#include <math_constants.h>
 #include "mfq_cuda_kv_quantization.h"
 
 #include <algorithm>
@@ -162,7 +163,7 @@ template<int W,bool use_hot=false> __global__ void attention_kernel(const float*
         for(int i=0;i<N;++i){float other=__shfl_xor_sync(0xffffffff,q[i],stride);q[i]=lane&stride?other-q[i]:q[i]+other;}
     for(int stride=1;stride<N;stride*=2){float next[N];for(int i=0;i<N;++i){float a=q[i&~stride],b=q[i|stride];next[i]=i&stride?a-b:a+b;}for(int i=0;i<N;++i)q[i]=next[i];}
     for(int i=0;i<N;++i)q[i]*=rsqrtf(float(W));
-    float maximum=-INFINITY,mass=0;
+    float maximum=-CUDART_INF_F,mass=0;
     const int end=selected?slots: ::min(slots,::max(0,visible));
     for(int start=part*span;start<min((part+1)*span,end);start+=TILE) {
         for(int at=tid;at<TILE*W;at+=SG*32) {
@@ -182,7 +183,7 @@ template<int W,bool use_hot=false> __global__ void attention_kernel(const float*
         for(int j=0;j<TILE;++j) {
             float score=0;
             for(int i=0;i<N;++i)if(lane+i*32<W)score+=q[i]*kt[j*W+lane+i*32];
-            score=warp_sum(score);scores[j]=ids[j]>=0?score*scale:-INFINITY;top=fmaxf(top,scores[j]);
+            score=warp_sum(score);scores[j]=ids[j]>=0?score*scale:-CUDART_INF_F;top=fmaxf(top,scores[j]);
         }
         const float factor=::isfinite(maximum)?expf(maximum-top):0.f;
         mass*=factor;
@@ -202,7 +203,7 @@ __global__ void attention_output(const float* partial,const float* stats,const f
     const int lane=threadIdx.x,row=blockIdx.x;
     __shared__ float factors[32],norm,work[1024];
     if(lane<32) {
-        float top=lane<parts?stats[(int64_t(row)*parts+lane)*2]:-INFINITY;top=warp_max(top);
+        float top=lane<parts?stats[(int64_t(row)*parts+lane)*2]:-CUDART_INF_F;top=warp_max(top);
         float mass=0;
         if(lane<parts){int64_t at=(int64_t(row)*parts+lane)*2;float f=::isfinite(stats[at])?expf(stats[at]-top):0.f;factors[lane]=f;mass=f*stats[at+1];}
         mass=warp_sum(mass);if(lane==0)norm=mass;

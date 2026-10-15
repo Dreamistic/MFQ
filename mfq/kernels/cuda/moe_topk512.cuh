@@ -1,4 +1,5 @@
 #pragma once
+#include <math_constants.h>
 // 512-expert, top-10, unbiased softmax routing. Keep MFQ's original
 // per-lane summation and shuffle-down normalization order.
 template <typename scalar_t, bool Sorted, bool Redux=false>
@@ -10,7 +11,7 @@ __global__ void __launch_bounds__(32) topk512_specialized_kernel(
     ids += size_t(blockIdx.x) * 10;
     weights += size_t(blockIdx.x) * 10;
     float values[16];
-    float maximum = -INFINITY;
+    float maximum = -CUDART_INF_F;
 #pragma unroll
     for (int slot = 0; slot < 16; ++slot) {
         float raw = load_float(logits, lane + slot * 32);
@@ -31,7 +32,7 @@ __global__ void __launch_bounds__(32) topk512_specialized_kernel(
         values[slot] /= sum;
         expert_ids[slot] = lane + slot * 32;
         if constexpr (Sorted) {
-            if (isnan(values[slot])) { values[slot] = -INFINITY; expert_ids[slot] = INT_MAX; }
+            if (isnan(values[slot])) { values[slot] = -CUDART_INF_F; expert_ids[slot] = INT_MAX; }
         }
     }
     if constexpr (Sorted) {
@@ -59,7 +60,7 @@ __global__ void __launch_bounds__(32) topk512_specialized_kernel(
     float selected = 0.0f;
 #pragma unroll 1
     for (int rank = 0; rank < 10; ++rank) {
-        float best = -INFINITY;
+        float best = -CUDART_INF_F;
         int expert = INT_MAX;
         if constexpr (Sorted) { best = values[0]; expert = expert_ids[0]; }
         else {
@@ -99,12 +100,12 @@ __global__ void __launch_bounds__(32) topk512_specialized_kernel(
                 for (int slot = 0; slot < 15; ++slot) {
                     values[slot] = values[slot + 1]; expert_ids[slot] = expert_ids[slot + 1];
                 }
-                values[15] = -INFINITY; expert_ids[15] = INT_MAX;
+                values[15] = -CUDART_INF_F; expert_ids[15] = INT_MAX;
             }
         } else {
 #pragma unroll
             for (int slot = 0; slot < 16; ++slot) {
-                if (expert == lane + slot * 32) values[slot] = -INFINITY;
+                if (expert == lane + slot * 32) values[slot] = -CUDART_INF_F;
             }
         }
     }
