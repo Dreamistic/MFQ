@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <limits>
 #include <cassert>
+#include <cstdlib>
+#include <cuda_fp16.h>
 
 namespace mfq::cuda {
 namespace tb=mfq_tensor_backend;
@@ -64,6 +66,81 @@ template<class Word> __global__ void gather_exclusive(Word* out,const Word* keys
     for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<int64_t(count)*heads*width;i+=int64_t(blockDim.x)*gridDim.x) {
         const int row=int(i/width)%count,head=int(i/(int64_t(count)*width)),col=int(i%width),slot=mapping[row];
         out[i]=slot>=0?keys[(int64_t(head)*cells+slot)*width+col]:cold[(int64_t(head)*cold_cells+cold_map[row])*width+col];
+    }
+}
+
+template<class Word> __global__ void append_exclusive_decode(
+        const void* input_k,const void* input_v,Word* keys,Word* values,Word* cold_keys,Word* cold_values,
+        const int64_t* positions,int count,int cells,int cold_cells,int maximum,int heads,int kw,int vw,
+        int64_t khs,int64_t kts,int64_t vhs,int64_t vts,int32_t* mapping,int32_t* ids,Stamp* epochs,
+        int32_t* cold_map,int32_t* free_rows,int32_t* free_gpu,int32_t* control,Stamp* hot_control,
+        const void* index_rows,void* index_storage,int index_width,int64_t index_stride,
+        bool index_input_half,bool index_output_half,bool begin_prepare,bool float_keys,bool float_values) {
+    __shared__ int slots[32],old_rows[32],cold_rows[32];
+    const int tid=threadIdx.x;
+    const int team=count==1?128:count==2?64:32;
+    const int lane=tid&(team-1),worker=tid/team;
+    // The graph serializes users of this cache. Plan all rewritten rows first,
+    // then reserve disjoint slots; no per-row global atomic or grid barrier.
+    if(tid==0) {
+        int free_count=control[1],gpu_count=control[2],next_cold=control[0];
+        Stamp cursor=hot_control[1];
+        for(int i=0;i<count;++i) {
+            const int row=int(positions[i]);assert(row>=0 && row<maximum);
+            const int slot=mapping[row],cold=cold_map[row];
+            if(slot>=0){ids[slot]=-1;free_gpu[gpu_count++]=slot;}
+            if(cold>=0)free_rows[free_count++]=cold;
+            mapping[row]=-1;cold_map[row]=-1;
+        }
+        for(int i=0;i<count;++i) {
+            int slot=-1,row=-1,cold=-1;
+            if(gpu_count>0)slot=free_gpu[--gpu_count];
+            else {
+                for(int attempt=0;attempt<cells;++attempt) {
+                    const int candidate=int(cursor++%Stamp(cells));
+                    if(ids[candidate]>=0){slot=candidate;row=ids[slot];break;}
+                }
+                assert(slot>=0);
+            }
+            ids[slot]=-2;
+            if(row>=0) {
+                cold=free_count>0?free_rows[--free_count]:next_cold++;
+                assert(cold<cold_cells);
+            }
+            slots[i]=slot;old_rows[i]=row;cold_rows[i]=cold;
+        }
+        control[0]=next_cold;control[1]=free_count;control[2]=gpu_count;hot_control[1]=cursor;
+        if(begin_prepare){++hot_control[0];hot_control[2]=0;hot_control[6]=positions[count-1]<cells;}
+    }
+    __syncthreads();
+    for(int i=worker;i<count;i+=blockDim.x/team) {
+        const int slot=slots[i],cold=cold_rows[i];
+        for(int x=lane;x<heads*kw;x+=team) {
+            const int head=x/kw,col=x%kw;const auto at=(int64_t(head)*cells+slot)*kw+col;
+            if(old_rows[i]>=0)cold_keys[(int64_t(head)*cold_cells+cold)*kw+col]=keys[at];
+            const auto from=head*khs+i*kts+col;
+            keys[at]=float_keys?Word(__half_as_ushort(__float2half_rn(static_cast<const float*>(input_k)[from]))):
+                static_cast<const Word*>(input_k)[from];
+        }
+        for(int x=lane;x<heads*vw;x+=team) {
+            const int head=x/vw,col=x%vw;const auto at=(int64_t(head)*cells+slot)*vw+col;
+            if(old_rows[i]>=0)cold_values[(int64_t(head)*cold_cells+cold)*vw+col]=values[at];
+            const auto from=head*vhs+i*vts+col;
+            values[at]=float_values?Word(__half_as_ushort(__float2half_rn(static_cast<const float*>(input_v)[from]))):
+                static_cast<const Word*>(input_v)[from];
+        }
+        for(int col=lane;col<index_width;col+=team) {
+            const auto from=i*index_stride+col,to=positions[i]*index_width+col;
+            const float value=index_input_half?__half2float(static_cast<const __half*>(index_rows)[from]):
+                static_cast<const float*>(index_rows)[from];
+            if(index_output_half)static_cast<__half*>(index_storage)[to]=__float2half_rn(value);
+            else static_cast<float*>(index_storage)[to]=value;
+        }
+    }
+    __syncthreads();
+    if(tid==0)for(int i=0;i<count;++i) {
+        if(old_rows[i]>=0){cold_map[old_rows[i]]=cold_rows[i];mapping[old_rows[i]]=-1;}
+        const int row=int(positions[i]),slot=slots[i];mapping[row]=slot;ids[slot]=row;epochs[slot]=0;
     }
 }
 __global__ void begin(Stamp* control,const int64_t* positions,int tokens,int cells,bool skip_small) {
@@ -191,6 +268,7 @@ void HotKvCache::set_cold_storage(const tb::Tensor& k,const tb::Tensor& v) {
 }
 void HotKvCache::append(const tb::Tensor& k,const tb::Tensor& v,const tb::Tensor& positions) {
     MFQ_RUNTIME_CHECK(exclusive() && k.size(2)==positions.numel() && v.size(2)==positions.numel(),"exclusive KV append geometry mismatch");
+    if(append_decode(k,v,positions))return;
     auto source_k=k.contiguous(),source_v=v.contiguous(),pos=positions.to(tb::kInt64).contiguous();
     const int count=int(pos.numel()),cells=int(keys.size(2)),cold_cells=int(cold_keys.size(2)),heads=int(keys.size(1)),kw=int(keys.size(3)),vw=int(values.size(3));
     if(!count)return;
@@ -211,6 +289,50 @@ void HotKvCache::append(const tb::Tensor& k,const tb::Tensor& v,const tb::Tensor
     if(keys.element_size()==2){MFQ_APPEND_EXCLUSIVE(uint16_t);}else{MFQ_APPEND_EXCLUSIVE(uint32_t);}
     #undef MFQ_APPEND_EXCLUSIVE
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
+bool HotKvCache::append_decode(const tb::Tensor& k,const tb::Tensor& v,const tb::Tensor& positions,
+        const tb::Tensor& index_rows,const tb::Tensor& index_storage,bool begin_prepare) {
+    const auto* option=std::getenv("MFQ_KV_APPEND_FUSED");
+    if((option && option[0]=='0') || !exclusive() || positions.numel()<1 || positions.numel()>32 ||
+        positions.numel()>keys.size(2) || positions.scalar_type()!=tb::kInt64 || !positions.is_contiguous())return false;
+    if(!option && positions.numel()>8)return false;
+    const int count=int(positions.numel()),cells=int(keys.size(2)),cold_cells=int(cold_keys.size(2)),heads=int(keys.size(1)),
+        kw=int(keys.size(3)),vw=int(values.size(3));
+    const auto compatible=[&](const tb::Tensor& source,const tb::Tensor& target,int width) {
+        return source.is_cuda() && source.device()==target.device() && source.dim()==4 && source.size(0)==1 &&
+            source.size(1)==heads && source.size(2)==count && source.size(3)==width && source.stride(3)==1 &&
+            (source.scalar_type()==target.scalar_type() ||
+                (source.scalar_type()==tb::kFloat32 && target.scalar_type()==tb::kFloat16));
+    };
+    if(!compatible(k,keys,kw) || !compatible(v,values,vw) || positions.device()!=keys.device())return false;
+    int index_width=0;
+    if(index_rows.defined() || index_storage.defined()) {
+        const auto numeric=[](const tb::Tensor& t){return t.scalar_type()==tb::kFloat16 || t.scalar_type()==tb::kFloat32;};
+        if(!index_rows.defined() || !index_storage.defined() || !numeric(index_rows) || !numeric(index_storage) ||
+            index_rows.device()!=keys.device() || index_storage.device()!=keys.device() || index_rows.dim()!=3 ||
+            index_storage.dim()!=3 || index_rows.size(0)!=1 || index_storage.size(0)!=1 || index_rows.size(1)!=count ||
+            index_storage.size(1)!=mapping.numel() || index_rows.size(2)!=index_storage.size(2) ||
+            index_rows.stride(2)!=1 || !index_storage.is_contiguous())return false;
+        index_width=int(index_rows.size(2));
+    }
+    const auto launch=[&](auto word) {
+        using Word=decltype(word);
+        append_exclusive_decode<<<1,128,0,mfq_current_cuda_stream()>>>(
+            k.data_ptr(),v.data_ptr(),
+            static_cast<Word*>(keys.data_ptr()),static_cast<Word*>(values.data_ptr()),
+            static_cast<Word*>(cold_keys.data_ptr()),static_cast<Word*>(cold_values.data_ptr()),positions.data_ptr<int64_t>(),
+            count,cells,cold_cells,int(mapping.numel()),heads,kw,vw,k.stride(1),k.stride(2),v.stride(1),v.stride(2),
+            mapping.data_ptr<int32_t>(),slot_ids.data_ptr<int32_t>(),reinterpret_cast<Stamp*>(epochs.data_ptr()),
+            cold_mapping.data_ptr<int32_t>(),free_cold.data_ptr<int32_t>(),free_gpu.data_ptr<int32_t>(),
+            cold_control.data_ptr<int32_t>(),reinterpret_cast<Stamp*>(control.data_ptr()),
+            index_width?index_rows.data_ptr():nullptr,index_width?index_storage.data_ptr():nullptr,index_width,
+            index_width?index_rows.stride(1):0,index_width && index_rows.scalar_type()==tb::kFloat16,
+            index_width && index_storage.scalar_type()==tb::kFloat16,begin_prepare,
+            k.scalar_type()==tb::kFloat32 && keys.scalar_type()==tb::kFloat16,
+            v.scalar_type()==tb::kFloat32 && values.scalar_type()==tb::kFloat16);
+    };
+    if(keys.element_size()==2)launch(uint16_t{});else if(keys.element_size()==4)launch(uint32_t{});else return false;
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();return true;
 }
 std::pair<tb::Tensor,tb::Tensor> HotKvCache::gather(int64_t count) const {
     MFQ_RUNTIME_CHECK(exclusive() && count>0 && count<=mapping.numel(),"invalid exclusive KV read");
@@ -267,7 +389,7 @@ void HotKvCache::publish(const tb::Tensor& source_keys,const tb::Tensor& source_
 }
 
 void HotKvCache::prepare(const tb::Tensor& source_keys,const tb::Tensor& source_values,
-        const tb::Tensor& selected,const tb::Tensor& positions,int64_t columns,bool skip_small_prefix) {
+        const tb::Tensor& selected,const tb::Tensor& positions,int64_t columns,bool skip_small_prefix,bool epoch_ready) {
     if(!defined())return;
     MFQ_RUNTIME_CHECK(source_keys.is_contiguous() && source_values.is_contiguous() && source_keys.size(0)==1 &&
         source_keys.size(2)==mapping.numel() && source_keys.scalar_type()==keys.scalar_type() &&
@@ -278,12 +400,12 @@ void HotKvCache::prepare(const tb::Tensor& source_keys,const tb::Tensor& source_
     MFQ_RUNTIME_CHECK(count>0 && columns<=mapping.numel() &&
         (!indices.defined() || (indices.size(0)==1 && indices.dim()==3)),"invalid resident KV selection");
     auto* meta=reinterpret_cast<Stamp*>(control.data_ptr());
-    begin<<<1,1,0,mfq_current_cuda_stream()>>>(meta,boundaries.defined()?boundaries.data_ptr<int64_t>():nullptr,
-        boundaries.defined()?int(boundaries.numel()):0,int(keys.size(2)),skip_small_prefix);
     const int blocks=int(std::min<int64_t>(65535,(count+255)/256));
+    if(!epoch_ready)begin<<<1,1,0,mfq_current_cuda_stream()>>>(meta,boundaries.defined()?boundaries.data_ptr<int64_t>():nullptr,
+        boundaries.defined()?int(boundaries.numel()):0,int(keys.size(2)),skip_small_prefix);
     mark_rows<int32_t,int64_t><<<blocks,256,0,mfq_current_cuda_stream()>>>(
         indices.defined()?indices.data_ptr<int32_t>():nullptr,boundaries.defined()?boundaries.data_ptr<int64_t>():nullptr,
-        count,int(columns),boundaries.defined()?int(boundaries.numel()):0,int(mapping.numel()),mapping.data_ptr<int32_t>(),
+        count,int(keys.size(2)),boundaries.defined()?int(boundaries.numel()):0,int(mapping.numel()),mapping.data_ptr<int32_t>(),
         slot_ids.data_ptr<int32_t>(),reinterpret_cast<Stamp*>(requested.data_ptr()),reinterpret_cast<Stamp*>(epochs.data_ptr()),
         queue.data_ptr<int32_t>(),meta);
     const int grid=int(std::min<int64_t>(128,(std::min<int64_t>(count,mapping.numel())+3)/4));

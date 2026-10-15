@@ -48,15 +48,29 @@ void large_window() {
 }
 int main(int argc,char** argv)try {
     const bool mapped_rows=argc==2 && std::string(argv[1])=="--mapped-rows";
-    if(mapped_rows) {
+    const bool device_rows=argc==2 && std::string(argv[1])=="--device-rows";
+    if(mapped_rows || device_rows) {
 #ifdef _WIN32
-        _putenv_s("MFQ_PLE_MAPPED_ROWS","1");
+        _putenv_s("MFQ_PLE_MAPPED_ROWS",mapped_rows?"1":"0");
 #else
-        setenv("MFQ_PLE_MAPPED_ROWS","1",1);
+        setenv("MFQ_PLE_MAPPED_ROWS",mapped_rows?"1":"0",1);
 #endif
     }
-    const auto stream=mfq_current_cuda_stream();
-    auto context=mfq::cuda::default_context(mfq_current_cuda_device());context->begin_graph_pool(stream);
+    // Hold the context before borrowing its raw stream. current_stream()'s
+    // temporary owner otherwise destroys a freshly created context here;
+    // the usual driver often reuses the handle, hiding the stale stream.
+    auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
+    if(!std::getenv("MFQ_PLE_MAPPED_ROWS")) {
+        auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
+        auto table=std::make_shared<mfq::NintRows>(fixture->blob.data(),fixture->blob.size());
+        NintRowPipeline pipeline({table});const tb::Device device{tb::kCUDA,0};
+        if(!pipeline.make_stage({1,1,4},device)->mapped_rows() ||
+           !pipeline.make_stage({1,6,4},device)->mapped_rows() ||
+           pipeline.make_stage({1,32,4},device)->mapped_rows() ||
+           pipeline.make_stage({1,6,256},device)->mapped_rows())
+            throw std::runtime_error("PLE automatic packet policy changed");
+    }
     if(argc==2 && std::string(argv[1])=="--large-window") {
         large_window();context->end_graph_pool(stream);return 0;
     }
@@ -168,9 +182,11 @@ int main(int argc,char** argv)try {
             throw std::runtime_error("PLE recovery retained incomplete row data");
         ++recoveries;
     }
-    large_window();
+    // The 12K-node submission stress is checked separately without kernel
+    // instrumentation; retain all row correctness/recovery cases in memcheck.
+    if(!std::getenv("MFQ_PLE_TEST_SKIP_LARGE_WINDOW"))large_window();
     MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));context->end_graph_pool(stream);
     std::cout<<"MFQ PLE native row gather/cache/issue/collect PASS cases="<<cases
         <<" asynchronous graph cases="<<graph_cases<<" changed_rows="<<changed_rows
-        <<" cancel_guards="<<cancel_guards<<" recoveries="<<recoveries<<" mapped_rows="<<mapped_rows<<'\n';
+        <<" cancel_guards="<<cancel_guards<<" recoveries="<<recoveries<<" mapped_rows="<<mapped_rows<<std::endl;
 }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}

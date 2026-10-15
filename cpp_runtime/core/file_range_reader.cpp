@@ -2,6 +2,7 @@
 #include "mfq/host_parallel.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -89,6 +90,10 @@ FileRangeReader::FileRangeReader(const std::filesystem::path& path, FileReadMode
     impl_->handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
     if (impl_->handle == INVALID_HANDLE_VALUE)
         throw std::system_error(GetLastError(), std::system_category(), "open model file");
+    // Every operation owns an explicit OVERLAPPED event. The shared file-object
+    // event is unused; suppress its redundant updates across PLE I/O workers.
+    // Unsupported file systems retain their normal notification behavior.
+    (void)SetFileCompletionNotificationModes(impl_->handle,FILE_SKIP_SET_EVENT_ON_HANDLE);
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(impl_->handle, &size) || size.QuadPart < 0)
         throw std::system_error(GetLastError(), std::system_category(), "size model file");
@@ -204,6 +209,72 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
             throw std::invalid_argument("batched model-file destination is null");
     }
 #if defined(_WIN32)
+    if(impl_->mode==FileReadMode::Buffered) {
+        // Buffered reads accept the caller's exact spans. Reuse a bounded
+        // event ring per I/O worker: no per-range event/temporary allocation,
+        // and all five NINT streams can be in flight before any wait.
+        struct Events {
+            std::array<HANDLE,64> handles{};
+            ~Events(){for(auto h:handles)if(h)CloseHandle(h);}
+            HANDLE at(std::size_t i) {
+                if(!handles[i])handles[i]=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+                if(!handles[i])throw std::system_error(GetLastError(),std::system_category(),"create buffered batch event");
+                return handles[i];
+            }
+        };
+        static thread_local Events events;
+        struct Requests {
+            HANDLE file;
+            std::array<OVERLAPPED,64> native{};
+            std::array<DWORD,64> bytes{};
+            std::array<bool,64> submitted{},finished{};
+            std::size_t count=0;
+            explicit Requests(HANDLE h):file(h){}
+            ~Requests() {
+                // Even submission/short-read failures must drain every read
+                // before caller-owned destinations and OVERLAPPEDs go away.
+                for(std::size_t i=0;i<count;++i)if(submitted[i] && !finished[i]) {
+                    DWORD ignored=0;GetOverlappedResult(file,&native[i],&ignored,TRUE);
+                }
+            }
+        };
+        const auto started=std::chrono::steady_clock::now();
+        try {
+            std::size_t span_index=0,span_offset=0;
+            while(span_index<spans.size()) {
+                Requests requests(impl_->handle);
+                while(requests.count<requests.native.size() && span_index<spans.size()) {
+                    const auto& span=spans[span_index];
+                    if(span_offset==span.size){++span_index;span_offset=0;continue;}
+                    const auto i=requests.count++;
+                    const auto offset=span.offset+span_offset;
+                    auto& request=requests.native[i];
+                    request.Offset=static_cast<DWORD>(offset);request.OffsetHigh=static_cast<DWORD>(offset>>32);
+                    request.hEvent=events.at(i);
+                    // ReadFile resets this event before starting the operation.
+                    // The preceding batch was fully drained before slot reuse.
+                    requests.bytes[i]=static_cast<DWORD>(std::min<std::size_t>(span.size-span_offset,std::numeric_limits<DWORD>::max()));
+                    impl_->calls.fetch_add(1,std::memory_order_relaxed);
+                    const auto ok=ReadFile(impl_->handle,span.destination+span_offset,requests.bytes[i],nullptr,&request);
+                    const auto error=ok?ERROR_SUCCESS:GetLastError();
+                    if(!ok && error!=ERROR_IO_PENDING)throw std::system_error(error,std::system_category(),"submit buffered batch read");
+                    requests.submitted[i]=true;span_offset+=requests.bytes[i];
+                }
+                for(std::size_t i=0;i<requests.count;++i) {
+                    DWORD actual=0;
+                    const auto ok=GetOverlappedResult(impl_->handle,&requests.native[i],&actual,TRUE);
+                    requests.finished[i]=true;
+                    if(!ok)throw std::system_error(GetLastError(),std::system_category(),"complete buffered batch read");
+                    impl_->physical.fetch_add(actual,std::memory_order_relaxed);
+                    if(actual!=requests.bytes[i])throw std::runtime_error("model file truncated during buffered batch read");
+                    impl_->logical.fetch_add(actual,std::memory_order_relaxed);
+                }
+            }
+        }catch(...){impl_->errors.fetch_add(1,std::memory_order_relaxed);throw;}
+        impl_->nanos.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-started).count(),std::memory_order_relaxed);
+        return;
+    }
     struct Request {
         const Impl& owner;
         OVERLAPPED native{};

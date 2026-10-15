@@ -8,7 +8,10 @@
 #include <map>
 #include <cstdlib>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 namespace tb=mfq_tensor_backend;
 namespace {
 using RowClock=std::chrono::steady_clock;
@@ -43,7 +46,7 @@ struct NintRowStage::Impl {
     uint64_t future_ns=0,pack_ns=0,copy_api_ns=0;
     std::vector<int64_t> shape;
     mfq::cuda::HostBuffer host;
-    tb::Tensor packed,descriptors,inverse,flat,shaped;
+    tb::Tensor packet,packed,descriptors,inverse,flat,shaped;
     Impl(uint64_t identity,int64_t n,int w,std::size_t capacity,
         std::vector<int64_t> dimensions,const tb::Device& device,bool use_mapped)
         :source(identity),rows(n),width(w),payload_bytes(capacity),host_bytes(capacity+n*32),
@@ -53,6 +56,8 @@ struct NintRowStage::Impl {
         auto options=tb::TensorOptions().device(device);
         std::vector<int32_t> initial(static_cast<std::size_t>(n)*6,0);
         for(int64_t row=0;row<n;++row)initial[row*6+4]=w;
+        const auto* packed_option=std::getenv("MFQ_PLE_PACKED_UPLOAD");
+        const bool packed_upload=!packed_option || packed_option[0]!='0';
         if(mapped) {
             // The stage owns this locked host allocation until the captured
             // window and all of its readers have finished. Host publication
@@ -65,6 +70,17 @@ struct NintRowStage::Impl {
             packed=tb::from_blob(address,{static_cast<int64_t>(capacity)},options.dtype(tb::kUInt8));
             descriptors=tb::from_blob(address+capacity,{n,6},options.dtype(tb::kInt32));
             inverse=tb::from_blob(address+capacity+n*24,{n},options.dtype(tb::kInt64));
+        }else if(packed_upload) {
+            // One stable packet contains the payload, row descriptors and
+            // inverse map. All views remain alive through the stage owner.
+            std::memset(host.data(),0,host_bytes);
+            std::memcpy(static_cast<uint8_t*>(host.data())+capacity,initial.data(),initial.size()*sizeof(int32_t));
+            packet=tb::empty({static_cast<int64_t>(host_bytes)},options.dtype(tb::kUInt8));
+            auto* address=packet.data_ptr<uint8_t>();
+            packed=tb::from_blob(address,{static_cast<int64_t>(capacity)},options.dtype(tb::kUInt8));
+            descriptors=tb::from_blob(address+capacity,{n,6},options.dtype(tb::kInt32));
+            inverse=tb::from_blob(address+capacity+n*24,{n},options.dtype(tb::kInt64));
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(address,host.data(),host_bytes,cudaMemcpyHostToDevice,mfq_current_cuda_stream()));
         }else {
             packed=tb::zeros({static_cast<int64_t>(capacity)},options.dtype(tb::kUInt8));
             descriptors=tb::tensor(initial).reshape({n,6}).to(device);
@@ -97,10 +113,20 @@ struct NintRowPipeline::Impl {
     bool profile=false,serial_small=false;uint64_t serial=0;
     std::vector<int64_t> current_ids,current_shape;
     std::future<Gathered> pending;std::unique_ptr<Gathered> ready;
+    bool reuse_worker=true,active_read_pool=true,stopping=false;
+    mfq::HostParallelPool read_pool{{},false};
+    std::mutex work_mutex;
+    std::condition_variable work_ready;
+    std::packaged_task<Gathered()> work;
+    std::thread worker;
     explicit Impl(std::vector<std::shared_ptr<mfq::NintRows>> data):tables(std::move(data)) {
         const auto* trace=std::getenv("MFQ_TRACE_PLE_TIMINGS");profile=trace && trace[0]=='1';
         const auto* serial_setting=std::getenv("MFQ_PLE_SERIAL_SMALL_GATHER");
         serial_small=serial_setting && serial_setting[0]=='1';
+        const auto* worker_setting=std::getenv("MFQ_PLE_REUSE_WORKER");
+        reuse_worker=!worker_setting || worker_setting[0]!='0';
+        const auto* pool_setting=std::getenv("MFQ_PLE_ACTIVE_READ_POOL");
+        active_read_pool=!pool_setting || pool_setting[0]!='0';
         static std::atomic<uint64_t> next{1};source_id=next.fetch_add(1);
         if(tables.empty() || !tables.front())throw std::invalid_argument("MFQ PLE needs row sources");
         rows=tables.front()->rows();width=tables.front()->width();
@@ -108,6 +134,43 @@ struct NintRowPipeline::Impl {
             throw std::invalid_argument("MFQ PLE shard dimensions differ");
         if(rows*static_cast<int64_t>(tables.size())>int64_t(UINT32_MAX))throw std::overflow_error("PLE logical row cache key overflow");
         if(source_id>UINT32_MAX)throw std::overflow_error("PLE source cache identity overflow");
+    }
+    ~Impl() {
+        // A queued read owns references to this source and its row cache.
+        // Complete it before destroying either, including on failed requests.
+        {
+            std::lock_guard<std::mutex> lock(work_mutex);
+            stopping=true;
+        }
+        work_ready.notify_one();
+        if(worker.joinable())worker.join();
+        if(pending.valid())pending.wait();
+    }
+    std::future<Gathered> submit(std::vector<int64_t> ids,uint64_t sequence,RowClock::time_point issued) {
+        if(!reuse_worker)return std::async(std::launch::async,
+            [this,ids=std::move(ids),sequence,issued]{return gather(ids,sequence,issued);});
+        std::packaged_task<Gathered()> next([this,ids=std::move(ids),sequence,issued]{return gather(ids,sequence,issued);});
+        auto result=next.get_future();
+        {
+            std::lock_guard<std::mutex> lock(work_mutex);
+            // issue() consumes the preceding future before submitting again.
+            if(work.valid())throw std::logic_error("PLE source has an unconsumed row request");
+            if(!worker.joinable())worker=std::thread([this] {
+                for(;;) {
+                    std::packaged_task<Gathered()> next;
+                    {
+                        std::unique_lock<std::mutex> lock(work_mutex);
+                        work_ready.wait(lock,[this]{return stopping || work.valid();});
+                        if(!work.valid())return;
+                        next=std::move(work);
+                    }
+                    next(); // packaged_task propagates read failures to get().
+                }
+            });
+            work=std::move(next);
+        }
+        work_ready.notify_one();
+        return result;
     }
     Gathered gather(const std::vector<int64_t>& ids,uint64_t sequence,RowClock::time_point issued) {
         Gathered out;out.serial=sequence;
@@ -125,13 +188,27 @@ struct NintRowPipeline::Impl {
         const auto read_started=profile?RowClock::now():RowClock::time_point{};
         std::size_t missing_rows=0;
         for(const auto& shard:misses)missing_rows+=shard.size();
-        // A few small row reads do not justify waking the whole global pool.
-        // Large prefill gathers retain their existing parallel read path.
         const int threads=serial_small && missing_rows<=32?1:mfq_get_num_threads();
-        mfq::host_parallel_for(0,static_cast<int64_t>(tables.size()),1,threads,[&](int64_t first,int64_t last) {
-            for(auto shard=first;shard<last;++shard)if(!misses[shard].empty())
-                tables[shard]->append_rows(misses[shard].data(),misses[shard].size(),fetched[shard],1);
-        });
+        if(active_read_pool) {
+            // Decode normally misses only a few of the 128 tables. Give each
+            // active shard its own work item instead of partitioning empty
+            // shards too. Finish when the reads finish; sleeping workers do
+            // not own the callback and need not acknowledge an empty slice.
+            std::vector<std::size_t> active;
+            for(std::size_t shard=0;shard<misses.size();++shard)
+                if(!misses[shard].empty())active.push_back(shard);
+            read_pool.run(0,static_cast<int64_t>(active.size()),1,threads,[&](int64_t first,int64_t last) {
+                for(auto i=first;i<last;++i) {
+                    const auto shard=active[i];
+                    tables[shard]->append_rows(misses[shard].data(),misses[shard].size(),fetched[shard],1);
+                }
+            });
+        }else {
+            mfq::host_parallel_for(0,static_cast<int64_t>(tables.size()),1,threads,[&](int64_t first,int64_t last) {
+                for(auto shard=first;shard<last;++shard)if(!misses[shard].empty())
+                    tables[shard]->append_rows(misses[shard].data(),misses[shard].size(),fetched[shard],1);
+            });
+        }
         if(profile) {
             out.read_ns=row_elapsed(read_started);
             for(const auto& batch:fetched){out.source_bytes+=batch.source_bytes_read();out.misses+=batch.rows();}
@@ -157,7 +234,7 @@ void NintRowPipeline::issue(const std::vector<int64_t>& ids,const std::vector<in
     s.current_ids=ids;s.current_shape=shape;s.ready.reset();
     const auto issued=s.profile?RowClock::now():RowClock::time_point{};
     const auto sequence=++s.serial;
-    s.pending=std::async(std::launch::async,[&s,ids,sequence,issued]{return s.gather(ids,sequence,issued);});
+    s.pending=s.submit(ids,sequence,issued);
 }
 tb::Tensor NintRowPipeline::collect(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,const tb::Device& device) {
     auto& s=*impl_;issue(ids,shape);
@@ -181,7 +258,12 @@ std::shared_ptr<NintRowStage> NintRowPipeline::make_stage(const std::vector<int6
     if(row_bytes>std::size_t(INT_MAX)/n)throw std::overflow_error("PLE graph payload exceeds bounds");
     const auto capacity=(row_bytes*n+7)&~std::size_t(7);
     const auto* setting=std::getenv("MFQ_PLE_MAPPED_ROWS");
-    const bool mapped=setting && setting[0]=='1';
+    // Small decode packets need only a few PCIe cache lines. Reading the
+    // locked packet in the existing decoder avoids a separate DMA submission
+    // and host completion callback. Large windows keep the device upload.
+    const bool small_decode=shape.size()==3 && shape[0]==1 && shape[1]<=6 &&
+        capacity+std::size_t(n)*32<=16u*1024;
+    const bool mapped=setting?setting[0]=='1':small_decode;
     return std::shared_ptr<NintRowStage>(new NintRowStage(std::make_unique<NintRowStage::Impl>(
         s.source_id,n,s.width,capacity,shape,device,mapped)));
 }
@@ -211,8 +293,12 @@ void NintRowPipeline::upload(NintRowStage& stage,const std::vector<int64_t>& ids
     if(target.profile){target.pack_ns+=row_elapsed(point);point=RowClock::now();}
     if(target.mapped)return;
     const MfqCudaGuard guard(target.packed.device());const auto stream=mfq_current_cuda_stream();
-    MFQ_CUDA_CHECK(cudaMemcpyAsync(target.packed.data_ptr(),host,result.batch.packed_nbytes(),cudaMemcpyHostToDevice,stream));
-    MFQ_CUDA_CHECK(cudaMemcpyAsync(target.descriptors.data_ptr(),descriptors,descriptor_bytes,cudaMemcpyHostToDevice,stream));
-    MFQ_CUDA_CHECK(cudaMemcpyAsync(target.inverse.data_ptr(),inverse,result.inverse.size()*sizeof(int64_t),cudaMemcpyHostToDevice,stream));
+    if(target.packet.defined()) {
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(target.packet.data_ptr(),host,target.host_bytes,cudaMemcpyHostToDevice,stream));
+    }else {
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(target.packed.data_ptr(),host,result.batch.packed_nbytes(),cudaMemcpyHostToDevice,stream));
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(target.descriptors.data_ptr(),descriptors,descriptor_bytes,cudaMemcpyHostToDevice,stream));
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(target.inverse.data_ptr(),inverse,result.inverse.size()*sizeof(int64_t),cudaMemcpyHostToDevice,stream));
+    }
     if(target.profile)target.copy_api_ns+=row_elapsed(point);
 }

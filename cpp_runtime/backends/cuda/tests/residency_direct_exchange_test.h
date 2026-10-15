@@ -5,6 +5,23 @@
 // Seed real compressed transfer-cache fields without launching the unrelated
 // FFN consumer graph; this fixture can also run under Compute Sanitizer.
 struct MoeResidencyTestAccess {
+    static void seed_kv_refill(MoeExpertCache& cache) {
+        cache.kv_expert_loan_=std::make_shared<mfq::cuda::KvExpertLoan>();
+        auto arena=tb::zeros({16<<20},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+        cache.kv_expert_loan_->add(arena,4096,4096,false);
+        for(const auto& source:cache.sources_) {
+            const auto lease=source->quant_source_->acquire_expert(1);
+            const auto fields=moe_cache_fields(lease->weights);
+            for(std::size_t f=0;f<fields.size();++f) {
+                const auto bytes=tensor_nbytes(fields[f]);if(bytes<int64_t(mfq::cuda::KvExpertLoan::page))continue;
+                bool hit=false;
+                if(!cache.kv_expert_loan_->pin({source->id_,1,int64_t(f)},fields[f].data_ptr(),
+                        std::size_t(bytes),mfq_current_cuda_stream(),hit))
+                    throw std::runtime_error("KV refill fixture did not retain an expert field");
+            }
+        }
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
+    }
     static void seed_exchange_wire(MoeExpertCache& cache,int64_t bytes) {
         cache.pipeline_wire_gpu_=tb::full({bytes+4096},91,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
         MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
@@ -130,6 +147,8 @@ void verify_direct_exchange(const std::filesystem::path& root) {
         }
         if(!MoeResidencyTestAccess::transfer_enabled(*cache))throw std::runtime_error("direct fixture needs transfer caching");
         for(int p=0;p<cached_projections;++p)MoeResidencyTestAccess::seed(*cache,p,1);
+        const bool loan_refill=std::getenv("MFQ_TEST_RESIDENCY_KV_REFILL")!=nullptr;
+        if(loan_refill)MoeResidencyTestAccess::seed_kv_refill(*cache);
         if(defaults)MoeResidencyTestAccess::verify_defaults_guard(*cache);
         MoeHostExpertCache::Lease reader;std::atomic_bool complete=false;
         auto manager=std::make_unique<MoeResidencyManager>(cache.get(),[&](const char* event,std::size_t index) {
@@ -180,6 +199,8 @@ void verify_direct_exchange(const std::filesystem::path& root) {
         int resident=(phase=="none" || phase=="window" || phase=="prefill")?1:0;
         if(manager && resident==1 && (!manager->stats().direct_exchange_bytes || manager->stats().direct_exchange_rounds!=1))
             throw std::runtime_error("direct exchange fixture did not execute the candidate");
+        if(manager && resident==1 && loan_refill && cached_projections<3 && !manager->stats().kv_refill_bytes)
+            throw std::runtime_error("direct exchange did not reuse borrowed KV expert bytes");
         if(manager && resident==1 && batching && (cached_projections || gpu_wire) && !manager->stats().cached_copy_batches)
             throw std::runtime_error("direct exchange fixture did not batch cached refills");
         if(resident==1 && gpu_wire && cached_projections<3 && !MoeResidencyTestAccess::wire_payload_used(*cache))

@@ -66,8 +66,8 @@ int main() {
           require(bool(stream),"cannot write fixture"); }
         exercise(path,expected,mfq::FileReadMode::Buffered);
         exercise(path,expected,mfq::FileReadMode::Direct);
-        {
-            auto reader=std::make_shared<mfq::AsyncRangeReader>(path);
+        for(auto mode:{mfq::FileReadMode::Buffered,mfq::FileReadMode::Direct}) {
+            auto reader=std::make_shared<mfq::AsyncRangeReader>(path,mode);
             std::vector<std::future<void>> jobs;
             for(int client=0;client<4;++client)jobs.push_back(std::async(std::launch::async,[&,reader,client] {
                 for(int round=0;round<8;++round) {
@@ -87,6 +87,19 @@ int main() {
             const auto stats=reader->stats();require(stats.errors==0 && stats.logical_bytes>stats.physical_bytes,"MFQ did not deduplicate sector reads");
             bool invalid=false;try{reader->read({{expected.size(),expected.data(),1}});}catch(const std::out_of_range&){invalid=true;}
             require(invalid,"MFQ batch accepted a range outside the file");
+            std::vector<std::byte> many(400*4,std::byte{0x5a});
+            std::vector<mfq::ReadSpan> spans;
+            for(std::size_t i=0;i<400;++i)spans.push_back({i*127,many.data()+i*4+1,2});
+            reader->read(spans);
+            for(std::size_t i=0;i<400;++i) {
+                require(many[i*4]==std::byte{0x5a} && many[i*4+3]==std::byte{0x5a},"batched ring overwrote guards");
+                require(many[i*4+1]==expected[i*127] && many[i*4+2]==expected[i*127+1],"batched ring wrap changed bytes");
+            }
+            require(reader->stats().staging_bytes==0 && reader->stats().mode==mode,"batched read mode/staging accounting differs");
+            // All ranges are checked before any destination is modified.
+            std::byte guard{0x5a};invalid=false;
+            try{reader->read({{0,&guard,1},{expected.size(),&guard,1}});}catch(const std::out_of_range&){invalid=true;}
+            require(invalid && guard==std::byte{0x5a},"invalid batched range changed an earlier destination");
         }
         std::filesystem::remove(path);
         bool rejected=false;

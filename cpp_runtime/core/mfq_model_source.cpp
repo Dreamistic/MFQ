@@ -109,6 +109,33 @@ public:
         if(!destination)throw std::invalid_argument("mapped tensor destination is null");
         std::memcpy(destination,static_cast<const std::byte*>(view_)+prefix_+static_cast<std::size_t>(offset),size);
     }
+    void read_batch(const std::vector<ReadSpan>& spans)const {
+        // Check the complete batch before touching any destination. A failed
+        // hint is harmless: the following bounded read faults in that page.
+        for(const auto& span:spans) {
+            if(span.offset>bytes_ || span.size>bytes_-span.offset)
+                throw std::out_of_range("mapped tensor batch is out of bounds");
+            if(span.size && !span.destination)
+                throw std::invalid_argument("mapped tensor batch destination is null");
+        }
+#ifdef _WIN32
+        // Like Strata's PLE prefetch, submit the independent pages together.
+        // NINT stores q, sub-scale/min and neuron anchors in separate streams;
+        // sequential mapped reads otherwise fault those five streams in turn.
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+        ranges.reserve(std::min<std::size_t>(spans.size(),4096));
+        const auto prefetch=[&] {
+            if(!ranges.empty())(void)PrefetchVirtualMemory(GetCurrentProcess(),ranges.size(),ranges.data(),0);
+            ranges.clear();
+        };
+        for(const auto& span:spans)if(span.size) {
+            ranges.push_back({static_cast<std::byte*>(view_)+prefix_+static_cast<std::size_t>(span.offset),span.size});
+            if(ranges.size()==4096)prefetch();
+        }
+        prefetch();
+#endif
+        for(const auto& span:spans)if(span.size)read(span.offset,span.destination,span.size);
+    }
 };
 
 std::filesystem::path stable_path(const std::filesystem::path& path) {
@@ -650,8 +677,18 @@ ModelSource::TensorReader MfqModelSource::mapped_tensor_reader(std::string_view 
 bool MfqModelSource::supports_parallel_tensor_reads() const noexcept {
     return impl_->read_mode == FileReadMode::Direct;
 }
+ModelSource::TensorBatchReader MfqModelSource::mapped_tensor_batch_reader(std::string_view name) const {
+    auto found=impl_->records_by_name.find(std::string(name));
+    if(found==impl_->records_by_name.end()) {
+        const auto alias=impl_->legacy_tensor_compatibility.canonical_to_stored.find(std::string(name));
+        if(alias!=impl_->legacy_tensor_compatibility.canonical_to_stored.end())found=impl_->records_by_name.find(alias->second);
+    }
+    if(found==impl_->records_by_name.end() || impl_->records[found->second].asset)
+        throw std::runtime_error("mapped model tensor not found: "+std::string(name));
+    auto range=std::make_shared<MappedTensorRange>(impl_->records[found->second]);
+    return [range](const std::vector<ReadSpan>& spans){range->read_batch(spans);};
+}
 ModelSource::TensorBatchReader MfqModelSource::tensor_batch_reader(std::string_view name) const {
-    if(impl_->read_mode!=FileReadMode::Direct)return {};
     auto found=impl_->records_by_name.find(std::string(name));
     if(found==impl_->records_by_name.end()) {
         const auto alias=impl_->legacy_tensor_compatibility.canonical_to_stored.find(std::string(name));
@@ -663,7 +700,7 @@ ModelSource::TensorBatchReader MfqModelSource::tensor_batch_reader(std::string_v
     {
         std::lock_guard lock(impl_->pipeline_reader_mutex);
         auto& slot=impl_->pipeline_readers[record.source_path];
-        if(!slot)slot=std::make_shared<AsyncRangeReader>(record.source_path);
+        if(!slot)slot=std::make_shared<AsyncRangeReader>(record.source_path,impl_->read_mode);
         reader=slot;
     }
     return [record,reader](const std::vector<ReadSpan>& spans) {

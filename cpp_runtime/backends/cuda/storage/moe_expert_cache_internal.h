@@ -521,6 +521,11 @@ public:
                << " pipeline_dma_copies=" << stats_.pipeline_dma_copies
                << " pipeline_window_dma_copies=" << stats_.pipeline_window_dma_copies
                << " pipeline_window_dma_bytes=" << stats_.pipeline_window_dma_bytes
+               << " pipeline_window_pcie_payload_bytes=" << stats_.pipeline_window_pcie_payload_bytes
+               << " pipeline_fused_transfer_copy_serves=" << stats_.pipeline_fused_transfer_copy_serves
+               << " pipeline_empty_transfer_serves=" << stats_.pipeline_empty_transfer_serves
+               << " kv_expert_loan_hit_bytes=" << (kv_expert_loan_?kv_expert_loan_->hits():0)
+               << " kv_expert_loan_retired_bytes=" << (kv_expert_loan_?kv_expert_loan_->retired_bytes():0)
                << " pipeline_dma_graph_launches=" << stats_.pipeline_dma_graph_launches
                << " pipeline_dma_graph_fallbacks=" << stats_.pipeline_dma_graph_fallbacks
                << " pipeline_ram_registered_bytes=" << pipeline_ram_registered_bytes_
@@ -543,6 +548,25 @@ public:
                << " pipeline_fixed_gpu_timing_skips=" << stats_.pipeline_fixed_gpu_timing_skips
                << " pipeline_transfer_stream_writes=" << stats_.pipeline_transfer_stream_writes
                << " pipeline_transfer_host_callbacks=" << stats_.pipeline_transfer_host_callbacks
+               << " pipeline_transfer_event_polls=" << stats_.pipeline_transfer_event_polls
+               << " pipeline_kv_direct_read_bytes=" << stats_.pipeline_kv_direct_read_bytes
+               << " pipeline_kv_direct_read_fields=" << stats_.pipeline_kv_direct_read_fields
+               << " pipeline_kv_projection_hits=" << stats_.pipeline_kv_projection_hits
+               << " pipeline_kv_projection_misses=" << stats_.pipeline_kv_projection_misses
+               << " pipeline_kv_projection_fallbacks=" << stats_.pipeline_kv_projection_fallbacks
+               << " pipeline_kv_projection_small_hit_bytes=" << stats_.pipeline_kv_projection_small_hit_bytes
+               << " pipeline_kv_projection_early_hits=" << stats_.pipeline_kv_projection_early_hits
+               << " pipeline_kv_gpu_resident_experts=" << stats_.pipeline_kv_gpu_resident_experts
+               << " pipeline_kv_gpu_resident_bytes=" << stats_.pipeline_kv_gpu_resident_bytes
+               << " pipeline_kv_gpu_early_gu_experts=" << stats_.pipeline_kv_gpu_early_gu_experts
+               << " pipeline_reader_fence_reuses=" << stats_.pipeline_reader_fence_reuses
+               << " pipeline_host_packet_serves=" << stats_.pipeline_host_packet_serves
+               << " pipeline_host_packet_descriptor_bytes=" << stats_.pipeline_host_packet_descriptor_bytes
+               << " pipeline_cached_phase_publishes=" << stats_.pipeline_cached_phase_publishes
+               << " pipeline_kv_early_gu_serves=" << stats_.pipeline_kv_early_gu_serves
+               << " pipeline_native_dma_batches=" << stats_.pipeline_native_dma_batches
+               << " pipeline_native_dma_copies=" << stats_.pipeline_native_dma_copies
+               << " pipeline_native_dma_fallbacks=" << stats_.pipeline_native_dma_fallbacks
                << " pipeline_window_input_view_serves=" << stats_.pipeline_window_input_view_serves
                << " pipeline_gate_up_dma_bytes=" << stats_.pipeline_gate_up_dma_bytes
                << " pipeline_down_dma_bytes=" << stats_.pipeline_down_dma_bytes
@@ -575,6 +599,10 @@ public:
                << " residency_cached_copy_descriptors=" << (moe_residency_?moe_residency_->stats().cached_copy_descriptors:0)
                << " residency_cached_copy_blocks=" << (moe_residency_?moe_residency_->stats().cached_copy_blocks:0)
                << " residency_exchange_defaults=" << (moe_residency_?moe_residency_->stats().exchange_defaults:0)
+               << " residency_kv_refill_bytes=" << (moe_residency_?moe_residency_->stats().kv_refill_bytes:0)
+               << " residency_native_dma_batches=" << (moe_residency_?moe_residency_->stats().native_dma_batches:0)
+               << " residency_native_dma_copies=" << (moe_residency_?moe_residency_->stats().native_dma_copies:0)
+               << " residency_native_dma_fallbacks=" << (moe_residency_?moe_residency_->stats().native_dma_fallbacks:0)
                << " residency_expert_fence_wait_ns=" << (moe_residency_?moe_residency_->stats().expert_fence_wait_ns:0)
                << " residency_backup_submit_ns=" << (moe_residency_?moe_residency_->stats().backup_submit_ns:0)
                << " residency_refill_submit_ns=" << (moe_residency_?moe_residency_->stats().refill_submit_ns:0)
@@ -645,6 +673,7 @@ public:
                << static_cast<double>(
                     stats_.range_overlap_wait_nanoseconds) / 1.0e6
                << "\n";
+        if(moe_residency_)moe_residency_->trace_rank_summary(stream);
         print_cpu_profiles(stream);
         print_dma_profiles(stream);
         if(!pipeline_dispatch_record_path_.empty()) {

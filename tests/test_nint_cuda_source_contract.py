@@ -152,7 +152,7 @@ def test_mfe_nint_projection_fuses_glu_in_the_unified_kernel():
     assert "mfq_glu_runtime(" in NINT
     assert "FragmentC accumulators[projections]" in NINT
     assert "constexpr int projections = FusedGlu ? 2 : 1;" in NINT
-    assert "static_cast<size_t>(pair) * result_rows" in NINT
+    assert re.search(r"static_cast<size_t>\(pair\)\s*\*\s*result_rows", NINT)
     assert (
         "return forward_impl(execution, x, route, false, gelu ? 2 : 1);"
         in RUNTIME

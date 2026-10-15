@@ -867,6 +867,68 @@ static void check_exclusive_kv() {
     }
 }
 
+static void check_decode_kv_append() {
+    namespace tb=mfq_tensor_backend;
+    auto stream=mfq_get_stream_from_pool();MfqCudaStreamGuard guard(stream);
+    auto context=default_context();context->begin_graph_pool(stream.stream());
+    constexpr int maximum=96,cells=32,heads=2,width=32,iw=8;
+    const auto options=tb::TensorOptions().device(tb::kCUDA);
+    for(auto type:{tb::kFloat16,tb::kFloat32,tb::kInt32})for(auto index_type:{tb::kFloat16,tb::kFloat32})
+    for(bool cast:{false,true}) {
+        if(cast && type!=tb::kFloat16)continue;
+        auto hot=HotKvCache::allocate(heads,maximum,cells,width,width,options.dtype(type));
+        hot.set_cold_storage(tb::empty({1,heads,maximum-cells,width},options.dtype(type)),
+            tb::empty({1,heads,maximum-cells,width},options.dtype(type)));
+        // Both KV and indexer inputs retain a larger row stride.
+        auto k=tb::arange(heads*maximum*(width+8),options.dtype(tb::kFloat32)).remainder(71)
+            .reshape({1,maximum,heads,width+8}).narrow(3,0,width).permute({0,2,1,3}).to(type);
+        if(cast)k=k.to(tb::kFloat32)+.00031;
+        auto v=(k.to(tb::kFloat32)*2).to(type);
+        if(cast)v=v.to(tb::kFloat32)-.00039;
+        auto raw=tb::arange(maximum*iw*3,options.dtype(tb::kFloat32)).remainder(53)
+            .reshape({1,maximum,iw*3}).to(index_type).narrow(2,iw,iw);
+        auto stored=tb::zeros({1,maximum,iw},options.dtype(index_type==tb::kFloat16?tb::kFloat32:tb::kFloat16));
+        auto positions=tb::arange(maximum,options.dtype(tb::kInt64));
+        int begin=0;
+        for(int count:{1,2,3,4,5,6,11,32,32}) {
+            const bool fused=hot.append_decode(k.narrow(2,begin,count),v.narrow(2,begin,count),positions.narrow(0,begin,count),
+                raw.narrow(1,begin,count),stored);
+            check(fused || count>8,"short KV append did not dispatch");
+            if(!fused) {
+                hot.append(k.narrow(2,begin,count).to(type),v.narrow(2,begin,count).to(type),positions.narrow(0,begin,count));
+                stored.index_copy_(1,positions.narrow(0,begin,count),raw.narrow(1,begin,count).to(stored.scalar_type()));
+            }
+            begin+=count;
+        }
+        const auto compare=[&] {
+            auto saved=hot.gather(maximum);
+            for(const auto& pair:{std::pair{saved.first,k.to(type)},std::pair{saved.second,v.to(type)},std::pair{stored,raw.to(stored.scalar_type())}}) {
+                auto a=pair.first.contiguous().cpu(),b=pair.second.contiguous().cpu();
+                check(a.nbytes()==b.nbytes() && !std::memcmp(a.data_ptr(),b.data_ptr(),a.nbytes()),
+                    "fused KV/index append changed stored rows");
+            }
+        };
+        compare();
+        // Replay the same graph at new positions, rewriting both RAM and VRAM
+        // rows at full capacity; every cold allocation must reuse freed space.
+        auto pos=positions.narrow(0,0,6).clone();
+        auto key=k.narrow(2,0,6).contiguous(),value=v.narrow(2,0,6).contiguous();
+        auto index=raw.narrow(1,0,6).contiguous();
+        auto source_k=k.to(type).contiguous(),source_v=v.to(type).contiguous();
+        DecodeWindow window(mfq_current_cuda_stream(),false);
+        window.capture([&] {
+            check(hot.append_decode(key,value,pos,index,stored,true),"captured KV append rejected");
+            hot.prepare(source_k,source_v,pos.reshape({1,1,6}),pos,6,true,true);
+        },[]{},[]{});
+        for(int start:{0,90,31,12,60,1}) {
+            pos.copy_(positions.narrow(0,start,6));key.copy_(k.narrow(2,start,6));
+            value.copy_(v.narrow(2,start,6));index.copy_(raw.narrow(1,start,6));
+            window.run();compare();
+        }
+    }
+    context->end_graph_pool(stream.stream());
+}
+
 static void check_kv_expert_loan() {
     namespace tb=mfq_tensor_backend;
     const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8);
@@ -898,6 +960,112 @@ static void check_kv_expert_loan() {
     check(store.expert_loan_bytes()==0,"streamed KV growth did not reclaim its expert pages");
     auto recovered=store.read(block).to(tb::kCPU,tb::kFloat32).contiguous();
     for(int64_t i=0;i<recovered.numel();++i)check(recovered.data_ptr<float>()[i]==7,"streamed KV overwrote a live expert transfer");
+
+    KvExpertLoan retired;auto retirement_arena=tb::zeros({512<<10},options);
+    retired.add(retirement_arena,128,4096,true);
+    for(const auto key:{KvExpertLoan::Key{1,2,0},{1,2,1},{2,2,0},{1,3,0}})
+        check(retired.copy(key,source.data_ptr(),destination.data_ptr(),source.nbytes(),copy.get(),hit) && !hit,
+            "retirement fixture did not fill all expert pages");
+    retired.retire_expert(1,2,2);retired.retire_expert(1,2,2);
+    check(retired.bytes()==4*source.nbytes(),"promotion reclaimed an in-flight expert address");
+    // Reuse before the next publication cancels retirement for that field.
+    check(retired.pin({1,2,1},source.data_ptr(),source.nbytes(),copy.get(),hit) && hit,
+        "retired expert address vanished before its packet completed");
+    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));
+    retired.next_packet();
+    check(retired.bytes()==3*source.nbytes() && retired.retired_bytes()==source.nbytes(),
+        "promotion retirement reclaimed the wrong expert fields");
+    for(const auto key:{KvExpertLoan::Key{1,2,1},{2,2,0},{1,3,0}})
+        check(retired.pin(key,source.data_ptr(),source.nbytes(),copy.get(),hit) && hit,
+            "retirement evicted an unrelated or reused field");
+    check(retired.copy({3,4,0},source.data_ptr(),destination.data_ptr(),source.nbytes(),copy.get(),hit) && !hit,
+        "promotion did not return reusable expert pages");
+    retired.retire_expert(3,4,1);
+    retired.ensure(128);retirement_arena.zero_();
+    check(retired.bytes()==0,"KV growth did not revoke a retired expert field");
+    result=destination.cpu().contiguous();
+    for(int64_t i=0;i<result.numel();++i)check(result.data_ptr<uint8_t>()[i]==73,"retirement raced a pending expert copy");
+}
+
+static void check_kv_projection_loan() {
+    namespace tb=mfq_tensor_backend;
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8);
+    auto arena=tb::zeros({512<<10},options),source=tb::full({128<<10},73,options.device(tb::kCPU));
+    auto destination=tb::empty({128<<10},options);
+    Stream copy(0);KvExpertLoan loan;loan.add(arena,128,4096,true);
+    const std::vector<int64_t> sizes={64<<10,17,4097,0};
+    std::map<int64_t,const void*> visible;
+    int publications=0,invalidations=0;
+    loan.observe_projections(7,[&](int64_t expert,const void* pointer,const auto&) {
+        if(pointer){visible[expert]=pointer;++publications;}
+        else {visible.erase(expert);++invalidations;}
+    });
+    int uploads=0;bool hit=false;
+    std::array<std::size_t,8> existing_offsets{};std::size_t existing_bytes=0;
+    check(!loan.pin_existing_projection(7,11,sizes,existing_offsets,existing_bytes) && !loan.bytes(),
+        "lookup-only miss allocated a projection");
+    const auto fill=[&](void* pointer,const std::array<std::size_t,8>& offsets) {
+        ++uploads;
+        for(std::size_t f=0;f<sizes.size();++f)if(sizes[f])
+            MFQ_NATIVE_CUDA_CHECK(cudaMemcpyAsync(static_cast<uint8_t*>(pointer)+offsets[f],source.data_ptr(),
+                std::size_t(sizes[f]),cudaMemcpyHostToDevice,copy.get()));
+    };
+    const auto* first=loan.pin_projection(7,11,sizes,copy.get(),hit,fill);
+    check(first && !hit && uploads==1,"projection miss did not populate exactly once");
+    check(visible.empty(),"new projection became GPU-visible before its reader boundary");
+    for(std::size_t f=0;f<sizes.size();++f)if(sizes[f]) {
+        const auto* field=loan.find_for_exchange({7,11,int64_t(f)},std::size_t(sizes[f]));
+        check(field!=nullptr,"exchange could not find a compact projection field");
+        MFQ_NATIVE_CUDA_CHECK(cudaMemcpyAsync(destination.data_ptr(),field,std::size_t(sizes[f]),cudaMemcpyDeviceToDevice,copy.get()));
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));
+        auto value=destination.narrow(0,0,sizes[f]).cpu();
+        for(int64_t i=0;i<sizes[f];++i)check(value.data_ptr<uint8_t>()[i]==73,"compact metadata bytes changed");
+    }
+    check(loan.pin_projection(7,11,sizes,copy.get(),hit,fill)==first && hit && uploads==1,
+        "complete projection hit re-uploaded small metadata");
+    check(loan.pin_existing_projection(7,11,sizes,existing_offsets,existing_bytes)==first &&
+        existing_bytes==(64<<10)+17+4097 && uploads==1,"early projection hit changed bytes or staged RAM");
+    for(std::size_t f=0;f<sizes.size();++f)if(sizes[f])
+        check(static_cast<const uint8_t*>(first)+existing_offsets[f]==loan.find_for_exchange({7,11,int64_t(f)},sizes[f]),
+            "early projection offsets differ from exchange lookup");
+    bool rejected=false;auto invalid=sizes;invalid[1]=18;
+    try{loan.pin_projection(7,11,invalid,copy.get(),hit,fill);}catch(const std::logic_error&){rejected=true;}
+    check(rejected && uploads==1,"same-size projection layout mismatch was accepted");
+    rejected=false;
+    try{loan.pin_existing_projection(7,11,invalid,existing_offsets,existing_bytes);}catch(const std::logic_error&){rejected=true;}
+    check(rejected,"early projection hit ignored changed field geometry");
+    check(loan.pin_projection(7,12,sizes,copy.get(),hit,fill) && !hit,"second projection did not fit");
+    check(loan.pin_projection(7,13,sizes,copy.get(),hit,fill) && !hit,"third projection did not fit");
+    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));
+    loan.next_packet();loan.protect_packet_fields({{7,11,-1}});
+    check(publications==3 && visible.at(11)==first,"completed projections were not published at the route boundary");
+    int late_observed=0;
+    loan.observe_projections(7,[&](int64_t,const void* pointer,const auto&){late_observed+=pointer?1:-1;});
+    check(late_observed==3,"new observer missed already published projections");
+    const std::vector<int64_t> large={192<<10};
+    const auto large_fill=[&](void* pointer,const auto&) {++uploads;
+        MFQ_NATIVE_CUDA_CHECK(cudaMemsetAsync(pointer,41,192<<10,copy.get()));};
+    check(loan.pin_projection(8,1,large,copy.get(),hit,large_fill) && !hit,"projection eviction did not recover contiguous pages");
+    check(loan.pin_projection(7,11,sizes,copy.get(),hit,fill)==first && hit && uploads==4,
+        "an earlier miss evicted a protected later projection");
+    check(!loan.find_for_exchange({7,12,0},sizes[0]) && !loan.find_for_exchange({7,13,0},sizes[0]),
+          "projection LRU did not evict unprotected entries");
+    check(visible.size()==1 && invalidations==2 && late_observed==1,"evicted projections stayed GPU-visible");
+    loan.retire_expert(7,11,4);loan.retire_expert(7,11,4);
+    check(visible.empty() && invalidations==3,"retirement did not invalidate GPU eligibility exactly once");
+    check(loan.find_for_exchange({7,11,1},sizes[1])!=nullptr,"retirement freed a live compact field");
+    check(loan.pin_existing_projection(7,11,sizes,existing_offsets,existing_bytes)==first,
+          "early projection hit could not revive a deferred retirement");
+    check(visible.empty(),"revived projection was republished before its reader boundary");
+    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));loan.next_packet();
+    check(visible.at(11)==first && publications==4,"revived projection did not become visible at the next boundary");
+    loan.retire_expert(7,11,4);
+    MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));
+    loan.next_packet();check(!loan.find_for_exchange({7,11,1},sizes[1]),"retired projection survived its packet");
+    loan.ensure(128);arena.zero_();check(loan.bytes()==0,"KV growth did not reclaim compact projections");
+    check(!loan.pin_existing_projection(8,1,large,existing_offsets,existing_bytes),"early lookup returned KV-reclaimed pages");
+    check(!loan.pin_projection(7,11,sizes,copy.get(),hit,fill) && uploads==4,"failed projection allocation staged data");
+    std::cout<<"KV compact projection bytes, metadata hits, geometry, packet protection, LRU, retirement and KV growth PASS\n";
 }
 
 static void check_workspace_loan() {
@@ -1064,14 +1232,42 @@ void check_dma_copy_buckets() {
     }
 }
 
+#include "kv_cache_bench.h"
+#include "mapped_copy_bench.h"
+#include "mfe_prepare_bench.h"
+#include "mfe_transfer_bench.h"
+#include "sampling_bench.h"
+#include "transfer_copy_bench.h"
 int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    if(argc==2 && std::string(argv[1])=="--kv-expert-loan-check") {
+        const auto context=default_context();check_kv_expert_loan();check_kv_projection_loan();return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--sampling-bench") {benchmark_sampling_keys();return 0;}
+    if(argc==2 && std::string(argv[1])=="--sampling-check") {benchmark_sampling_keys(false);return 0;}
+    if(argc==2 && std::string(argv[1])=="--transfer-copy-bench") {benchmark_transfer_copy();return 0;}
+    if(argc==2 && std::string(argv[1])=="--transfer-copy-check") {benchmark_transfer_copy(false);return 0;}
+    if(argc==2 && std::string(argv[1])=="--kv-cache-bench") {benchmark_decode_kv_cache();return 0;}
+    if(argc==2 && std::string(argv[1])=="--route-export-bench") {benchmark_route_export();return 0;}
+    if(argc==2 && std::string(argv[1])=="--mapped-copy-bench") {benchmark_mapped_copy();return 0;}
+    if(argc==2 && std::string(argv[1])=="--mfe-prepare-bench") {benchmark_mfe_prepare();return 0;}
+    if(argc==2 && std::string(argv[1])=="--mfe-prepare-check") {benchmark_mfe_prepare(false);return 0;}
+    if(argc==2 && std::string(argv[1])=="--mapped-copy-check") {benchmark_mapped_copy(false);return 0;}
+    if(argc==2 && std::string(argv[1])=="--mapped-copy-pcie-bench") {benchmark_mapped_copy(true,true);return 0;}
+    if(argc==2 && std::string(argv[1])=="--mfe-transfer-bench") {benchmark_mfe_transfer();return 0;}
+    if(argc==2 && std::string(argv[1])=="--mfe-transfer-check") {benchmark_mfe_transfer(false);return 0;}
+    if(argc==2 && std::string(argv[1])=="--kv-append-check") {
+        check_exclusive_kv();check_decode_kv_append();
+        std::cout<<"Exclusive short KV/index append and graph replay checks passed\n";return 0;
+    }
     check_dma_copy_buckets();
     check_workspace_loan();
     check_kv_memory();
     check_exclusive_kv();
+    check_decode_kv_append();
     check_kv_expert_loan();
+    check_kv_projection_loan();
     check_graph_workspace_reuse();
     check_gelu_approximations();
     check_streamed_graph_segments();

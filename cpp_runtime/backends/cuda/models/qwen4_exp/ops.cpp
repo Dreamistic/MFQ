@@ -352,8 +352,13 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
     MoeFfnSharedWeights shared_weights;
     shared_weights.projections={weight_loader::linear_weight(sg),weight_loader::linear_weight(su),weight_loader::linear_weight(sd)};
     const auto shared_gate_weight=weight_loader::linear_weight(shared_gate);
+    shared_weights.scalar_gate=shared_gate_weight;
     shared_weights.gate=[shared_gate,shared_gate_weight](CudaExecutionContext& execution,const Tensor& input) {
         const auto option=mfq::cuda::runtime_options::shared_gate_fused();
+        const auto* nint_option=std::getenv("MFQ_SHARED_GATE_NINT");
+        if((!option || *option) && (!nint_option || nint_option[0]!='0') && shared_gate_weight &&
+                shared_gate_weight->is_nint() && !shared_gate_weight->tensor_parallel())
+            if(auto output=try_nint_shared_gate_sigmoid_cuda(input,shared_gate_weight->nint))return *output;
         if((!option || *option) && shared_gate_weight && shared_gate_weight->is_dense() &&
             !shared_gate_weight->tensor_parallel())
             if(auto output=try_shared_gate_sigmoid_cuda(input,shared_gate_weight->dense))return *output;
@@ -1241,6 +1246,14 @@ struct Qwen4DecodeGraph {
         cell.ids.copy_(ids);
         mfq_qwen4_exp::fill_decode_positions(cell.cache_positions,cell.positions,model.cache_pos,model.decode_position_delta);
         try {
+            // PLE depends only on token IDs and the committed ngram context.
+            // Start its read before waiting for adaptive expert exchanges,
+            // rather than leaving that CPU interval outside the I/O overlap.
+            // Task reset repeats issue() idempotently; it never advances the
+            // context, which is still committed by upload_graph().
+            const auto* early_ple=std::getenv("MFQ_PLE_EARLY_ISSUE");
+            if(!early_ple || early_ple[0]!='0')
+                for(const auto& stage:cell.ple)stage->ple->prefetch_tokens(cell.host_ids);
             finish_moe_expert_exchanges(model.execution->moe_expert_cache);
             // Prefix restoration and eager prefill update the same KV/index
             // storage; refresh pooled keys even when this graph is already valid.

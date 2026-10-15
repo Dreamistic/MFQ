@@ -25,11 +25,16 @@ std::shared_ptr<mfq::NintRows> load_nint_row_table(
         "NINT row table size overflow");
     auto read = source.tensor_reader(name);
     bool parallel=source.supports_parallel_tensor_reads();
-    auto batch=source.tensor_batch_reader(name);
+    const auto* batched=std::getenv("MFQ_PLE_BATCH_READ");
+    auto batch=(!batched || batched[0]!='0') ? source.tensor_batch_reader(name) : mfq::ModelSource::TensorBatchReader{};
     bool mapped_file=false;
     const auto mapped=mfq::cuda::runtime_options::ple_file_map();
     if(mapped.value_or(false)) {
-        if(auto mapping=source.mapped_tensor_reader(name)) {
+        if(auto mapping=source.mapped_tensor_batch_reader(name)) {
+            batch=std::move(mapping);
+            read=[batch](uint64_t offset,std::byte* out,std::size_t count){batch({{offset,out,count}});};
+            parallel=true;mapped_file=true;
+        } else if(auto mapping=source.mapped_tensor_reader(name)) {
             read=std::move(mapping);parallel=true;batch={};mapped_file=true;
         }
     }

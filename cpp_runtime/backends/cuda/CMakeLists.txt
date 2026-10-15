@@ -86,7 +86,9 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/moe.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_parity_read.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_prepare.cu
     ${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.cpp
     ${MFQ_CUDA_KERNEL_ROOT}/mx_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/fp8_sq.cu
@@ -123,6 +125,8 @@ set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.cu PROPERTIES
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.h;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.cu PROPERTIES
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_nvq_compact_dot.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_jsc_bank_map.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_compact.h")
+set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_parity_read.cu PROPERTIES
+    OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_gu_prequantized.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_gu_transfer_routes.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_nvq_compact_dot.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_nvq_parity_read.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_jsc_bank_map.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_launch.h")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.cu PROPERTIES
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_device.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn.h;${MFQ_CUDA_KERNEL_ROOT}/mfe_ffn_token_groups.h;${MFQ_CUDA_KERNEL_ROOT}/packed_nint.cuh;${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_e8_dense_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_d4_dense_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_dense_window32.cuh;${MFQ_CUDA_KERNEL_ROOT}/nvq_jsc_bank_map.cuh;${MFQ_CUDA_KERNEL_ROOT}/nint_route_group.cuh;${MFQ_CUDA_KERNEL_ROOT}/mfe_nint_whole.cuh")
 set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu PROPERTIES
@@ -610,6 +614,7 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
     add_test(NAME mfq-cuda-qsa-live-scores-test COMMAND mfq-window-attention-test --qsa-live-score-check)
+    add_test(NAME mfq-cuda-qsa-pool-write-test COMMAND mfq-window-attention-test --qsa-pool-write-check)
     add_test(NAME mfq-cuda-qsa-history-prime-test COMMAND mfq-window-attention-test --qsa-history-prime-check)
     add_test(NAME mfq-cuda-qsa-kv-offload-test COMMAND mfq-window-attention-test --qsa-kv-offload-check)
     foreach(bits 0 2.5 4)
@@ -685,7 +690,15 @@ if(BUILD_TESTING)
         MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-cuda-runtime-state-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-cuda-runtime-state-test COMMAND mfq-cuda-runtime-state-test)
+    add_test(NAME mfq-cuda-mfe-prepare-test COMMAND mfq-cuda-runtime-state-test --mfe-prepare-check)
+    add_test(NAME mfq-cuda-mfe-transfer-test COMMAND mfq-cuda-runtime-state-test --mfe-transfer-check)
+    add_test(NAME mfq-cuda-mapped-copy-test COMMAND mfq-cuda-runtime-state-test --mapped-copy-check)
+    add_test(NAME mfq-cuda-sampling-keys-test COMMAND mfq-cuda-runtime-state-test --sampling-check)
+    add_test(NAME mfq-cuda-transfer-copy-test COMMAND mfq-cuda-runtime-state-test --transfer-copy-check)
     set_tests_properties(mfq-cuda-runtime-state-test PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(mfq-cuda-mfe-prepare-test mfq-cuda-mfe-transfer-test mfq-cuda-mapped-copy-test PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(mfq-cuda-sampling-keys-test PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(mfq-cuda-transfer-copy-test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 add_library(mfq-cuda-eval STATIC ${MFQ_CUDA_ROOT}/eval/kl.cpp)

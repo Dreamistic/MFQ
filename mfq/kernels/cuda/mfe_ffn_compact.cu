@@ -1,8 +1,12 @@
 #define MFQ_MFE_COMPACT_NVQ 1
 #include "mfe_ffn_device.cuh"
 #include "mfe_ffn_compact.h"
+#include <atomic>
+#include <cstdio>
 
 namespace mfq::cuda {
+void mfe_ffn_parity_read_gate_up(const MfeFfnBatch&,int,int,cudaStream_t);
+void mfe_ffn_parity_transfer_routes(const MfeFfnBatch&,const int32_t*,cudaStream_t);
 namespace {
 bool enabled(const char* name) {
     const auto* setting=std::getenv(name);
@@ -82,8 +86,34 @@ void single_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
 }
 bool mfe_ffn_compact_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
     if(!launch_contract(b,false))return false;
+    const auto* parity_read=std::getenv("MFQ_MFE_PARITY_READ");
+    if(parity_read?parity_read[0]!='0':b.tokens==1) {
+        mfe_ffn_parity_read_gate_up(b,partition,width,stream);
+        static std::atomic<bool> reported{false};
+        if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+            "mfe_parity_read_dispatch scope=first_gu_launch enabled=1 tokens=%d partition=%d mask=%u\n",
+            b.tokens,partition,b.nvq_format_mask);
+        return true;
+    }
     if(!(b.nvq_format_mask&~0x3f820u))gate_up<0x3f820u>(b,partition,width,stream);
     else gate_up<0x3f922u>(b,partition,width,stream);
+    return true;
+}
+// Transfer-only work is usually a small fraction of the routed experts. Its
+// existing completion path avoids a second mostly empty quantization node.
+// Resident GU continues to use the independent quantization schedule.
+bool mfe_ffn_compact_transferred_fused(const MfeFfnBatch& b,cudaStream_t stream,const int32_t* routes) {
+    if(!enabled("MFQ_MFE_TRANSFER_HIDDEN_FUSED") || b.tokens!=1 || !b.plan_ready || !b.completion ||
+            b.token_group_counts || b.token_group_aligned_gu || !launch_contract(b,false))return false;
+    const int width=std::max(b.intermediate,b.shared?b.shared_intermediate:0);
+    const auto* parity_read=std::getenv("MFQ_MFE_PARITY_READ");
+    if(routes && (!parity_read || parity_read[0]!='0'))mfe_ffn_parity_transfer_routes(b,routes,stream);
+    else if(!parity_read || parity_read[0]!='0')mfe_ffn_parity_read_gate_up(b,2,width,stream);
+    else if(!(b.nvq_format_mask&~0x3f820u))gate_up<0x3f820u>(b,2,width,stream);
+    else gate_up<0x3f922u>(b,2,width,stream);
+    static std::atomic<bool> reported{false};
+    if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+        "mfe_transfer_hidden_fused_dispatch scope=first_transfer_gu enabled=1 tokens=%d\n",b.tokens);
     return true;
 }
 bool mfe_ffn_compact_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {

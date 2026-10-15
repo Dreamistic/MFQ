@@ -102,7 +102,9 @@ int main(int argc,char** argv)try {
     const bool norm_register_sweep=std::string(argv[2])=="--norm-register-quant-sweep";
     const bool norm_inline_sweep=std::string(argv[2])=="--norm-inline-down-sweep";
     const bool down_s16_sweep=std::string(argv[2])=="--down-direct-s16-sweep";
-    const bool norm_fixed_sweep=std::string(argv[2])=="--norm-fixed-types-sweep" || norm_register_sweep || norm_inline_sweep || down_s16_sweep;
+    const bool norm_replicated_sweep=std::string(argv[2])=="--norm-replicated-sweep";
+    const bool norm_vector_sweep=std::string(argv[2])=="--norm-vector-stats-sweep";
+    const bool norm_fixed_sweep=std::string(argv[2])=="--norm-fixed-types-sweep" || norm_register_sweep || norm_inline_sweep || down_s16_sweep || norm_vector_sweep || norm_replicated_sweep;
     const bool norm_many_sweep=std::string(argv[2])=="--norm-many-slices-sweep";
     const bool norm_slices_sweep=std::string(argv[2])=="--norm-slices-sweep";
     const bool norm_quant_sweep=std::string(argv[2])=="--norm-quant-sweep";
@@ -119,7 +121,7 @@ int main(int argc,char** argv)try {
     const bool thread_sweep=std::string(argv[2])=="--up-thread-sweep";
     const bool capacity_sweep=std::string(argv[2])=="--up-capacity-sweep";
     const bool sweep=norm_fixed_sweep || norm_many_sweep || down_fused_mma_sweep || up_four_sweep || up_half_fused_sweep || up_vector_sweep || norm_slices_sweep || up_int_mma_sweep || norm_fast_sweep || up_fast_sigmoid_sweep || down_split_sweep || norm_stats_sweep || norm_threads_sweep || up_direct_stats_sweep || fused_unsigned_sweep || up_fused_split_sweep || up_split_major_sweep || up_parts_vector_sweep || up_fused_direct_sweep || up_half_unroll_sweep || up_half_register_sweep || up_direct_s16_sweep || capacity_sweep || down_sweep || thread_sweep || group_sweep || metadata_sweep || unroll_sweep || norm_sweep || two_plane_sweep || three_plane_sweep || integer16_sweep || up_integer_sweep || integer_best_sweep || up_mix_sweep || up_prepare_sweep || up_groups_sweep || up_mma_sweep || up_mma_uniform_sweep || up_mma_half_sweep || up_mma_m1_half_sweep || up_coefficient_sweep || down_mma_sweep || combined_sweep || norm_quant_sweep || norm_wide_sweep || norm_group_sweep || unsigned_dot_sweep || uniform_prepare_sweep || packed24_sweep || packed24_pair_sweep || int_pair_sweep || chain_post_sweep;
-    const int variants=down_s16_sweep || norm_inline_sweep || norm_register_sweep || norm_many_sweep || norm_slices_sweep || up_int_mma_sweep || down_split_sweep || norm_stats_sweep || norm_threads_sweep || up_direct_stats_sweep || up_fused_direct_sweep || up_half_unroll_sweep || up_direct_s16_sweep || integer16_sweep || integer_best_sweep || packed24_sweep || uniform_prepare_sweep || up_mma_m1_half_sweep || up_coefficient_sweep?3:2;
+    const int variants=norm_replicated_sweep || down_s16_sweep || norm_inline_sweep || norm_register_sweep || norm_many_sweep || norm_slices_sweep || up_int_mma_sweep || down_split_sweep || norm_stats_sweep || norm_threads_sweep || up_direct_stats_sweep || up_fused_direct_sweep || up_half_unroll_sweep || up_direct_s16_sweep || integer16_sweep || integer_best_sweep || packed24_sweep || uniform_prepare_sweep || up_mma_m1_half_sweep || up_coefficient_sweep?3:2;
     const bool verify=std::string(argv[2])=="--check";
     const bool timing=std::getenv("MFQ_GR_PROBE_NO_TIMING")==nullptr;
     if(!verify && !sweep && !uniform_prepare_sweep && std::string(argv[2])!="--bench")throw std::runtime_error("unknown batch GR mode");
@@ -150,9 +152,10 @@ int main(int argc,char** argv)try {
     context->begin_graph_pool(stream.stream());
     int cases=0,checks=0;
     const auto batches=argc==5?std::vector<int>{std::stoi(argv[4])}:
-        verify?std::vector<int>{9,16,17,32}:std::vector<int>{16,32};
+        verify?std::vector<int>{9,16,17,32}:norm_replicated_sweep?std::vector<int>{1,2,3,4,5,6}:std::vector<int>{16,32};
     for(int batch:batches)
     for(bool half:{false,true})for(bool after:{false,true}) {
+        if(norm_replicated_sweep && !half && argc!=5)continue;
         if(chain_post_sweep && !after)continue;
         auto residual=tb::tensor(fb::input(batch,10240)).reshape({batch,1,10240})
             .to(tb::kCUDA,half?tb::kFloat16:tb::kFloat32);
@@ -165,6 +168,15 @@ int main(int argc,char** argv)try {
         std::array<std::vector<std::vector<tb::Tensor>>,3> outputs;
         std::array<MfqCudaGraph,3> graphs;context->begin_graph_warmup(stream.stream());
         const auto body=[&](int fused) {
+            // Legacy normalization sweeps compare the original two-stage
+            // implementations; the replicated candidate has its own sweep.
+            if(norm_fixed_sweep && !norm_replicated_sweep) {
+#ifdef _WIN32
+                if(_putenv_s("MFQ_GR_NORM_REPLICATED","0"))throw std::runtime_error("GR norm baseline option");
+#else
+                if(setenv("MFQ_GR_NORM_REPLICATED","0",1))throw std::runtime_error("GR norm baseline option");
+#endif
+            }
             if(down_fused_mma_sweep) {
 #ifdef _WIN32
                 if(_putenv_s("MFQ_GR_DOWN_MMA_FUSED_UP",fused?"1":"0"))throw std::runtime_error("GR Down MMA fused Up option");
@@ -193,7 +205,22 @@ int main(int argc,char** argv)try {
                 if(setenv("MFQ_GR_UP_VECTOR_WEIGHTS",fused?"1":"0",1))throw std::runtime_error("GR Up vector weight option");
 #endif
             }
-            if(norm_fixed_sweep && !norm_register_sweep && !norm_inline_sweep && !down_s16_sweep) {
+            if(norm_replicated_sweep) {
+                const char* mode=fused==2?"8":fused==1?"4":"0";
+#ifdef _WIN32
+                if(_putenv_s("MFQ_GR_NORM_REPLICATED",mode))throw std::runtime_error("GR replicated norm option");
+#else
+                if(setenv("MFQ_GR_NORM_REPLICATED",mode,1))throw std::runtime_error("GR replicated norm option");
+#endif
+            }
+            if(norm_vector_sweep) {
+#ifdef _WIN32
+                if(_putenv_s("MFQ_GR_NORM_VECTOR_STATS",fused?"1":"0"))throw std::runtime_error("GR vector stats option");
+#else
+                if(setenv("MFQ_GR_NORM_VECTOR_STATS",fused?"1":"0",1))throw std::runtime_error("GR vector stats option");
+#endif
+            }
+            if(norm_fixed_sweep && !norm_register_sweep && !norm_inline_sweep && !down_s16_sweep && !norm_vector_sweep && !norm_replicated_sweep) {
 #ifdef _WIN32
                 if(_putenv_s("MFQ_GR_NORM_FIXED_TYPES",fused?"1":"0"))throw std::runtime_error("GR fixed norm type option");
 #else
@@ -624,7 +651,7 @@ int main(int argc,char** argv)try {
             fb::check(cudaStreamSynchronize(stream.stream()));
             if(verify||sweep)for(int candidate=1;candidate<variants;++candidate)
             for(size_t bank=0;bank<banks.size();++bank)for(size_t out=0;out<3;++out) {
-                if(((norm_fixed_sweep && !norm_register_sweep) || norm_many_sweep || down_fused_mma_sweep || up_four_sweep || up_half_fused_sweep || norm_fast_sweep || up_fast_sigmoid_sweep || down_split_sweep || two_plane_sweep || three_plane_sweep || integer16_sweep || up_integer_sweep || integer_best_sweep || up_groups_sweep || up_mma_sweep || up_mma_uniform_sweep || up_mma_half_sweep || up_mma_m1_half_sweep || down_mma_sweep || combined_sweep || packed24_sweep) && out==0)mixed_two_plane_check(outputs[candidate][bank][out],outputs[0][bank][out]);
+                if(((norm_fixed_sweep && !norm_register_sweep && !norm_vector_sweep && !norm_replicated_sweep) || norm_many_sweep || down_fused_mma_sweep || up_four_sweep || up_half_fused_sweep || norm_fast_sweep || up_fast_sigmoid_sweep || down_split_sweep || two_plane_sweep || three_plane_sweep || integer16_sweep || up_integer_sweep || integer_best_sweep || up_groups_sweep || up_mma_sweep || up_mma_uniform_sweep || up_mma_half_sweep || up_mma_m1_half_sweep || down_mma_sweep || combined_sweep || packed24_sweep) && out==0)mixed_two_plane_check(outputs[candidate][bank][out],outputs[0][bank][out]);
                 else if(norm_fast_sweep && out==2)mixed_two_plane_check(outputs[candidate][bank][out],outputs[0][bank][out]);
                 else exact(outputs[candidate][bank][out],outputs[0][bank][out].cpu(),"continuous GR batch="+
                     std::to_string(batch)+" bank="+std::to_string(bank)+" output="+std::to_string(out));++checks;
@@ -653,6 +680,7 @@ int main(int argc,char** argv)try {
             if(norm_threads_sweep)std::cout<<" threads512_us="<<fb::median(times[2]);
             if(norm_stats_sweep)std::cout<<" stats512_us="<<fb::median(times[2]);
             if(up_int_mma_sweep)std::cout<<" mma_shared_unroll_us="<<fb::median(times[2]);
+            if(norm_replicated_sweep)std::cout<<" groups8_us="<<fb::median(times[2]);
             if(norm_many_sweep)std::cout<<" slices32_threads1024_us="<<fb::median(times[2]);
             if(norm_register_sweep)std::cout<<" register128_us="<<fb::median(times[2]);
             if(norm_inline_sweep)std::cout<<" tile16_us="<<fb::median(times[2]);

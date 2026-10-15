@@ -6,6 +6,7 @@
 #include "mfq_cuda_moe_ops.h"
 #include "moe_cache_transfer.h"
 #include "runtime/moe_residency.h"
+#include "runtime/kv_expert_loan.h"
 #include "storage/moe_quant_range_source.h"
 #include "storage/moe_expert_cache.h"
 #include "storage/weight_loader.h"
@@ -1456,7 +1457,7 @@ int verify_transfer_hit_reservation(const std::filesystem::path& root) {
     return cases;
 }
 void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_views=false,
-        bool noncontiguous=false,bool gpu_cold=false) {
+        bool noncontiguous=false,bool gpu_cold=false,int tokens=1,bool serial_layers=false) {
     const auto counter=[](const std::shared_ptr<MoeExpertCache>& cache,const char* name) {
         std::ostringstream out;print_moe_expert_cache_stats(cache,out);
         std::smatch match;const auto text=out.str();
@@ -1479,13 +1480,25 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
         }
         ~Environment(){set(existed?old.c_str():"");}
     } environment(input_views?"MFQ_MFE_WINDOW_INPUT_VIEWS":"MFQ_MOE_EARLY_NO_CPU_READY");
+    const bool check_transfer_poll=std::getenv("MFQ_TEST_TRANSFER_POLL")!=nullptr;
+    const bool check_kv_direct=std::getenv("MFQ_TEST_KV_DIRECT_READ")!=nullptr;
+    const bool adaptive_kv_direct=check_kv_direct && std::getenv("MFQ_TEST_KV_DIRECT_ADAPT");
+    const bool trace_kv_direct=std::getenv("MFQ_TRACE_KV_DIRECT_READ")!=nullptr;
+    const bool force_direct_off=std::getenv("MFQ_TEST_KV_DIRECT_FORCE_OFF")!=nullptr;
+    const int route_count=std::getenv("MFQ_TEST_KV_WIDE_ROUTES")?10:2;
+    const bool partial_gu=std::getenv("MFQ_TEST_KV_PARTIAL_GU")!=nullptr;
+    Environment notification_environment("MFQ_MOE_POLL_TRANSFER_READY");
+    Environment direct_environment("MFQ_MOE_KV_DIRECT_READ");
     int cases=0,cpu_groups=0,gpu_only=0,cancelled=0;
     const std::array<MfqCudaStream,2> streams={mfq_get_stream_from_pool(),mfq_get_current_cuda_stream()};
     for(const std::string format:{"nint5","nvq3j-512"}) {
         std::array<CudaExecutionContext,2> executions;
         std::array<std::shared_ptr<MoeExpertCache>,2> caches;
+        std::array<std::shared_ptr<mfq::cuda::KvExpertLoan>,2> loans;
+        std::array<std::size_t,2> loan_bytes{};
         std::array<std::array<std::shared_ptr<MoeQuantRangeSource>,3>,2> sources;
-        std::array<MoeFfnForward,2> forwards;
+        std::array<MoeFfnForward,2> forwards,tail_forwards;
+        std::array<std::array<std::shared_ptr<MoeQuantRangeSource>,3>,2> tail_sources;
         std::array<tb::Tensor,2> outputs;
         std::array<std::unique_ptr<mfq::cuda::DecodeWindow>,2> windows;
         std::array<int,2> observed_cpu{};
@@ -1495,13 +1508,21 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
             auto& execution=executions[mode];auto& cfg=execution.config;
             cfg.moe_preload_all=true;cfg.moe_assert_resident=true;cfg.moe_pipeline=true;
             cfg.moe_hybrid_cpu=true;cfg.moe_direct_ram=true;cfg.moe_two_stage_ffn=true;
-            cfg.moe_ram_pcie=true;cfg.moe_ram_pcie_fraction=gpu_cold?1.:0.;cfg.moe_residency_adapt=false;
+            cfg.moe_ram_pcie=true;cfg.moe_ram_pcie_fraction=gpu_cold?1.:0.;cfg.moe_residency_adapt=adaptive_kv_direct;
+            if(adaptive_kv_direct)cfg.moe_residency_warm=true;
             std::size_t bundle=0;
             for(int p=0;p<3;++p) {
                 sources[mode][p]=source(root/(format+(p==2?"-2560-640.mfq":"-640-2560.mfq")));
                 bundle+=bytes(sources[mode][p]->metadata()->pools[0]);
             }
-            cfg.moe_host_cache_bytes=3*bundle;caches[mode]=make_moe_expert_cache(2*bundle,cfg);
+            cfg.moe_host_cache_bytes=(serial_layers?6:3)*bundle;caches[mode]=make_moe_expert_cache(2*bundle,cfg);
+            if(check_kv_direct) {
+                loan_bytes[mode]=std::max<std::size_t>(8<<20,bundle);
+                loans[mode]=std::make_shared<mfq::cuda::KvExpertLoan>();
+                loans[mode]->add(tb::zeros({int64_t(loan_bytes[mode])},
+                    tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8)),loan_bytes[mode],1,false);
+                set_moe_kv_expert_loan(caches[mode],loans[mode]);
+            }
             std::vector<std::shared_ptr<MfeWeight>> gu,down;
             for(int p=0;p<3;++p) {
                 auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(caches[mode],
@@ -1509,10 +1530,21 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
                 (p==2?down:gu).push_back(weight);
             }
             forwards[mode]=make_moe_ffn_pipeline(gu,down,{},[&,mode](const mfq::MoeDispatchPlan& plan) {
+
                 observed_cpu[mode]=int(std::count_if(plan.groups.begin(),plan.groups.end(),[](const auto& group) {
                     return group.kind==mfq::MoeDispatchKind::Cpu;
                 }));
             });
+            if(serial_layers) {
+                std::vector<std::shared_ptr<MfeWeight>> tail_gu,tail_down;
+                for(int p=0;p<3;++p) {
+                    tail_sources[mode][p]=source(root/(format+(p==2?"-2560-640.mfq":"-640-2560.mfq")));
+                    auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(caches[mode],
+                        "direct-tail/"+std::to_string(p),tail_sources[mode][p],1,1,std::to_string(p)));
+                    (p==2?tail_down:tail_gu).push_back(weight);
+                }
+                tail_forwards[mode]=make_moe_ffn_pipeline(tail_gu,tail_down);
+            }
             finalize_moe_expert_cache(caches[mode]);
             for(int expert=0;expert<3;++expert) {
                 const bool all_hot=std::all_of(sources[mode].begin(),sources[mode].end(),[&](const auto& s){return s->gpu_resident(expert);});
@@ -1522,22 +1554,37 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
             }
         }
         if(hot<0 || cold<0)throw std::runtime_error("CPU-ready test lacks a full GPU and RAM bundle");
-        std::vector<float> values(2560);for(int i=0;i<2560;++i)values[i]=std::sin(float(i)*.023f)*.15f;
-        auto x=tb::tensor(values).reshape({1,2560}).to(tb::kFloat16).to(tb::kCUDA);
-        auto ids=tb::tensor(std::vector<int32_t>{hot,hot}).reshape({1,2}).to(tb::kCUDA);
-        auto weights=tb::tensor(std::vector<float>{.375f,.625f}).reshape({1,2}).to(tb::kCUDA);
+        const auto route_tensor=[&](int32_t a,int32_t b) {
+            std::vector<int32_t> rows(tokens*route_count);
+            for(int i=0;i<tokens;++i)for(int r=0;r<route_count;++r)rows[i*route_count+r]=r&1?b:a;
+            return tb::tensor(rows).reshape({tokens,route_count}).to(tb::kCUDA);
+        };
+        const auto weight_tensor=[&](float a,float b) {
+            std::vector<float> rows(tokens*route_count);
+            for(int i=0;i<tokens;++i)for(int r=0;r<route_count;++r)rows[i*route_count+r]=(r&1?b:a)/(route_count/2);
+            return tb::tensor(rows).reshape({tokens,route_count}).to(tb::kCUDA);
+        };
+        std::vector<float> values(tokens*2560);for(int i=0;i<tokens*2560;++i)values[i]=std::sin(float(i)*.023f)*.15f;
+        auto x=tb::tensor(values).reshape({tokens,2560}).to(tb::kFloat16).to(tb::kCUDA);
+        auto ids=route_tensor(hot,hot);
+        auto weights=weight_tensor(.375f,.625f);
         mfq_cuda_synchronize();
         for(int mode=0;mode<2;++mode) {
             MfqCudaStreamGuard guard(streams[mode]);
             environment.set(mode?"1":"0");
+            if(check_transfer_poll)notification_environment.set(mode?"1":"0");
+            if(check_kv_direct)direct_environment.set(mode && !force_direct_off?"1":"0");
             windows[mode]=std::make_unique<mfq::cuda::DecodeWindow>(streams[mode].stream());
             windows[mode]->capture([&,mode] {
-                if(!input_views)outputs[mode]=forwards[mode](executions[mode],x,ids,weights);
+                if(!input_views) {
+                    outputs[mode]=forwards[mode](executions[mode],x,ids,weights);
+                    if(serial_layers)outputs[mode]=tail_forwards[mode](executions[mode],moe_weighted_reduce_cuda(outputs[mode],weights).to(tb::kFloat16),ids,weights);
+                }
                 else {
                     {
-                        auto temporary_x=noncontiguous?tb::empty({1,2560,2},x.options()).select(2,0):x.clone();
-                        auto temporary_ids=noncontiguous?tb::empty({1,2,2},ids.options()).select(2,0):ids.clone();
-                        auto temporary_weights=noncontiguous?tb::empty({1,2,2},weights.options()).select(2,0):weights.clone();
+                        auto temporary_x=noncontiguous?tb::empty({tokens,2560,2},x.options()).select(2,0):x.clone();
+                        auto temporary_ids=noncontiguous?tb::empty({tokens,2,2},ids.options()).select(2,0):ids.clone();
+                        auto temporary_weights=noncontiguous?tb::empty({tokens,2,2},weights.options()).select(2,0):weights.clone();
                         if(noncontiguous) {
                             temporary_x.copy_(x);temporary_ids.copy_(ids);temporary_weights.copy_(weights);
                             if(temporary_x.is_contiguous() || temporary_ids.is_contiguous() || temporary_weights.is_contiguous())
@@ -1547,34 +1594,66 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
                     }
                     // Reuse temporary allocation sizes after the FFN consumers,
                     // exercising graph-pool lifetimes rather than persistent inputs.
-                    auto overwrite_x=tb::full({1,2560},-.75f,x.options());
-                    auto overwrite_ids=tb::full({1,2},-123,ids.options());
-                    auto overwrite_weights=tb::full({1,2},-4.f,weights.options());
+                    auto overwrite_x=tb::full({tokens,2560},-.75f,x.options());
+                    auto overwrite_ids=tb::full({tokens,2},-123,ids.options());
+                    auto overwrite_weights=tb::full({tokens,2},-4.f,weights.options());
                 }
             },[]{},[&,mode]{outputs[mode]={};});
+            if(adaptive_kv_direct)std::fprintf(stderr,"kv_direct_adapt mode=%d phase=captured\n",mode);
         }
         const std::array<std::array<int32_t,2>,7> routes={{{hot,hot},{cold,cold},{hot,cold},
             {cold,hot},{hot,hot},{cold,cold},{hot,hot}}};
         const char* checked_counter=input_views?"pipeline_window_input_view_serves":"pipeline_early_no_cpu_ready_serves";
+
         const std::array<uint64_t,2> early_before={counter(caches[0],checked_counter),counter(caches[1],checked_counter)};
+
         uint64_t expected_early=0;
         for(int repeat=0;repeat<2;++repeat)for(const auto& route:routes) {
+
             if(input_views) {
-                for(int i=0;i<2560;++i)values[i]=std::sin(float(i+cases*19)*.023f)*(.11f+.01f*repeat);
-                x.copy_(tb::tensor(values).reshape({1,2560}).to(tb::kFloat16).to(tb::kCUDA));
-                weights.copy_(tb::tensor(std::vector<float>{.125f+.025f*cases,.875f-.013f*cases}).reshape({1,2}).to(tb::kCUDA));
+                for(int i=0;i<tokens*2560;++i)values[i]=std::sin(float(i+cases*19)*.023f)*(.11f+.01f*repeat);
+                x.copy_(tb::tensor(values).reshape({tokens,2560}).to(tb::kFloat16).to(tb::kCUDA));
+                weights.copy_(weight_tensor(.125f+.025f*cases,.875f-.013f*cases));
             }
-            ids.copy_(tb::tensor(std::vector<int32_t>(route.begin(),route.end())).reshape({1,2}).to(tb::kCUDA));
+            ids.copy_(route_tensor(route[0],route[1]));
+
             mfq_cuda_synchronize();
+
             std::array<tb::Tensor,2> actual;
             for(int mode=0;mode<2;++mode) {
                 MfqCudaStreamGuard guard(streams[mode]);
-                environment.set(mode?"1":"0");windows[mode]->run();actual[mode]=outputs[mode].cpu().contiguous();
+                if(check_kv_direct) {
+                    direct_environment.set(mode && !force_direct_off?"1":"0");
+                    // Force staging misses while retaining the loan cache,
+                    // then reuse the filled staging slots in the second pass.
+                    if(!repeat && !adaptive_kv_direct)prepare_moe_pipeline_comparison(caches[mode],false);
+                    else if(repeat && route==routes.front())loans[mode]->ensure(loan_bytes[mode]/2);
+                    if(partial_gu && mode && gpu_cold) {
+                        // This fixture registers GU/Down as source 0/1/2,
+                        // followed by the second layer's 3/4/5. Prior output
+                        // copies above have completed the previous readers.
+                        const int fields=format=="nint5"?7:4;
+                        loans[mode]->retire_expert(2,cold,fields);
+                        if(serial_layers)loans[mode]->retire_expert(5,cold,fields);
+                        loans[mode]->next_packet();
+                    }
+                }
+                if(adaptive_kv_direct && trace_kv_direct)std::fprintf(stderr,"kv_direct_adapt repeat=%d case=%d mode=%d route=%d,%d phase=replay\n",
+                    repeat,cases,mode,route[0],route[1]);
+
+                environment.set(mode?"1":"0");windows[mode]->run();
+
+                actual[mode]=outputs[mode].cpu().contiguous();
+                // Finish this independent cache before the other comparison
+                // graph shares its CUDA context with a background allocation.
+                if(adaptive_kv_direct)finish_moe_expert_exchanges(caches[mode]);
+
+                if(adaptive_kv_direct && trace_kv_direct)std::fprintf(stderr,"kv_direct_adapt repeat=%d case=%d mode=%d phase=done\n",repeat,cases,mode);
             }
             if(observed_cpu[0]!=observed_cpu[1] || std::memcmp(actual[0].data_ptr(),actual[1].data_ptr(),actual[0].numel()*actual[0].element_size()))
                 throw std::runtime_error("early CPU completion changed replayed GPU/CPU output bytes");
             cpu_groups+=observed_cpu[1];gpu_only+=observed_cpu[1]==0;++cases;
-            expected_early+=input_views?!noncontiguous:observed_cpu[1]==0;
+            expected_early+=input_views?!noncontiguous:(observed_cpu[1]==0)*(serial_layers?2:1);
         }
         if(counter(caches[0],checked_counter)!=early_before[0] ||
             counter(caches[1],checked_counter)-early_before[1]!=expected_early)
@@ -1585,9 +1664,98 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
         if(!gpu_cold && (counter(caches[0],"pipeline_fixed_gpu_timing_skips") ||
             counter(caches[1],"pipeline_fixed_gpu_timing_skips")))
             throw std::runtime_error("a graph with a CPU quota omitted its rate timing");
+        if(check_transfer_poll) {
+            const auto baseline=counter(caches[0],"pipeline_transfer_event_polls");
+            const auto candidate=counter(caches[1],"pipeline_transfer_event_polls");
+            if(baseline || (gpu_cold?!candidate:bool(candidate)))
+                throw std::runtime_error("transfer event notifications did not respect GPU-only dispatch");
+            std::cout<<"transfer_poll format="<<format<<" gpu_cold="<<gpu_cold
+                <<" baseline="<<baseline<<" candidate="<<candidate<<" exact PASS\n";
+        }
+        if(check_kv_direct) {
+            const auto baseline=counter(caches[0],"pipeline_kv_direct_read_bytes");
+            const auto candidate=counter(caches[1],"pipeline_kv_direct_read_bytes");
+            if(baseline || ((gpu_cold && !force_direct_off)?!candidate:bool(candidate)))
+                throw std::runtime_error("direct KV fields did not respect GPU-only window dispatch");
+            std::cout<<"kv_direct_read format="<<format<<" tokens="<<tokens<<" gpu_cold="<<gpu_cold
+                <<" baseline_bytes="<<baseline<<" candidate_bytes="<<candidate
+                <<" loan_hits="<<loans[1]->hits()<<" staged_reuse_and_growth exact PASS\n";
+        }
+        if(const auto* native=std::getenv("MFQ_MOE_RESIDENCY_NATIVE_DMA");native && native[0]=='1' && adaptive_kv_direct) {
+            const auto batches=counter(caches[1],"residency_native_dma_batches");
+            if(!batches)throw std::runtime_error("adaptive native DMA comparison did not execute a batch");
+            std::cout<<"adaptive_native_dma format="<<format<<" batches="<<batches
+                <<" copies="<<counter(caches[1],"residency_native_dma_copies")<<" exact PASS\n";
+        }
+        if(const auto* native=std::getenv("MFQ_MOE_NATIVE_DMA_BATCH");native && native[0]!='0' && gpu_cold) {
+            const auto batches=counter(caches[1],"pipeline_native_dma_batches");
+            if(!batches)throw std::runtime_error("native DMA comparison did not execute a batch");
+            std::cout<<"native_dma format="<<format<<" tokens="<<tokens<<" batches="<<batches
+                <<" copies="<<counter(caches[1],"pipeline_native_dma_copies")
+                <<" fallbacks="<<counter(caches[1],"pipeline_native_dma_fallbacks")<<" exact PASS\n";
+        }
+        if(const auto* projection=std::getenv("MFQ_MOE_KV_PROJECTION_CACHE");projection && projection[0]=='1' && check_kv_direct) {
+            const auto baseline=counter(caches[0],"pipeline_kv_projection_hits");
+            const auto hits=counter(caches[1],"pipeline_kv_projection_hits");
+            const auto misses=counter(caches[1],"pipeline_kv_projection_misses");
+            const auto small=counter(caches[1],"pipeline_kv_projection_small_hit_bytes");
+            if(baseline || ((gpu_cold && !force_direct_off)?(!hits || !misses || !small):bool(hits || misses || small)))
+                throw std::runtime_error("projection cache did not exercise whole-field reuse or dispatch isolation");
+            std::cout<<"kv_projection_cache format="<<format<<" tokens="<<tokens<<" gpu_cold="<<gpu_cold
+                <<" hits="<<hits<<" misses="<<misses<<" small_hit_bytes="<<small
+                <<" fallbacks="<<counter(caches[1],"pipeline_kv_projection_fallbacks")<<" exact PASS\n";
+        }
+        if(const auto* early=std::getenv("MFQ_MOE_KV_EARLY_GU");early && early[0]=='1' && check_kv_direct) {
+            const auto baseline=counter(caches[0],"pipeline_kv_early_gu_serves");
+            const auto candidate=counter(caches[1],"pipeline_kv_early_gu_serves");
+            if(baseline || ((gpu_cold && !force_direct_off)?!candidate:bool(candidate)))
+                throw std::runtime_error("early GU submission did not respect direct-read dispatch");
+            std::cout<<"early_gu_dma format="<<format<<" tokens="<<tokens<<" gpu_cold="<<gpu_cold
+                <<" candidate="<<candidate<<" exact PASS\n";
+        }
+        if(const auto* packet=std::getenv("MFQ_MOE_KV_HOST_PACKET");packet && packet[0]=='1' && check_kv_direct) {
+            const auto baseline=counter(caches[0],"pipeline_host_packet_serves");
+            const auto served=counter(caches[1],"pipeline_host_packet_serves");
+            const auto bytes=counter(caches[1],"pipeline_host_packet_descriptor_bytes");
+            const auto cached=counter(caches[1],"pipeline_cached_phase_publishes");
+            const auto resident=counter(caches[1],"pipeline_kv_gpu_resident_experts");
+            const bool descriptors_dma=counter(caches[1],"pipeline_native_dma_batches")>0;
+            if(baseline || ((gpu_cold && !force_direct_off)?(!served || (!bytes && !resident && !descriptors_dma)):bool(served || bytes || cached || resident)))
+                throw std::runtime_error("host cache packet did not respect direct-read dispatch: baseline="+
+                    std::to_string(baseline)+" serves="+std::to_string(served)+" bytes="+std::to_string(bytes)+
+                    " cached="+std::to_string(cached));
+            const auto* projection=std::getenv("MFQ_MOE_KV_PROJECTION_CACHE");
+            if(projection && projection[0]=='1' && gpu_cold && !adaptive_kv_direct && !force_direct_off && !cached && !resident)
+                throw std::runtime_error("host cache packet never published a cached phase without DMA");
+            std::cout<<"kv_host_packet format="<<format<<" tokens="<<tokens<<" gpu_cold="<<gpu_cold
+                <<" serves="<<served<<" descriptor_bytes="<<bytes<<" cached_phase_publishes="<<cached<<" exact PASS\n";
+        }
+        if(const auto* first=std::getenv("MFQ_MOE_KV_LOOKUP_FIRST");first && first[0]=='1' && check_kv_direct) {
+            const auto baseline=counter(caches[0],"pipeline_kv_projection_early_hits");
+            const auto hits=counter(caches[1],"pipeline_kv_projection_early_hits");
+            if(baseline || ((gpu_cold && !force_direct_off)?!hits:bool(hits)))
+                throw std::runtime_error("complete projection cache did not bypass RAM lookup");
+            std::cout<<"kv_projection_early_hits format="<<format<<" tokens="<<tokens<<" hits="<<hits<<" exact PASS\n";
+        }
+        if(const auto* option=std::getenv("MFQ_MOE_KV_GPU_RESIDENT");option && option[0]=='1' && check_kv_direct) {
+            const auto baseline=counter(caches[0],"pipeline_kv_gpu_resident_experts");
+            const auto hits=counter(caches[1],"pipeline_kv_gpu_resident_experts");
+            const auto early=counter(caches[1],"pipeline_kv_gpu_early_gu_experts");
+            if(baseline || ((gpu_cold && !force_direct_off && !adaptive_kv_direct)?(!hits && !(partial_gu && early)):(!gpu_cold && hits)))
+                throw std::runtime_error("cached resident dispatch was not exercised or escaped GPU-only paths");
+            std::cout<<"kv_gpu_resident format="<<format<<" tokens="<<tokens<<" experts="<<hits<<" exact PASS\n";
+            if(partial_gu && gpu_cold && !early)throw std::runtime_error("partial cache fixture did not execute early GU");
+            if(partial_gu)std::cout<<"kv_gpu_early_gu format="<<format<<" tokens="<<tokens<<" experts="<<early<<" exact PASS\n";
+            if(route_count>2 && gpu_cold && !force_direct_off) {
+                const auto fences=counter(caches[1],"pipeline_reader_fence_reuses");
+                if(counter(caches[0],"pipeline_reader_fence_reuses") || !fences)
+                    throw std::runtime_error("wide-route fixture did not exercise reader-fenced lease release");
+                std::cout<<"kv_reader_fence format="<<format<<" tokens="<<tokens<<" skips="<<fences<<" exact PASS\n";
+            }
+        }
         // The public dispatcher rejects invalid expert IDs. Both notification
         // schedules must cancel an in-flight graph and reject its next replay.
-        ids.copy_(tb::tensor(std::vector<int32_t>{cold,-1}).reshape({1,2}).to(tb::kCUDA));
+        ids.copy_(route_tensor(cold,-1));
         mfq_cuda_synchronize();
         for(int mode=0;mode<2;++mode) {
             MfqCudaStreamGuard guard(streams[mode]);environment.set(mode?"1":"0");
@@ -1604,7 +1772,7 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
     }
     if((!gpu_cold && !cpu_groups) || !gpu_only)throw std::runtime_error("CPU-ready/view test did not exercise its configured dispatch tiers");
     std::cout<<(input_views?"window_input_view_cases=":"early_no_cpu_ready_cases=")<<cases
-        <<" strided="<<noncontiguous<<" gpu_cold="<<gpu_cold<<" cpu_groups="<<cpu_groups<<" gpu_only="<<gpu_only
+        <<" tokens="<<tokens<<" strided="<<noncontiguous<<" gpu_cold="<<gpu_cold<<" cpu_groups="<<cpu_groups<<" gpu_only="<<gpu_only
         <<" cancellations="<<cancelled<<" repeated GPU/CPU transitions and duplicate routes exact; invalid-route cancellation PASS\n";
 }
 void verify_router_prefetch(const std::filesystem::path& root) {
@@ -2104,6 +2272,29 @@ int main(int argc,char** argv)try {
             for(bool strided:{false,true})for(bool gpu_cold:{false,true})
                 verify_early_no_cpu_ready(root,true,strided,gpu_cold);
             return 0;
+        }
+        if(std::string(argv[2])=="--transfer-poll-check") {
+            if(!std::getenv("MFQ_TEST_TRANSFER_POLL"))throw std::runtime_error("missing transfer poll comparison option");
+            for(int tokens:{1,2,6})for(bool gpu_cold:{false,true})
+                verify_early_no_cpu_ready(root,true,false,gpu_cold,tokens);
+            return 0;
+        }
+        if(std::string(argv[2])=="--kv-direct-read-check") {
+            if(!std::getenv("MFQ_TEST_KV_DIRECT_READ"))throw std::runtime_error("missing direct KV comparison option");
+            for(int tokens:{1,2,6})for(bool gpu_cold:{true,false}) {
+                if(!gpu_cold && std::getenv("MFQ_TEST_KV_DIRECT_GPU_ONLY"))continue;
+                verify_early_no_cpu_ready(root,true,false,gpu_cold,tokens);
+            }
+            return 0;
+        }
+        if(std::string(argv[2])=="--kv-direct-read-serial-check") {
+            if(!std::getenv("MFQ_TEST_KV_DIRECT_READ"))throw std::runtime_error("missing serial direct KV comparison option");
+            for(int tokens:{1,4,6})verify_early_no_cpu_ready(root,false,false,true,tokens,true);
+            return 0;
+        }
+        if(std::string(argv[2])=="--kv-direct-read-adapt-check") {
+            if(!std::getenv("MFQ_TEST_KV_DIRECT_ADAPT"))throw std::runtime_error("missing adaptive direct KV comparison option");
+            verify_early_no_cpu_ready(root,false,false,true,4);return 0;
         }
         if(std::string(argv[2])=="--shared-window-input-views-check") {
             if(!mfq::cuda::runtime_options::window_input_views())
