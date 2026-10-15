@@ -54,6 +54,47 @@ def test_job_storage_lifecycle_and_restart_recovery(tmp_path: Path) -> None:
     assert [event.sequence for event in reopened.list_job_events(JOB_ID)] == [1, 2, 3, 4, 5]
 
 
+def test_download_retry_and_restart_preserve_task_identity_and_progress(tmp_path):
+    async def run():
+        store = make_store(tmp_path)
+        original = store.create_job('download.modelscope', {'repo_id': 'owner/model'})
+        store.claim_job(original.id)
+        store.update_job_progress(original.id, .45, data={'downloaded_bytes': 450})
+        store.interrupt_job(original.id)
+        started = asyncio.Event()
+        async def handler(context, payload):
+            started.set()
+            await asyncio.Event().wait()
+        manager = JobManager(store, {'download.modelscope': handler})
+        resumed = await manager.retry(original.id)
+        assert resumed.id == original.id and resumed.progress == .45 and resumed.error is None
+        await started.wait()
+        again = await manager.retry(original.id)
+        assert again.id == original.id and len(store.list_jobs()) == 1
+        await manager.close()
+        saved = store.get_job(original.id)
+        assert saved.status == JobStatus.QUEUED and saved.progress == .45 and saved.error is None
+        assert saved.progress_data['downloaded_bytes'] == 450
+        started.clear()
+        restarted = JobManager(store, {'download.modelscope': handler})
+        await restarted.start()
+        await started.wait()
+        assert store.get_job(original.id).status == JobStatus.RUNNING
+        assert len(store.list_jobs()) == 1
+        await restarted.close()
+    asyncio.run(run())
+
+
+def test_crashed_download_returns_to_queue_without_resetting_progress(tmp_path):
+    store = make_store(tmp_path)
+    original = store.create_job('download.huggingface', {'repo_id': 'owner/model'})
+    store.claim_job(original.id)
+    store.update_job_progress(original.id, .42)
+    store.recover_interrupted_jobs()
+    saved = store.get_job(original.id)
+    assert saved.status == JobStatus.QUEUED and saved.progress == .42 and saved.error is None
+
+
 def test_job_event_tail_keeps_latest_output_and_preserves_forward_replay(tmp_path: Path) -> None:
     async def run() -> None:
         store = make_store(tmp_path)

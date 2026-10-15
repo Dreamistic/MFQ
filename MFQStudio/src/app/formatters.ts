@@ -21,6 +21,7 @@ export function errorMessage(error: unknown, tr?: (chinese: string, english: str
         insufficient_disk_space: ['可用磁盘空间不足，或已被其它下载预留。可勾选“驱逐 SSD Prefix 预算”回收前缀缓存，或更换下载目录。', 'Available disk space is insufficient or reserved by other downloads. Enable “Reclaim SSD prefix budget” or choose another download folder.'],
         download_size_unknown: ['尚未获取完整文件大小，请刷新模型文件列表后再下载。', 'File sizes are not available yet. Refresh the model file list before downloading.'],
         download_destination_busy: ['此目录已有下载任务，请等待完成或先取消该任务。', 'This folder already has an active download. Wait for it to finish or cancel it first.'],
+        download_already_exists: ['目标目录已存在完整文件，无需重复下载。', 'The complete files already exist in the destination folder. No download is needed.'],
         cache_reclaim_busy: ['前缀缓存正在使用或模型正在加载，请稍后重试下载。', 'The prefix cache is in use or a model is loading. Retry the download shortly.'],
         cache_reclaim_failed: ['未能释放足够的前缀缓存空间，请稍后重试或更换下载目录。', 'Not enough prefix cache space could be released. Retry or choose another download folder.'],
         model_directory_not_found: ['找不到此文件夹，请检查路径或重新选择。', 'This folder could not be found. Check the path or choose it again.'],

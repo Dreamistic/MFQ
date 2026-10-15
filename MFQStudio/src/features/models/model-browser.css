@@ -234,7 +234,12 @@ body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env
 .download-storage-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 10.5px; }
 .download-storage-summary > span:last-child { font-family: var(--small-numerals-font); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .download-prefix-reclaim { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10.5px; cursor: pointer; }
-.download-prefix-reclaim input { width: 13px; height: 13px; margin: 0; accent-color: var(--accent); }
+.download-prefix-reclaim input { appearance: none; -webkit-appearance: none; width: 13px; height: 13px; margin: 0; flex: 0 0 13px; border: 1px solid var(--muted); border-radius: 3px; background: var(--surface); display: grid; place-content: center; }
+.download-prefix-reclaim input:checked { background: var(--accent); border-color: var(--accent); }
+.download-prefix-reclaim input:checked::after { content: ''; width: 6px; height: 3px; border: solid white; border-width: 0 0 1.5px 1.5px; transform: translateY(-1px) rotate(-45deg); }
+.download-prefix-reclaim input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.download-prefix-reclaim input:disabled { cursor: wait; }
+.download-prefix-reclaim input { transition: none; }
 .download-directory-control > span { flex-shrink: 0; }
 .download-directory-control > code { min-width: 0; max-width: 520px; overflow: hidden; color: var(--ink-soft); font-family: inherit; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .download-directory-control > button { display: inline-flex; flex-shrink: 0; align-items: center; gap: 5px; min-height: 28px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-control); color: var(--ink-soft); font-size: 11px; }

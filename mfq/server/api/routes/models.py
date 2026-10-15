@@ -26,6 +26,7 @@ from mfq.server.protocol.models import (
     HubModelInfo,
     HubModelSearchResult,
     HubReferenceRequest,
+    HubDownloadProbeRequest,
     ModelArtifactList,
     ModelCacheProfile,
     ModelDirectoryList,
@@ -49,6 +50,11 @@ from mfq.server.services.service import ServiceError
 
 hub_router = APIRouter()
 router = APIRouter()
+
+
+@hub_router.post('/api/v1/hub/download-sources/probe', responses=ERROR_RESPONSES, tags=['models'])
+async def probe_download_sources(service: ServiceDependency, body: HubDownloadProbeRequest) -> dict[str, Any]:
+    return await service.hub_catalog.probe_download_sources(body.sources)
 
 @hub_router.get("/api/v1/hub/download-directory", responses=ERROR_RESPONSES, tags=["models"])
 async def download_directory(service: ServiceDependency) -> dict[str, str | int | bool | None]:
