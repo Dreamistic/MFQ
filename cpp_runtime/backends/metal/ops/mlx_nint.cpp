@@ -133,7 +133,7 @@ public:
 
     MTL::ComputePipelineState* prepared_kernel(const char* name = nullptr) {
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(selected_stream.device);
+        auto& device = kernel_device(selected_stream.device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -1323,7 +1323,7 @@ public:
 
     MTL::ComputePipelineState* prepared_kernel() {
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(selected_stream.device);
+        auto& device = kernel_device(selected_stream.device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(plan_->kernel_name, options,
@@ -2341,7 +2341,8 @@ MlxNintSwiGluPair::from_weights(
         gate.group_size(),
         gate.groups(),
         gate.input_size(),
-        gate.output_size());
+        gate.output_size(),
+        gate.has_uniform_q_bits() && up.has_uniform_q_bits());
 }
 
 bool MlxNintWeight::can_fuse_swiglu(

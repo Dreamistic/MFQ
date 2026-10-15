@@ -25,6 +25,7 @@ struct MlxMfeKernelProfile {
     std::uint64_t vq_layouts = 0;
     std::shared_ptr<const std::vector<int>> nint_group_sizes;
     bool vq_execution_layout = false;
+    bool nint_q_dispatch = false;
 };
 
 struct MlxMfeProjectionInfo {
@@ -249,7 +250,8 @@ public:
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_weights,
         bool shared_gate_is_logits = false,
-        const mlx::core::array* route_groups = nullptr) const;
+        const mlx::core::array* route_groups = nullptr,
+        const mlx::core::array* softmax_router_logits = nullptr) const;
     // Decode/small-M MXFP4 fast path. For one through six tokens, project
     // every selected expert and apply its routing weight in one Metal
     // dispatch, avoiding the transient [M,routes,hidden] down-projection

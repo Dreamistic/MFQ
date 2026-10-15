@@ -35,6 +35,8 @@ fail() {
 for mfq_command in uv cmake codesign hdiutil install_name_tool lipo npm cargo strings; do
   command -v "${mfq_command}" >/dev/null 2>&1 || fail "${mfq_command} is required"
 done
+xcrun --find metal >/dev/null 2>&1 || fail "Xcode Metal Toolchain is required to build release shaders"
+xcrun --find metallib >/dev/null 2>&1 || fail "Xcode Metal Toolchain is required to build release shaders"
 
 rm -rf \
   "${mfq_script_dir}/build" \
@@ -87,6 +89,7 @@ cmake -S "${mfq_project_dir}/cpp_runtime" -B "${mfq_native_build_dir}" -G Ninja 
   -DCMAKE_OSX_DEPLOYMENT_TARGET="${mfq_macos_deployment_target}" \
   -DMFQ_BUILD_RUNTIME_COMMUNICATION=ON \
   -DMFQ_BUILD_METAL_RUNTIME=ON \
+  -DMFQ_BUILD_PRECOMPILED_METAL=ON \
   -DMFQ_MLX_ROOT="${mfq_mlx_root}" \
   -DMFQ_MLX_METALLIB_DEFAULT:STRING=
 cmake --build "${mfq_native_build_dir}" \
@@ -106,6 +109,9 @@ install -m 644 "${mfq_mlx_root}/lib/libmlx.dylib" "${mfq_framework_dir}/libmlx.d
 install -m 644 "${mfq_mlx_root}/lib/libjaccl.dylib" "${mfq_framework_dir}/libjaccl.dylib"
 install -m 755 "${mfq_video_source}" "${mfq_framework_dir}/libmfq_avfoundation_video.dylib"
 install -m 644 "${mfq_mlx_root}/lib/mlx.metallib" "${mfq_resource_dir}/mlx.metallib"
+[[ -s "${mfq_native_build_dir}/metal/lib/mfq-metal/manifest.json" ]] \
+  || fail "native build did not create the precompiled MFQ Metal libraries"
+cp -R "${mfq_native_build_dir}/metal/lib/mfq-metal" "${mfq_resource_dir}/mfq-metal"
 
 mfq_license_dir="${mfq_resource_dir}/licenses"
 rm -rf "${mfq_license_dir}"

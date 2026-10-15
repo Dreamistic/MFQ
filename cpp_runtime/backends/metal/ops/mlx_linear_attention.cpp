@@ -405,7 +405,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(

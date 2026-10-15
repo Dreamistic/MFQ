@@ -1017,7 +1017,7 @@ void test_residual_write_norm_matches_composition() {
         "Qwen fused write/RMS injection");
 }
 
-void test_packed_mhc(const char* path) {
+void test_packed_mhc(const char* path, bool decode_only = false) {
     using namespace mlx::core;
     using mfq::metal::MlxLinear;
     const mfq::metal::MfqContainer model(path);
@@ -1143,6 +1143,7 @@ void test_packed_mhc(const char* path) {
     };
     for (auto dtype : {float16, bfloat16, float32}) {
         for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 17, 24, 64, 2048, 4096}) {
+            if (decode_only && rows > 16) continue;
             try { compare(dtype, rows); }
             catch (const std::exception& error) {
                 throw std::runtime_error("dtype=" + std::to_string(static_cast<int>(dtype.val())) + " rows=" +
@@ -1150,7 +1151,8 @@ void test_packed_mhc(const char* path) {
             }
         }
     }
-    std::cout << "packed MHC decode, chained residual, final mixer and 4096-row prefill passed: "
+    std::cout << "packed MHC decode, chained residual, final mixer"
+              << (decode_only ? " passed: " : " and 4096-row prefill passed: ")
               << packed_bytes << " packed bytes / " << expanded_bytes << " expanded bytes\n";
 }
 
@@ -1231,8 +1233,9 @@ void benchmark_packed_mhc(const char* path) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 3 && std::string(argv[1]) == "--packed-mhc") {
-            test_packed_mhc(argv[2]);
+        if (argc == 3 && (std::string(argv[1]) == "--packed-mhc" ||
+                         std::string(argv[1]) == "--packed-mhc-decode")) {
+            test_packed_mhc(argv[2], std::string(argv[1]) == "--packed-mhc-decode");
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--benchmark-packed-mhc") {

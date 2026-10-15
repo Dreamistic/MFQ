@@ -1487,8 +1487,9 @@ TensorFixture make_nint_v2_tensor(
     int columns,
     int salt,
     int group_size = kGroupSize,
-    bool all_q_widths = false) {
-    constexpr int nominal_bits = 4;
+    bool all_q_widths = false,
+    int fixed_q = 0) {
+    const int nominal_bits = fixed_q != 0 ? fixed_q : 4;
     constexpr int nominal_sub_bits = 6;
     const int groups = (columns + group_size - 1) / group_size;
     const int values_per_row = groups * group_size;
@@ -1502,7 +1503,7 @@ TensorFixture make_nint_v2_tensor(
         static_cast<std::size_t>(rows) * groups);
     std::vector<std::uint8_t> sub_min(sub_scale.size());
     for (int row = 0; row < rows; ++row) {
-        const int q_bits = all_q_widths
+        const int q_bits = fixed_q != 0 ? fixed_q : all_q_widths
             ? 1 + (row + salt) % 8
             : 2 + (row + salt) % 5;
         const int sub_bits = 5 + (row + salt) % 4;
@@ -2724,12 +2725,14 @@ void test_two_stage_nint_shared_decode(
     bool precomputed_gate = false,
     bool packed_gate_up = false,
     int routed_group_size = kGroupSize,
-    bool repeated_routes = false) {
-    constexpr int experts = 32;
+    bool repeated_routes = false,
+    int experts = 32,
+    bool check_folded_topk = false,
+    int fixed_q = 0) {
     constexpr int routes = 10;
     const std::vector<std::string> profiles(experts, "NINTv2");
     const auto make_fixture = [&](int output, int input, int salt) {
-        if (!nvq3jl && routed_group_size != 48)
+        if (!nvq3jl && routed_group_size != 48 && fixed_q == 0)
             return make_moe_fixture(profiles, output, input, salt, routed_group_size);
         std::vector<PoolFixture> pools;
         std::vector<float> dense(experts * output * input);
@@ -2742,7 +2745,7 @@ void test_two_stage_nint_shared_decode(
                 tensor = {std::move(vq.blob), std::move(vq.dense), output, input};
             } else {
                 profile = "NINT";
-                tensor = make_nint_v2_tensor(output, input, salt + expert, nvq3jl ? 28 : routed_group_size, true);
+                tensor = make_nint_v2_tensor(output, input, salt + expert, nvq3jl ? 28 : routed_group_size, true, fixed_q);
             }
             std::copy(tensor.dense.begin(), tensor.dense.end(),
                 dense.begin() + expert * output * input);
@@ -2766,11 +2769,11 @@ void test_two_stage_nint_shared_decode(
         down_fixture.blob);
 
     const auto shared_gate_fixture = make_nint_v2_tensor(
-        intermediate, hidden, 43, shared_group_size, true);
+        intermediate, hidden, 43, shared_group_size, true, fixed_q != 0 ? 8 : 0);
     const auto shared_up_fixture = make_nint_v2_tensor(
-        intermediate, hidden, 47, shared_group_size, true);
+        intermediate, hidden, 47, shared_group_size, true, fixed_q != 0 ? 8 : 0);
     const auto shared_down_fixture = make_nint_v2_tensor(
-        hidden, intermediate, 53, shared_group_size, true);
+        hidden, intermediate, 53, shared_group_size, true, fixed_q != 0 ? 8 : 0);
     const auto shared_gate = mfq::metal::MlxNintWeight::from_blob(
         shared_gate_fixture.blob);
     const auto shared_up = mfq::metal::MlxNintWeight::from_blob(
@@ -2838,6 +2841,61 @@ void test_two_stage_nint_shared_decode(
         precomputed_gate);
     require(fused.has_value(),
             "two-stage NINT/shared decode path was not selected");
+    const auto expected_dispatch = fixed_q != 0 ? "_rowq_auto1s1" : "_rowq_auto0s0";
+    for (const auto* node : {&*fused, &fused->inputs().at(22)}) {
+        const auto* kernel = dynamic_cast<const mfq::metal::MlxPreparableKernel*>(&node->primitive());
+        require(kernel != nullptr && kernel->preparation_key().find(expected_dispatch) != std::string::npos,
+            "NINT row-q dispatch did not match the actual row precision layout");
+    }
+    if (check_folded_topk) {
+        require(tokens == 1, "folded top-k fixture must have one token");
+        for (int fixture = 0; fixture < 6; ++fixture) {
+            std::vector<float> logits_values(experts);
+            for (int expert = 0; expert < experts; ++expert) {
+                float value = std::sin(float(expert * 17 + 3)) * 4.0f;
+                if (fixture == 1) value = expert % 2 ? -0.0f : 0.0f;
+                if (fixture == 2) value = float(expert % 5) / 1024.0f;
+                if (fixture == 3) value = std::numeric_limits<float>::quiet_NaN();
+                if (fixture == 4 && expert % 3 == 0)
+                    value = std::numeric_limits<float>::quiet_NaN();
+                if (fixture == 5) value = expert % 2
+                    ? std::numeric_limits<float>::infinity()
+                    : -std::numeric_limits<float>::infinity();
+                logits_values[expert] = value;
+            }
+            const auto logits = mlx::core::astype(mlx::core::array(
+                logits_values.begin(), mlx::core::Shape{1, experts}), mlx::core::float16);
+            const auto selected = mfq::metal::moe_topk(logits, routes, false, false, true);
+            auto expected = gate_up.decode_nint_shared(down, *shared_gate_up, shared_down,
+                gate_input, input, selected.ids, selected.weights, precomputed_gate);
+            auto folded = gate_up.decode_nint_shared(down, *shared_gate_up, shared_down,
+                gate_input, input, selected.ids, selected.weights, precomputed_gate, nullptr, &logits);
+            require(expected.has_value() && folded.has_value(), "folded routing disabled MFE");
+            if (fixture == 0) {
+                mfq::metal::MlxKernelPreparation preparation(128, 128);
+                preparation.add(*folded);
+                const auto active_memory = mlx::core::get_active_memory();
+                preparation.finish();
+                require(preparation.unsupported().empty(), "folded routing cannot be prepared");
+                require(mlx::core::get_active_memory() == active_memory && !folded->is_available(),
+                        "folded routing preparation executed the graph");
+            }
+            const auto routing = folded->inputs().at(27);
+            require(routing.shape() == mlx::core::Shape{2, routes} && routing.dtype() == mlx::core::float32,
+                    "folded routing was not selected");
+            const auto routing_values = evaluated_floats(routing);
+            const auto selected_ids = evaluated_floats(selected.ids);
+            const auto selected_weights = evaluated_floats(selected.weights);
+            require(std::memcmp(routing_values.data(), selected_ids.data(), routes * sizeof(float)) == 0,
+                    "folded routing changed expert IDs");
+            require(std::memcmp(routing_values.data() + routes, selected_weights.data(), routes * sizeof(float)) == 0,
+                    "folded routing changed normalized weights");
+            const auto expected_values = evaluated_floats(*expected);
+            const auto folded_values = evaluated_floats(*folded);
+            require(std::memcmp(expected_values.data(), folded_values.data(), expected_values.size() * sizeof(float)) == 0,
+                    "folded routing changed MoE output");
+        }
+    }
     if (tokens > 1) {
         std::vector<mlx::core::array> row_outputs;
         for (int row = 0; row < tokens; ++row) {
@@ -7034,17 +7092,20 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
     if (mtp) {
         const auto full = paged.resident_full_expert_bytes();
         const auto before = mlx::core::get_active_memory();
-        paged.set_expert_cache_limit(full * 3 / 4);
-        require(paged.resident_full_expert_bytes() == 0 && paged.expert_cache_limit_bytes() == full * 3 / 4,
-            "Qwen4 budget pressure did not transfer all expert space to the shared LRU");
+        const auto budget = full * 3 / 4;
+        paged.set_expert_cache_limit(budget);
+        const auto remaining = paged.resident_full_expert_bytes();
+        require(remaining > 0 && remaining < full
+                && remaining + paged.expert_cache_limit_bytes() == budget,
+            "Qwen4 partial shrink did not share the budget with retained expert banks");
         require(paged.reclaimable_expert_bytes() <= full * 3 / 4
                 && mlx::core::get_active_memory() < before,
             "Qwen4 partial shrink did not release actual expert buffers");
         require(paged.cache_position() == 3 && paged.kv_cache_bytes() == kv,
             "Qwen4 partial expert shrink discarded the live context");
-        require(paged.ssd_expert_payload_bytes() == layer_payload * 2 &&
-                mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == layer_payload * 2,
-            "Qwen4 shared expert LRU did not report all backing records");
+        require(paged.ssd_expert_payload_bytes() == layer_payload &&
+                mfq::metal::MlxResourceTelemetry::snapshot().expert_payload_bytes == layer_payload,
+            "Qwen4 partial shrink reported unspilled expert banks as SSD backing");
         const auto input = mlx::core::array({4}, mlx::core::Shape{1, 1});
         const auto expected = evaluated_floats(reference.forward(input));
         const auto actual = evaluated_floats(paged.forward(input));
@@ -8367,6 +8428,20 @@ int main(int argc, char** argv) {
         } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     }
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--test-folded-topk") {
+            for (const int experts : {32, 64, 128, 512, 4096})
+                test_two_stage_nint_shared_decode(24, 32, 24, false, 1, false, false, kGroupSize, false, experts, true);
+            test_two_stage_nint_shared_decode(28, 256, 68, true, 1, true, false, kGroupSize, false, 32, true);
+            test_two_stage_nint_shared_decode(28, 68, 256, true, 1, true, true, kGroupSize, false, 32, true);
+            test_two_stage_nint_shared_decode(28, 260, 72, true, 2, true, false, 28, true);
+            test_two_stage_nint_shared_decode(28, 264, 76, true, 2, true, false, 28, true);
+            for (const int q : {4, 5, 6, 8}) {
+                test_two_stage_nint_shared_decode(28, 260, 72, true, 1, true, false, 28, false, 32, true, q);
+                test_two_stage_nint_shared_decode(28, 264, 76, true, 2, true, false, 28, true, 32, false, q);
+            }
+            std::cout << "MFQ folded top-k decode tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--test-portable-prefill") {
             test_portable_mmq_row_buckets();
             test_grouped_split_nint_swiglu_prefill();
@@ -8442,6 +8517,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--test-route-groups") {
+            for (const int group_size : {12, 24, 28, 48})
+                for (const int tokens : {2, 6})
+                    test_two_stage_nint_shared_decode(24, 65, 41, false,
+                        tokens, true, false, group_size, true);
             for (const int tokens : {2, 3, 5, 6, 8, 12, 17, 24}) {
                 test_two_stage_nint_shared_decode(23, 65, 41, false, tokens);
                 test_two_stage_nint_shared_decode(24, 65, 41, false, tokens, false, false, 23);

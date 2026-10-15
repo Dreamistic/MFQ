@@ -194,6 +194,7 @@ public:
     int groups() const noexcept { return groups_; }
     int input_size() const noexcept { return input_size_; }
     int output_size() const noexcept { return output_size_; }
+    bool has_uniform_q_bits() const noexcept { return uniform_q_bits_; }
 
 private:
     MlxNintSwiGluPair(
@@ -204,7 +205,8 @@ private:
         int group_size,
         int groups,
         int input_size,
-        int output_size)
+        int output_size,
+        bool uniform_q_bits)
         : q_packed_(std::move(q_packed)),
           row_metadata_(std::move(row_metadata)),
           sub_scale_(std::move(sub_scale)),
@@ -212,7 +214,8 @@ private:
           group_size_(group_size),
           groups_(groups),
           input_size_(input_size),
-          output_size_(output_size) {}
+          output_size_(output_size),
+          uniform_q_bits_(uniform_q_bits) {}
 
     mlx::core::array q_packed_;
     mlx::core::array row_metadata_;
@@ -222,6 +225,7 @@ private:
     int groups_ = 0;
     int input_size_ = 0;
     int output_size_ = 0;
+    bool uniform_q_bits_ = false;
 };
 
 } // namespace mfq::metal
