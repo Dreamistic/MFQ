@@ -1025,7 +1025,8 @@ public:
         NintProjectionConfig config)
         : UnaryPrimitive(stream), config_(std::move(config)),
           kernel_name_(config_.swiglu
-              ? "mfq_nint_projection" : "mfq_nint_projection_common") {
+              ? "mfq_nint_projection" : config_.rows <= 6
+                  ? "mfq_nint_projection_common_rowq" : "mfq_nint_projection_common") {
         kernel_name_ += config_.dtype == mlx::core::float32 ? "_f32" : "_f16";
         for (int value : {
                  config_.rows, config_.group_size, config_.groups,
@@ -1200,7 +1201,8 @@ private:
                 "#define OPS_PER_SIMD " + std::to_string(config_.outputs_per_simd(width)) + "\n"
                 "#define MFQ_NINT_STORE_OUTPUT(index, value) "
                 "y[row * uint(TOTAL_OUT) + " + std::to_string(offset) + "u + output] = T(value)\n";
-            source += detail::nint_matmul_metal_body();
+            source += config_.rows <= 6 ? detail::nint_matmul_metal_row_q_body()
+                : detail::nint_matmul_metal_body();
             source +=
                 "#undef MFQ_NINT_STORE_OUTPUT\n#undef OPS_PER_SIMD\n"
                 "#undef LOGICAL_OUT\n#undef OUT\n}\n";
