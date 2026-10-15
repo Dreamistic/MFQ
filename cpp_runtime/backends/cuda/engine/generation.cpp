@@ -83,9 +83,27 @@ template <typename Model> struct CudaGenerationOps {
         };
         auto ids = full_ids.narrow(1, chunk.offset, chunk.count).contiguous();
         Tensor hidden;
-        bool layer_major=false;
+        bool layer_major=false,short_windows=false;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
-            if((!prepared || !prepared->transformed()) &&
+            if((!prepared || !prepared->transformed()) && model.reuse_decode_graphs &&
+                    model.graph_registry && chunk.count<=128) {
+                // The same bounded prompt windows as MTP avoid materializing
+                // a whole expert layer before a short prompt has any scratch.
+                short_windows=true;
+                for(int64_t offset=0;offset<chunk.count;) {
+                    if(output && output->stopped())break;
+                    const auto rows=model.cache_pos==0?int64_t(1):std::min<int64_t>(4,chunk.count-offset);
+                    auto part=ids.narrow(1,offset,rows);
+                    Tensor window_logits;
+                    if(auto result=qwen4_decode_graph_hidden(model,part,nullptr,rows>1?1:0,
+                            nullptr,{},&window_logits))
+                        hidden=std::move(*result);
+                    else hidden=model.hidden_forward(part,mfq_nullopt,mfq_nullopt,nullptr,
+                        mfq_nullopt,nullptr,rows>1?1:0);
+                    if(rows>1)model.commit_speculative();
+                    offset+=rows;
+                }
+            } else if((!prepared || !prepared->transformed()) &&
                 qwen4_layer_major_prefill_eligible(model,chunk.count)) {
                 layer_major=true;
                 hidden=qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,true,
@@ -138,6 +156,7 @@ template <typename Model> struct CudaGenerationOps {
         const auto elapsed=timer.elapsed_ms();
         if(graph_config.trace)std::cerr<<"runtime_prefill_chunk offset="<<chunk.offset
             <<" tokens="<<chunk.count<<" layer_major="<<layer_major
+            <<" short_windows="<<short_windows
             <<" compute_chunk="<<prefill_compute_chunk<<" elapsed_ms="<<elapsed
             <<" timing=before_cache_restore"<<'\n';
         return elapsed;
