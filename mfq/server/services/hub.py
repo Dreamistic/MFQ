@@ -153,99 +153,6 @@ class _OfficialModelSpec:
     supports_ssd_streaming: bool = False
 
 
-_OFFICIAL_MODELS = (
-    _OfficialModelSpec(
-        id="deepseek-v4-flash-0731",
-        name="DeepSeek-V4-Flash-0731",
-        family="DeepSeek-V4-Flash Series",
-        architecture="deepseek_v4",
-        description=(
-            "DeepSeek V4 Flash-series MoE model with approximately 284B total and "
-            "13B active parameters per token, with enhanced agentic capabilities and MTP."
-        ),
-        description_zh=(
-            "DeepSeek V4 Flash 系列 MoE 模型，约 284B 总参数、每 token 激活约 13B，"
-            "增强智能体能力，支持 MTP。"
-        ),
-        parameter_label="284B",
-        active_parameter_label="13B",
-        modalities=("text",),
-        capabilities=("MTP", "MoE"),
-        precision_options=("Expert-Wise V2",),
-        license=None,
-        sources=(
-            _OfficialSourceSpec(
-                "huggingface", "Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ"
-            ),
-            _OfficialSourceSpec(
-                "modelscope", "Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ"
-            ),
-        ),
-        supports_ssd_streaming=True,
-    ),
-    _OfficialModelSpec(
-        id="qwen3-8-27b",
-        name="Qwen3.8-27B",
-        family="Qwen3.8",
-        architecture="qwen3_5",
-        description=(
-            "A 27B dense model in the Qwen3.8 series for coding, reasoning, and "
-            "multi-step agent tasks, with native image and video understanding."
-        ),
-        description_zh=(
-            "Qwen3.8 系列的 27B 稠密模型，面向编程、推理与多步骤智能体任务，原生支持图像与视频理解。"
-        ),
-        parameter_label="27B",
-        active_parameter_label="27B",
-        modalities=("text", "image", "video"),
-        capabilities=("Vision", "MTP"),
-        precision_options=("V1–V4", "S4–S6"),
-        license=None,
-        sources=(_OfficialSourceSpec("modelscope", "Tylogi/Qwen3.8-27B-MFQ"),),
-    ),
-    _OfficialModelSpec(
-        id="qwen3-6-27b",
-        name="Qwen3.6-27B",
-        family="Qwen3.6",
-        architecture="qwen3_5",
-        description=(
-            "A 27B dense model in the Qwen3.6 series with text reasoning, image "
-            "and video understanding, and multi-token prediction."
-        ),
-        description_zh=(
-            "Qwen3.6 系列的 27B 稠密模型，支持文本推理、图像与视频理解，以及多 token 预测。"
-        ),
-        parameter_label="27B",
-        active_parameter_label="27B",
-        modalities=("text", "image", "video"),
-        capabilities=("Vision", "MTP"),
-        precision_options=("V2–V3", "S2–S6"),
-        license=None,
-        sources=(_OfficialSourceSpec("huggingface", "Tylogi/Qwen3.6-27B-MFQ"),),
-    ),
-    _OfficialModelSpec(
-        id="minicpm-o-4-5",
-        name="MiniCPM-o 4.5",
-        family="MiniCPM-o",
-        architecture="minicpmo",
-        description=(
-            "MiniCPM-o 4.5 omnimodal model for text, image, video, audio, speech output, "
-            "and full-duplex interaction."
-        ),
-        description_zh=(
-            "MiniCPM-o 4.5 全模态模型，支持文本、图像、视频、音频、语音输出与全双工交互。"
-        ),
-        parameter_label=None,
-        active_parameter_label=None,
-        modalities=("text", "image", "video", "audio"),
-        capabilities=("Vision", "Audio", "Speech output", "Full duplex"),
-        precision_options=("S4–S8",),
-        license=None,
-        sources=(_OfficialSourceSpec("modelscope", "Tylogi/MiniCPM-o-4_5-MFQ"),),
-    ),
-)
-
-
 def resolve_hub_reference(
     reference: str, fallback_provider: HubProvider = "huggingface"
 ) -> tuple[HubProvider, str, str | None]:
@@ -628,11 +535,6 @@ class HubCatalog:
             if not math.isfinite(updated_at) or updated_at > now:
                 return
             age = now - updated_at
-            sources = {
-                (source.provider, source.repo_id)
-                for model in _OFFICIAL_MODELS
-                for source in model.sources
-            }
             cache = {}
             times = {}
             for item in payload["models"]:
@@ -641,7 +543,7 @@ class HubCatalog:
                 if not math.isfinite(cached_at) or cached_at > now:
                     return
                 key = (model.provider, model.repo_id)
-                if key in sources or self._is_official_repo(model.repo_id):
+                if self._is_official_repo(model.repo_id):
                     cache[key] = model
                     times[key] = time.monotonic() - (now - cached_at)
                     self._discovered_sources.add(key)
@@ -922,7 +824,7 @@ class HubCatalog:
         profile = profile or system_profile()
         refreshing = self._refresh_task is not None and not self._refresh_task.done()
         stale = (
-            not self._official_cache
+            self._official_cache_time == 0.0
             or time.monotonic() - self._official_cache_time >= _OFFICIAL_CACHE_TTL
         )
         if not self._closed and not refreshing and (refresh or stale):
@@ -940,11 +842,6 @@ class HubCatalog:
         sources = {
             (source.provider, source.repo_id)
             for model in self._official_specs()
-            for source in model.sources
-        }
-        static_sources = {
-            (source.provider, source.repo_id)
-            for model in _OFFICIAL_MODELS
             for source in model.sources
         }
         discovered: dict[HubProvider, set[tuple[HubProvider, str]]] = {}
@@ -976,8 +873,8 @@ class HubCatalog:
 
         try:
             await asyncio.gather(*(inspect(*key) for key in sorted(sources)), discover("huggingface"), discover("modelscope"))
-            removed = missing | {key for key in self._discovered_sources
-                if key[0] in discovered and key not in discovered[key[0]] and key not in static_sources}
+            removed = missing | {key for key in self._discovered_sources | self._official_cache.keys()
+                if key[0] in discovered and key not in discovered[key[0]]}
             self._discovered_sources.difference_update(removed)
             for key in removed:
                 self._official_cache.pop(key, None)
@@ -1036,7 +933,7 @@ class HubCatalog:
             raise HubError('Official model discovery failed') from error
 
     def _official_specs(self) -> list[_OfficialModelSpec]:
-        specs = {model.sources[0].repo_id.split('/')[1].casefold(): model for model in _OFFICIAL_MODELS}
+        specs: dict[str, _OfficialModelSpec] = {}
         for provider, repo_id in sorted(self._discovered_sources):
             source = _OfficialSourceSpec(provider, repo_id)
             name = repo_id.split('/')[1]
@@ -1077,6 +974,15 @@ class HubCatalog:
             return (int(info.parameter_breakdown is not None) + int(info.cache_profile is not None), coverage, -index)
         selected_index = max(range(len(source_models)), key=source_quality)
         source_info = source_models[selected_index]
+        parameters = source_info.parameter_breakdown if source_info else None
+        modalities = source_info.modalities if source_info and source_info.modalities else list(spec.modalities)
+        capabilities = [name for name, enabled in (
+            ('MoE', parameters is not None and parameters.routed_experts > 0),
+            ('PLE', source_info is not None and bool(source_info.ple_parameter_count or parameters and parameters.ple)),
+            ('MTP', source_info is not None and source_info.mtp_supported is True),
+            ('Vision', 'image' in modalities or 'video' in modalities),
+            ('Audio', 'audio' in modalities),
+        ) if enabled]
         sources = [
             OfficialModelSource(
                 provider=source.provider,
@@ -1111,11 +1017,11 @@ class HubCatalog:
             parameter_breakdown=source_info.parameter_breakdown if source_info else None,
             cache_profile=source_info.cache_profile if source_info else None,
             mtp_supported=source_info.mtp_supported if source_info and source_info.mtp_supported is not None else True if 'MTP' in spec.capabilities else None,
-            modalities=list(spec.modalities),
-            capabilities=list(spec.capabilities),
+            modalities=modalities,
+            capabilities=capabilities,
             precision_options=list(spec.precision_options),
             license=source_info.license if source_info and source_info.license else spec.license,
-            supports_ssd_streaming=spec.supports_ssd_streaming,
+            supports_ssd_streaming='MoE' in capabilities,
             sources=sources,
             selected_source=selected_source,
             revision=source_info.revision if source_info else "main",

@@ -1,5 +1,6 @@
 #include "mlx_sparse_attention.h"
 #include "mlx_kernel_prepare.h"
+#include "mlx_builtin_kernels.h"
 
 #include "mfq_mfe_prefill_embedded.h"
 #include "mlx_platform.h"
@@ -38,16 +39,6 @@ using TemplateArgs = std::vector<
 
 #include "../kernels/mfq_sparse_attention_kernels.inc"
 #include "../kernels/mfq_sparse_block_nax.inc"
-#include "../kernels/mfq_qsa_prefill.inc"
-
-std::string qsa_prefill_indexer_source() {
-    std::string source = "#include <metal_stdlib>\n"
-        "#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n";
-    source += detail::kSteelMmaSource;
-    source += "\n#define STEEL_PRAGMA_UNROLL _Pragma(\"clang loop unroll(full)\")\n";
-    source += kQsaPrefillIndexerSource;
-    return source;
-}
 
 class QsaPrefillScoresPrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
 public:
@@ -56,7 +47,7 @@ public:
 
     std::string preparation_key() const override { return "mfq_qsa_prefill_scores"; }
     void prepare_gpu() override {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         auto* library = prepared_library();
         (void)device.get_kernel("mfq_qsa_prefill_scores_f16", library);
         (void)device.get_kernel("mfq_qsa_prefill_scores_bf16", library);
@@ -65,7 +56,7 @@ public:
     MTL::Library* prepared_library() {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        return mlx::core::metal::device(stream().device).get_library(
+        return kernel_device(stream().device).get_library(
             "mfq_qsa_prefill_indexer_v1", options, qsa_prefill_indexer_source);
     }
 
@@ -79,7 +70,7 @@ public:
         const auto& key = inputs.at(1);
         auto& output = outputs.front();
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         auto* library = prepared_library();
         const char* name = query.dtype() == mlx::core::float16
             ? "mfq_qsa_prefill_scores_f16" : "mfq_qsa_prefill_scores_bf16";
@@ -138,7 +129,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library("mfq_qsa_prefill_indexer_v1",
@@ -259,7 +250,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -363,7 +354,7 @@ bool sparse_block_nax_available() {
         if (!__builtin_available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
             return false;
         }
-        const auto& device = mlx::core::metal::device(mlx::core::Device::gpu);
+        const auto& device = kernel_device(mlx::core::Device::gpu);
         const auto& architecture = device.get_architecture();
         return !architecture.empty() && device.get_architecture_gen() >=
             (architecture.back() == 'p' ? 18 : 17);
@@ -443,7 +434,7 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -662,29 +653,13 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
             "mfq_sparse_attention_v1",
             options,
-            [] {
-                std::string source;
-                source.reserve(
-                    sizeof(detail::kSteelAttentionSource)
-                    + sizeof(detail::kDsaSparsePrefillSource)
-                    + sizeof(detail::kSparseBlockGqaSource)
-                    + 192);
-                source += "#include <metal_stdlib>\n";
-                source += "#include <metal_simdgroup>\n";
-                source += "#include <metal_simdgroup_matrix>\n";
-                source += "using namespace metal;\n";
-                source += "using bfloat16_t = bfloat;\n";
-                source += detail::kSteelAttentionSource;
-                source += detail::kDsaSparsePrefillSource;
-                source += detail::kSparseBlockGqaSource;
-                return source;
-            });
+            sparse_attention_source);
         const char* kernel_name = dtype_ == mlx::core::float16
             ? "mfq_sparse_block_gqa_f16_bk64_dc64_gqa12_d256_wm2"
             : "mfq_sparse_block_gqa_bf16_bk64_dc64_gqa12_d256_wm2";
@@ -713,7 +688,7 @@ public:
         }
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(selected_stream.device);
+        auto& device = kernel_device(selected_stream.device);
         auto* kernel = prepared_kernel();
         auto& encoder = mlx::core::metal::get_command_encoder(selected_stream);
         encoder.set_compute_pipeline_state(kernel);
@@ -813,29 +788,13 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
             "mfq_sparse_attention_v1",
             options,
-            [] {
-                std::string source;
-                source.reserve(
-                    sizeof(detail::kSteelAttentionSource)
-                    + sizeof(detail::kDsaSparsePrefillSource)
-                    + sizeof(detail::kSparseBlockGqaSource)
-                    + 192);
-                source += "#include <metal_stdlib>\n";
-                source += "#include <metal_simdgroup>\n";
-                source += "#include <metal_simdgroup_matrix>\n";
-                source += "using namespace metal;\n";
-                source += "using bfloat16_t = bfloat;\n";
-                source += detail::kSteelAttentionSource;
-                source += detail::kDsaSparsePrefillSource;
-                source += detail::kSparseBlockGqaSource;
-                return source;
-            });
+            sparse_attention_source);
         const char* kernel_name = dtype_ == mlx::core::bfloat16
             ? "mfq_dsa_sparse_prefill_bf16_bk256_dc32"
             : "mfq_dsa_sparse_prefill_f16_bk256_dc32";
@@ -857,7 +816,7 @@ public:
         }
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(selected_stream.device);
+        auto& device = kernel_device(selected_stream.device);
         auto* kernel = prepared_kernel();
         auto& encoder =
             mlx::core::metal::get_command_encoder(selected_stream);
@@ -918,29 +877,13 @@ public:
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
-        auto& device = mlx::core::metal::device(stream().device);
+        auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
             "mfq_sparse_attention_v1",
             options,
-            [] {
-                std::string source;
-                source.reserve(
-                    sizeof(detail::kSteelAttentionSource)
-                    + sizeof(detail::kDsaSparsePrefillSource)
-                    + sizeof(detail::kSparseBlockGqaSource)
-                    + 192);
-                source += "#include <metal_stdlib>\n";
-                source += "#include <metal_simdgroup>\n";
-                source += "#include <metal_simdgroup_matrix>\n";
-                source += "using namespace metal;\n";
-                source += "using bfloat16_t = bfloat;\n";
-                source += detail::kSteelAttentionSource;
-                source += detail::kDsaSparsePrefillSource;
-                source += detail::kSparseBlockGqaSource;
-                return source;
-            });
+            sparse_attention_source);
         const char* kernel_name = dtype_ == mlx::core::bfloat16
             ? "mfq_dsa_sparse_circular_bf16_bk256_dc32"
             : "mfq_dsa_sparse_circular_f16_bk256_dc32";
@@ -962,7 +905,7 @@ public:
         }
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(selected_stream.device);
+        auto& device = kernel_device(selected_stream.device);
         auto* kernel = prepared_kernel();
         auto& encoder =
             mlx::core::metal::get_command_encoder(selected_stream);

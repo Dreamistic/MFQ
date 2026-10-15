@@ -879,7 +879,7 @@ public:
                         source,
                         routes.ids,
                         routes.weights,
-                        shared_gate_weight == nullptr, route_groups)) {
+                        shared_gate_weight == nullptr, route_groups, &router_logits)) {
                     if (detail::component_profile_active()) {
                         detail::profile_eval(
                             "qwen4.moe.two_stage", *fused);
@@ -1995,7 +1995,12 @@ private:
             preparation->collect([&] {
                 for (const auto rows : preparation->row_buckets()) {
                     const auto input = mlx::core::zeros(
-                        Shape{1, rows, static_cast<int>(config_.hidden_size * config_.hc_count)}, mlx::core::float32);
+                        Shape{1, rows, static_cast<int>(config_.hidden_size * config_.hc_count)}, mlx::core::float16);
+                    const auto embeddings = mlx::core::zeros(
+                        Shape{1, rows, static_cast<int>(config_.hidden_size)}, mlx::core::float16);
+                    const auto projected = project(input, embeddings);
+                    preparation->add(projected.first);
+                    preparation->add(projected.second);
                     const auto normalized = qwen4_grouped_rms_norm(input, norm_conv_,
                         static_cast<int>(config_.hidden_size), static_cast<float>(config_.rms_norm_eps));
                     preparation->add(qwen4_grouped_rms_norm(input, norm_query_,
@@ -3844,6 +3849,18 @@ struct Qwen4MtpForward {
 
 class Qwen4Mtp {
 public:
+    void prepare_inputs(const MlxEmbedding& embedding) {
+        if (auto* preparation = MlxKernelPreparation::current()) {
+            preparation->collect([&] {
+                for (const auto rows : preparation->row_buckets()) {
+                    const auto hidden = mlx::core::zeros(
+                        Shape{1, rows, static_cast<int>(config_.hc_count * config_.hidden_size)}, mlx::core::float16);
+                    const auto ids = mlx::core::zeros(Shape{1, rows}, mlx::core::int32);
+                    preparation->add(fuse_inputs(hidden, ids, embedding, false).streams);
+                }
+            });
+        }
+    }
     std::size_t layer_count() const noexcept { return layers_.size(); }
     void exchange_cache(std::vector<Qwen4RequestLayerCache>& layers, int& position, int& batch) {
         if (layers.size() != layers_.size()) throw std::invalid_argument("predictor request topology mismatch");
@@ -4572,6 +4589,17 @@ struct MlxQwen4CausalLm::Impl {
                 }
             }
         }
+        if (auto* preparation = MlxKernelPreparation::current()) {
+            preparation->collect([&] {
+                for (const auto rows : preparation->row_buckets()) {
+                    const auto streams = mlx::core::zeros(
+                        Shape{1, rows, static_cast<int>(result->config.hc_count * result->config.hidden_size)}, mlx::core::float16);
+                    const auto hidden = result->mixer.mix(streams);
+                    preparation->add(result->output ? (*result->output)(hidden) : result->embedding.project(hidden));
+                }
+            });
+            if (result->mtp) result->mtp->prepare_inputs(result->embedding);
+        }
         return result;
     }
 
@@ -4812,6 +4840,8 @@ MlxQwen4CausalLm MlxQwen4CausalLm::load(
     if (max_context <= 0) {
         throw std::invalid_argument("Qwen4 max_context must be positive");
     }
+    if (auto* preparation = MlxKernelPreparation::current(); preparation && !expert_cache_bytes)
+        preparation->use_model_paths();
     return MlxQwen4CausalLm(Impl::load(
         model, max_context, expert_cache_bytes));
 }

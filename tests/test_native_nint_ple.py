@@ -444,8 +444,11 @@ def test_native_qwen_nint_mhc_matches_dense_graph(tmp_path, adaptive, projection
 
 
 @pytest.mark.parametrize("adaptive", [False, True])
-@pytest.mark.parametrize("group_sizes", [(48, 24, 7), (28, 7, 24)])
-def test_native_qwen_packed_mhc_real_geometry(tmp_path, adaptive, group_sizes):
+@pytest.mark.parametrize("group_sizes,decode_only", [
+    ((48, 24, 7), False), ((28, 7, 24), False),
+    ((24, 28, 48), True), ((12, 12, 12), True), ((48, 48, 28), True),
+])
+def test_native_qwen_packed_mhc_real_geometry(tmp_path, adaptive, group_sizes, decode_only):
     executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-qwen-gated-hc-test"
     if not executable.is_file():
         pytest.skip("build mfq-metal-qwen-gated-hc-test to exercise packed MHC kernels")
@@ -458,7 +461,8 @@ def test_native_qwen_packed_mhc_real_geometry(tmp_path, adaptive, group_sizes):
         kbits = np.arange(rows, dtype=np.uint8) % 3 + 6 if adaptive else np.full(rows, 7, dtype=np.uint8)
         codes = np.empty((rows, groups, gs), dtype=np.uint8)
         for row in range(rows):
-            codes[row].reshape(-1)[:] = (np.arange(groups * gs) * 3 + row) % min(8, 1 << int(qbits[row]))
+            levels = 1 << int(qbits[row])
+            codes[row].reshape(-1)[:] = (np.arange(groups * gs) * 3 + row) % (levels if decode_only else min(8, levels))
         tensors[f"test.mhc.{suffix}.weight"] = NintTensor(
             spec=NintSpec(8, gs, 7), shape=(rows, width), axis=0, q=codes,
             neuron_scale=np.full(rows, 1 / 8192, dtype=np.float32),
@@ -469,10 +473,11 @@ def test_native_qwen_packed_mhc_real_geometry(tmp_path, adaptive, group_sizes):
         )
     path = tmp_path / "packed_mhc.mfq"
     io.save(path, FileHeader(model_arch="qwen4_exp", num_tensors=len(tensors)), tensors)
-    result = subprocess.run([str(executable), "--packed-mhc", str(path)],
+    mode = "--packed-mhc-decode" if decode_only else "--packed-mhc"
+    result = subprocess.run([str(executable), mode, str(path)],
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "4096-row prefill passed" in result.stdout
+    assert ("final mixer passed" if decode_only else "4096-row prefill passed") in result.stdout
 
 
 @pytest.mark.parametrize("name", [

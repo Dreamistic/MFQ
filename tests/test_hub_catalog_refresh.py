@@ -37,7 +37,6 @@ def no_network(monkeypatch):
 
 def test_rename_refresh_merges_sources_and_does_not_restore_old_card(tmp_path, monkeypatch):
     async def run():
-        monkeypatch.setattr(hub, '_OFFICIAL_MODELS', ())
         path = tmp_path / 'hub.json'
         catalog = hub.HubCatalog(cache_path=path)
         remember(catalog, 'huggingface', NEW)
@@ -80,7 +79,6 @@ def test_rename_refresh_merges_sources_and_does_not_restore_old_card(tmp_path, m
 
 def test_complete_listing_removes_absent_repo_after_inflight_metadata_finishes(monkeypatch):
     async def run():
-        monkeypatch.setattr(hub, '_OFFICIAL_MODELS', ())
         catalog = hub.HubCatalog()
         remember(catalog, 'modelscope', OLD)
         listed = asyncio.Event()
@@ -105,7 +103,6 @@ def test_complete_listing_removes_absent_repo_after_inflight_metadata_finishes(m
 
 def test_failed_provider_listing_keeps_its_cache_while_other_provider_is_reconciled(monkeypatch):
     async def run():
-        monkeypatch.setattr(hub, '_OFFICIAL_MODELS', ())
         catalog = hub.HubCatalog()
         remember(catalog, 'huggingface', NEW)
         remember(catalog, 'modelscope', OLD)
@@ -131,7 +128,6 @@ def test_failed_provider_listing_keeps_its_cache_while_other_provider_is_reconci
 
 def test_confirmed_missing_repo_is_removed_even_when_author_listing_is_offline(monkeypatch):
     async def run():
-        monkeypatch.setattr(hub, '_OFFICIAL_MODELS', ())
         catalog = hub.HubCatalog()
         remember(catalog, 'modelscope', OLD)
 
@@ -149,23 +145,75 @@ def test_confirmed_missing_repo_is_removed_even_when_author_listing_is_offline(m
     asyncio.run(run())
 
 
-def test_seeded_sources_are_retained_when_only_author_listing_omits_them(monkeypatch):
+@pytest.mark.parametrize('repo', [
+    'Tylogi/Qwen3.6-27B-MFQ', 'Tylogi/Qwen3.8-27B-MFQ',
+    'Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ', 'Tylogi/MiniCPM-o-4_5-MFQ',
+])
+@pytest.mark.parametrize('status', [401, 404])
+def test_deleted_repositories_have_no_exemptions_and_stay_absent_after_restart(tmp_path, monkeypatch, repo, status):
     async def run():
-        catalog = hub.HubCatalog()
-        source = hub._OFFICIAL_MODELS[0].sources[0]
-        remember(catalog, source.provider, source.repo_id)
+        path = tmp_path / 'hub.json'
+        catalog = hub.HubCatalog(cache_path=path)
+        remember(catalog, 'huggingface', repo)
+        catalog._save_cache()
+        catalog = hub.HubCatalog(cache_path=path)
 
         async def discover(*args):
             return []
 
-        async def fetch(*args):
-            raise hub.HubError('temporary outage')
+        monkeypatch.setattr(catalog, '_discover_official', discover)
+        monkeypatch.setattr(hub, '_metadata_client', lambda *args, **kwargs:
+            httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(status))))
+        await catalog._refresh_official_cache(PROFILE)
+        assert not catalog._official_cache and not catalog._discovered_sources
+        assert not catalog._source_cache_times and not catalog._detail_attempt_times
+        current = await catalog.official(profile=PROFILE)
+        assert not current.data and not current.refreshing
+        restored = hub.HubCatalog(cache_path=path)
+        current = await restored.official(profile=PROFILE)
+        assert not current.data and not current.refreshing
+        await restored.aclose()
+        await catalog.aclose()
+    asyncio.run(run())
 
+
+def test_empty_catalog_has_no_models_before_discovery_or_when_offline(monkeypatch):
+    async def run():
+        catalog = hub.HubCatalog()
+        assert not catalog._official_specs()
+        async def offline(*args):
+            raise hub.HubError('offline')
+        monkeypatch.setattr(catalog, '_discover_official', offline)
+        assert not (await catalog.official(profile=PROFILE)).data
+        await catalog._refresh_task
+        result = await catalog.official(profile=PROFILE)
+        assert not result.data and not result.refreshing
+        await catalog.aclose()
+    asyncio.run(run())
+
+
+def test_deleting_one_provider_preserves_other_provider_and_metadata(tmp_path, monkeypatch):
+    async def run():
+        path = tmp_path / 'hub.json'
+        catalog = hub.HubCatalog(cache_path=path)
+        for provider in ('huggingface', 'modelscope'):
+            remember(catalog, provider, NEW)
+        async def discover(provider):
+            return [NEW] if provider == 'modelscope' else []
+        async def fetch(provider, repo, revision, profile):
+            if provider == 'huggingface':
+                raise hub.HubError('401')
+            return model(provider, repo)
         monkeypatch.setattr(catalog, '_discover_official', discover)
         monkeypatch.setattr(catalog, '_fetch_info', fetch)
         await catalog._refresh_official_cache(PROFILE)
-        assert catalog._official_cache[(source.provider, source.repo_id)] is not None
+        restored = hub.HubCatalog(cache_path=path)
+        result = await restored.official(profile=PROFILE)
+        assert len(result.data) == 1
+        assert [(s.provider, s.available) for s in result.data[0].sources] == [('modelscope', True)]
+        assert result.data[0].variants[0].ssd_ple_bytes == 12
         await catalog.aclose()
+        await restored.aclose()
     asyncio.run(run())
 
 
