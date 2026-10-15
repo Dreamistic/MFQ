@@ -63,6 +63,29 @@ constexpr std::string_view kModelConfigAsset =
 // draft chain. Predictor layer count and maximum draft depth are independent.
 constexpr int kQwen4MtpMaximumDraftDepth = 5;
 
+struct Qwen4PromptPositions {
+    std::optional<array> prompt;
+    int delta = 0;
+
+    array full(int count) const {
+        if (!prompt) return mlx::core::arange(0, count, 1, mlx::core::int32);
+        const int prefix = std::min(count, prompt->shape(-1));
+        auto positions = mlx::core::slice(*prompt, {0, 0}, {3, prefix});
+        if (count > prefix) {
+            auto tail = mlx::core::broadcast_to(
+                mlx::core::arange(prefix + delta, count + delta, 1, mlx::core::int32),
+                Shape{3, count - prefix});
+            positions = mlx::core::concatenate({positions, tail}, -1);
+        }
+        return positions;
+    }
+
+    array current(const array& full, int start, int count) const {
+        return prompt ? mlx::core::slice(full, {0, start}, {3, start + count})
+                      : mlx::core::arange(start, start + count, 1, mlx::core::int32);
+    }
+};
+
 struct Qwen4PleSpeculativeState {
     std::optional<array> convolution_state;
     std::vector<std::int64_t> ngram_context;
@@ -4026,10 +4049,8 @@ public:
         const int batch = token_ids.shape(0);
         const int tokens = token_ids.shape(1);
         const int start = use_cache ? position_ : 0;
-        auto current_positions = mlx::core::arange(
-            start, start + tokens, 1, mlx::core::int32);
-        auto full_positions = mlx::core::arange(
-            0, start + tokens, 1, mlx::core::int32);
+        auto full_positions = prompt_positions.full(start + tokens);
+        auto current_positions = prompt_positions.current(full_positions, start, tokens);
         auto streams = layers_.at(0).forward(
             std::move(input.streams), input.ids,
             current_positions, full_positions, use_cache);
@@ -4066,10 +4087,8 @@ public:
         const MlxEmbedding& embedding) {
         auto input = fuse_inputs(previous_hidden, token_ids, embedding, true);
         const int tokens = token_ids.shape(1);
-        auto current_positions = mlx::core::arange(
-            position_, position_ + tokens, 1, mlx::core::int32);
-        auto full_positions = mlx::core::arange(
-            0, position_ + tokens, 1, mlx::core::int32);
+        auto full_positions = prompt_positions.full(position_ + tokens);
+        auto current_positions = prompt_positions.current(full_positions, position_, tokens);
         auto anchor = layers_.at(0).append_history(
             std::move(input.streams), input.ids, current_positions, full_positions);
         position_ += tokens;
@@ -4079,6 +4098,8 @@ public:
     int cache_position() const noexcept {
         return position_;
     }
+
+    Qwen4PromptPositions prompt_positions;
 
     std::size_t cache_bytes() const noexcept {
         std::size_t bytes = 0;
@@ -4397,6 +4418,36 @@ Qwen4Config Qwen4Config::from_json(std::string_view payload) {
     config.eos_token_id = eos.is_array()
         ? eos.at(0).get<std::int64_t>()
         : eos.is_null() ? 0 : eos.get<std::int64_t>();
+    if (outer.contains("vision_config") && !outer.at("vision_config").is_null()) {
+        const auto& vision = outer.at("vision_config");
+        if (vision.value("hidden_act", std::string("gelu_pytorch_tanh")) != "gelu_pytorch_tanh")
+            throw std::runtime_error("Qwen grid-ViT requires gelu_pytorch_tanh hidden_act");
+        GridVisionConfig v;
+        v.hidden_size = positive(vision, "hidden_size");
+        v.intermediate_size = positive(vision, "intermediate_size");
+        v.depth = positive(vision, "depth");
+        v.num_heads = positive(vision, "num_heads");
+        v.in_channels = vision.value("in_channels", 3);
+        v.patch_size = positive(vision, "patch_size");
+        v.temporal_patch_size = positive(vision, "temporal_patch_size");
+        v.spatial_merge_size = positive(vision, "spatial_merge_size");
+        v.out_hidden_size = positive(vision, "out_hidden_size");
+        v.num_position_embeddings = positive(vision, "num_position_embeddings");
+        v.rope_theta = vision.value("rope_parameters", json::object()).value(
+            "rope_theta", vision.value("rope_theta", 10000.0));
+        v.layer_norm_eps = vision.value("layer_norm_eps", 1e-6);
+        v.validate();
+        if (v.out_hidden_size != config.hidden_size)
+            throw std::runtime_error("Qwen4 vision merger width disagrees with text hidden size");
+        config.vision = v;
+        for (const auto* name : {"image_token_id", "video_token_id"}) {
+            if (!outer.contains(name) || outer.at(name).is_null()) continue;
+            const auto token = outer.at(name).get<std::int64_t>();
+            if (token < 0 || token >= config.vocab_size)
+                throw std::runtime_error("Qwen4 media token is out of range");
+            (std::string_view(name) == "image_token_id" ? config.image_token_id : config.video_token_id) = token;
+        }
+    }
     return config;
 }
 
@@ -4569,6 +4620,16 @@ struct MlxQwen4CausalLm::Impl {
             std::move(ssd_expert_cache),
             std::move(mfe_offload_cache)));
         result->source = std::make_unique<MfqContainer>(model);
+        if (const auto* vision = graph.component("vision")) {
+            if (vision->implementation != "grid_vit" || !result->config.vision ||
+                !result->config.image_token_id || !result->config.video_token_id ||
+                result->config.image_token_id == result->config.video_token_id ||
+                result->config.rope_sections.empty())
+                throw std::runtime_error("model graph Vision component is incompatible with Qwen4");
+            result->vision.emplace(MlxGridVisionPromptComponent::load(
+                model, *result->config.vision, *result->config.image_token_id,
+                *result->config.video_token_id, vision->input_contract, vision->position_policy));
+        }
         result->mtp_base_key = std::move(mtp_identity);
         result->mtp_full_precision = full_precision_mtp;
         // Count backing payloads once at load time, not on every UI refresh.
@@ -4611,7 +4672,8 @@ struct MlxQwen4CausalLm::Impl {
         const array& token_ids,
         bool use_cache,
         bool last_token_only = false,
-        int speculative_confirmed = 0) {
+        int speculative_confirmed = 0,
+        const std::optional<array>& embeddings = std::nullopt) {
         if (token_ids.ndim() != 2 || token_ids.shape(0) <= 0 ||
             token_ids.shape(1) <= 0) {
             throw std::runtime_error("Qwen4 token IDs must have [B,T] shape");
@@ -4642,7 +4704,8 @@ struct MlxQwen4CausalLm::Impl {
                 ple_pipeline[index] = layers[index].prefetch_ple(ids, use_cache);
             }
         }
-        auto hidden = embedding(ids, mlx::core::float16);
+        auto hidden = embeddings ? mlx::core::astype(*embeddings, mlx::core::float16)
+                                 : embedding(ids, mlx::core::float16);
         auto streams = mlx::core::reshape(
             mlx::core::broadcast_to(
                 mlx::core::expand_dims(hidden, -2),
@@ -4657,10 +4720,8 @@ struct MlxQwen4CausalLm::Impl {
                 tokens,
                 static_cast<int>(config.hc_count * config.hidden_size),
             });
-        auto current_positions = mlx::core::arange(
-            start, start + tokens, 1, mlx::core::int32);
-        auto full_positions = mlx::core::arange(
-            0, start + tokens, 1, mlx::core::int32);
+        auto full_positions = prompt_positions.full(start + tokens);
+        auto current_positions = prompt_positions.current(full_positions, start, tokens);
         const bool bounded_prefill = tokens > 1;
         const bool dispatch_decode = batch == 1 && tokens <= 6 && decode_async_enabled() &&
             !detail::component_profile_active();
@@ -4812,6 +4873,8 @@ public:
     int maximum;
     MlxEmbedding embedding;
     std::optional<MlxLinear> output;
+    std::optional<MlxGridVisionPromptComponent> vision;
+    Qwen4PromptPositions prompt_positions;
     std::vector<Qwen4Layer> layers;
     GatedResidual mixer;
     std::optional<Qwen4Mtp> mtp;
@@ -5410,6 +5473,54 @@ std::int32_t MlxQwen4CausalLm::generate(
     std::optional<std::size_t> stable_prefix_tokens,
     int prefill_chunk_size,
     const MlxPrefixCacheHooks& prefix_cache) {
+    MlxPreparedPrompt prepared;
+    prepared.token_ids = prompt;
+    return generate_prepared_impl(prepared, sampling, max_tokens, callback,
+        prefill_callback, token_constraint, stable_prefix_tokens, prefill_chunk_size, prefix_cache);
+}
+
+bool MlxQwen4CausalLm::supports_multimodal() const noexcept {
+    return impl_->vision.has_value();
+}
+
+std::string_view MlxQwen4CausalLm::multimodal_input_contract() const noexcept {
+    return impl_->vision ? impl_->vision->input_contract() : std::string_view{};
+}
+
+MlxPreparedPrompt MlxQwen4CausalLm::prepare_multimodal_prompt(
+    const std::vector<std::int64_t>& prompt, const MlxGridMediaInput& media) const {
+    if (!impl_->vision)
+        throw std::invalid_argument("model graph does not provide an enabled Vision component");
+    if (prompt.empty() || prompt.size() > static_cast<std::size_t>(impl_->maximum))
+        throw std::invalid_argument("multimodal prompt length is invalid");
+    std::vector<std::int32_t> values;
+    values.reserve(prompt.size());
+    for (const auto token : prompt) {
+        if (token < 0 || token >= impl_->config.vocab_size)
+            throw std::invalid_argument("multimodal prompt token is out of range");
+        values.push_back(static_cast<std::int32_t>(token));
+    }
+    const array ids(values.begin(), Shape{1, static_cast<int>(values.size())}, mlx::core::int32);
+    return impl_->vision->prepare(prompt, impl_->embedding(ids, mlx::core::float16), media);
+}
+
+std::int32_t MlxQwen4CausalLm::generate_prepared(
+    const MlxPreparedPrompt& prompt, const MlxSamplingParams& sampling,
+    std::int32_t max_tokens, const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(std::size_t, double)>& prefill_callback,
+    const MfqTokenConstraintPtr& token_constraint) {
+    return generate_prepared_impl(prompt, sampling, max_tokens, callback,
+        prefill_callback, token_constraint, std::nullopt, 2048, {});
+}
+
+std::int32_t MlxQwen4CausalLm::generate_prepared_impl(
+    const MlxPreparedPrompt& prepared, const MlxSamplingParams& sampling,
+    std::int32_t max_tokens, const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(std::size_t, double)>& prefill_callback,
+    const MfqTokenConstraintPtr& token_constraint,
+    std::optional<std::size_t> stable_prefix_tokens, int prefill_chunk_size,
+    const MlxPrefixCacheHooks& prefix_cache) {
+    const auto& prompt = prepared.token_ids;
     if (prompt.empty()) {
         throw std::invalid_argument("Qwen4 generation prompt cannot be empty");
     }
@@ -5420,6 +5531,16 @@ std::int32_t MlxQwen4CausalLm::generate(
     if (prompt.size() > static_cast<std::size_t>(impl_->maximum)) {
         throw std::invalid_argument("Qwen4 prompt exceeds context capacity");
     }
+    if (prepared.embeddings && prepared.embeddings->shape() !=
+            Shape{1, static_cast<int>(prompt.size()), static_cast<int>(impl_->config.hidden_size)})
+        throw std::invalid_argument("prepared prompt embeddings disagree with token geometry");
+    if (prepared.positions && (prepared.positions->shape() != Shape{3, static_cast<int>(prompt.size())} ||
+            prepared.positions->dtype() != mlx::core::int32))
+        throw std::invalid_argument("prepared prompt positions require int32 [3,T]");
+    if (static_cast<std::int64_t>(prompt.size()) + prepared.decode_position_delta < 0 ||
+        static_cast<std::int64_t>(prompt.size()) + prepared.decode_position_delta > impl_->maximum ||
+        (prepared.decode_position_delta != 0 && !prepared.positions))
+        throw std::invalid_argument("prepared prompt decode position is invalid");
     std::vector<std::int32_t> values;
     values.reserve(prompt.size());
     for (const auto token : prompt) {
@@ -5443,7 +5564,7 @@ std::int32_t MlxQwen4CausalLm::generate(
     impl_->last_mtp_stats = {
         impl_->mtp.has_value(), mtp_active, 0, 0, 0};
     std::size_t reused = 0;
-    if (stable_prefix_tokens && (!mtp_active || impl_->stable_mtp_ready) &&
+    if (!prepared.transformed() && stable_prefix_tokens && (!mtp_active || impl_->stable_mtp_ready) &&
         impl_->cache_batch == 1 && !impl_->stable_tokens.empty() &&
         impl_->cache_position == static_cast<int>(impl_->stable_tokens.size()) &&
         impl_->stable_tokens.size() <= *stable_prefix_tokens && impl_->stable_tokens.size() < prompt.size() &&
@@ -5452,6 +5573,17 @@ std::int32_t MlxQwen4CausalLm::generate(
     } else {
         reset_cache(1);
     }
+    impl_->prompt_positions = {prepared.positions, prepared.decode_position_delta};
+    if (impl_->mtp) impl_->mtp->prompt_positions = impl_->prompt_positions;
+    struct PositionReset {
+        Impl& runtime;
+        ~PositionReset() {
+            runtime.prompt_positions = {};
+            if (runtime.mtp) runtime.mtp->prompt_positions = {};
+            if (transformed) runtime.stable_tokens.clear();
+        }
+        bool transformed;
+    } position_reset{*impl_, prepared.transformed()};
     if (prefill_chunk_size <= 0) throw std::invalid_argument("Qwen4 prefill chunk size must be positive");
     const array prompt_ids(
         values.begin(), Shape{1, static_cast<int>(values.size())},
@@ -5479,7 +5611,12 @@ std::int32_t MlxQwen4CausalLm::generate(
                 offset + static_cast<std::size_t>(prefill_chunk_size)));
             auto ids = mlx::core::slice(prompt_ids, Shape{0, static_cast<int>(offset)},
                 Shape{1, static_cast<int>(end)});
-            auto prefill = impl_->forward_with_hidden(ids, true, true);
+            std::optional<array> embeddings;
+            if (prepared.embeddings)
+                embeddings = mlx::core::slice(*prepared.embeddings,
+                    {0, static_cast<int>(offset), 0},
+                    {1, static_cast<int>(end), static_cast<int>(impl_->config.hidden_size)});
+            auto prefill = impl_->forward_with_hidden(ids, true, true, 0, embeddings);
             last_logits = std::move(prefill.first);
             if (prefix_cache) {
                 if (mtp_active) {

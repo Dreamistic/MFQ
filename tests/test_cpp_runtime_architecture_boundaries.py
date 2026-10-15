@@ -1114,7 +1114,8 @@ def test_v41_keeps_shared_moe_hc_fusion_in_target_and_predictor() -> None:
 def test_server_exposes_predictors_by_role_not_architecture_name() -> None:
     assert SERVER_COMPONENTS.count(
         'component_declared(graph, "predictor")'
-    ) == 4
+    ) == 3
+    assert SERVER_COMPONENTS.count("return make_grid_vision_engine_components(") == 2
     assert re.search(
         r'component_with_implementation\([^;]*"predictor"',
         SERVER_COMPONENTS,
