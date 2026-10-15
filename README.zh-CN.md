@@ -26,7 +26,6 @@ MFQ 将面向实用率失真前沿设计的神经网络感知 SQ/VQ 格式、高
 </p>
 
 <p>
-  <a href="#mfq-studio">MFQ Studio</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#功能特性">功能特性</a> ·
   <a href="#模型">模型</a> ·
@@ -36,7 +35,9 @@ MFQ 将面向实用率失真前沿设计的神经网络感知 SQ/VQ 格式、高
 
 </div>
 
-## MFQ Studio
+## 快速开始
+
+### 使用预编译包
 
 在一个桌面应用中下载和加载模型、配置服务与内存预算、分析量化精度、运行测评。
 应用与 Agent 可以通过 OpenAI 和 Anthropic 兼容 API 接入。
@@ -44,10 +45,6 @@ MFQ 将面向实用率失真前沿设计的神经网络感知 SQ/VQ 格式、高
 <p align="center">
   <img src="./docs/figures/mfq-studio-overview-zh.png" alt="MFQ Studio：本地模型服务、实时性能与资源概览" width="1100">
 </p>
-
-## 快速开始
-
-### 使用预编译包
 
 从 [Releases](https://github.com/Tylogi/MFQ/releases) 下载 **MFQ Studio**。
 安装包包含桌面应用、MFQ Server 和原生运行时，无需从源码构建。在「下载」中

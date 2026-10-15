@@ -29,7 +29,6 @@ memory, storage, and latency limits.
 </p>
 
 <p>
-  <a href="#mfq-studio">MFQ Studio</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#features">Features</a> ·
   <a href="#models">Models</a> ·
@@ -39,7 +38,9 @@ memory, storage, and latency limits.
 
 </div>
 
-## MFQ Studio
+## Quick start
+
+### Use a prebuilt package
 
 Download and load models, configure serving and memory budgets, inspect
 quantization, and run benchmarks from one desktop app. Applications and agents
@@ -48,10 +49,6 @@ can connect through OpenAI- and Anthropic-compatible APIs.
 <p align="center">
   <img src="./docs/figures/mfq-studio-overview-en.png" alt="MFQ Studio: local model serving, live performance and resource overview" width="1100">
 </p>
-
-## Quick start
-
-### Use a prebuilt package
 
 Download **MFQ Studio** from [Releases](https://github.com/Tylogi/MFQ/releases).
 The package includes the desktop app, MFQ Server, and native runtime; no source
