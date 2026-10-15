@@ -2707,6 +2707,17 @@ private:
 
 class Qwen4Qsa final : public Qwen4Attention {
 public:
+    void prepare_history_projections() const {
+        if (auto* preparation = MlxKernelPreparation::current()) {
+            preparation->collect([&] {
+                for (const int rows : preparation->row_buckets()) {
+                    const auto hidden = mlx::core::zeros(
+                        Shape{1, rows, static_cast<int>(config_.hidden_size)}, mlx::core::float16);
+                    for (const auto& output : cache_projections_(hidden)) preparation->add(output);
+                }
+            });
+        }
+    }
     std::vector<array> decode_input_projections(const array& hidden) override {
         return input_projections_(hidden);
     }
@@ -3716,13 +3727,14 @@ public:
         std::size_t expert_cache_layer_base = 0) {
         const auto prefix =
             "predictor.block." + std::to_string(index);
+        auto attention = Qwen4Qsa::load(model, config, prefix + ".attention", maximum);
+        attention->prepare_history_projections();
         return Qwen4Layer(
             GatedResidual::load(
                 model, config, prefix + ".attention.mhc.pre"),
             GatedResidual::load(
                 model, config, prefix + ".mlp.mhc.pre"),
-            Qwen4Qsa::load(
-                model, config, prefix + ".attention", maximum),
+            std::move(attention),
             Qwen4Moe::load(
                 model,
                 config,
