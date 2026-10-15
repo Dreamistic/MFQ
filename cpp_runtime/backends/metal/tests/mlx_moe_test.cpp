@@ -2728,7 +2728,8 @@ void test_two_stage_nint_shared_decode(
     bool repeated_routes = false,
     int experts = 32,
     bool check_folded_topk = false,
-    int fixed_q = 0) {
+    int fixed_q = 0,
+    int shared_up_group_size = 0) {
     constexpr int routes = 10;
     const std::vector<std::string> profiles(experts, "NINTv2");
     const auto make_fixture = [&](int output, int input, int salt) {
@@ -2771,7 +2772,8 @@ void test_two_stage_nint_shared_decode(
     const auto shared_gate_fixture = make_nint_v2_tensor(
         intermediate, hidden, 43, shared_group_size, true, fixed_q != 0 ? 8 : 0);
     const auto shared_up_fixture = make_nint_v2_tensor(
-        intermediate, hidden, 47, shared_group_size, true, fixed_q != 0 ? 8 : 0);
+        intermediate, hidden, 47, shared_up_group_size > 0 ? shared_up_group_size : shared_group_size,
+        true, fixed_q != 0 ? 8 : 0);
     const auto shared_down_fixture = make_nint_v2_tensor(
         hidden, intermediate, 53, shared_group_size, true, fixed_q != 0 ? 8 : 0);
     const auto shared_gate = mfq::metal::MlxNintWeight::from_blob(
@@ -2844,6 +2846,10 @@ void test_two_stage_nint_shared_decode(
         precomputed_gate);
     require(fused.has_value(),
             "two-stage NINT/shared decode path was not selected");
+    std::optional<mlx::core::array> mixed_shared_activation;
+    if (shared_up_group_size > 0)
+        mixed_shared_activation = mlx::core::slice(fused->inputs().at(22),
+            {0, routes * intermediate}, {tokens, (routes + 1) * intermediate});
     const auto expected_dispatch = fixed_q != 0 ? "_rowq_auto1s1" : "_rowq_auto0s0";
     for (const auto* node : {&*fused, &fused->inputs().at(22)}) {
         const auto* kernel = dynamic_cast<const mfq::metal::MlxPreparableKernel*>(&node->primitive());
@@ -2984,6 +2990,22 @@ void test_two_stage_nint_shared_decode(
         dense_shared_matmul(shared_up_fixture, input);
     auto shared_output = dense_shared_matmul(
         shared_down_fixture, shared_intermediate);
+    if (shared_up_group_size > 0) {
+        auto gate_fp32 = mlx::core::astype(shared_gate_output, mlx::core::float32);
+        auto expected_shared = mlx::core::astype(gate_fp32 * mlx::core::sigmoid(gate_fp32) *
+            mlx::core::astype(dense_shared_matmul(shared_up_fixture, input), mlx::core::float32),
+            mlx::core::float16);
+        const auto actual_shared = evaluated_floats(*mixed_shared_activation);
+        const auto expected_values = evaluated_floats(expected_shared);
+        float error = 0.0f, scale = 0.0f;
+        for (std::size_t index = 0; index < actual_shared.size(); ++index) {
+            error = std::max(error, std::abs(actual_shared[index] - expected_values[index]));
+            scale = std::max(scale, std::abs(expected_values[index]));
+        }
+        require(scale > 1e-5f && error <= std::max(5e-7f, 0.005f * scale),
+            "mixed-GS shared Gate/Up differs from independent dense weights: error=" +
+            std::to_string(error) + " scale=" + std::to_string(scale));
+    }
     auto reference = mfq::metal::moe_weighted_reduce_shared_gate(
         routed_output,
         route_weights,
@@ -8555,6 +8577,16 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--test-route-groups") {
+            for (const auto [gate_gs, up_gs] : {std::pair{24, 28}, {28, 24}, {7, 24}, {48, 28}}) {
+                for (const int tokens : {1, 2, 6}) {
+                    test_two_stage_nint_shared_decode(gate_gs, 65, 41, false, tokens,
+                        false, false, 24, false, 32, tokens == 1, 0, up_gs);
+                    test_two_stage_nint_shared_decode(gate_gs, 256, 68, true, tokens,
+                        false, false, 24, false, 32, tokens == 1, 0, up_gs);
+                }
+                test_two_stage_nint_shared_decode(gate_gs, 256, 68, true, 1,
+                    false, false, 24, false, 32, true, 8, up_gs);
+            }
             for (const int group_size : {12, 24, 28, 48})
                 for (const int tokens : {2, 6})
                     test_two_stage_nint_shared_decode(24, 65, 41, false,

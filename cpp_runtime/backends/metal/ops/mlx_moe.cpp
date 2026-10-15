@@ -3451,6 +3451,8 @@ struct MfeNintDecodeConfig {
     std::shared_ptr<const std::vector<int>> down_nint_group_sizes;
     int shared_gate_group_size = 0;
     int shared_gate_groups = 0;
+    int shared_up_group_size = 0;
+    int shared_up_groups = 0;
     int shared_down_group_size = 0;
     int shared_down_groups = 0;
     int k_lanes = 16;
@@ -3512,6 +3514,9 @@ std::string mfe_decode_kernel_name(
     if (config.shared_gate_is_logits) name.append("_gate_logits");
     if (stage == 1 && config.shared_router_group_size)
         name.append("_srg").append(std::to_string(config.shared_router_group_size));
+    if (stage == 1 && config.shared_up_group_size != config.shared_gate_group_size)
+        name.append("_ugs").append(std::to_string(config.shared_up_group_size))
+            .append("_ug").append(std::to_string(config.shared_up_groups));
     if (config.packed_gate_up) name.append("_packed_gu");
     if (config.folded_topk) name.append("_folded_topk");
     if (stage == 2 && mfe_paired_nint_down(config)) name.append("_nint_pair");
@@ -3653,10 +3658,19 @@ void append_mfe_shared_nint_decoder(
         << "  device const uchar* nint_q = shared_q;\n"
         << "  device const uchar* nint_sub_scale = shared_sub_scale;\n"
         << "  device const uchar* nint_sub_min = shared_sub_min;\n"
-        << "  uint x_offset = " << (gate_up ? "0u" : "SHARED_OFFSET") << ";\n"
-        << "  uint q_offset = 0u, sub_offset = 0u, groups = " << groups << "u;\n"
-        << "  MFQ_MFE_NINT_CALL_WITH(" << group_size << "u, "
-        << (gate_up ? config.shared_gate_q_dispatch : config.shared_down_q_dispatch) << ");\n";
+        << "  uint x_offset = " << (gate_up ? "0u" : "SHARED_OFFSET") << ";\n";
+    if (gate_up && config.shared_up_group_size != group_size) {
+        source << "  uint q_offset = 0u, sub_offset = 0u;\n"
+            << "  if (projection == 0u) { uint groups = " << groups << "u;\n"
+            << "    MFQ_MFE_NINT_CALL_WITH(" << group_size << "u, " << config.shared_gate_q_dispatch << ");\n"
+            << "  } else { uint groups = " << config.shared_up_groups << "u;\n"
+            << "    MFQ_MFE_NINT_CALL_WITH(" << config.shared_up_group_size << "u, " << config.shared_gate_q_dispatch << ");\n"
+            << "  }\n";
+    } else {
+        source << "  uint q_offset = 0u, sub_offset = 0u, groups = " << groups << "u;\n"
+            << "  MFQ_MFE_NINT_CALL_WITH(" << group_size << "u, "
+            << (gate_up ? config.shared_gate_q_dispatch : config.shared_down_q_dispatch) << ");\n";
+    }
 }
 
 constexpr const char* kFoldedTopKHeader = R"METAL(
@@ -11367,6 +11381,8 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
         .down_nint_group_sizes = down.impl_->nint_group_sizes,
         .shared_gate_group_size = shared_gate_up.group_size(),
         .shared_gate_groups = shared_gate_up.groups(),
+        .shared_up_group_size = shared_gate_up.up_group_size(),
+        .shared_up_groups = shared_gate_up.up_groups(),
         .shared_down_group_size = shared_down.group_size(),
         .shared_down_groups = shared_down.groups(),
         .k_lanes = decode_k_lanes,

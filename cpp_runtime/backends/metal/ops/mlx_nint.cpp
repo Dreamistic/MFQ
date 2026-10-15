@@ -2244,7 +2244,9 @@ std::optional<MlxNintSwiGluPair>
 MlxNintSwiGluPair::from_weights(
     const MlxNintWeight& gate,
     const MlxNintWeight& up) {
-    if (!gate.can_fuse_swiglu(up)) {
+    if (gate.group_size() <= 0 || up.group_size() <= 0 ||
+        gate.input_size() != up.input_size() ||
+        gate.output_size() != up.output_size()) {
         return std::nullopt;
     }
     const auto gate_q_bytes = gate.packed_values().size();
@@ -2340,6 +2342,8 @@ MlxNintSwiGluPair::from_weights(
         std::move(sub_min),
         gate.group_size(),
         gate.groups(),
+        up.group_size(),
+        up.groups(),
         gate.input_size(),
         gate.output_size(),
         gate.has_uniform_q_bits() && up.has_uniform_q_bits());
