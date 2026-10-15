@@ -7,7 +7,7 @@ import { ApiError } from '../../shared/api/client';
 import { useJobStore } from '../../stores/jobStore';
 import { ModelHubPage } from './ModelHubPage';
 
-vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { officialHubModels: vi.fn(), downloadDirectory: vi.fn(), modelDirectories: vi.fn(), configureDownloadDirectory: vi.fn(), configureDownloadReclaim: vi.fn() } }));
+vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { officialHubModels: vi.fn(), downloadDirectory: vi.fn(), modelDirectories: vi.fn(), configureDownloadDirectory: vi.fn(), configureDownloadReclaim: vi.fn(), probeDownloadSources: vi.fn().mockResolvedValue({ data: [] }) } }));
 vi.mock('../../shared/api/resources/jobs', () => ({ jobsApi: { jobKinds: vi.fn(), createJob: vi.fn(), cancelJob: vi.fn(), retryJob: vi.fn(), deleteJob: vi.fn() } }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ addJob: (job: JobResource) => useJobStore.getState().addJob(job) }) }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
@@ -126,6 +126,22 @@ it('shows remaining download disk capacity and refreshes it while mounted', asyn
   expect(modelsApi.downloadDirectory).toHaveBeenCalledTimes(2);
 });
 
+it('keeps the checked prefix setting and folder through a transient status failure', async () => {
+  vi.useFakeTimers();
+  vi.mocked(modelsApi.downloadDirectory).mockResolvedValueOnce({ directory: null,
+    actual_directory: '/workspace/models', default_directory: '/workspace/models', evict_prefix_cache: true })
+    .mockRejectedValueOnce(new Error('temporarily offline'));
+  let view: ReturnType<typeof render>;
+  await act(async () => { view = render(<ModelHubPage />); });
+  const checkbox = screen.getByRole('checkbox', { name: 'Reclaim SSD prefix budget' });
+  expect(checkbox).toBeChecked();
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  expect(checkbox).toBeChecked();
+  expect(checkbox).toBeEnabled();
+  expect(screen.getByText('/workspace/models')).toBeInTheDocument();
+  view!.unmount();
+});
+
 it('keeps download controls usable when disk capacity is not reported', async () => {
   vi.mocked(modelsApi.downloadDirectory).mockResolvedValue({ directory: null, actual_directory: '/workspace/models', default_directory: '/workspace/models' });
   render(<ModelHubPage />);
@@ -166,14 +182,16 @@ it('explains a missing folder and restores the last valid location without chang
 it('cancels and retries only the chosen download through the existing jobs API', async () => {
   useJobStore.getState().setJobs([download()]);
   vi.mocked(jobsApi.cancelJob).mockResolvedValue({ ...download(), status: 'cancelled' });
-  vi.mocked(jobsApi.retryJob).mockResolvedValue(download('retry'));
+  vi.mocked(jobsApi.retryJob).mockResolvedValue(download());
   render(<ModelHubPage />);
   fireEvent.click(screen.getByRole('tab', { name: 'Download queue' }));
   fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
   await screen.findByText('Cancelled');
   expect(jobsApi.cancelJob).toHaveBeenCalledWith('download-1');
   fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-  await waitFor(() => expect(useJobStore.getState().jobs).toHaveLength(2));
+  await waitFor(() => expect(screen.getByText('Queued')).toBeInTheDocument());
+  expect(useJobStore.getState().jobs).toHaveLength(1);
+  expect(document.querySelector('.download-flight')).not.toBeInTheDocument();
   expect(jobsApi.retryJob).toHaveBeenCalledWith('download-1');
   expect(screen.getByRole('tab', { name: 'Download queue' })).toHaveAttribute('aria-selected', 'true');
 });

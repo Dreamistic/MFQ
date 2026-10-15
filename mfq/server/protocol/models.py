@@ -986,6 +986,16 @@ class ConfigureDownloadDirectoryRequest(ProtocolModel):
     evict_prefix_cache: bool | None = None
 
 
+class HubDownloadSource(ProtocolModel):
+    provider: Literal['huggingface', 'modelscope']
+    repo_id: str = Field(pattern=r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+    revision: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class HubDownloadProbeRequest(ProtocolModel):
+    sources: list[HubDownloadSource] = Field(min_length=1, max_length=2)
+
+
 class HubModelSummary(ProtocolModel):
     provider: Literal["huggingface", "modelscope"]
     repo_id: str = Field(min_length=3, max_length=255)

@@ -2055,6 +2055,33 @@ class SessionStore:
             ).fetchall()
         return [UUID(row["id"]) for row in rows]
 
+    def active_download_jobs(self) -> list[JobResource]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM jobs WHERE archived_at IS NULL AND kind IN (?, ?) AND status IN (?, ?, ?) ORDER BY created_at",
+                ('download.huggingface', 'download.modelscope', JobStatus.QUEUED.value, JobStatus.RUNNING.value, JobStatus.CANCELLING.value),
+            ).fetchall()
+        return [self._job_from_row(row) for row in rows]
+
+    def requeue_job(self, job_id: UUID, *, now: datetime | None = None) -> JobResource:
+        resumed_at = now or _utcnow()
+        with self._connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM jobs WHERE id = ? AND archived_at IS NULL', (str(job_id),)).fetchone()
+            if row is None:
+                raise JobNotFoundError(str(job_id))
+            if row['status'] in {JobStatus.QUEUED.value, JobStatus.RUNNING.value}:
+                return self._job_from_row(row)
+            if row['status'] not in {JobStatus.FAILED.value, JobStatus.CANCELLED.value, JobStatus.INTERRUPTED.value}:
+                raise InvalidJobStateError(f"cannot resume job in state {row['status']}")
+            connection.execute(
+                'UPDATE jobs SET status = ?, cancel_requested = 0, error_json = NULL, result_json = NULL, started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?',
+                (JobStatus.QUEUED.value, _timestamp(resumed_at), str(job_id)),
+            )
+            self._append_job_event(connection, job_id, JobEventType.STATE, JobEventLevel.INFO,
+                message=JobStatus.QUEUED.value, data={'status': JobStatus.QUEUED.value, 'reason': 'resumed'}, now=resumed_at)
+        return self.get_job(job_id)
+
     def claim_job(self, job_id: UUID, *, now: datetime | None = None) -> JobResource:
         started_at = now or _utcnow()
         with self._connection() as connection:
@@ -2416,11 +2443,17 @@ class SessionStore:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
-                "SELECT id FROM jobs WHERE status IN (?, ?)",
+                "SELECT id, kind, status, cancel_requested FROM jobs WHERE status IN (?, ?)",
                 (JobStatus.RUNNING.value, JobStatus.CANCELLING.value),
             ).fetchall()
             for row in rows:
                 job_id = UUID(row["id"])
+                if row['kind'] in {'download.huggingface', 'download.modelscope'} and not row['cancel_requested']:
+                    connection.execute('UPDATE jobs SET status = ?, error_json = NULL, updated_at = ?, completed_at = NULL WHERE id = ?',
+                        (JobStatus.QUEUED.value, _timestamp(recovered_at), str(job_id)))
+                    self._append_job_event(connection, job_id, JobEventType.STATE, JobEventLevel.INFO,
+                        message=JobStatus.QUEUED.value, data={'status': JobStatus.QUEUED.value, 'reason': 'service_restarted'}, now=recovered_at)
+                    continue
                 connection.execute(
                     """
                     UPDATE jobs SET status = ?, error_json = ?, updated_at = ?, completed_at = ?

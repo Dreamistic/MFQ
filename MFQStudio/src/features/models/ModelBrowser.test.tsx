@@ -1,11 +1,11 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { HubModelInfo, HubSystemProfile, OfficialModelList } from '../../shared/api/types';
 import { modelsApi } from '../../shared/api/resources/models';
 import { ModelBrowser } from './ModelBrowser';
 
 vi.mock('../../shared/api/resources/models', () => ({
-  modelsApi: { officialHubModels: vi.fn(), hubModelInfo: vi.fn(), resolveHubModel: vi.fn() },
+  modelsApi: { officialHubModels: vi.fn(), hubModelInfo: vi.fn(), resolveHubModel: vi.fn(), probeDownloadSources: vi.fn().mockResolvedValue({ data: [] }) },
 }));
 
 const configuration = {
@@ -61,6 +61,31 @@ function catalog(refreshing: boolean, available: boolean): OfficialModelList {
 afterEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
+  vi.mocked(modelsApi.probeDownloadSources).mockResolvedValue({ data: [] });
+});
+
+it('automatically selects the faster measured source without overriding a manual choice', async () => {
+  const data = catalog(false, true);
+  const first = data.data[0];
+  const hf = { ...first.sources[0], provider: 'huggingface' as const, url: 'https://huggingface.co/owner/first' };
+  first.sources = [hf, first.sources[0]];
+  first.selected_source = hf;
+  vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
+  vi.mocked(modelsApi.probeDownloadSources).mockResolvedValue({ data: [
+    { provider: 'huggingface', repo_id: hf.repo_id, bytes_per_second: 10 },
+    { provider: 'modelscope', repo_id: hf.repo_id, bytes_per_second: 100 },
+  ] });
+  vi.mocked(modelsApi.hubModelInfo).mockImplementation(async (provider, repo_id, revision) => ({
+    provider, repo_id, revision: revision || 'master', downloads: 0, likes: 0, total_bytes: 42,
+    files: [], tags: [], architectures: [], modalities: [], gated: false, variants: first.variants,
+  }));
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  await waitFor(() => expect(screen.getByRole('option', { name: 'Auto · ModelScope' })).toBeInTheDocument());
+  expect(screen.getByRole('combobox', { name: 'Download source' })).toHaveValue('auto');
+  fireEvent.change(screen.getByRole('combobox', { name: 'Download source' }), { target: { value: '0' } });
+  await act(async () => {});
+  expect(screen.getByRole('combobox', { name: 'Download source' })).toHaveValue('0');
+  expect(modelsApi.probeDownloadSources).toHaveBeenCalledTimes(1);
 });
 
 it.each(['zh', 'en'])('shows file minus PLE as resident weights rather than runtime estimates: %s', async (language) => {
@@ -270,7 +295,7 @@ it('refreshes a renamed repository into one card with both current sources', asy
   await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Refresh' })));
   expect(screen.queryByRole('button', { name: oldRepo })).not.toBeInTheDocument();
   expect(screen.getByRole('button', { name: currentRepo })).toBeInTheDocument();
-  expect(screen.getByRole('combobox', { name: 'Download source' }).querySelectorAll('option')).toHaveLength(2);
+  expect(screen.getByRole('combobox', { name: 'Download source' }).querySelectorAll('option')).toHaveLength(3);
   expect(document.querySelectorAll('.official-model-card')).toHaveLength(1);
 });
 

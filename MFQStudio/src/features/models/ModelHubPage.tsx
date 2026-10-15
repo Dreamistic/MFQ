@@ -50,7 +50,9 @@ export function ModelHubPage() {
 
   function trackDownload(job: JobResource, origin: DownloadOrigin) {
     if (!connectionScope()()) return;
+    const existing = useJobStore.getState().jobs.some(item => item.id === job.id);
     addJob(job);
+    if (existing) { toast.success(tr('该下载任务已在队列中', 'This download is already in the queue')); return; }
     toast.success(tr('下载任务已提交', 'Download job submitted'));
     const rect = circle.current?.getBoundingClientRect();
     if (rect) setFlight({ id: job.id, origin, dx: rect.left + rect.width / 2 - origin.x, dy: rect.top + rect.height / 2 - origin.y });

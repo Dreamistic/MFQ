@@ -628,6 +628,31 @@ class HubCatalog:
             })
         return await self._fetch_info(provider, repo_id, revision, profile)
 
+    async def download_files(self, provider: HubProvider, repo_id: str, revision: str | None) -> HubModelInfo:
+        cached = self._official_cache.get((provider, repo_id))
+        if cached is not None and revision in {None, cached.revision} and time.monotonic() - self._source_cache_times.get(
+                (provider, repo_id), self._official_cache_time) < _OFFICIAL_CACHE_TTL:
+            return cached
+        fetch = self._info_huggingface if provider == 'huggingface' else self._info_modelscope
+        return await asyncio.wait_for(fetch(repo_id, revision, system_profile()), timeout=_METADATA_DEADLINE)
+
+    async def probe_download_sources(self, sources) -> dict[str, Any]:
+        from mfq.server.api.network import hub_download_url, probe_download_route
+        async def probe(source) -> dict[str, Any]:
+            result = {'provider': source.provider, 'repo_id': source.repo_id, 'bytes_per_second': 0.0}
+            try:
+                info = await self.download_files(source.provider, source.repo_id, source.revision)
+                files = [item for item in info.files if item.byte_size >= 262144 and
+                    item.name.lower().endswith(('.mfq', '.safetensors', '.gguf', '.bin'))]
+                if files:
+                    use_proxy, speed = await probe_download_route(hub_download_url(
+                        source.provider, source.repo_id, info.revision, files[0].name))
+                    result.update(bytes_per_second=speed, route='proxy' if use_proxy else 'direct')
+            except (HubError, asyncio.TimeoutError):
+                pass
+            return result
+        return {'data': await asyncio.gather(*(probe(source) for source in sources))}
+
     async def _fetch_info(
         self, provider: HubProvider, repo_id: str, revision: str | None,
         profile: HubSystemProfile,

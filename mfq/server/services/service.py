@@ -315,6 +315,7 @@ class ServerService:
         self._active_responses: dict[UUID, tuple[UUID, asyncio.Task[Any]]] = {}
         self._runtime_metric_state: dict[str, tuple[float, tuple[Any, ...]]] = {}
         self._close_lock = asyncio.Lock()
+        self._download_job_lock = asyncio.Lock()
         self._closed = False
         if runtime_manager is not None:
             runtime_manager.store = store
@@ -376,6 +377,16 @@ class ServerService:
             await self.backend.aclose()
 
     async def create_job(self, request: CreateJobRequest) -> JobResource:
+        if request.kind in {'download.huggingface', 'download.modelscope'}:
+            async with self._download_job_lock:
+                existing = await self._active_download_job(request)
+                if existing is not None:
+                    return existing
+                await self._check_download_job(request)
+                return await self._submit_job(request)
+        return await self._submit_job(request)
+
+    async def _submit_job(self, request: CreateJobRequest) -> JobResource:
         try:
             return await self.jobs.submit(request)
         except JobKindNotRegisteredError as error:
@@ -384,6 +395,44 @@ class ServerService:
                 "job_kind_unavailable",
                 f"job kind is not registered: {error}",
             ) from error
+
+    async def _active_download_job(self, request: CreateJobRequest) -> JobResource | None:
+        if self.tool_handlers is None:
+            return None
+        try:
+            payload, destination = await asyncio.to_thread(self.tool_handlers.download_request, request.kind, request.payload)
+        except JobExecutionError as error:
+            raise ServiceError(422, error.detail.code, error.detail.message) from error
+        destinations = await asyncio.to_thread(self.tool_handlers.download_destinations, request.kind, payload)
+        for job in await asyncio.to_thread(self.store.active_download_jobs):
+            other, path = await asyncio.to_thread(self.tool_handlers.download_request, job.kind, job.payload)
+            if path not in destinations:
+                continue
+            same_files = (other.repo_id.casefold(), sorted(other.include), sorted(other.exclude)) == (
+                payload.repo_id.casefold(), sorted(payload.include), sorted(payload.exclude))
+            if same_files and (path != destination or (job.kind, other.revision) == (request.kind, payload.revision)):
+                return job
+            raise ServiceError(409, 'download_destination_busy', 'This folder already has an active download.')
+        return None
+
+    async def _check_download_job(self, request: CreateJobRequest) -> None:
+        if request.kind not in {'download.huggingface', 'download.modelscope'} or self.tool_handlers is None:
+            return
+        try:
+            payload, destination = await asyncio.to_thread(self.tool_handlers.download_request, request.kind, request.payload)
+            destinations = await asyncio.to_thread(self.tool_handlers.download_destinations, request.kind, payload)
+            existing = await asyncio.to_thread(lambda: [path for path in destinations if path.is_dir() and any(path.iterdir())])
+            if not existing:
+                return
+            provider = request.kind.split('.')[1]
+            info = await self.hub_catalog.download_files(provider, payload.repo_id, payload.revision)
+            for path in existing:
+                if await asyncio.to_thread(self.tool_handlers.download_files_present, path, payload, info.files, mfq_only=path != destination):
+                    raise ServiceError(409, 'download_already_exists', 'The requested files already exist in the download folder.')
+        except JobExecutionError as error:
+            raise ServiceError(422, error.detail.code, error.detail.message) from error
+        except (HubError, asyncio.TimeoutError) as error:
+            raise ServiceError(502, 'model_hub_error', 'Could not verify existing download files. Refresh the model and retry.', retryable=True) from error
 
     async def job_kinds(self) -> JobKindList:
         return self.jobs.kinds()
@@ -420,6 +469,15 @@ class ServerService:
 
     async def retry_job(self, job_id: UUID) -> JobResource:
         try:
+            previous = await asyncio.to_thread(self.store.get_job, job_id)
+            if previous.kind in {'download.huggingface', 'download.modelscope'}:
+                async with self._download_job_lock:
+                    request = CreateJobRequest(kind=previous.kind, payload=previous.payload)
+                    existing = await self._active_download_job(request)
+                    if existing is not None:
+                        return existing
+                    await self._check_download_job(request)
+                    return await self.jobs.retry(job_id)
             return await self.jobs.retry(job_id)
         except JobNotFoundError as error:
             raise ServiceError(404, "job_not_found", str(error)) from error

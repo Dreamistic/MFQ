@@ -46,7 +46,7 @@ export function DownloadQueue({ jobs, onJobCreated }: {
     try {
       const next = retry ? await jobsApi.retryJob(job.id) : await jobsApi.cancelJob(job.id);
       if (!current()) return;
-      if (retry) onJobCreated(next, origin); else addJob(next);
+      if (retry && next.id !== job.id) onJobCreated(next, origin); else addJob(next);
     } catch (cause) {
       if (current()) toast.error(errorMessage(cause, tr));
     } finally {
