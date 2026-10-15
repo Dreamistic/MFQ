@@ -20,6 +20,9 @@ def test_preparation_defaults_to_available_cpu_concurrency():
     assert "requested > maximum_workers" in source
     assert "workers = std::min(workers, total);" in source
     assert "[1, 16]" not in source
+    assert "std::vector<std::thread> threads;" in source
+    assert "thread.joinable()" in source
+    assert "std::jthread" not in source
 
 
 def test_custom_kernel_cache_matches_source_and_compile_options():

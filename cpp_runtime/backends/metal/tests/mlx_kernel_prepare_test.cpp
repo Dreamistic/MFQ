@@ -77,7 +77,8 @@ void test_parallel_jobs() {
             std::thread::hardware_concurrency()), "preparation exceeded available CPU concurrency");
     {
         mfq::metal::MlxKernelPreparation preparation(128, 128);
-        preparation.add(array({1}, float32, std::make_shared<PrepareProbe>(state, 99, true), {}));
+        for (int key = 0; key < 8; ++key)
+            preparation.add(array({1}, float32, std::make_shared<PrepareProbe>(state, 99 + key, key == 0), {}));
         bool failed = false;
         try { preparation.finish(); }
         catch (const std::runtime_error& e) { failed = std::string(e.what()) == "expected preparation failure"; }

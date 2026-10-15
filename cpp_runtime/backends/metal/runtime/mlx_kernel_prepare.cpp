@@ -153,9 +153,18 @@ void MlxKernelPreparation::finish() {
         }
     };
     {
-        std::vector<std::jthread> threads;
-        for (std::size_t i = 1; i < workers; ++i) threads.emplace_back(run);
-        run();
+        std::vector<std::thread> threads;
+        struct Join {
+            std::vector<std::thread>& threads;
+            ~Join() { for (auto& thread : threads) if (thread.joinable()) thread.join(); }
+        } join{threads};
+        try {
+            for (std::size_t i = 1; i < workers; ++i) threads.emplace_back(run);
+            run();
+        } catch (...) {
+            failed.store(true);
+            throw;
+        }
     }
     active_ = previous_;
     if (failure) { jobs_.clear(); std::rethrow_exception(failure); }
