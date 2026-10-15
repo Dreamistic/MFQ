@@ -17553,6 +17553,16 @@
               "title": "Model Id",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "include_recurrent",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Recurrent",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

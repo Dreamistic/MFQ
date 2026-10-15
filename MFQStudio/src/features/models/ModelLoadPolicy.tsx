@@ -53,7 +53,8 @@ export function ModelLoadPolicy({ catalog }: { catalog: ReturnType<typeof useMod
           }
         />
       </div>
-      <ModelLoadContext key={catalog.connectionRevision} value={catalog.loadContext} onChange={catalog.setLoadContext} disabled={catalog.busy} />
+      <ModelLoadContext key={catalog.connectionRevision} value={catalog.loadContext} onChange={catalog.setLoadContext}
+        disabled={catalog.busy} models={catalog.artifacts} runtime={catalog.runtime} deviceIds={catalog.loadDeviceIds} />
     </TMPanel>
   );
 }

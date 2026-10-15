@@ -66,8 +66,8 @@ export const modelsApi = {
     return request(`/api/v1/models/${encodeURIComponent(modelId)}/analysis`, { signal });
   },
 
-  modelCacheProfile(modelId: string, signal?: AbortSignal): Promise<ModelCacheProfile | null> {
-    return request(`/api/v1/models/${encodeURIComponent(modelId)}/cache-profile`, { signal });
+  modelCacheProfile(modelId: string, signal?: AbortSignal, includeRecurrent = false): Promise<ModelCacheProfile | null> {
+    return request(`/api/v1/models/${encodeURIComponent(modelId)}/cache-profile${includeRecurrent ? '?include_recurrent=true' : ''}`, { signal });
   },
 
   openModelDirectoryInFinder(directoryId: string): Promise<{ opened: boolean }> {

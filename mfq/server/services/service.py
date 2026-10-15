@@ -1000,7 +1000,7 @@ class ServerService:
         directory = artifact.path if artifact.resource.format == "hf" else artifact.path.parent
         return await self.model_directories(path=str(directory))
 
-    async def model_cache_profile(self, model_id: str) -> ModelCacheProfile | None:
+    async def model_cache_profile(self, model_id: str, *, include_recurrent: bool = False) -> ModelCacheProfile | None:
         if self.catalog is None:
             raise ServiceError(501, "model_catalog_unavailable", "model catalog is unavailable")
         try:
@@ -1009,7 +1009,7 @@ class ServerService:
             raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
         try:
             return await asyncio.to_thread(checkpoint_cache_profile, artifact,
-                cuda=getattr(self.runtime_manager, "backend", None) == "cuda")
+                cuda=getattr(self.runtime_manager, "backend", None) == "cuda", include_recurrent=include_recurrent)
         except (ValueError, OSError) as error:
             raise ServiceError(422, "model_cache_profile_unavailable", "checkpoint cache metadata cannot be read") from error
 
