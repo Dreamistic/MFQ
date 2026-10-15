@@ -489,7 +489,10 @@ __global__ void sample_top_k_top_p_kernel(
     }
     if (threadIdx.x != 0) return;
     float max_v = top_vals[0];
-    float probs[SAMPLE_MAX_TOP_K];
+    // Selection is complete; reuse its shared values for probabilities. A
+    // 1024-float thread-local array grows the context's device stack backing
+    // even though only thread zero samples, costing hundreds of MiB on Ampere.
+    float* probs = top_vals;
     float sum = 0.0f;
     for (int j = 0; j < top_k; ++j) {
         probs[j] = expf(top_vals[j] - max_v);

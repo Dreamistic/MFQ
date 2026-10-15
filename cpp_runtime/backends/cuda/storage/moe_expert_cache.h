@@ -3,6 +3,7 @@
 #include "moe_cache_profile.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <algorithm>
 #include <functional>
 #include <memory>
@@ -12,9 +13,17 @@
 #include <utility>
 
 class MoeExpertCache;
-// Share one bounded transfer arena across single-token decode and MTP.
+// Bound each target/predictor transfer arena across single-token and batched decode.
 inline int moe_decode_transfer_slots(int rows, int routes) {
     return std::max(80, rows * routes);
+}
+inline bool moe_predictor_transfer_cache_enabled() {
+    const auto* option=std::getenv("MFQ_MOE_PREDICTOR_TRANSFER_CACHE");
+    return !option || option[0]!='0';
+}
+inline std::string moe_packed_transfer_prefix(int projection,bool predictor) {
+    return std::string("decodepacked:")+(predictor && moe_predictor_transfer_cache_enabled()?"mtp:":"")+
+        std::to_string(projection)+":";
 }
 namespace mfq::cuda {class KvExpertLoan;}
 void set_moe_kv_expert_loan(const std::shared_ptr<MoeExpertCache>& cache,std::shared_ptr<mfq::cuda::KvExpertLoan> loan);

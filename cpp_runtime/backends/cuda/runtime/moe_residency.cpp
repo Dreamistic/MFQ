@@ -277,9 +277,14 @@ struct MoeResidencyManager::Impl {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         mfq::moe_cache_mapped_gather_cuda(map_descriptors_device,int(maps.size()),1,stream);
     }
+    unsigned projection_mask(int bundle,int projection) const {
+        if(projection<0)return 7;
+        const auto& sources=cache->pipeline_bundles_[bundle];
+        return projection==0 && sources[0]==sources[1]?3:1u<<projection;
+    }
     std::size_t complete_pending_bundles() const {
         std::map<std::pair<int,int>,unsigned> masks;
-        for(const auto& move:pending)masks[{move.incoming_bundle,move.incoming}]|=1u<<move.incoming_projection;
+        for(const auto& move:pending)masks[{move.incoming_bundle,move.incoming}]|=projection_mask(move.incoming_bundle,move.incoming_projection);
         return std::count_if(masks.begin(),masks.end(),[](const auto& item){return item.second==7;});
     }
     struct CachedRefill {
@@ -327,13 +332,12 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
     for(const auto& bundle:cache->pipeline_bundles_) {
         const auto& source=cache->sources_.at(bundle[0]);s.heat.emplace_back(std::size_t(source->n_experts()),0.0f);
         s.observations.emplace_back(std::size_t(source->n_experts()),0.0f);
-        // Two row views of combined predictor Gate/Up must never schedule
-        // exchanges of the same compressed source twice.
-        if(bundle[0]==bundle[1])continue;
         for(int id:bundle)if(cache->sources_.at(id)->layer_id_!=source->layer_id_ ||
                 cache->sources_.at(id)->n_experts()!=source->n_experts())
             throw std::invalid_argument("adaptive expert bundle geometry differs");
-        s.first=std::min(s.first,source->layer_id_);s.last=std::max(s.last,source->layer_id_);
+        if(source->layer_id_>=0) {
+            s.first=std::min(s.first,source->layer_id_);s.last=std::max(s.last,source->layer_id_);
+        }
         for(int p=0;p<3;++p) {
             if(p==1 && bundle[0]==bundle[1])continue;
             const auto& projection=*cache->sources_[bundle[p]];
@@ -342,14 +346,20 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
                 stages.push_back({std::to_string(p)+":"+cohort.arena->signature,nullptr,p});
         }
     }
+    if(s.first==std::numeric_limits<int>::max())for(const auto& bundle:cache->pipeline_bundles_) {
+        const auto layer=cache->sources_[bundle[0]]->layer_id_;
+        s.first=std::min(s.first,layer);s.last=std::max(s.last,layer);
+    }
     using Expert=mfq::MoeResidencyRanker::Expert;
     std::vector<std::vector<Expert>> layout;
     if(cache->config_.moe_residency_warm && cache->config_.moe_residency_projection_heat) {
         std::map<std::pair<MoeGpuArena*,int>,std::vector<Expert>> groups;
         for(std::size_t b=0;b<cache->pipeline_bundles_.size();++b) {
             const auto& bundle=cache->pipeline_bundles_[b];
-            if(bundle[0]==bundle[1])continue;
             for(int e=0;e<cache->sources_[bundle[0]]->n_experts();++e)for(int p=0;p<3;++p) {
+                // Combined Gate/Up is one physical projection. Rank it once
+                // alongside Down so predictor experts can adapt as well.
+                if(p==1 && bundle[0]==bundle[1])continue;
                 const auto& source=*cache->sources_[bundle[p]];
                 // Field-major prefill images keep each source's slot count
                 // and geometry. Exchanges within that source retain the image.
@@ -547,11 +557,13 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
     if(!s.cache->config_.moe_residency_warm && (tokens>8 || (++s.rounds%4)!=0))return;
     // Strata adjusts its cache every few completed windows. Keep collecting
     // all routes between rounds; prompt batches still prepare immediately.
-    // Independent decode rows accumulate routes every step and transact at
-    // the single-token interval. Speculative windows retain their existing
-    // cache response because reducing its frequency regressed complete MTP.
+    // Independent and speculative windows retain every route observation.
+    // Rank and exchange at the configured window interval for both paths;
+    // exchanging after every speculative verification serializes the next
+    // draft behind a multi-millisecond backbone cache transaction.
     const auto* short_interval=std::getenv("MFQ_MOE_SHORT_DECODE_INTERVAL");
-    const bool interval_decode=tokens==1 || (independent_sequences && tokens<=8 && (!short_interval || short_interval[0]!='0'));
+    const bool interval_decode=tokens==1 || (tokens<=8 &&
+        (!independent_sequences || !short_interval || short_interval[0]!='0'));
     if(s.cache->config_.moe_residency_warm && interval_decode && (++s.rounds%s.interval)!=0)return;
     if(!s.pending.empty())throw std::logic_error("adaptive tier has an unpublished transaction");
     for(std::size_t b=0;b<s.heat.size();++b)for(std::size_t e=0;e<s.heat[b].size();++e) {
@@ -612,7 +624,8 @@ void MoeResidencyManager::prepare() {
     const PhaseClock clock(s.prepare_ns,s.pending_tokens<=8?&s.decode_prepare_ns:nullptr);
     const MfqCudaGuard guard(cache.sources_.front()->cohorts_.front().active.expert_local.device());
     using Expert=mfq::MoeResidencyRanker::Expert;
-    if(cache.pipeline_transfer_cache_)for(auto& stages:s.transfer_stages)for(auto& stage:stages)
+    if(cache.pipeline_transfer_cache_)for(std::size_t source_id=0;source_id<s.transfer_stages.size();++source_id)
+      for(auto& stage:s.transfer_stages[source_id])
         if(!stage.arena) {
             const auto found=cache.pipeline_stages_.find(stage.key);
             if(found!=cache.pipeline_stages_.end())stage.arena=found->second.get();
@@ -620,7 +633,7 @@ void MoeResidencyManager::prepare() {
             // Prefer the smallest compatible arena if multiple widths exist.
             for(const auto& item:cache.pipeline_stages_)
                 if((item.first.starts_with(stage.key+":") ||
-                    item.first.starts_with("decodepacked:"+std::to_string(stage.projection)+":")) &&
+                    item.first.starts_with(moe_packed_transfer_prefix(stage.projection,cache.sources_[source_id]->layer_id_<0))) &&
                     (!stage.arena || item.second->slots<stage.arena->slots))
                     stage.arena=item.second.get();
         }
@@ -650,7 +663,7 @@ void MoeResidencyManager::prepare() {
         });
     std::map<std::pair<int,int>,unsigned> candidates;
     for(const auto& pair:pairs) {
-        candidates[{pair.incoming.bundle,pair.incoming.expert}]|=pair.incoming.projection<0?7:1u<<pair.incoming.projection;
+        candidates[{pair.incoming.bundle,pair.incoming.expert}]|=s.projection_mask(pair.incoming.bundle,pair.incoming.projection);
         s.candidate_projections+=pair.incoming.projection<0?3:1;
     }
     s.candidate_bundles+=std::count_if(candidates.begin(),candidates.end(),[](const auto& item){return item.second==7;});

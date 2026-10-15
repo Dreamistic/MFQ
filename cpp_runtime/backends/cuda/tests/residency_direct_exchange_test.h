@@ -5,6 +5,9 @@
 // Seed real compressed transfer-cache fields without launching the unrelated
 // FFN consumer graph; this fixture can also run under Compute Sanitizer.
 struct MoeResidencyTestAccess {
+    static void bundles(MoeExpertCache& cache,std::vector<std::array<int,3>> bundles) {
+        cache.pipeline_bundles_=std::move(bundles);
+    }
     static void seed_kv_refill(MoeExpertCache& cache) {
         cache.kv_expert_loan_=std::make_shared<mfq::cuda::KvExpertLoan>();
         auto arena=tb::zeros({16<<20},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));

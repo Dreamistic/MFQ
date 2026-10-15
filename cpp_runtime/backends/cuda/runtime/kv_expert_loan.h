@@ -26,15 +26,32 @@ class KvExpertLoan {
 public:
     using Key=std::array<int64_t,3>; // source, expert, field
     static constexpr std::size_t page=64<<10;
-    std::size_t add(mfq_tensor_backend::Tensor owner,int64_t capacity,std::size_t row_bytes,bool prefix,int64_t ratio=1,bool manual=false) {
+    std::size_t add(mfq_tensor_backend::Tensor owner,int64_t capacity,std::size_t row_bytes,bool prefix,int64_t ratio=1,bool manual=false,bool external=false) {
         std::lock_guard<std::mutex> lock(mutex_);
         Region region;region.owner=std::move(owner);region.capacity=capacity;region.row_bytes=row_bytes;region.prefix=prefix;region.ratio=ratio;
         region.manual_live=manual?0:-1;
+        region.external=external;
         region.end=region.owner.nbytes()/page;region.largest_free=region.end;if(region.end)region.free[0]=region.end;
-        regions_.push_back(std::move(region));update_bounds();
+        std::size_t index=0;
+        while(index<regions_.size() && regions_[index].owner.defined())++index;
+        if(index==regions_.size())regions_.push_back(std::move(region));
+        else regions_[index]=std::move(region);
+        update_bounds();
         initialized_.record(current_stream().stream());
         initialization_waited_=false;
-        return regions_.size()-1;
+        return index;
+    }
+    // Called at a completed request/window boundary. Revoke published expert
+    // addresses and drain their uploads before returning this allocation.
+    void remove(std::size_t region) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& r=regions_.at(region);
+        for(auto* entries:{&lru_,&retired_})for(auto it=entries->begin();it!=entries->end();) {
+            if(it->region==region){auto old=it++;erase(old);}else ++it;
+        }
+        if(copy_stream_)MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
+        r=Region{};
     }
     void ensure(int64_t tokens) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -73,12 +90,14 @@ public:
     }
     using ProjectionFill=std::function<void(void*,const std::array<std::size_t,8>&)>;
     using ProjectionObserver=std::function<void(int64_t,const void*,const std::array<std::size_t,8>&)>;
-    void observe_projections(int64_t source,ProjectionObserver observer) {
+    void observe_projections(int64_t source,ProjectionObserver observer,std::shared_ptr<void> owner={}) {
         if(!observer)throw std::invalid_argument("empty KV projection observer");
         std::lock_guard<std::mutex> lock(mutex_);
         for(const auto& entry:lru_)if(entry.key[0]==source && entry.projection && entry.published)
             observer(entry.key[1],pointer(entry),entry.projection->offsets);
-        observers_[source].push_back(std::move(observer));
+        auto& observers=observers_[source];
+        std::erase_if(observers,[](const auto& value){return value.managed && value.owner.expired();});
+        observers.push_back({std::move(observer),owner,bool(owner)});
     }
     // Route publication has fenced the previous readers. Check complete hits
     // before acquiring RAM expert slices or reserving transfer-stage slots.
@@ -149,6 +168,12 @@ public:
         return cache!=nullptr;
     }
     std::size_t bytes() const {std::lock_guard<std::mutex> lock(mutex_);return bytes_;}
+    std::size_t external_bytes() const {
+        std::lock_guard<std::mutex> lock(mutex_);std::size_t result=0;
+        for(const auto* entries:{&lru_,&retired_})for(const auto& entry:*entries)
+            if(regions_[entry.region].external)result+=entry.bytes;
+        return result;
+    }
     std::size_t hits() const {std::lock_guard<std::mutex> lock(mutex_);return hits_;}
     std::size_t retired_bytes() const {std::lock_guard<std::mutex> lock(mutex_);return retired_bytes_;}
     double lookup_us() const {std::lock_guard<std::mutex> lock(mutex_);return lookup_us_;}
@@ -157,7 +182,7 @@ public:
         for(const auto* entries:{&lru_,&retired_})for(const auto& e:*entries)if(e.region==region)result+=e.bytes;return result;
     }
 private:
-    struct Region {mfq_tensor_backend::Tensor owner;int64_t capacity=0,ratio=1,manual_live=-1;std::size_t row_bytes=0,begin=0,end=0,largest_free=0;bool prefix=false;std::map<std::size_t,std::size_t> free;};
+    struct Region {mfq_tensor_backend::Tensor owner;int64_t capacity=0,ratio=1,manual_live=-1;std::size_t row_bytes=0,begin=0,end=0,largest_free=0;bool prefix=false,external=false;std::map<std::size_t,std::size_t> free;};
     struct Entry {Key key;std::size_t region,first,pages,bytes;uint64_t packet=0;bool retired=false,published=false;
         std::unique_ptr<ProjectionLayout> projection;};
     struct KeyHash {
@@ -221,6 +246,7 @@ private:
     bool update_bounds() {
         bool changed=false;
         for(auto& r:regions_) {
+            if(!r.owner.defined())continue;
             const auto live=std::min(r.capacity,r.manual_live>=0?r.manual_live:(high_water_+r.ratio-1)/r.ratio);
             const auto begin=r.prefix?0:(std::size_t(live)*r.row_bytes+page-1)/page;
             const auto end=r.prefix?std::size_t(r.capacity-live)*r.row_bytes/page:r.owner.nbytes()/page;
@@ -254,9 +280,11 @@ private:
     void* pointer(const Entry& e) const {return static_cast<uint8_t*>(regions_[e.region].owner.data_ptr())+e.first*page;}
     void notify_projection(const Entry& entry,bool valid) {
         if(!entry.projection)return;
-        if(auto found=observers_.find(entry.key[0]);found!=observers_.end())
+        if(auto found=observers_.find(entry.key[0]);found!=observers_.end()) {
+            std::erase_if(found->second,[](const auto& value){return value.managed && value.owner.expired();});
             for(const auto& observer:found->second)
-                observer(entry.key[1],valid?pointer(entry):nullptr,entry.projection->offsets);
+                observer.callback(entry.key[1],valid?pointer(entry):nullptr,entry.projection->offsets);
+        }
     }
     void erase(std::list<Entry>::iterator it) {
         if(it->published)notify_projection(*it,false);
@@ -276,7 +304,8 @@ private:
     std::vector<Region> regions_;
     std::list<Entry> lru_,retired_;
     std::unordered_map<Key,std::list<Entry>::iterator,KeyHash> entries_;
-    std::unordered_map<int64_t,std::vector<ProjectionObserver>> observers_;
+    struct Observer {ProjectionObserver callback;std::weak_ptr<void> owner;bool managed=false;};
+    std::unordered_map<int64_t,std::vector<Observer>> observers_;
     std::vector<Key> pending_publications_;
     uint64_t packet_=1;
     std::size_t bytes_=0,hits_=0,retired_bytes_=0;

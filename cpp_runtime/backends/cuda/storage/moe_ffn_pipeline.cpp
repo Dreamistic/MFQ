@@ -1050,13 +1050,15 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     MoeGpuArena& stage(int projection,MoeCachedCohort& cohort,int requested_slots=moe_decode_transfer_slots(8,10),bool packed=false) {
         if(combined_gate_up_ && projection==1)projection=0;
         if(packed && moe_packed_transfer_stages_enabled()) {
-            const auto key="decodepacked:"+std::to_string(projection)+":"+std::to_string(requested_slots);
+            const bool predictor=sources_[0]->layer_id_<0 && moe_predictor_transfer_cache_enabled();
+            const auto key=moe_packed_transfer_prefix(projection,predictor)+std::to_string(requested_slots);
             auto& arena=cache_->pipeline_stages_[key];
             if(arena)return *arena;
             arena=std::make_unique<MoeGpuArena>();arena->signature=key;
             for(const auto& bundle:cache_->pipeline_bundles_) {
                 if(projection==1 && bundle[0]==bundle[1])continue;
                 const auto& source=cache_->sources_[bundle[projection]];
+                if(moe_predictor_transfer_cache_enabled() && (source->layer_id_<0)!=predictor)continue;
                 arena->slots=std::max(arena->slots,int(source->n_experts()));
                 for(const auto& c:source->cohorts_)
                     arena->slot_bytes=std::max(arena->slot_bytes,moe_packed_slot_bytes(c.bytes_per_expert));
@@ -1065,7 +1067,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             arena->packed=tb::empty({arena->slots*arena->slot_bytes},
                 tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
             arena->book=std::make_unique<mfq::MoeCacheSlotBook>(arena->slots);
-            std::cerr<<"moe_packed_transfer_arena projection="<<projection<<" slots="<<arena->slots
+            std::cerr<<"moe_packed_transfer_arena projection="<<projection<<" predictor="<<predictor<<" slots="<<arena->slots
                 <<" bytes="<<arena->slots*arena->slot_bytes<<'\n';
             return *arena;
         }
@@ -1469,15 +1471,16 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                         }
                     }
                     cache_->kv_expert_loan_->observe_projections(source.id_,
-                        [table,p,sizes=std::move(sizes),adjustments=std::move(adjustments)]
+                        [weak_table=std::weak_ptr(table),p,sizes=std::move(sizes),adjustments=std::move(adjustments)]
                         (int64_t expert,const void* base,const std::array<std::size_t,8>& offsets) {
+                            const auto table=weak_table.lock();if(!table)return;
                             auto& state=table->h<mfq::cuda::MfeCachedExpert>()[expert];
                             const auto version=(state.ready_mask+8)&~uint64_t(7);
                             if(!base){state.ready_mask=version|((state.ready_mask&7)&~(uint64_t(1)<<p));std::atomic_thread_fence(std::memory_order_release);return;}
                             for(std::size_t f=0;f<sizes[expert].size();++f)
                                 state.fields[p][f]=sizes[expert][f]?reinterpret_cast<uint64_t>(base)+offsets[f]+adjustments[expert][f]:0;
                             std::atomic_thread_fence(std::memory_order_release);_mm_sfence();state.ready_mask=version|(state.ready_mask&7)|(uint64_t(1)<<p);
-                        });
+                        },table);
                 }
                 cached_expert_fields_=std::move(table);
             }

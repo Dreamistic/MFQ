@@ -27,6 +27,7 @@ struct Qwen4ExpMtp final : MtpModule {
     uint64_t graph_captures=0;
     uint64_t graph_replays = 0;
     bool graph_initialized = false;
+    Tensor graph_compact_topk() const;
     bool take_graph_initialization() noexcept override { return std::exchange(graph_initialized,false); }
     uint64_t graph_replay_count() const noexcept override { return graph_replays; }
 

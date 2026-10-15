@@ -80,6 +80,11 @@ public:
     bool should_exit() const noexcept { return exit_streak_ >= (gradual_warmup_?6:16); }
     bool speculation_losing() const {
         if (!warmup_.empty() || !cycle_ms_.front()) return false;
+        // The first speculative width also pays predictor setup and sampling.
+        // Its difference from scalar decode is not the marginal cost of every
+        // additional draft. With good acceptance, measure wider windows before
+        // parking; cold-window limits may defer that measurement until later.
+        if (needs_wider_measurement()) return false;
         const double baseline = score(0);
         if (baseline <= 0.0) return false;
         double best = 0.0;
@@ -129,7 +134,8 @@ public:
                     const int next=warmup_.front();
                     const bool cold_blocked=cold_tokens_left_>0 && next>cold_maximum_depth_ &&
                         time_estimate(next)>cold_window_ms_;
-                    if(!cold_blocked && score(next)>=score(0))break;
+                    if(!cold_blocked && (score(next)>=score(0) ||
+                            (width_needs_measurement(next) && needs_wider_measurement())))break;
                     warmup_.erase(warmup_.begin());
                 }
             }
@@ -138,7 +144,16 @@ public:
                 return;
             }
             current_depth_ = best_depth();
+            if (const auto next = unmeasured_width()) {
+                current_depth_ = *next;
+                warmup_.push_back(*next);
+            }
             milliseconds_since_probe_ = 0.0;
+            return;
+        }
+        if (const auto next = unmeasured_width()) {
+            current_depth_ = *next;
+            warmup_.push_back(*next);
             return;
         }
         if (probe_left_ > 0) {
@@ -177,6 +192,24 @@ public:
     }
 
 private:
+    bool width_needs_measurement(int depth) const {
+        const auto index = static_cast<std::size_t>(depth);
+        return !cycle_ms_[index] || cycle_age_ms_[index] == std::numeric_limits<double>::infinity();
+    }
+    bool needs_wider_measurement() const {
+        if (!gradual_warmup_ || !post_baseline_shallow_ || conditional_acceptance(0) < 0.65)
+            return false;
+        for (int depth = 2; depth <= maximum_depth_; ++depth)
+            if (width_needs_measurement(depth)) return true;
+        return false;
+    }
+    std::optional<int> unmeasured_width() const {
+        if (!needs_wider_measurement()) return std::nullopt;
+        const int maximum = cold_tokens_left_ > 0 ? cold_maximum_depth_ : maximum_depth_;
+        for (int depth = 2; depth <= maximum; ++depth)
+            if (width_needs_measurement(depth)) return depth;
+        return std::nullopt;
+    }
     void update_time(int depth, double cycle_ms) {
         const auto index = static_cast<std::size_t>(depth);
         auto& estimate = cycle_ms_[index];
@@ -296,7 +329,10 @@ private:
 class PolicyState {
 public:
     DepthController begin(int maximum_depth,bool gradual_warmup=false,double cold_window_ms=0.0) const {
-        double margin = 1.15;
+        // CUDA measures complete graph windows, including drafting and exact
+        // sampling. Do not discard a measured 3-15% gain by imposing the
+        // generic loop's initial tax; observed plain-loop tax still overrides it.
+        double margin = gradual_warmup ? 1.03 : 1.15;
         if (loop_tax_) {
             const double age = std::chrono::duration<double>(Clock::now()-loop_tax_time_).count();
             margin += (*loop_tax_-margin) * std::exp(-age/600.0);

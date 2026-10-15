@@ -1174,14 +1174,20 @@ class ToolJobHandlers:
             if process.returncode is not None:
                 return
             with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
+                if os.name == 'nt':
+                    process.terminate()
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
             try:
                 await asyncio.wait_for(
                     process.wait(), timeout=_TOOL_TERMINATE_TIMEOUT_SECONDS
                 )
             except asyncio.TimeoutError:
                 with suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
+                    if os.name == 'nt':
+                        process.kill()
+                    else:
+                        os.killpg(process.pid, signal.SIGKILL)
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(
                         process.wait(), timeout=_TOOL_KILL_TIMEOUT_SECONDS
@@ -1190,36 +1196,42 @@ class ToolJobHandlers:
         context.add_cleanup(stop)
         lines: deque[str] = deque(maxlen=_TOOL_OUTPUT_TAIL_LINES)
         assert process.stdout is not None
-        while True:
-            raw = await process.stdout.readline()
-            if not raw:
-                break
-            context.raise_if_cancelled()
-            line = raw.decode("utf-8", errors="replace").rstrip()
-            if not line:
-                continue
-            lines.append(line)
-            await context.log(line[:4096])
-            if progress_parser is not None:
-                parsed = progress_parser(line)
-                if parsed is not None:
-                    progress, message = parsed[:2]
-                    await context.progress(min(0.99, max(0.01, progress)), message=message[:200], data=parsed[2] if len(parsed) == 3 else None)
-            if progress_pattern is not None:
-                match = progress_pattern.search(line)
-                if match:
-                    amount = int(match.group(1))
-                    progress = amount / progress_total if progress_total else amount / 100
-                    await context.progress(min(0.99, max(0.01, progress)), message=line[:200])
-        status = await process.wait()
-        if status != 0:
-            raise self._failure(
-                "tool_process_failed",
-                f"tool process exited with status {status}",
-                retryable=status in {75, 130, 143},
-            )
-        await context.progress(final_progress, message=final_message)
-        return list(lines)
+        try:
+            while True:
+                raw = await process.stdout.readline()
+                if not raw:
+                    break
+                context.raise_if_cancelled()
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if not line:
+                    continue
+                lines.append(line)
+                await context.log(line[:4096])
+                if progress_parser is not None:
+                    parsed = progress_parser(line)
+                    if parsed is not None:
+                        progress, message = parsed[:2]
+                        await context.progress(min(0.99, max(0.01, progress)), message=message[:200], data=parsed[2] if len(parsed) == 3 else None)
+                if progress_pattern is not None:
+                    match = progress_pattern.search(line)
+                    if match:
+                        amount = int(match.group(1))
+                        progress = amount / progress_total if progress_total else amount / 100
+                        await context.progress(min(0.99, max(0.01, progress)), message=line[:200])
+            status = await process.wait()
+            if status != 0:
+                raise self._failure(
+                    "tool_process_failed",
+                    f"tool process exited with status {status}",
+                    retryable=status in {75, 130, 143},
+                )
+            await context.progress(final_progress, message=final_message)
+            return list(lines)
+        except BaseException:
+            # Download reservations close before JobContext cleanup. Reap the
+            # child here so it cannot hold disk-budget locks during that close.
+            await stop()
+            raise
 
 
     @staticmethod

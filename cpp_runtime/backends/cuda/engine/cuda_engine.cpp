@@ -5,6 +5,8 @@
 #include "storage/weight_loader.h"
 #include "storage/moe_expert_cache.h"
 #include "runtime/kv_offload.h"
+#include "runtime/kv_expert_loan.h"
+#include "mfq_cuda_resident_allocations.h"
 #include "runtime/execution_options.h"
 #include "cuda_batching.h"
 #include "storage/text_session_cache.h"
@@ -37,6 +39,89 @@ struct CudaEngineState {
     std::unique_ptr<ContinuousBatch<CudaBatchOperations<Model>>> batching;
     bool duplex_active = false;
     std::size_t resident_budget=0, weight_budget=0, initial_expert_budget=0, allocation_ceiling=0;
+    std::shared_ptr<KvExpertLoan> graph_expert_loan;
+    mfq_tensor_backend::Tensor graph_expert_storage;
+    std::optional<std::size_t> graph_expert_region;
+    int graph_draft_depth=3;
+    bool preparing_graph_depth=true;
+
+    void release_graph_expert_space() {
+        if(!graph_expert_region)return;
+        finish_moe_expert_exchanges(execution->moe_expert_cache);
+        MFQ_CUDA_CHECK(cudaDeviceSynchronize());
+        const auto bytes=graph_expert_storage.nbytes();
+        graph_expert_loan->remove(*graph_expert_region);
+        graph_expert_region.reset();graph_expert_storage={};
+        auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
+        context->reclaim_idle_memory();
+        std::cerr<<"runtime_mtp_workspace_cache action=reclaim bytes="<<bytes<<'\n';
+    }
+
+    void restore_graph_expert_space() {
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            if(preparing_graph_depth || graph_expert_region || !graph_expert_loan || !components.mtp)return;
+            const auto maximum=qwen4_mtp_graph_reserve(language,components.mtp.get());
+            const auto active=qwen4_mtp_graph_reserve(language,components.mtp.get(),graph_draft_depth);
+            if(active>=maximum)return;
+            auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
+            const auto available=context->available_memory(),headroom=std::size_t(256)<<20;
+            auto bytes=std::min(maximum-active,available>headroom?available-headroom:0);
+            bytes=bytes/KvExpertLoan::page*KvExpertLoan::page;
+            if(!bytes)return;
+            // An ordinary resident tensor supplies revocable expert pages;
+            // no decode graph captures an address into this allocation.
+            ResidentAllocationScope resident;
+            try {
+                graph_expert_storage=mfq_tensor_backend::empty({int64_t(bytes)},
+                    mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kUInt8));
+            } catch(const std::exception& error) {
+                const std::string message=error.what();
+                if(message.find("VRAM limit")==std::string::npos && message.find("out of memory")==std::string::npos)throw;
+                std::cerr<<"runtime_mtp_workspace_cache action=skip reason=memory_pressure\n";
+                return;
+            }
+            graph_expert_region=graph_expert_loan->add(graph_expert_storage,int64_t(bytes),1,true,1,true,true);
+            std::cerr<<"runtime_mtp_workspace_cache action=lend depth="<<graph_draft_depth<<" bytes="<<bytes<<'\n';
+        }
+    }
+
+    void prepare_graph_depth(const InferenceRequest& input) {
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            if(!components.mtp)return;
+            const auto* warmup=std::getenv("MFQ_QWEN4_WARMUP_GRAPHS");
+            if(!language.reuse_decode_graphs || !execution->config.moe_pipeline || (warmup && warmup[0]=='0'))return;
+            const auto& sampling=input.sampling;
+            const bool wide=sampling.temperature<=0 || sampling.top_k==1 ||
+                (sampling.top_k>0 && sampling.top_k<=64);
+            const int requested=sampling.enable_mtp && wide
+                ?std::clamp(int(sampling.mtp_max_draft_tokens),1,components.mtp->maximum_draft_depth()):1;
+            // Short prefill shares the existing four-row graphs. Only draft
+            // caps above three need additional verification storage.
+            const int depth=std::max(3,requested);
+            if(depth==graph_draft_depth && language.graph_registry)return;
+            const auto started=std::chrono::steady_clock::now();
+            preparing_graph_depth=true;
+            try {
+                release_graph_expert_space();
+                graph.invalidate();
+                qwen4_release_decode_graphs(language,components.mtp.get());
+                release_moe_decode_buffers(execution->moe_expert_cache);
+                language.reset(1);components.mtp->reset(1);
+                auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
+                context->reclaim_idle_memory();
+                reclaim_prefix_workspace((std::size_t(2)<<30)+qwen4_mtp_graph_reserve(language,components.mtp.get(),depth));
+                qwen4_warmup_decode_graphs(language,components.mtp.get(),depth);
+                graph_draft_depth=depth;
+                preparing_graph_depth=false;
+                restore_graph_expert_space();
+            } catch(...) {
+                graph_draft_depth=0;preparing_graph_depth=false;
+                throw;
+            }
+            std::cerr<<"runtime_mtp_depth_plan requested_depth="<<requested<<" prepared_depth="<<depth
+                <<" ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count()<<'\n';
+        }
+    }
 
     bool online_budget_supported() const {
         return execution->layer_placement.devices.size()<=1 && !execution->tensor_parallel.enabled()
@@ -47,10 +132,12 @@ struct CudaEngineState {
         auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
         const auto available=context->available_memory();
         if(available>=bytes)return;
+        if(graph_expert_region)release_graph_expert_space();
+        if(context->available_memory()>=bytes)return;
         std::size_t hot=0;
         for(const auto& [name,value]:cache.metrics())
             if(name=="prefix_cache_hot_bytes")hot=std::size_t(value);
-        const auto shortage=bytes-available;
+        const auto shortage=bytes-context->available_memory();
         const auto released=cache.trim_hot(hot>shortage?hot-shortage:0);
         context->reclaim_idle_memory();
         if(released)std::cerr<<"runtime_workspace_reclaim requested_bytes="<<bytes
@@ -81,6 +168,12 @@ struct CudaEngineState {
         }
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
+            graph_expert_loan=execution->kv_memory?execution->kv_memory->expert_loan():nullptr;
+            if(!graph_expert_loan && components.mtp) {
+                graph_expert_loan=std::make_shared<KvExpertLoan>();
+                set_moe_kv_expert_loan(execution->moe_expert_cache,graph_expert_loan);
+            }
+            language.restore_decode_workspace=[this]{restore_graph_expert_space();};
             set_moe_workspace_reservation(execution->moe_expert_cache,
                 [this](std::size_t bytes) {reclaim_prefix_workspace(bytes);},
                 [this](std::size_t bytes) {cache.reserve_ram(bytes);});
@@ -88,6 +181,8 @@ struct CudaEngineState {
                 const auto device = execution->layer_placement.primary_device();
                 auto context = mfq::cuda::default_context(device);
                 if (context->available_memory() >= bytes) return;
+                if(graph_expert_region)release_graph_expert_space();
+                if(context->available_memory()>=bytes)return;
                 std::size_t hot = 0;
                 for (const auto& [name,value] : cache.metrics())
                     if (name == "prefix_cache_hot_bytes") hot = std::size_t(value);
@@ -146,6 +241,8 @@ struct CudaEngineState {
                 mfq::cuda::default_context(execution->layer_placement.primary_device())->reclaim_idle_memory();
             }
         }
+        preparing_graph_depth=false;
+        restore_graph_expert_space();
     }
     bool can_batch(const EngineRequest& request) const {
         if constexpr (std::is_same_v<Model,Qwen4CausalLm>)
@@ -154,6 +251,9 @@ struct CudaEngineState {
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
     }
     ~CudaEngineState() {
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>)language.restore_decode_workspace={};
+        try {release_graph_expert_space();}
+        catch(const std::exception& error) {std::cerr<<"runtime_mtp_workspace_cache cleanup_error="<<error.what()<<'\n';}
         if(execution->kv_memory)execution->kv_memory->set_reservation({});
         set_moe_workspace_reservation(execution->moe_expert_cache,{});
         if (execution->qsa_kv_store) execution->qsa_kv_store->set_ram_reservation({});
@@ -235,6 +335,7 @@ struct CudaEngineState {
     }
     Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared,
                              const RequestId& id, bool batched) {
+        if(!batched)prepare_graph_depth(input);
         return internal::generate(language, graph, cache, config,
                                   input, output, batched ? nullptr : components.mtp.get(), std::move(prepared),
                                   batched ? batching.get() : nullptr, id);
@@ -256,6 +357,9 @@ struct CudaEngineState {
             const auto batch_metrics = batching ? batching->metrics() : Metrics{};
             const auto capabilities = components.state();
             Metrics metrics{
+                {"mtp_graph_prepared_depth",double(graph_draft_depth)},
+                {"mtp_flexible_expert_capacity_bytes",double(graph_expert_storage.defined()?graph_expert_storage.nbytes():0)},
+                {"mtp_flexible_expert_used_bytes",double(graph_expert_loan?graph_expert_loan->external_bytes():0)},
                 {"kv_memory_supported",std::is_same_v<Model,Qwen4CausalLm>?1.0:0.0},
                 {"kv_quantization_supported",(std::is_same_v<Model,Qwen4CausalLm>||std::is_same_v<Model,Qwen35CausalLm>)?1.0:0.0},
                 {"kv_quantization_bits",(std::is_same_v<Model,Qwen4CausalLm>||std::is_same_v<Model,Qwen35CausalLm>)?cuda_kv_quantization().bits:0.0},
