@@ -228,4 +228,6 @@ private:
     bool uniform_q_bits_ = false;
 };
 
+mlx::core::array pack_nint_single_row(const MlxNintWeight& weight);
+
 } // namespace mfq::metal

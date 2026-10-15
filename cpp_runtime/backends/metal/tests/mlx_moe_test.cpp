@@ -2824,9 +2824,12 @@ void test_two_stage_nint_shared_decode(
     auto gate_logits = mlx::core::matmul(
         mlx::core::astype(input, mlx::core::bfloat16),
         mlx::core::transpose(shared_gate_weight));
+    std::optional<mlx::core::array> packed_router;
     if (precomputed_gate) {
-        const auto gate_fixture = make_nint_v2_tensor(1, hidden, 67, shared_group_size, true);
-        gate_logits = mfq::metal::MlxNintWeight::from_blob(gate_fixture.blob).matmul(input);
+        const auto gate_fixture = make_nint_v2_tensor(1, hidden, 67, shared_group_size, true, fixed_q);
+        const auto router = mfq::metal::MlxNintWeight::from_blob(gate_fixture.blob);
+        gate_logits = router.matmul(input);
+        packed_router = mfq::metal::pack_nint_single_row(router);
     }
     const auto gate_input = precomputed_gate ? gate_logits : shared_gate_weight;
 
@@ -2846,6 +2849,20 @@ void test_two_stage_nint_shared_decode(
         const auto* kernel = dynamic_cast<const mfq::metal::MlxPreparableKernel*>(&node->primitive());
         require(kernel != nullptr && kernel->preparation_key().find(expected_dispatch) != std::string::npos,
             "NINT row-q dispatch did not match the actual row precision layout");
+    }
+    if (packed_router) {
+        auto packed = gate_up.decode_nint_shared(down, *shared_gate_up, shared_down,
+            *packed_router, input, expert_ids, route_weights);
+        require(packed.has_value(), "packed shared router disabled two-stage fusion");
+        const auto expected_values = evaluated_floats(*fused);
+        const auto packed_values = evaluated_floats(*packed);
+        float error = 0.0f, scale = 0.0f;
+        for (std::size_t index = 0; index < expected_values.size(); ++index) {
+            error = std::max(error, std::abs(expected_values[index] - packed_values[index]));
+            scale = std::max(scale, std::abs(expected_values[index]));
+        }
+        require(error == 0.0f, "packed shared router error=" + std::to_string(error) +
+            " scale=" + std::to_string(scale));
     }
     if (check_folded_topk) {
         require(tokens == 1, "folded top-k fixture must have one token");
@@ -8281,6 +8298,27 @@ void test_kernel_preparation() {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--test-packed-shared-router") {
+        try {
+            mlx::core::set_default_device(mlx::core::Device::gpu);
+            for (int groups : {7, 24, 28, 48})
+                for (int tokens : {1, 2, 3, 4, 5, 6, 8, 24})
+                    for (int bits : {4, 8}) {
+                        try {
+                            test_two_stage_nint_shared_decode(groups, 65, 41, false,
+                                tokens, true, false, 24, false, 32, false, bits);
+                        } catch (const std::exception& error) {
+                            throw std::runtime_error("GS=" + std::to_string(groups) +
+                                " M=" + std::to_string(tokens) + " q=" + std::to_string(bits) + ": " + error.what());
+                        }
+                    }
+            std::cout << "MFQ packed shared router tests passed\n";
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << '\n';
+            return 1;
+        }
+    }
     if (argc == 5 && std::string_view(argv[1]) == "--probe-mtp-cache") {
         try {
             using namespace mlx::core;

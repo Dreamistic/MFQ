@@ -2354,6 +2354,32 @@ bool MlxNintWeight::can_fuse_swiglu(
         output_size_ == up.output_size_;
 }
 
+array pack_nint_single_row(const MlxNintWeight& weight) {
+    if (weight.output_size() != 1)
+        throw std::invalid_argument("packed NINT router requires one output row");
+    constexpr std::size_t header_bytes = 9 * sizeof(std::uint32_t);
+    std::array<std::uint32_t, 9> header{};
+    std::size_t size = header_bytes;
+    const std::array streams{weight.packed_values(), weight.sub_scales(), weight.sub_mins()};
+    for (std::size_t index = 0; index < streams.size(); ++index) {
+        header[index] = checked_shape(size, "packed NINT router offset");
+        size += streams[index].nbytes() + 4;
+    }
+    header[3] = weight.group_size();
+    header[8] = weight.input_size();
+    auto metadata = weight.row_metadata();
+    metadata.eval();
+    std::copy_n(metadata.data<std::uint32_t>(), 4, header.begin() + 4);
+    detail::StagingVector<std::uint8_t> packed(checked_shape(size, "packed NINT router bytes"));
+    std::memcpy(packed.data(), header.data(), header_bytes);
+    for (std::size_t index = 0; index < streams.size(); ++index) {
+        auto stream = streams[index];
+        stream.eval();
+        std::memcpy(packed.data() + header[index], stream.data<std::uint8_t>(), stream.nbytes());
+    }
+    return make_array(packed, Shape{static_cast<int>(packed.size())});
+}
+
 array MlxNintWeight::swiglu(
     const MlxNintWeight& up,
     const array& input) const {
