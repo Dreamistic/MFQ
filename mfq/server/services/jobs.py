@@ -201,7 +201,7 @@ class JobContext:
 
 
 class JobManager:
-    """Run only explicitly registered job kinds with bounded concurrency."""
+    """Run registered jobs with independently bounded execution lanes."""
 
     def __init__(
         self,
@@ -215,6 +215,8 @@ class JobManager:
         self.store = store
         self.handlers: dict[str, JobHandler] = dict(handlers or {})
         self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._download_semaphore = asyncio.Semaphore(max_concurrency)
+        self._runtime_semaphore = asyncio.Semaphore(max_concurrency)
         self._tasks: dict[UUID, asyncio.Task[None]] = {}
         self._cancel_events: dict[UUID, asyncio.Event] = {}
         self._started = False
@@ -339,7 +341,14 @@ class JobManager:
     async def _run(self, job_id: UUID, cancel_event: asyncio.Event) -> None:
         context = JobContext(self.store, job_id, cancel_event)
         try:
-            async with self._semaphore:
+            job = await asyncio.to_thread(self.store.get_job, job_id)
+            if job.kind.startswith("download.") or job.kind.endswith(".download"):
+                semaphore = self._download_semaphore
+            elif job.kind.startswith(("model.", "runtime.")):
+                semaphore = self._runtime_semaphore
+            else:
+                semaphore = self._semaphore
+            async with semaphore:
                 job = await asyncio.to_thread(self.store.get_job, job_id)
                 if job.status != JobStatus.QUEUED:
                     return

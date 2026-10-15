@@ -1,6 +1,7 @@
 /** 提供 Studio 现有图标、页面标题、业务面板与指标展示组件。 */
 import { ReactNode } from 'react';
 import { formatNumber } from './formatters';
+import mfqMark from '../assets/mfq-mark.svg';
 
 export type ModelMonogramState = "idle" | "loading" | "ready" | "failed";
 
@@ -160,7 +161,7 @@ export function ModelMonogram({
   const initial = Array.from(name.trim())[0]?.toLocaleUpperCase() || "E";
   return (
     <span aria-hidden="true" className={`model-monogram ${state}`}>
-      {state === "idle" ? <img src="/mfq-mark.svg" alt="" /> : initial}
+      {state === "idle" ? <img src={mfqMark} alt="" /> : initial}
     </span>
   );
 }
