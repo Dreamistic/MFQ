@@ -323,7 +323,7 @@ inline void mfq_nvq1_profile(
             state_offset + state_cursor.x, auxiliary_offset + (state_index >> 3u),
             index_cursor.y | (state_cursor.y << 3u) | ((state_index & 7u) << 6u));
     }
-    #pragma clang loop unroll_count(INPUT_ROWS == 1u ? 2 : 1)
+    #pragma clang loop unroll_count(MATRIX_ROWS == 1u && INPUT_ROWS == 1u ? 2 : 1)
     for (uint group = k_lane; group < GROUPS; group += K_LANES) {
         uint2 records[MATRIX_ROWS];
         float weight_scales[MATRIX_ROWS];
