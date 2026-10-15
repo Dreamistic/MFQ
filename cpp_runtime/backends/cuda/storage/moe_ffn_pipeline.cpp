@@ -662,6 +662,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         int64_t ram_begin=0,bytes=0;
     };
     std::unique_ptr<LayerPrefill> prefill_layer_;
+    bool prefill_async_reported_=false;
     bool prefill_layer_flush() const {
         const auto option=mfq::cuda::runtime_options::moe_prefill_layer_flush();
         return !option || *option!=0;
@@ -963,6 +964,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             (!reuse_option || *reuse_option!=0);
         if(!cache_->pipeline_prefill_layer_buffer_.defined() || !cache_->pipeline_prefill_layer_overlap_ ||
                 (!prefill_layer_async() && !same_layer))MFQ_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        else if(prefill_layer_async() && !prefill_async_reported_) {
+            std::cerr<<"runtime_prefill_async_dispatch layer="<<sources_[0]->layer_id_
+                <<" tokens="<<input.size(0)<<" overlap=1\n";
+            prefill_async_reported_=true;
+        }
         if(prefill_stream_)return streamed_prefill(execution,input,ids,weights);
         try { initialize_prefill_layer(execution,ids); }
         catch(const MfqResourceExhausted& error) {

@@ -832,6 +832,26 @@ std::size_t Context::workspace_available() const {
     return bytes;
 }
 
+std::vector<std::pair<void*,std::size_t>> Context::workspace_touched_regions() const {
+    std::lock_guard lock(graph_pool_mutex_);
+    std::vector<std::pair<void*,std::size_t>> result;
+    if(!workspace_loan_)return result;
+    auto ranges=workspace_loan_->touched;
+    std::sort(ranges.begin(),ranges.end());
+    for(const auto& [begin,size]:ranges) {
+        if(!result.empty()) {
+            auto& last=result.back();
+            const auto previous=reinterpret_cast<std::uintptr_t>(last.first);
+            if(begin<=previous+last.second) {
+                last.second=std::max(previous+last.second,begin+size)-previous;
+                continue;
+            }
+        }
+        result.emplace_back(reinterpret_cast<void*>(begin),size);
+    }
+    return result;
+}
+
 void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     if (bytes == 0) {
         return nullptr;
@@ -879,6 +899,9 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
             if(best!=loan.free.end()) {
                 const auto base=best->first,size=best->second;
                 auto* result=reinterpret_cast<void*>(base);
+                // Record conservatively before publishing the allocation.
+                // A failed bookkeeping allocation can only cause extra restore.
+                loan.touched.emplace_back(base,aligned);
                 loan.live.emplace(result,aligned);
                 loan.free.erase(best);
                 if(size>aligned)loan.free.emplace(base+aligned,size-aligned);

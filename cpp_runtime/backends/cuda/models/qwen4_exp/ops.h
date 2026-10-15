@@ -78,6 +78,12 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     Qwen4CausalLm&, mfq_tensor_backend::Tensor ids, int64_t compute_chunk = 1024,
     bool last_only = true, const std::function<bool()>& cancelled = {},
     mfq_tensor_backend::Tensor* raw_hidden = nullptr, bool raw_hidden_host = false);
+// Report completed prompt computation before restoring lent expert storage.
+mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
+    Qwen4CausalLm&, mfq_tensor_backend::Tensor ids, int64_t compute_chunk,
+    bool last_only, const std::function<bool()>& cancelled,
+    mfq_tensor_backend::Tensor* raw_hidden, bool raw_hidden_host,
+    const std::function<void()>& computation_finished);
 
 struct Qwen4Model : CausalResources {
     Qwen4Model();

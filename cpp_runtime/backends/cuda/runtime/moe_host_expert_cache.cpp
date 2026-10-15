@@ -60,12 +60,15 @@ struct MoeHostExpertCache::Impl {
     }
     bool make_room(std::size_t bytes) {
         if (!bytes || bytes>budget) return false;
-        if (preserve) return ledger->managed.load()<=budget-bytes;
         auto candidate=lru.end();
         while (ledger->managed.load()>budget-bytes) {
             if (candidate==lru.begin()) return false;
             --candidate;
             auto found=entries.find(*candidate);
+            // Negative source IDs are reusable prefill backup images. Their
+            // GPU copy still exists outside the loan; discard them before a
+            // request needs more RAM, even in complete-residency mode.
+            if (preserve && candidate->source>=0) continue;
             // Externally held payloads stay charged even after removal. Keep
             // their lookup entry rather than evicting useful pinned data.
             if (found->second.value.use_count()!=1) continue;

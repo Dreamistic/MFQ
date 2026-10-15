@@ -1,6 +1,7 @@
 """Prefill may overwrite expert tails, then decode must use restored weights."""
 import asyncio
 import os
+import re
 from contextlib import suppress
 
 import numpy as np
@@ -92,6 +93,11 @@ def test_prefill_loan_restores_experts_and_retains_graphs(tmp_path, ram_hot, cac
                     loans = trace.count('runtime_prefill_loan action=borrow')
                     assert loans >= 3
                     assert trace.count('runtime_prefill_loan action=return') == loans
+                    assert any(int(value)>0 for value in re.findall(r'cached_arenas=(\d+)',trace)), trace
+                    returns = re.findall(r'action=return restored_bytes=(\d+) restore_bytes=(\d+) selective=(\d+)', trace)
+                    assert len(returns) == loans
+                    assert all(0 <= int(copied) <= int(capacity) and selective == '1'
+                               for capacity, copied, selective in returns), returns
                     assert trace.count('runtime_prefill_ring split=1') == (0 if cache_only else 1)
                 else:
                     assert 'runtime_prefill_loan action=borrow' not in trace

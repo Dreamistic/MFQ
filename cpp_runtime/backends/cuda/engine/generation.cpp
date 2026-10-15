@@ -75,6 +75,12 @@ template <typename Model> struct CudaGenerationOps {
     double prefill(const mfq::engine::PrefillChunk &chunk) {
         using Tensor = mfq_tensor_backend::Tensor;
         PrefillCudaTimer timer;
+        bool prefill_finished=false;
+        const auto finish_prefill=[&] {
+            if(prefill_finished)return;
+            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+            prefill_finished=true;
+        };
         auto ids = full_ids.narrow(1, chunk.offset, chunk.count).contiguous();
         Tensor hidden;
         bool layer_major=false;
@@ -83,11 +89,11 @@ template <typename Model> struct CudaGenerationOps {
                 qwen4_layer_major_prefill_eligible(model,chunk.count)) {
                 layer_major=true;
                 hidden=qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,true,
-                    [&] {return output && output->stopped();});
+                    [&] {return output && output->stopped();},nullptr,false,finish_prefill);
             }
         }
         if(output && output->stopped()) {
-            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+            finish_prefill();
             return timer.elapsed_ms();
         }
         if (hidden.defined()) {
@@ -105,6 +111,7 @@ template <typename Model> struct CudaGenerationOps {
                 nullptr,
                 mfq_nullopt,
                 true);
+            finish_prefill();
             if(borrowed) {
                 workspace.suspend();
                 hidden=hidden.narrow(1,hidden.size(1)-1,1).clone();
@@ -117,20 +124,22 @@ template <typename Model> struct CudaGenerationOps {
                 length = mfq_tensor_backend::full({1}, chunk.offset + 1, full_ids.options());
             hidden = model.hidden_forward(ids, mfq_nullopt, length);
         }
+        // Match prompt-progress timing: first-token head/sampling and expert
+        // restoration remain in TTFT, outside reported prefill throughput.
+        finish_prefill();
         if (chunk.offset + chunk.count == full_ids.size(1)) {
             auto logits = model
                               .logits_from_hidden(hidden.index({Slice(), -1, Slice()})
                                       .to(mfq_tensor_backend::kFloat16)
                                       .contiguous())
                               .reshape({1, -1});
-            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
             pending = mfq::cuda::sample_logits(sampler, std::move(logits), counts, constraint);
-        } else
-            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
+        }
         const auto elapsed=timer.elapsed_ms();
         if(graph_config.trace)std::cerr<<"runtime_prefill_chunk offset="<<chunk.offset
             <<" tokens="<<chunk.count<<" layer_major="<<layer_major
-            <<" compute_chunk="<<prefill_compute_chunk<<" elapsed_ms="<<elapsed<<'\n';
+            <<" compute_chunk="<<prefill_compute_chunk<<" elapsed_ms="<<elapsed
+            <<" timing=before_cache_restore"<<'\n';
         return elapsed;
     }
     std::int64_t first_token() { return pending.template item<int64_t>(); }

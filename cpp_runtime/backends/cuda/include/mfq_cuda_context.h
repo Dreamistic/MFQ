@@ -205,6 +205,7 @@ public:
     void suspend_workspace_loan();
     void end_workspace_loan();
     std::size_t workspace_available() const;
+    std::vector<std::pair<void*,std::size_t>> workspace_touched_regions() const;
     void check_memory_limit(std::size_t additional = 0) const;
     void set_memory_limit(std::size_t bytes);
 
@@ -247,6 +248,7 @@ private:
         bool enabled=true;
         std::map<std::uintptr_t,std::size_t> free;
         std::unordered_map<void*,std::size_t> live;
+        std::vector<std::pair<std::uintptr_t,std::size_t>> touched;
     };
     std::unique_ptr<WorkspaceLoan> workspace_loan_;
     std::unordered_map<cudaStream_t, GraphPool> graph_pools_;

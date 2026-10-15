@@ -202,6 +202,12 @@ template <class Model> struct CudaMtpOps {
   };
   PrefillResult prefill(mfq::engine::PrefillChunk chunk) {
     PrefillCudaTimer timer;
+    bool prefill_finished=false;
+    const auto finish_prefill=[&] {
+      if(prefill_finished)return;
+      MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+      prefill_finished=true;
+    };
     Tensor raw;
     auto ids = input_ids.narrow(1, chunk.offset, chunk.count).contiguous();
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
@@ -232,8 +238,8 @@ template <class Model> struct CudaMtpOps {
         // bounded tiles, so a host copy avoids a sequence-sized VRAM reservation.
         const bool host_history=host_prompt_history(chunk.count);
         auto hidden=mfq::cuda::qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,true,
-            [&] { return output && output->stopped(); }, &raw,host_history);
-        MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+            [&] { return output && output->stopped(); }, &raw,host_history,finish_prefill);
+        finish_prefill();
         return {std::move(hidden),std::move(raw),timer.elapsed_ms()};
       }
     }
@@ -254,14 +260,13 @@ template <class Model> struct CudaMtpOps {
                   mfq_nullopt, nullptr, mfq_nullopt, true, mfq_nullopt, &raw)
             : target_forward(ids, &raw);
     if(host_history)raw=raw.to(mfq_tensor_backend::kCPU);
+    finish_prefill();
     if(borrowed) {
       workspace.suspend();
       hidden=hidden.narrow(1,hidden.size(1)-1,1).clone();
       if(!host_history)raw=raw.clone();
       workspace.finish();
     }
-    MFQ_CUDA_CHECK(
-        cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
     return {std::move(hidden), std::move(raw), timer.elapsed_ms()};
   }
   Tensor ids_for(std::vector<int64_t> tokens) {
@@ -354,12 +359,18 @@ template <class Model> struct CudaMtpOps {
     return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
   }
   double end_predictor_prefill() {
-    const auto started=std::chrono::steady_clock::now();
     if(predictor_loan){predictor_loan->finish();predictor_loan.reset();}
-    return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+    // Every predictor tile has already synchronized its compute-end event.
+    // Returning the expert loan is TTFT maintenance, not prompt computation.
+    return 0;
   }
   double predictor_prefill(Tensor hidden, Tensor ids, Tensor positions) {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(!cache_only_prompt_history() && model.reuse_decode_graphs && model.graph_registry && ids.size(1)<=128)
+        end_predictor_prefill();
+    }
     PrefillCudaTimer timer;
+    bool prefill_finished=false;
     if(!cache_only_prompt_history())hidden=hidden.to(mfq_tensor_backend::kCUDA);
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(cache_only_prompt_history()) {
@@ -371,11 +382,12 @@ template <class Model> struct CudaMtpOps {
           auto resident_hidden=hidden.to(mfq_tensor_backend::kCUDA);
           (void)predictor.evaluate(target,resident_hidden,ids,0,true,positions,{},true);
         }
+        MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+        prefill_finished=true;
         workspace.finish();
       } else if(model.reuse_decode_graphs && model.graph_registry && ids.size(1)<=128) {
         // The short tail uses decode graphs, whose expert addresses must again
         // contain weights. The final long compute tile has already retired.
-        end_predictor_prefill();
         for(int64_t offset=0;offset<ids.size(1);offset+=4) {
           const auto rows=std::min<int64_t>(4,ids.size(1)-offset);
           predictor_history_step(hidden.narrow(1,offset,rows),ids.narrow(1,offset,rows),
@@ -383,7 +395,8 @@ template <class Model> struct CudaMtpOps {
         }
       } else (void)predictor_step(std::move(hidden),std::move(ids),std::move(positions));
     } else (void)predictor_step(std::move(hidden),std::move(ids),std::move(positions));
-    MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+    if(!prefill_finished)
+      MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
     return timer.elapsed_ms();
   }
   int32_t sample_normal(Tensor logits, Tensor token_counts) {
