@@ -423,7 +423,7 @@ inline void mfq_nvq_banked_bits(
     constexpr bool FLAT_RECORDS = EXPANSION && INPUT_ROWS > 1u;
     constexpr uint WORK = FLAT_RECORDS ? SIGNS : GROUPS;
     constexpr bool STATIC_RECORDS = !FLAT_RECORDS && VECTOR_SIZE == 4u
-        && INDEX_BITS == 9u && INPUT_ROWS > 1u;
+        && INPUT_ROWS > 1u;
     uint state_rows[MATRIX_ROWS];
     uint4 cursors[MATRIX_ROWS];
     static_assert(K_LANES % 8u == 0u);
