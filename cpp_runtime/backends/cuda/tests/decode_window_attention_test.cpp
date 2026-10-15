@@ -347,6 +347,65 @@ void gdn_case(bool model_shape = false) {
         <<" capture restore and persistent conv/recurrent addresses PASS\n";
 }
 
+void gdn_prefix_checkpoint_case() {
+    CudaExecutionContext execution;
+    const auto bits=[](const Tensor& a,const Tensor& b,const char* label) {
+        auto x=a.cpu().contiguous(),y=b.cpu().contiguous();
+        if(x.sizes()!=y.sizes() || x.scalar_type()!=y.scalar_type() ||
+           std::memcmp(x.data_ptr(),y.data_ptr(),x.numel()*x.element_size()))
+            throw std::runtime_error(std::string(label)+" changed bytes");
+    };
+    const auto option=[](const char* value) {
+#ifdef _WIN32
+        _putenv_s("MFQ_MTP_GDN_FUSED_CHECKPOINT",value);
+#else
+        setenv("MFQ_MTP_GDN_FUSED_CHECKPOINT",value,1);
+#endif
+    };
+    int checked=0;
+    for(int width:{32,128})for(int tokens:{2,3,4,6})for(int confirmed:{1,tokens-1}) {
+        const int hidden=32,nk=width==128?16:1,nv=nk*3,channels=(2*nk+nv)*width;
+        auto gpu=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
+        GdnWeights weights{linear(hidden,channels,11),linear(hidden,nv*width,12),linear(hidden,nv,13),linear(hidden,nv,14),
+            linear(nv*width,hidden,15),data({channels,4},16),tb::zeros({nv},gpu),tb::zeros({nv},gpu),tb::ones({width},gpu)};
+        auto separate=weights;
+        weights.input_projection=[separate](CudaExecutionContext& e,const Tensor& x) {
+            return std::vector<Tensor>{separate.qkv(e,x),separate.gate(e,x),separate.alpha(e,x),separate.beta(e,x)};
+        };
+        Gdn actual(weights,nk,nv,width,4,1e-6,false),reference(weights,nk,nv,width,4,1e-6,false);
+        auto history=data({1,3,hidden},17,.4f),input=data({1,tokens,hidden},18,.3f);
+        actual.forward_chunk(execution,history,true);
+        reference.restore_session(actual.conv_state(),*actual.graph_state()[1]);
+        auto initial_conv=actual.conv_state().clone(),initial_state=actual.graph_state()[1]->clone();
+        std::vector<Tensor> conv,state,expected_conv,expected_state;
+        for(int i=0;i<tokens-confirmed;++i) {
+            conv.push_back(tb::empty_like(initial_conv));state.push_back(tb::empty_like(initial_state));
+            expected_conv.push_back(tb::empty_like(initial_conv));expected_state.push_back(tb::empty_like(initial_state));
+        }
+        option("0");
+        auto expected=reference.forward_graph(execution,input,confirmed,expected_conv,expected_state).clone();
+        option("1");
+        Tensor output;
+        DecodeWindow window(mfq_current_cuda_stream());
+        window.capture([&]{output=actual.forward_graph(execution,input,confirmed,conv,state);},[&]{
+            actual.graph_state()[0]->copy_(initial_conv);actual.graph_state()[1]->copy_(initial_state);
+        },[&]{output={};});
+        window.run();bits(output,expected,"GDN fused checkpoint output");
+        bits(actual.conv_state(),reference.conv_state(),"GDN final convolution");
+        bits(*actual.graph_state()[1],*reference.graph_state()[1],"GDN final recurrent state");
+        for(int i=0;i<tokens-confirmed;++i) {
+            bits(conv[i],expected_conv[i],"GDN prefix convolution");
+            bits(state[i],expected_state[i],"GDN prefix recurrence");
+            actual.bind_graph_checkpoint(conv,state,confirmed);actual.rollback(confirmed+i);
+            bits(actual.conv_state(),expected_conv[i],"GDN rejected-prefix convolution");
+            bits(*actual.graph_state()[1],expected_state[i],"GDN rejected-prefix recurrence");
+            ++checked;
+        }
+    }
+    option("");
+    std::cout<<"GDN fused prefix checkpoint bytes/graph/rejection checks="<<checked<<" PASS\n";
+}
+
 void gdn_preparation_case() {
     int ordinary=0,changing=0;
     const auto bits=[](const Tensor& a,const Tensor& b,const char* label) {
@@ -1077,6 +1136,7 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--gdn-independent-check") {
         for(int tiles:{4,2,1}){GdnTileScope setting(tiles);gdn_independent_state_case();}
     }
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefix-checkpoint-check")gdn_prefix_checkpoint_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-short-check")gdn_short_preparation_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-short-path-bench")gdn_short_preparation_benchmark();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-check")gdn_prefill_case();

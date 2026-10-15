@@ -11,6 +11,17 @@ namespace tb=mfq_tensor_backend;
 namespace {
 using Stamp=unsigned long long;
 constexpr Stamp busy=Stamp{1}<<63;
+__global__ void reset_hot_cache(int32_t* mapping,int32_t* ids,Stamp* requested,Stamp* epochs,
+    Stamp* control,int32_t* cold_mapping,int32_t* free_gpu,int32_t* cold_control,int maximum,int cells) {
+    const int thread=blockIdx.x*blockDim.x+threadIdx.x;
+    for(int i=thread;i<maximum;i+=blockDim.x*gridDim.x) {
+        mapping[i]=-1;requested[i]=0;
+        if(cold_mapping)cold_mapping[i]=-1;
+        if(i<cells){ids[i]=-1;epochs[i]=0;if(free_gpu)free_gpu[i]=i;}
+    }
+    if(thread<7)control[thread]=0;
+    if(cold_control && thread<3)cold_control[thread]=thread==2?cells:0;
+}
 __device__ int take_cold(int32_t* free_rows,int32_t* control,int capacity) {
     int n=atomicAdd(control+1,0);
     while(n>0) {const int previous=atomicCAS(control+1,n,n-1);if(previous==n)return free_rows[n-1];n=previous;}
@@ -356,8 +367,16 @@ std::size_t HotKvCache::bytes() const {
 }
 void HotKvCache::reset() {
     if(!defined())return;
-    mapping.fill_(-1);slot_ids.fill_(-1);requested.zero_();epochs.zero_();control.zero_();
-    if(exclusive()){cold_mapping.fill_(-1);cold_control.zero_();cold_control.narrow(0,2,1).fill_(keys.size(2));free_gpu.copy_(tb::arange(keys.size(2),mapping.options()));}
+    // Reuse every preallocated table, including the GPU free-slot list.
+    // Reset must work at the memory ceiling without a temporary arange.
+    MfqCudaGuard guard(mapping.device());
+    reset_hot_cache<<<std::min<int64_t>(65535,(mapping.numel()+255)/256),256,0,mfq_current_cuda_stream()>>>(
+        mapping.data_ptr<int32_t>(),slot_ids.data_ptr<int32_t>(),
+        reinterpret_cast<Stamp*>(requested.data_ptr()),reinterpret_cast<Stamp*>(epochs.data_ptr()),
+        reinterpret_cast<Stamp*>(control.data_ptr()),exclusive()?cold_mapping.data_ptr<int32_t>():nullptr,
+        exclusive()?free_gpu.data_ptr<int32_t>():nullptr,exclusive()?cold_control.data_ptr<int32_t>():nullptr,
+        int(mapping.numel()),int(keys.size(2)));
+    MFQ_CUDA_CHECK(cudaGetLastError());
 }
 void HotKvCache::invalidate(const tb::Tensor& positions) {
     if(!defined() || !positions.numel())return;

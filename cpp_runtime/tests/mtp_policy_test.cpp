@@ -1,9 +1,15 @@
 #include "mtp_metrics.h"
 #include <array>
 #include <iostream>
+#include <source_location>
 
 namespace {
-void require(bool ok) { if (!ok) throw std::runtime_error("MTP policy test failed"); }
+void require(bool ok, const std::source_location location = std::source_location::current()) {
+    if (!ok) {
+        std::cerr << "MTP policy test failed at line " << location.line() << std::endl;
+        throw std::runtime_error("MTP policy test failed");
+    }
+}
 template<class F> void rejects(F&& fn) {
     bool rejected = false;
     try { fn(); } catch (const std::exception&) { rejected = true; }
@@ -177,6 +183,42 @@ int main() {
         require(policy.parked());
         for(int i=0;i<128;++i)policy.observe_plain(20.0);
         require(!policy.parked() && policy.depth()==1);
+    }
+    {
+        // A shared predictor cost makes depth-one extrapolation pessimistic:
+        // 1.875 / 32.4 loses against 1 / 15.9, while wider windows can win.
+        DepthController controller(3,nullptr,7.0,1.15,true,60.0);
+        bool tried_two=false,tried_three=false;
+        for(int cycle=0;cycle<120 && (controller.warming_up() || !tried_three);++cycle) {
+            const int depth=controller.depth();
+            tried_two=tried_two || depth==2;
+            tried_three=tried_three || depth==3;
+            const double ms=depth==0?15.9:depth==1?32.4:depth==2?38.0:44.0;
+            controller.observe(depth,depth,ms);
+            require(!controller.should_exit());
+        }
+        require(tried_two && tried_three);
+        require(controller.measured_cycle_ms(2) && controller.measured_cycle_ms(3));
+        while(controller.warming_up()) {
+            const int depth=controller.depth();
+            controller.observe(depth,depth,depth==0?15.9:depth==1?32.4:depth==2?38.0:44.0);
+        }
+        require(*controller.measured_cycle_ms(2)==38.0 && *controller.measured_cycle_ms(3)==44.0);
+    }
+    {
+        PolicyState state;
+        auto cuda=state.begin(1,true),generic=state.begin(1,false);
+        for(int cycle=0;cycle<128;++cycle) {
+            for(auto* controller:{&cuda,&generic}) {
+                const auto depth=controller->warming_up()?controller->depth():1;
+                controller->observe(depth,depth,depth?28.0:15.0);
+            }
+        }
+        cuda.observe(0,0,15.0);generic.observe(0,0,15.0);
+        // 2/28 is 7.1% faster than 1/15. CUDA must retain that benefit;
+        // the generic backend still requires its original 15% margin.
+        require(!cuda.speculation_losing() && !cuda.should_exit());
+        require(generic.speculation_losing());
     }
     {
         PolicyState state;

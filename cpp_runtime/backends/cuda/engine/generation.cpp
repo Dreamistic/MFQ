@@ -152,6 +152,8 @@ template <typename Model> struct CudaGenerationOps {
                                       .contiguous())
                               .reshape({1, -1});
             pending = mfq::cuda::sample_logits(sampler, std::move(logits), counts, constraint);
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                if(model.restore_decode_workspace)model.restore_decode_workspace();
         }
         const auto elapsed=timer.elapsed_ms();
         if(graph_config.trace)std::cerr<<"runtime_prefill_chunk offset="<<chunk.offset

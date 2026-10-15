@@ -84,11 +84,12 @@ void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budg
         transfer_reserve=legacy_transfer_reserve;
         if(config_.moe_two_stage_ffn && moe_packed_transfer_stages_enabled() &&
                 std::all_of(sources_.begin(),sources_.end(),[](const auto& s){return s->two_stage_compatible();})) {
-            std::map<int,std::pair<int64_t,int64_t>> packed;
+            std::map<std::pair<bool,int>,std::pair<int64_t,int64_t>> packed;
             for(const auto& bundle:pipeline_bundles_)for(int p=0;p<3;++p) {
                 if(p==1 && bundle[0]==bundle[1])continue;
                 const auto& source=sources_[bundle[p]];
-                auto& [slots,stride]=packed[p];
+                const bool predictor=source->layer_id_<0 && moe_predictor_transfer_cache_enabled();
+                auto& [slots,stride]=packed[{predictor,p}];
                 slots=std::max(slots,std::min<int64_t>(source->n_experts(),moe_decode_transfer_slots(8,10)));
                 for(const auto& cohort:source->cohorts_)
                     stride=std::max(stride,moe_packed_slot_bytes(cohort.bytes_per_expert));
@@ -147,6 +148,35 @@ void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budg
             arena.minimum_slots,
             arena.registered_experts,
         });
+    }
+    // Draft steps visit one predictor layer repeatedly between backbone
+    // windows. An explicit diagnostic preference can keep its experts resident
+    // within a quarter of the existing expert budget. Tiered caching remains
+    // the default: high-precision predictors can displace too much backbone.
+    // These are planning preferences, not rigid minima: prefill can still
+    // borrow their storage and context growth can shrink the expert cache.
+    const auto* predictor_option=std::getenv("MFQ_MTP_RESIDENT_EXPERTS");
+    if(config_.moe_preload_all && config_.moe_two_stage_ffn &&
+            predictor_option && predictor_option[0]=='1') {
+        std::map<MoeGpuArena*,int> predictor_slots;
+        for(const auto& source:sources_)if(source->layer_id_<0)
+            for(const auto& cohort:source->cohorts_)predictor_slots[cohort.arena]+=cohort.cpu->local_experts;
+        int64_t bytes=0;
+        for(const auto& [arena,slots]:predictor_slots)bytes+=int64_t(slots)*arena->slot_bytes;
+        if(bytes>0 && bytes<=budget_bytes_/4) {
+            auto preferred=demands;
+            int64_t required=0;
+            for(auto& demand:preferred) {
+                auto* arena=arenas_.at(demand.signature).get();
+                if(const auto it=predictor_slots.find(arena);it!=predictor_slots.end())
+                    demand.minimum_slots=std::min(arena->registered_experts,it->second+arena->minimum_slots);
+                required+=int64_t(demand.minimum_slots)*demand.slot_bytes;
+            }
+            if(required<=budget_bytes_) {
+                demands=std::move(preferred);
+                std::cerr<<"moe_predictor_residency preferred_bytes="<<bytes<<" expert_budget_bytes="<<budget_bytes_<<'\n';
+            }
+        }
     }
 
     if (profile_.has_value()) {
@@ -414,6 +444,9 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
     const bool force=option && std::string_view(option)=="force";
     if((option && option[0]=='0') || !complete_residency_ || !layer_prefill_ready())return 0;
     const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    // Reclaim revocable expert overflow before backing up and borrowing the
+    // primary expert arrays. Both consumers use the same physical headroom.
+    if(reserve_workspace_ && context->available_memory()<workspace_bytes)reserve_workspace_(workspace_bytes);
     if(!force && context->available_memory()>=workspace_bytes)return 0;
     const auto loan_started=std::chrono::steady_clock::now();
     finish_pipeline_exchanges();
@@ -820,8 +853,19 @@ void MoeExpertCache::preload_complete_residency() {
         warm[source->id_].resize(source->n_experts());
         maximum=std::max(maximum,source->n_experts());
     }
+    std::unordered_map<MoeGpuArena*,int> predictor_slots;
+    for(const auto& source:sources_)if(source->layer_id_<0)for(const auto& cohort:source->cohorts_)
+        predictor_slots[cohort.arena]+=cohort.cpu->local_experts;
+    const auto* predictor_option=std::getenv("MFQ_MTP_RESIDENT_EXPERTS");
+    const bool resident_predictor=config_.moe_two_stage_ffn && predictor_option && predictor_option[0]=='1' &&
+        std::all_of(predictor_slots.begin(),predictor_slots.end(),[&](const auto& item){return remaining[item.first]>=item.second;});
+    if(resident_predictor)for(const auto& source:sources_)if(source->layer_id_<0)
+        for(int expert=0;expert<source->n_experts();++expert)if(!source->quant_source_->gpu_resident(expert)) {
+            warm[source->id_][expert]=true;
+            --remaining[source->cohorts_[source->expert_to_cohort_[expert]].arena];
+        }
     for (int expert=0; expert<maximum; ++expert) for (const auto& source:sources_) {
-        if (expert>=source->n_experts() || source->quant_source_->gpu_resident(expert)) continue;
+        if (expert>=source->n_experts() || source->quant_source_->gpu_resident(expert) || warm[source->id_][expert]) continue;
         auto* arena=source->cohorts_[source->expert_to_cohort_[expert]].arena;
         if (remaining[arena]>0) { warm[source->id_][expert]=true; --remaining[arena]; }
     }
@@ -985,11 +1029,9 @@ void MoeExpertCache::preload_complete_residency() {
         auto* address=pipeline_ram_complement_->data_ptr();
         int64_t registered=ram_allocated;
 #ifdef _WIN32
-        // Leave predictor images pageable, as before the prefill layout was
-        // enabled for them. WDDM's shared-memory charge must leave room for
-        // mapped decode plans and transfer buffers allocated after loading.
-        for(const auto& [layer,span]:pipeline_prefill_layers_)
-            if(layer<0 && span.first>0)registered=std::min(registered,span.first);
+        // Include predictor images when the measured WDDM budget allows it.
+        // The shared-memory reserve and registration fallback below still
+        // protect decode plans and leave an oversized complement pageable.
         if(const auto available=mfq::cuda::shared_memory_available(mfq_current_cuda_device())) {
             // Decode stages are bounded; prefill backup registration separately
             // checks current headroom and leaves excess backups pageable.

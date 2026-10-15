@@ -9,6 +9,7 @@
 #include "runtime/kv_expert_loan.h"
 #include "storage/moe_quant_range_source.h"
 #include "storage/moe_expert_cache.h"
+#include "storage/moe_expert_cache_internal.h"
 #include "storage/weight_loader.h"
 #include "moe.h"
 #include "core/rope.h"
@@ -490,13 +491,13 @@ void verify_short_decode_residency_interval(const std::filesystem::path& root) {
             manager.after_layer(0,std::vector<int32_t>(tokens,step%2),tokens,false,independent);
             manager.apply_pending();
             const auto stats=manager.stats();
-            if(stats.scheduled_rounds!=std::uint64_t(tokens==1 || (independent && tokens<=8)?step/4:step) ||
+            if(stats.scheduled_rounds!=std::uint64_t(tokens<=8?step/4:step) ||
                 stats.observed_routes!=std::uint64_t(tokens*step))
                 throw std::runtime_error("short decode interval lost route observations or scheduled too often");
             ++checks;
         }
     }
-    std::cout<<"short_decode_residency_interval checks="<<checks<<" independent rows1-6/8, MTP and prefill unchanged, all route observations retained PASS\n";
+    std::cout<<"short_decode_residency_interval checks="<<checks<<" independent and speculative rows1-6/8, prefill unchanged, all route observations retained PASS\n";
 }
 int verify_warm_residency(const std::filesystem::path& root, bool shared_cases=true) {
     int cases=0,phase_cases=0,async_cases=0,window_cases=0,fence_cases=0;
@@ -1947,6 +1948,65 @@ void verify_router_lookahead_inputs() {
     std::cout<<"router_lookahead_input_samples=3 layer_rows=9 warmup_samples=0 guards=4 original_bytes_exact=1 PASS\n";
 }
 #include "residency_direct_exchange_test.h"
+void verify_predictor_residency(const std::filesystem::path& root,bool prefer_resident=false) {
+    struct Preference {
+        std::string previous=std::getenv("MFQ_MTP_RESIDENT_EXPERTS")?std::getenv("MFQ_MTP_RESIDENT_EXPERTS"):"";
+        static void set(const char* value) {
+#ifdef _WIN32
+            _putenv_s("MFQ_MTP_RESIDENT_EXPERTS",value);
+#else
+            if(*value)setenv("MFQ_MTP_RESIDENT_EXPERTS",value,1);else unsetenv("MFQ_MTP_RESIDENT_EXPERTS");
+#endif
+        }
+        ~Preference(){set(previous.c_str());}
+    } preference;
+    Preference::set(prefer_resident?"1":"0");
+    CudaExecutionContext execution;auto& config=execution.config;
+    config.moe_pipeline=true;config.moe_preload_all=true;config.moe_assert_resident=true;
+    config.moe_residency_warm=true;config.moe_residency_projection_heat=true;
+    config.moe_ram_pcie=true;config.moe_ram_pcie_fraction=1;config.moe_direct_ram=true;
+    config.moe_two_stage_ffn=prefer_resident;
+    const int main_layers=prefer_resident?10:1,predictor_source=main_layers*3;
+    std::vector<std::shared_ptr<MoeQuantRangeSource>> sources(predictor_source+2);
+    std::size_t gpu_bytes=0;
+    for(int p=0;p<int(sources.size());++p) {
+        const bool down=p<predictor_source?p%3==2:p==predictor_source+1;
+        sources[p]=source(root/(std::string("nint5")+(down?"-2560-640.mfq":"-640-2560.mfq")));
+        gpu_bytes+=bytes(sources[p]->metadata()->pools[0]);
+    }
+    config.moe_host_cache_bytes=3*gpu_bytes;
+    auto cache=make_moe_expert_cache(gpu_bytes,config);
+    std::vector<MfeWeight> weights(sources.size());
+    for(int p=0;p<int(sources.size());++p)weights[p]=cache_quant_moe_weight(cache,std::to_string(p),sources[p],1,p<predictor_source?p/3:-1,std::to_string(p));
+    // Exercise the physical cache topology independently of FFN dimensions:
+    // predictor Gate and Up alias one source, while Down owns another.
+    std::vector<std::array<int,3>> bundles;
+    for(int layer=0;layer<main_layers;++layer)bundles.push_back({layer*3,layer*3+1,layer*3+2});
+    bundles.push_back({predictor_source,predictor_source,predictor_source+1});
+    MoeResidencyTestAccess::bundles(*cache,std::move(bundles));
+    finalize_moe_expert_cache(cache);
+    if(prefer_resident) {
+        for(int p=predictor_source;p<int(sources.size());++p)for(int e=0;e<3;++e)
+            if(!sources[p]->gpu_resident(e))throw std::runtime_error("predictor preference left an expert in RAM");
+        std::cout<<"predictor_residency preferred=1 all_predictor_experts_on_GPU=1 shared_budget=1 PASS\n";
+        return;
+    }
+    const auto before=sources[predictor_source]->host_cache()->stats();
+    MoeResidencyManager manager(cache.get());
+    manager.after_layer(-1,std::vector<int32_t>(100,2),100);
+    manager.after_layer(0,{},100);
+    manager.apply_pending();
+    const auto stats=manager.stats();
+    if(!sources[3]->gpu_resident(2) || !sources[4]->gpu_resident(2) ||
+            stats.committed_projections!=2 || stats.committed_bundles!=1 || stats.observed_routes!=100)
+        throw std::runtime_error("combined predictor did not promote exactly its two physical projections");
+    const auto after=sources[3]->host_cache()->stats();
+    if(before.managed_bytes!=after.managed_bytes || before.managed_peak_bytes!=after.managed_peak_bytes)
+        throw std::runtime_error("predictor promotion duplicated RAM weights");
+    for(const auto& source:sources)if(source->expert_disk_reads_after_preload())
+        throw std::runtime_error("predictor promotion reread SSD weights");
+    std::cout<<"predictor_residency combined_gate_up=1 physical_promotions=2 routes=100 RAM_bytes_unchanged=1 SSD_reads=0 PASS\n";
+}
 #include "prefill_pipeline_test.h"
 #include "compact_prefill_mma_test.h"
 #include "nvq_prefill_k_tile_test.h"
@@ -2243,6 +2303,9 @@ int main(int argc,char** argv)try {
         }
         if(std::string(argv[2])=="--short-decode-residency-interval-check") {
             verify_short_decode_residency_interval(root);return 0;
+        }
+        if(std::string(argv[2])=="--predictor-residency-check") {
+            verify_predictor_residency(root);verify_predictor_residency(root,true);return 0;
         }
         if(std::string(argv[2])=="--warm-residency-dedicated-check") {
             verify_warm_residency(root,false);return 0;

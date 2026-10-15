@@ -210,11 +210,14 @@ class Gdn {
         std::vector<Tensor> outputs;
         for(int64_t begin=0;begin<x.size(1);) {
             const auto count=begin==0?confirmed:1;
+            const auto end=begin+count,index=end-confirmed;
+            bool snapshot_written=false;
             outputs.push_back(forward_chunk(execution,x.narrow(1,begin,count),true,
-                slice(begin,count),!grouped));
-            begin+=count;
-            if(begin<x.size(1)) {
-                const auto index=begin-confirmed;
+                slice(begin,count),!grouped,
+                end<x.size(1)?checkpoint_conv[index]:Tensor{},
+                end<x.size(1)?checkpoint_state[index]:Tensor{},&snapshot_written));
+            begin=end;
+            if(begin<x.size(1) && !snapshot_written) {
                 checkpoint_conv[index].copy_(conv_);checkpoint_state[index].copy_(state_);
             }
         }
@@ -249,7 +252,9 @@ class Gdn {
             [](Tensor prefix, Tensor suffix) { return tb::cat({prefix, suffix}, 1); });
     }
     Tensor forward_chunk(CudaExecutionContext &execution, const Tensor &x, bool cache,
-                         std::vector<Tensor> projections = {},bool project_output=true) {
+                         std::vector<Tensor> projections = {},bool project_output=true,
+                         Tensor checkpoint_conv={},Tensor checkpoint_state={},bool* snapshot_written=nullptr) {
+        if(snapshot_written)*snapshot_written=false;
         const auto b = x.size(0), t = x.size(1), kw = nk_ * d_, vw = nv_ * d_,
                    channels = 2 * kw + vw;
         auto options = x.options().dtype(tb::kFloat32);
@@ -281,12 +286,34 @@ class Gdn {
                 if(!core_workspace_.defined())core_workspace_=tb::zeros({b,nv_,d_+1},options);
                 const auto stride_setting=mfq::cuda::runtime_options::gdn_strided_projections();
                 const auto direct=[&](const Tensor& value){return !stride_setting || *stride_setting?value:value.contiguous();};
-                auto decoded=gdn_decode_core_cuda(direct(projections[0]),direct(projections[1]),
+                const auto decode=[&](bool checkpoint) {
+                  auto qkv=direct(projections[0]),gate=direct(projections[1]);
+                  auto alpha=projections[2].reshape({b,t,nv_}),beta=projections[3].reshape({b,t,nv_});
+                  if(checkpoint)return gdn_decode_core_checkpoint_cuda(qkv,gate,alpha,beta,previous,state_,
+                    weight,w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
+                    w_.norm.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
+                    x.scalar_type()==tb::kFloat16,true,core_workspace_,true,checkpoint_conv,checkpoint_state);
+                  return gdn_decode_core_cuda(qkv,gate,
                     projections[2].reshape({b,t,nv_}),projections[3].reshape({b,t,nv_}),previous,state_,
                     weight,w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
                     w_.norm.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
                     x.scalar_type()==tb::kFloat16,true,core_workspace_,
                     [] {const auto value=mfq::cuda::runtime_options::gdn_inplace_state();return !value || *value;}());
+                };
+                const auto* checkpoint_option=std::getenv("MFQ_MTP_GDN_FUSED_CHECKPOINT");
+                const bool fused_snapshot=checkpoint_conv.defined() && checkpoint_state.defined() &&
+                    (!checkpoint_option || checkpoint_option[0]!='0') &&
+                    [] {const auto value=mfq::cuda::runtime_options::gdn_inplace_state();return !value || *value;}();
+                auto decoded=decode(fused_snapshot);
+                if(snapshot_written)*snapshot_written=fused_snapshot;
+                if(fused_snapshot) {
+                    static thread_local bool reported=false;
+                    if(!reported) {
+                        reported=true;
+                        std::fprintf(stderr,"runtime_mtp_gdn_checkpoint fused=1 width=%lld heads=%lld\n",
+                            static_cast<long long>(d_),static_cast<long long>(nv_));
+                    }
+                }
                 auto output=project_output?w_.output(execution,decoded[0]):decoded[0];
                 if(conv_.data_ptr()!=decoded[1].data_ptr())conv_.copy_(decoded[1]);
                 if(state_.data_ptr()!=decoded[2].data_ptr())state_.copy_(decoded[2]);
