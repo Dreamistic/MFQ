@@ -191,6 +191,39 @@ it('shows transfer speed and deletes a completed record without touching files',
   expect(jobsApi.deleteJob).toHaveBeenCalledExactlyOnceWith('download-1');
 });
 
+it('updates download ETA from aggregate remaining bytes and hides it after completion', async () => {
+  useJobStore.getState().setJobs([{ ...download(), status: 'running',
+    progress_data: { downloaded_bytes: 1024, total_bytes: 8192, bytes_per_second: 1024 } }]);
+  render(<ModelHubPage />);
+  fireEvent.click(screen.getByRole('tab', { name: 'Download queue' }));
+  expect(screen.getByLabelText('Estimated time remaining')).toHaveTextContent('7s remaining');
+  act(() => useJobStore.getState().updateJob('download-1', {
+    progress_data: { downloaded_bytes: 4096, total_bytes: 8192, bytes_per_second: 2048 },
+  }));
+  expect(screen.getByLabelText('Estimated time remaining')).toHaveTextContent('2s remaining');
+  act(() => useJobStore.getState().updateJob('download-1', {
+    progress_data: { downloaded_bytes: 8192, total_bytes: 8192, bytes_per_second: 2048 },
+  }));
+  expect(screen.getByLabelText('Estimated time remaining')).toHaveTextContent('Finishing download');
+  act(() => useJobStore.getState().updateJob('download-1', { status: 'succeeded' }));
+  expect(screen.queryByLabelText('Estimated time remaining')).not.toBeInTheDocument();
+  expect(jobsApi.cancelJob).not.toHaveBeenCalled();
+  expect(jobsApi.retryJob).not.toHaveBeenCalled();
+});
+
+it('waits for download size and transfer speed instead of showing an invalid ETA', () => {
+  useJobStore.getState().setJobs([{ ...download(), status: 'running' }]);
+  render(<ModelHubPage />);
+  fireEvent.click(screen.getByRole('tab', { name: 'Download queue' }));
+  expect(screen.getByLabelText('Estimated time remaining')).toHaveTextContent('Estimating time remaining…');
+  act(() => useJobStore.getState().updateJob('download-1', {
+    progress_data: { downloaded_bytes: 1024, total_bytes: 8192, bytes_per_second: 0 },
+  }));
+  expect(screen.getByLabelText('Estimated time remaining')).toHaveTextContent('Estimating time remaining…');
+  act(() => useJobStore.getState().updateJob('download-1', { status: 'queued' }));
+  expect(screen.queryByLabelText('Estimated time remaining')).not.toBeInTheDocument();
+});
+
 it('does not put an old download into the active connection after leaving its page', async () => {
   let finish!: (job: JobResource) => void;
   vi.mocked(jobsApi.createJob).mockReturnValue(new Promise((resolve) => { finish = resolve; }));

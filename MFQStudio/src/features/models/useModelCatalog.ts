@@ -30,6 +30,7 @@ export function useModelCatalog() {
   const { tr } = useSettings();
   const navigate = useNavigate();
   const [artifacts, setArtifacts] = useState<ModelArtifact[]>([]);
+  const artifactRequest = useRef(0);
   const [busy, setBusy] = useState(false);
   const observedActiveLoadJobIds = useRef(new Set<string>());
   const reportedFailedJobIds = useRef(new Set<string>());
@@ -108,16 +109,34 @@ export function useModelCatalog() {
   useEffect(() => {
     if (!ready) return;
     let active = true;
-    void modelsApi
-      .modelArtifacts()
-      .then((items) => {
-        if (active) setArtifacts(items);
-      })
-      .catch((cause) => {
-        if (active) reportError(cause);
-      });
+    let polling = false;
+    let reported = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function update() {
+      if (!active || polling) return;
+      clearTimeout(timer);
+      if (document.hidden) return;
+      polling = true;
+      const request = ++artifactRequest.current;
+      try {
+        const items = await modelsApi.modelArtifacts(true);
+        if (active && request === artifactRequest.current) { setArtifacts(items); reported = false; }
+      } catch (cause) {
+        if (active && request === artifactRequest.current && !reported) { reportError(cause); reported = true; }
+      } finally {
+        polling = false;
+        if (active) timer = setTimeout(() => void update(), 5000);
+      }
+    }
+    function visible() { if (!document.hidden) void update(); }
+    document.addEventListener('visibilitychange', visible);
+    window.addEventListener('focus', visible);
+    void update();
     return () => {
       active = false;
+      clearTimeout(timer);
+      document.removeEventListener('visibilitychange', visible);
+      window.removeEventListener('focus', visible);
     };
   }, [ready, connectionRevision, artifactRevision]);
   useEffect(() => {
@@ -167,9 +186,10 @@ export function useModelCatalog() {
 
   async function finishModelRegistration(names: string[], current: () => boolean) {
     if (!current()) return;
+    const request = ++artifactRequest.current;
     const nextArtifacts = await modelsApi.modelArtifacts(true);
     if (!current()) return;
-    setArtifacts(nextArtifacts);
+    if (request === artifactRequest.current) setArtifacts(nextArtifacts);
     const registered = nextArtifacts.filter((item) => names.includes(item.name));
     if (!registered.length) {
       throw new Error(

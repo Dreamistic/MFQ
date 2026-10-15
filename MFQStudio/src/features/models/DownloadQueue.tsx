@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { JobResource } from '../../shared/api/types';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { Icon } from '../../app/display';
-import { errorMessage, formatBytes, formatNumber } from '../../app/formatters';
+import { errorMessage, formatBytes, formatDuration, formatNumber } from '../../app/formatters';
 import { ApiError } from '../../shared/api/client';
 import { useJobStore } from '../../stores/jobStore';
 import { toast } from '../../stores/toastStore';
@@ -14,6 +14,15 @@ import { useConnectionScope } from '../../app/useConnectionScope';
 export const isModelDownload = (job: JobResource) => job.kind === 'download.huggingface' || job.kind === 'download.modelscope';
 export const isActiveDownload = (job: JobResource) => ['queued', 'running', 'cancelling'].includes(job.status);
 export const downloadProgress = (job: JobResource) => Number.isFinite(job.progress) ? Math.max(0, Math.min(1, job.progress)) : 0;
+
+export function downloadEtaSeconds(job: JobResource): number | null {
+  const { downloaded_bytes: downloaded, total_bytes: total, bytes_per_second: speed } = job.progress_data ?? {};
+  if (job.status !== 'running' || downloaded == null || total == null || speed == null ||
+    !Number.isFinite(downloaded) || !Number.isFinite(total) || !Number.isFinite(speed) ||
+    downloaded < 0 || total <= downloaded || speed < 1) return null;
+  const seconds = (total - downloaded) / speed;
+  return Number.isFinite(seconds) ? Math.ceil(seconds) : null;
+}
 
 export function DownloadQueue({ jobs, onJobCreated }: {
   jobs: JobResource[];
@@ -68,6 +77,14 @@ export function DownloadQueue({ jobs, onJobCreated }: {
       </div>}
       {jobs.map((job) => {
         const progress = downloadProgress(job);
+        const eta = downloadEtaSeconds(job);
+        const total = job.progress_data?.total_bytes;
+        const downloaded = job.progress_data?.downloaded_bytes;
+        const finishing = total != null && Number.isFinite(total) && total > 0 &&
+          downloaded != null && Number.isFinite(downloaded) && downloaded >= total;
+        const duration = eta == null ? '' : eta < 60 ? `${eta}s` : formatDuration(eta);
+        const etaLabel = eta != null ? tr(`预计剩余 ${duration}`, `${duration} remaining`)
+          : finishing ? tr('正在收尾', 'Finishing download') : tr('剩余时间估算中…', 'Estimating time remaining…');
         const retry = ['failed', 'cancelled', 'interrupted'].includes(job.status);
         const files = Array.isArray(job.payload.include)
           ? Array.from(new Set(job.payload.include.filter((file): file is string => typeof file === 'string' && !!file && !/[?*\[]/.test(file))))
@@ -90,7 +107,10 @@ export function DownloadQueue({ jobs, onJobCreated }: {
                 {(job.progress_data.bytes_per_second ? formatBytes(job.progress_data.bytes_per_second).replace(/\b(KB|MB|GB|TB)\b/g, (unit) => `${unit[0]}iB`) : '0 B')}/s
                 {' · '}{formatBytes(job.progress_data.downloaded_bytes)}{job.progress_data.total_bytes ? ` / ${formatBytes(job.progress_data.total_bytes)}` : ''}
                 {' · '}{job.progress_data.files_completed ?? 0} {tr('个文件完成', 'files completed')}
+                {job.status === 'running' && <>{' · '}<span aria-label={tr('预计剩余时间', 'Estimated time remaining')}>{etaLabel}</span></>}
               </small>}
+              {job.status === 'running' && job.progress_data?.downloaded_bytes == null &&
+                <small className="download-transfer-stats" aria-label={tr('预计剩余时间', 'Estimated time remaining')}>{etaLabel}</small>}
               {job.error && <p className="download-item-error">{errorMessage(new ApiError(400, { error: job.error }), tr)}</p>}
             </div>
             {(isActiveDownload(job) || retry) && <button disabled={busyId !== null || job.status === 'cancelling'} onClick={(event) => {

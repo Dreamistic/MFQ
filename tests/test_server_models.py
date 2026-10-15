@@ -1009,6 +1009,23 @@ def test_catalog_loads_registered_external_mfq_files(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_catalog_refresh_drops_deleted_registered_files(tmp_path: Path) -> None:
+    async def run() -> None:
+        root = tmp_path / "catalog"
+        root.mkdir()
+        external = tmp_path / "portable.mfq"
+        _model(external)
+        index = root / MODEL_FILE_INDEX
+        index.write_text(json.dumps({"version": 1, "files": [str(external)]}))
+        catalog = ModelCatalog([root], cache_seconds=60)
+        assert len((await catalog.list()).data) == 1
+        external.unlink()
+        assert (await catalog.list(refresh=True)).data == []
+        assert (await ModelCatalog([root]).list()).data == []
+
+    asyncio.run(run())
+
+
 def test_catalog_expands_registered_external_shard_set(tmp_path: Path) -> None:
     async def run() -> None:
         source = tmp_path / "source.mfq"
