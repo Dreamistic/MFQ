@@ -1,6 +1,6 @@
 <div align="center">
 
-# TyloQuant MFQ
+# MFQ
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./docs/figures/tylogi-ai-lab-lockup-dark.svg">
@@ -29,7 +29,7 @@ memory, storage, and latency limits.
 </p>
 
 <p>
-  <a href="#deepseek-v41-raw-hf">DeepSeek V4.1</a> ·
+  <a href="#mfq-studio">MFQ Studio</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#features">Features</a> ·
   <a href="#models">Models</a> ·
@@ -39,37 +39,24 @@ memory, storage, and latency limits.
 
 </div>
 
-<a id="deepseek-v41-raw-hf"></a>
+## MFQ Studio
 
-## DeepSeek V4.1 raw-HF on one Mac Studio
-
-> **Run a 476 GB DeepSeek V4.1 Flash checkpoint directly from Hugging Face
-> Safetensors on a single 512 GB Apple M3 Ultra—without converting it to an
-> MFQ container first.** The tuned Metal path keeps the backbone and MoE
-> experts resident in unified memory while offloading only Engram storage to
-> the Mac's internal SSD.
-
-| Model / hardware | Placement | Model load | Prefill, ~0.5K / ~2K / ~16K tokens | TG, MTP off | TG, high-acceptance MTP |
-| --- | --- | ---: | ---: | ---: | ---: |
-| DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra, 512 GB | Full resident; Engram only on internal SSD | **38.6 s** | **390.2 / 458.6 / 471.1 tok/s** | **18.29 tok/s** | **33.46 tok/s** (**+83.0%**) |
-
-MFQ covers calibration, precision allocation, quantization, and inference.
-Create self-contained `.mfq` models with tensor-, expert-, and projection-level
-mixed precision, then deploy them with MFQ Studio or the inference API.
+Download and load models, configure serving and memory budgets, inspect
+quantization, and run benchmarks from one desktop app. Applications and agents
+can connect through OpenAI- and Anthropic-compatible APIs.
 
 <p align="center">
-  <img src="./docs/figures/tyloquant-mfq-webui-english.png" alt="MFQ Studio running a local model" width="900">
+  <img src="./docs/figures/mfq-studio-overview-en.png" alt="MFQ Studio: local model serving, live performance and resource overview" width="1100">
 </p>
 
 ## Quick start
 
 ### Use a prebuilt package
 
-The simplest Apple silicon path is a prebuilt **MFQ Studio** package. Prebuilt
-packages are published through the project
-[Releases](https://github.com/Tylogi/TyloQuant/releases) when available and
-bundle the desktop console, MFQ Server, and C++ runtime. Open Studio,
-register a model directory, and load any supported `.mfq` model.
+Download **MFQ Studio** from [Releases](https://github.com/Tylogi/MFQ/releases).
+The package includes the desktop app, MFQ Server, and native runtime; no source
+build is needed. Download a model from **Downloads**, then load it from
+**Models**, or open an existing local `.mfq` checkpoint.
 
 Prebuilt C++ workers can also be supplied directly to the server:
 
@@ -86,7 +73,7 @@ C++ toolchain. Use CUDA 12+ on NVIDIA systems, ROCm 6+ on AMD systems, or
 Metal on Apple silicon.
 
 ```bash
-git clone https://github.com/Tylogi/TyloQuant.git MFQ
+git clone https://github.com/Tylogi/MFQ.git MFQ
 cd MFQ
 
 # NVIDIA / CUDA
@@ -157,6 +144,18 @@ sharded output. See
   ready-to-run mixed-precision models, with quantization and inference support
   for new architectures added regularly.
 
+Scalar NINT and vector NVQ formats can coexist within the same layer, with
+independent choices for each expert's Gate, Up and Down projections. The
+heatmaps below use **Qwen3.8-Flash-Next V3-XXS** as an example: the overall
+expert average, followed by Gate, Up and Down, on a shared color scale.
+
+<p align="center">
+  <img src="./docs/figures/qwen38-flash-next-expert-precision.png" alt="Qwen3.8-Flash-Next V3-XXS: average expert precision and separate Gate, Up and Down heatmaps" width="1100">
+</p>
+
+Our calibration method is open source; see
+[Beyond Expert Rankings: Contrast Calibration for Mixed-Precision MoE Quantization](https://arxiv.org/abs/2610.20353).
+
 ### Inference
 
 - **Production Inference & Serving.** Continuous Batching, multi-model loading
@@ -167,19 +166,12 @@ sharded output. See
   attention, cache, and I/O kernels for CUDA and Metal, with early ROCm/HIP
   support for dense Qwen3.5–3.8 models on MI300X. Optimized CPU backends are planned.
 
-| Model | Model size | Expert budget | Precision | Hardware | Prefill | Decode |
-| --- | ---: | ---: | --- | --- | ---: | ---: |
-| DeepSeek-V4-Flash-0731 | ~160 GiB | 85.3 GiB | Official Native QAT Precision | Apple M5 Max, 128 GB | **312.4 tok/s** | **18.6 tok/s** |
+- **Efficient Fine-Grained Execution.** Heterogeneous expert fusion, grouped
+  projection dispatch and format-aware kernels preserve fast inference when
+  experts and projections use different formats and precisions.
 
-MFQ keeps heterogeneous MoE execution efficient at both supported precision
-granularities:
-
-| Model | Precision granularity | Average BPW | Prefill | Decode |
-| --- | --- | ---: | ---: | ---: |
-| Qwen3.8-Flash-Next | One precision per expert | **5.80** | **1.13K tok/s** | **25.4 tok/s** |
-| Qwen3.8-Flash-Next | Independent precision for each expert's Gate/Up/Down | **5.79** | **1.12K tok/s** | **24.4 tok/s** |
-
-*Warm end-to-end throughput on Apple M5 Max (40-core GPU, 128 GB).*
+- **Native Safetensors Loading.** Run supported raw-HF checkpoints directly,
+  including DeepSeek V4.1 Flash, without first converting them to `.mfq`.
 
 ## Models
 
@@ -189,9 +181,9 @@ Published `.mfq` models are available from
 
 | Model | Published precision families | Download |
 | --- | --- | --- |
+| Qwen3.8-Flash-Next | `V1-S`, `V1-M`, `S2-L`, `V3-XXS`, `S3-L`, `V4-XS`, `S4-L`, `S5-L` | [Hugging Face](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ) · [ModelScope](https://www.modelscope.cn/models/Tylogi/Qwen3.8-Flash-Next-EW-MFQ) |
 | DeepSeek-V4-Flash-0731 | Expert-Wise `V2` tiers | [Hugging Face](https://huggingface.co/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) · [ModelScope](https://www.modelscope.cn/models/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) |
 | Qwen3.8-27B | `V1`–`V4`, `S4`–`S6` tiers | [ModelScope](https://www.modelscope.cn/models/Tylogi/Qwen3.8-27B-MFQ) |
-| Qwen3.6-27B | `V2`–`V3`, `S2`–`S6` tiers | [Hugging Face](https://huggingface.co/Tylogi/Qwen3.6-27B-MFQ) |
 | MiniCPM-o 4.5 | `S4`–`S8` multimodal tiers | [ModelScope](https://www.modelscope.cn/models/Tylogi/MiniCPM-o-4_5-MFQ) |
 
 Supported architecture groups:
@@ -211,7 +203,7 @@ See the [runtime support matrix](./docs/runtime-support.md) for details.
 
 | Surface | Purpose |
 | --- | --- |
-| **MFQ Studio** | Local model catalog, load lifecycle, inference playground, server state, and resource controls |
+| **MFQ Studio** | Model downloads and loading, API and memory configuration, quantization analysis, benchmarks, and resource monitoring |
 | `mfq build` | Detect the platform and compile the optimized CUDA or Metal C++ worker |
 | `mfq quantize` | Apply uniform or mixed precision to HF, GGUF, or full-precision MFQ sources and write packed `.mfq` models |
 | `mfq calibrate` / `mfq solve-ew` | Collect activation and loss-sensitivity data, score and validate packed candidates, and allocate precision to exact serialized-byte budgets |
@@ -226,6 +218,7 @@ MFQ exposes several interfaces for applications and tooling:
 - **WebSocket realtime APIs** for audio and full-duplex sessions;
 - **OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints** from
   managed C++ workers and runtime adapters;
+- **Anthropic-compatible `/v1/messages` endpoint** for applications and agents;
 - **Function-tool calling** through the inference API; clients execute tools and return results.
 
 Start with the [HTTP API](./docs/api/http.md),
@@ -234,33 +227,47 @@ Start with the [HTTP API](./docs/api/http.md),
 
 ## Benchmarks
 
-### DeepSeek-V4-Flash-0731: model size vs. distribution fidelity
+### Qwen3.8-Flash-Next: local inference speed
+
+#### Apple
+
+| Tier | RAM Usage | Device | Input Size | Prompt Processing | Generation (no MTP) | Generation (MTP) | MTP Acceptance |
+| :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
+| [V1-M](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V1-M) | 42.91 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,530.1 tok/s | 67.4 tok/s | 94.7 tok/s | 86.5% |
+| [S2-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S2-L) | 46.95 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,503.4 tok/s | 67.7 tok/s | 93.3 tok/s | 83.7% |
+| [V3-XXS](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V3-XXS) | 49.85 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,497.0 tok/s | 64.3 tok/s | 93.2 tok/s | 85.6% |
+| [S3-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S3-L) | 57.50 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,556.6 tok/s | 65.6 tok/s | 93.9 tok/s | 84.3% |
+| [V4-XS](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V4-XS) | 61.02 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,532.0 tok/s | 65.3 tok/s | 89.0 tok/s | 77.7% |
+| [S4-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S4-L) | 78.19 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,420.6 tok/s | 60.3 tok/s | 87.6 tok/s | 82.6% |
+
+The PLE table stays on SSD; it does not need to occupy resident memory.
+For example, V1-M downloads 72.44 GiB, including 29.54 GiB of PLE, while its
+resident weights occupy 42.91 GiB.
+
+### Qwen3.8-Flash-Next: model size vs. KLD and Top1
+
+WikiText-2 evaluation: lower KLD is better; higher Top1 agreement with the
+reference model is better.
 
 <p align="center">
-  <img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash MFQ versus matched-size baseline Mean KLD" width="900">
+  <img src="./docs/figures/qwen38-flash-next-quality.png" alt="Qwen3.8-Flash-Next: MFQ, Unsloth UD and GSQ-RCO model size versus KLD and Top1 agreement" width="1100">
 </p>
 
-The evaluation uses the official 0731 weights and a fixed WikiText-2 protocol
-covering 573 chunks and 146,115 scored tokens at `ctx=512`.
-
-| Released tier | Size | Mean KLD ↓ | Same-top ↑ |
+| MFQ Tier | Weight size (GB) | KLD ↓ | Top1 agreement ↑ |
 | --- | ---: | ---: | ---: |
-| `EW-V2-S` | 77.519 GiB | `0.313576` | `82.2913%` |
-| `EW-V2-M` | 88.007 GiB | `0.244488` | `84.5300%` |
-| `EW-V2-L` | 98.007 GiB | `0.201444` | `86.0753%` |
+| `V1-S` | 72.536 | 0.22157 | 83.77% |
+| `V1-M` | 74.529 | 0.19689 | 84.72% |
+| `S2-L` | 78.859 | 0.14630 | 86.54% |
+| `V3-XXS` | 81.952 | 0.12436 | 87.62% |
+| `S3-L` | 89.976 | 0.08698 | 89.55% |
+| `V4-XS` | 93.672 | 0.07524 | 90.36% |
 
-Against the nearest-size Unsloth Dynamic baselines used in this evaluation,
-MFQ lowers Mean KLD by **34.24–51.42%**.
+At approximately 74.5 GB, **V1-M reduces KLD by 37.4% and improves Top1
+agreement by 5.03 percentage points** over Unsloth UD IQ1_M.
 
-### Qwen3.5-9B: matched precision tiers
-
-<p align="center">
-  <img src="./docs/figures/qwen35-9b-mfq-vs-ud-size-kld.svg" alt="Qwen3.5-9B MFQ versus matched-size baseline Mean KLD" width="900">
-</p>
-
-All plotted tiers use the same BF16 teacher and the complete 145-chunk,
-148,335-scored-token evaluation. MFQ records lower raw Mean KLD at every
-matched precision point shown.
+Weight sizes in this comparison exclude the vision encoder and MTP head;
+GB = 10⁹ bytes. See the [model card](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ)
+for the full comparison and tier selection guide.
 
 ## Documentation
 
