@@ -7213,9 +7213,12 @@ void test_materialized_mfe_projections() {
         std::unordered_set<const void*> allocations;
         std::size_t bytes = 0;
         std::function<void(const mlx::core::array&)> visit = [&](const auto& node) {
-            if (const auto data = node.data_shared_ptr(); data && data->buffer.ptr()
-                && allocations.insert(data->buffer.ptr()).second) {
-                bytes += node.buffer_size();
+            if (const auto data = node.data_shared_ptr(); data) {
+                const auto buffer = [&] {
+                    if constexpr (requires { data->buffer(); }) return data->buffer().ptr();
+                    else return data->buffer.ptr();
+                }();
+                if (buffer && allocations.insert(buffer).second) bytes += node.buffer_size();
             }
             if (node.has_primitive())
                 for (const auto& input : node.inputs()) visit(input);

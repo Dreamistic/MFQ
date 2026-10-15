@@ -2482,6 +2482,15 @@ array allocate_packed_array(std::size_t bytes, Dtype dtype) {
     return result;
 }
 
+template <typename Array = array>
+Array wrap_wire_buffer(mlx::core::allocator::Buffer buffer, const Shape& shape,
+    std::function<void(mlx::core::allocator::Buffer)> deleter) {
+    if constexpr (requires { Array(buffer, shape, mlx::core::uint8, deleter); })
+        return Array(buffer, shape, mlx::core::uint8, std::move(deleter));
+    else
+        return Array(typename Array::Data(buffer, std::move(deleter)), shape, mlx::core::uint8);
+}
+
 array allocate_wire_array(std::size_t bytes) {
     struct Storage {
         std::uint8_t* data = nullptr;
@@ -2502,7 +2511,7 @@ array allocate_wire_array(std::size_t bytes) {
     storage->buffer = mlx::core::allocator::make_buffer(storage->data, storage->bytes);
     if (!storage->buffer.ptr()) return allocate_packed_array(bytes, mlx::core::uint8);
     const auto buffer = storage->buffer;
-    return array(buffer, shape, mlx::core::uint8,
+    return wrap_wire_buffer(buffer, shape,
         [storage = std::move(storage)](mlx::core::allocator::Buffer) {});
 }
 
