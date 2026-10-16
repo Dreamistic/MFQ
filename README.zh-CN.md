@@ -101,7 +101,22 @@ Gate、Up、Down 精度，四张热力图使用同一色阶。
 [Beyond Expert Rankings: Contrast Calibration for Mixed-Precision MoE Quantization](https://arxiv.org/abs/2610.20353)。
 BibTeX 格式见[引用](#引用)。
 
-### 在现有硬件预算下运行大模型
+### 细粒度精度分配，也能高效推理
+
+为高效执行这些混合档位，MFQ 的原生内核将兼容的专家计算分组调度，同时保留
+各投影所选的量化格式。上一张图中的
+**V3-XXS** 档位，在输入 4,096 tokens、开启 MTP 时，生成速度达到
+**M5 Max 上的 105.4 tok/s**，以及 **RTX 3090 Ti + 32 GiB RAM 上的
+61.0 tok/s**。下图先展示各档位在 MTP 关闭和开启时的生成速度，再展示
+提示词处理速度。
+
+<p align="center">
+  <img src="./docs/figures/qwen38-flash-next-inference-speed.zh-CN.svg" alt="MFQ Qwen3.8-Flash-Next 推理速度横向柱状图：Apple Metal 与 NVIDIA CUDA 的 MTP 开关生成速度和提示词处理速度，底纹突出 V3-XXS" width="1100">
+</p>
+
+全部结果均使用 **4,096 tokens 输入**，CUDA 各档位的系统内存配置标在行标签中。
+浅色底纹标出与精度分配图相同的 `V3-XXS` 档位。完整表格见[性能与质量](#性能与质量)，
+绘图数值见[图表数据](./docs/figures/data/qwen38-flash-next-inference-speed.json)。
 
 CUDA 侧联合使用 VRAM、RAM 和 SSD，运行超出显存容量的模型；Metal 侧支持
 限制专家常驻量，并按需从 SSD 加载 MoE 专家与 PLE 表。CUDA 和 Metal 内核

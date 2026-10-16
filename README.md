@@ -108,7 +108,23 @@ Our calibration method is open source; see
 [Beyond Expert Rankings: Contrast Calibration for Mixed-Precision MoE Quantization](https://arxiv.org/abs/2610.20353).
 For BibTeX, see [Citation](#citation).
 
-### Run large models within your hardware budget
+### Fine-grained precision, fast native inference
+
+MFQ's native kernels make this granularity practical by grouping compatible
+expert work while preserving each projection's selected format. The **V3-XXS**
+tier shown above reaches **105.4 tok/s on M5 Max** and
+**61.0 tok/s on RTX 3090 Ti + 32 GiB RAM**, with MTP enabled and a 4,096-token
+input. The charts below show generation with and without MTP, followed by
+prompt processing across published tiers.
+
+<p align="center">
+  <img src="./docs/figures/qwen38-flash-next-inference-speed.svg" alt="MFQ Qwen3.8-Flash-Next horizontal speed charts: Apple Metal and NVIDIA CUDA generation with MTP off and on, plus prompt processing; V3-XXS is highlighted" width="1100">
+</p>
+
+All results use a **4,096-token input**. CUDA system RAM is listed per tier;
+the shaded rows identify the same `V3-XXS` tier used in the allocation figure.
+See [Benchmarks](#benchmarks) for the complete table and
+[chart data](./docs/figures/data/qwen38-flash-next-inference-speed.json) for the plotted values.
 
 CUDA combines VRAM, system RAM and SSD to run models that exceed GPU memory
 capacity. Metal supports bounded expert residency and SSD streaming for MoE
