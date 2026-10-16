@@ -72,8 +72,21 @@ MFQ 按专家、投影、Chunk 或神经元分配精度，让敏感权重保留�
 同一层内可以混用 NINT 标量与 NVQ 向量格式，每个专家的 Gate、Up、Down
 投影都能独立选择格式和精度，并由原生运行时直接执行。
 
+以 **Qwen3.8-Flash-Next** 为例，Unsloth UD `IQ3_XXS` 配方为每层的
+Gate、Up、Down 打包专家张量各选择一种 GGUF 格式；MFQ `V3-XXS` 则为
+**每个专家的每个投影**独立选择档位，每层有 **1,536 个分配位置**，
+对应上述 GGUF 配方的 **3 个**。
+
+<p align="center">
+  <img src="./docs/figures/qwen38-flash-next-allocation-comparison.zh-CN.svg" alt="第 0 层真实分配对比：Unsloth UD IQ3_XXS 在每个打包专家投影内共用一种格式，MFQ V3-XXS 则为每个专家的 Gate、Up、Down 独立分配档位" width="1100">
+</p>
+
+SVG 展示第 0 层、专家 0–11 的真实档位。例如，专家 9 的 **Gate、Up 使用
+NVQ3J-L，Down 使用 NINT4**。这里对比的是这些打包张量中的格式选择粒度，
+GGUF 的块内量化参数仍可变化。具体分配与来源见[数据记录](./docs/figures/data/qwen38-flash-next-layer0-allocation.json)。
+
 <details>
-<summary>查看专家之间的精度分配</summary>
+<summary>查看全模型精度热力图</summary>
 
 下图以 **Qwen3.8-Flash-Next V3-XXS** 为例，依次展示专家平均精度以及
 Gate、Up、Down 精度，四张热力图使用同一色阶。

@@ -1,0 +1,280 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1060" viewBox="0 0 1600 1060" role="img" aria-labelledby="title desc" xml:lang="zh-CN">
+<title id="title">精度分配，细到每个专家的每个投影</title>
+<desc id="desc">Qwen3.8-Flash-Next · 第 0 层真实分配 · 展示 512 个路由专家中的前 12 个. Gate、Up、Down 各用一个打包张量，每个张量选择一种格式. 为每个专家的每个投影，独立选择格式与精度档位. GGUF 对照限定于该配方的打包张量布局；块内量化参数仍可变化。</desc>
+<metadata>{&quot;model&quot;:&quot;Qwen3.8-Flash-Next&quot;,&quot;layer&quot;:0,&quot;expert_ids&quot;:[0,1,2,3,4,5,6,7,8,9,10,11],&quot;mfq_revision&quot;:&quot;3cdfba425c44177019d3fdac94fbfa5d17379505&quot;,&quot;gguf_revision&quot;:&quot;38bb39ee97821de2c9009abb7e93950eec396e66&quot;,&quot;source&quot;:&quot;data/qwen38-flash-next-layer0-allocation.json&quot;}</metadata>
+<rect x="0" y="0" width="1600" height="1060" rx="0" fill="#ffffff" stroke="none"/>
+<g font-family="Noto Sans CJK SC, Noto Sans, Arial, sans-serif">
+<text x="48" y="57" font-size="37" font-weight="700" fill="#14243a" text-anchor="start">精度分配，细到每个专家的每个投影</text>
+<text x="48" y="95" font-size="19" font-weight="400" fill="#62758d" text-anchor="start">Qwen3.8-Flash-Next · 第 0 层真实分配 · 展示 512 个路由专家中的前 12 个</text>
+<rect x="48" y="124" width="1504" height="316" rx="16" fill="#f6f8fb" stroke="#dce3ec"/>
+<text x="76" y="165" font-size="27" font-weight="700" fill="#25354a" text-anchor="start">GGUF · Unsloth UD IQ3_XXS</text>
+<text x="76" y="198" font-size="18" font-weight="400" fill="#62758d" text-anchor="start">Gate、Up、Down 各用一个打包张量，每个张量选择一种格式</text>
+<text x="1496" y="164" font-size="33" font-weight="700" fill="#52647b" text-anchor="end">3</text>
+<text x="1496" y="197" font-size="16" font-weight="400" fill="#62758d" text-anchor="end">个分配位置／层</text>
+<text x="244" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 0</text>
+<text x="352" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 1</text>
+<text x="460" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 2</text>
+<text x="568" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 3</text>
+<text x="676" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 4</text>
+<text x="784" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 5</text>
+<text x="892" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 6</text>
+<text x="1000" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 7</text>
+<text x="1108" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 8</text>
+<text x="1216" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 9</text>
+<text x="1324" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 10</text>
+<text x="1432" y="231" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 11</text>
+<text x="76" y="275" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Gate</text>
+<rect x="190" y="247" width="1296" height="42" rx="8" fill="#dce9f6" stroke="#b0c7dd"/>
+<path d="M298 251v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M406 251v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M514 251v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M622 251v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M730 251v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M838 251v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M946 251v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1054 251v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1162 251v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1270 251v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1378 251v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<rect x="586" y="249" width="504" height="38" rx="0" fill="#dce9f6" stroke="none"/>
+<text x="838" y="275" font-size="18" font-weight="600" fill="#214461" text-anchor="middle">IQ2_S · 全部 512 个专家共用该格式</text>
+<text x="76" y="331" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Up</text>
+<rect x="190" y="303" width="1296" height="42" rx="8" fill="#dce9f6" stroke="#b0c7dd"/>
+<path d="M298 307v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M406 307v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M514 307v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M622 307v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M730 307v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M838 307v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M946 307v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1054 307v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1162 307v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1270 307v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1378 307v34" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
+<rect x="586" y="305" width="504" height="38" rx="0" fill="#dce9f6" stroke="none"/>
+<text x="838" y="331" font-size="18" font-weight="600" fill="#214461" text-anchor="middle">IQ2_S · 全部 512 个专家共用该格式</text>
+<text x="76" y="387" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Down</text>
+<rect x="190" y="359" width="1296" height="42" rx="8" fill="#f2dfbd" stroke="#d5ba89"/>
+<path d="M298 363v34" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M406 363v34" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M514 363v34" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M622 363v34" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M730 363v34" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M838 363v34" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M946 363v34" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1054 363v34" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1162 363v34" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1270 363v34" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
+<path d="M1378 363v34" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
+<rect x="586" y="361" width="504" height="38" rx="0" fill="#f2dfbd" stroke="none"/>
+<text x="838" y="387" font-size="18" font-weight="600" fill="#654717" text-anchor="middle">IQ4_NL · 全部 512 个专家共用该格式</text>
+<text x="76" y="425" font-size="15" font-weight="400" fill="#62758d" text-anchor="start">三个打包张量，分别为 Gate、Up、Down 选择格式。</text>
+<text x="800" y="484" font-size="25" font-weight="700" fill="#976229" text-anchor="middle">每层精度分配位置：3 → 1,536（512 倍）</text>
+<rect x="48" y="510" width="1504" height="358" rx="16" fill="#fbfaf7" stroke="#dfd4c3"/>
+<rect x="48" y="528" width="4" height="48" rx="2" fill="#a77338" stroke="none"/>
+<text x="76" y="551" font-size="27" font-weight="700" fill="#25354a" text-anchor="start">MFQ · V3-XXS</text>
+<text x="76" y="584" font-size="18" font-weight="400" fill="#62758d" text-anchor="start">为每个专家的每个投影，独立选择格式与精度档位</text>
+<text x="1496" y="550" font-size="33" font-weight="700" fill="#976229" text-anchor="end">1,536</text>
+<text x="1496" y="583" font-size="16" font-weight="400" fill="#62758d" text-anchor="end">个分配位置／层</text>
+<text x="244" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 0</text>
+<text x="352" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 1</text>
+<text x="460" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 2</text>
+<text x="568" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 3</text>
+<text x="676" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 4</text>
+<text x="784" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 5</text>
+<text x="892" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 6</text>
+<text x="1000" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 7</text>
+<text x="1108" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 8</text>
+<text x="1216" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 9</text>
+<text x="1324" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 10</text>
+<text x="1432" y="619" font-size="14" font-weight="500" fill="#62758d" text-anchor="middle">专家 11</text>
+<text x="76" y="669" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Gate</text>
+<g data-projection="gate" data-expert="0" data-profile="NVQ3J">
+<rect x="192" y="636" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="244" y="659" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="244" y="678" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="gate" data-expert="1" data-profile="NVQ3J-512">
+<rect x="300" y="636" width="103" height="52" rx="7" fill="#b2bce8" stroke="#8898cf"/>
+<text x="352" y="659" font-size="14" font-weight="700" fill="#303d70" text-anchor="middle">NVQ3J-512</text>
+<text x="352" y="678" font-size="11" font-weight="500" fill="#303d70" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="gate" data-expert="2" data-profile="NVQ3J">
+<rect x="408" y="636" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="460" y="659" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="460" y="678" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="gate" data-expert="3" data-profile="NVQ2J-XL">
+<rect x="516" y="636" width="103" height="52" rx="7" fill="#77c2cb" stroke="#4399a5"/>
+<text x="568" y="659" font-size="14" font-weight="700" fill="#123e49" text-anchor="middle">NVQ2J-XL</text>
+<text x="568" y="678" font-size="11" font-weight="500" fill="#123e49" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="gate" data-expert="4" data-profile="NVQ3J-L">
+<rect x="624" y="636" width="103" height="52" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
+<text x="676" y="659" font-size="14" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<text x="676" y="678" font-size="11" font-weight="500" fill="#503576" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="gate" data-expert="5" data-profile="NVQ3J">
+<rect x="732" y="636" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="784" y="659" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="784" y="678" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="gate" data-expert="6" data-profile="NVQ1-S">
+<rect x="840" y="636" width="103" height="52" rx="7" fill="#faedc7" stroke="#e3cd8e"/>
+<text x="892" y="659" font-size="14" font-weight="700" fill="#614b14" text-anchor="middle">NVQ1-S</text>
+<text x="892" y="678" font-size="11" font-weight="500" fill="#614b14" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="gate" data-expert="7" data-profile="NVQ3J-L">
+<rect x="948" y="636" width="103" height="52" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
+<text x="1000" y="659" font-size="14" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<text x="1000" y="678" font-size="11" font-weight="500" fill="#503576" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="gate" data-expert="8" data-profile="NVQ3J">
+<rect x="1056" y="636" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="1108" y="659" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="1108" y="678" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="gate" data-expert="9" data-profile="NVQ3J-L">
+<rect x="1164" y="636" width="103" height="52" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
+<text x="1216" y="659" font-size="14" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<text x="1216" y="678" font-size="11" font-weight="500" fill="#503576" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="gate" data-expert="10" data-profile="NVQ3J-L">
+<rect x="1272" y="636" width="103" height="52" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
+<text x="1324" y="659" font-size="14" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<text x="1324" y="678" font-size="11" font-weight="500" fill="#503576" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="gate" data-expert="11" data-profile="NVQ2J-L">
+<rect x="1380" y="636" width="103" height="52" rx="7" fill="#a4dcd4" stroke="#6cb9ae"/>
+<text x="1432" y="659" font-size="14" font-weight="700" fill="#164e47" text-anchor="middle">NVQ2J-L</text>
+<text x="1432" y="678" font-size="11" font-weight="500" fill="#164e47" text-anchor="middle">VQ</text>
+</g>
+<text x="76" y="733" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Up</text>
+<g data-projection="up" data-expert="0" data-profile="NVQ3J">
+<rect x="192" y="700" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="244" y="723" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="244" y="742" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="up" data-expert="1" data-profile="NVQ3J">
+<rect x="300" y="700" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="352" y="723" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="352" y="742" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="up" data-expert="2" data-profile="NVQ3J">
+<rect x="408" y="700" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="460" y="723" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="460" y="742" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="up" data-expert="3" data-profile="NVQ3J">
+<rect x="516" y="700" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="568" y="723" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="568" y="742" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="up" data-expert="4" data-profile="NVQ3J-L">
+<rect x="624" y="700" width="103" height="52" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
+<text x="676" y="723" font-size="14" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<text x="676" y="742" font-size="11" font-weight="500" fill="#503576" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="up" data-expert="5" data-profile="NVQ3J">
+<rect x="732" y="700" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="784" y="723" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="784" y="742" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="up" data-expert="6" data-profile="NVQ1-S">
+<rect x="840" y="700" width="103" height="52" rx="7" fill="#faedc7" stroke="#e3cd8e"/>
+<text x="892" y="723" font-size="14" font-weight="700" fill="#614b14" text-anchor="middle">NVQ1-S</text>
+<text x="892" y="742" font-size="11" font-weight="500" fill="#614b14" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="up" data-expert="7" data-profile="NVQ3J-L">
+<rect x="948" y="700" width="103" height="52" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
+<text x="1000" y="723" font-size="14" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<text x="1000" y="742" font-size="11" font-weight="500" fill="#503576" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="up" data-expert="8" data-profile="NVQ3J">
+<rect x="1056" y="700" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="1108" y="723" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="1108" y="742" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="up" data-expert="9" data-profile="NVQ3J-L">
+<rect x="1164" y="700" width="103" height="52" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
+<text x="1216" y="723" font-size="14" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<text x="1216" y="742" font-size="11" font-weight="500" fill="#503576" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="up" data-expert="10" data-profile="NVQ3J-L">
+<rect x="1272" y="700" width="103" height="52" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
+<text x="1324" y="723" font-size="14" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<text x="1324" y="742" font-size="11" font-weight="500" fill="#503576" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="up" data-expert="11" data-profile="NVQ2J-L">
+<rect x="1380" y="700" width="103" height="52" rx="7" fill="#a4dcd4" stroke="#6cb9ae"/>
+<text x="1432" y="723" font-size="14" font-weight="700" fill="#164e47" text-anchor="middle">NVQ2J-L</text>
+<text x="1432" y="742" font-size="11" font-weight="500" fill="#164e47" text-anchor="middle">VQ</text>
+</g>
+<text x="76" y="797" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Down</text>
+<g data-projection="down" data-expert="0" data-profile="NVQ3J">
+<rect x="192" y="764" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="244" y="787" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="244" y="806" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="down" data-expert="1" data-profile="NVQ3J-512">
+<rect x="300" y="764" width="103" height="52" rx="7" fill="#b2bce8" stroke="#8898cf"/>
+<text x="352" y="787" font-size="14" font-weight="700" fill="#303d70" text-anchor="middle">NVQ3J-512</text>
+<text x="352" y="806" font-size="11" font-weight="500" fill="#303d70" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="down" data-expert="2" data-profile="NVQ3J-512">
+<rect x="408" y="764" width="103" height="52" rx="7" fill="#b2bce8" stroke="#8898cf"/>
+<text x="460" y="787" font-size="14" font-weight="700" fill="#303d70" text-anchor="middle">NVQ3J-512</text>
+<text x="460" y="806" font-size="11" font-weight="500" fill="#303d70" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="down" data-expert="3" data-profile="NVQ3J">
+<rect x="516" y="764" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="568" y="787" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="568" y="806" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="down" data-expert="4" data-profile="NVQ3J-L">
+<rect x="624" y="764" width="103" height="52" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
+<text x="676" y="787" font-size="14" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<text x="676" y="806" font-size="11" font-weight="500" fill="#503576" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="down" data-expert="5" data-profile="NVQ3J">
+<rect x="732" y="764" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="784" y="787" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="784" y="806" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="down" data-expert="6" data-profile="NVQ1-S">
+<rect x="840" y="764" width="103" height="52" rx="7" fill="#faedc7" stroke="#e3cd8e"/>
+<text x="892" y="787" font-size="14" font-weight="700" fill="#614b14" text-anchor="middle">NVQ1-S</text>
+<text x="892" y="806" font-size="11" font-weight="500" fill="#614b14" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="down" data-expert="7" data-profile="NVQ3J-L">
+<rect x="948" y="764" width="103" height="52" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
+<text x="1000" y="787" font-size="14" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<text x="1000" y="806" font-size="11" font-weight="500" fill="#503576" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="down" data-expert="8" data-profile="NVQ3J">
+<rect x="1056" y="764" width="103" height="52" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
+<text x="1108" y="787" font-size="14" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<text x="1108" y="806" font-size="11" font-weight="500" fill="#22466c" text-anchor="middle">VQ</text>
+</g>
+<g data-projection="down" data-expert="9" data-profile="NINT4">
+<rect x="1164" y="764" width="103" height="52" rx="7" fill="#efc590" stroke="#d39b52"/>
+<text x="1216" y="787" font-size="14" font-weight="700" fill="#654014" text-anchor="middle">NINT4</text>
+<text x="1216" y="806" font-size="11" font-weight="500" fill="#654014" text-anchor="middle">SQ</text>
+</g>
+<g data-projection="down" data-expert="10" data-profile="NINT4">
+<rect x="1272" y="764" width="103" height="52" rx="7" fill="#efc590" stroke="#d39b52"/>
+<text x="1324" y="787" font-size="14" font-weight="700" fill="#654014" text-anchor="middle">NINT4</text>
+<text x="1324" y="806" font-size="11" font-weight="500" fill="#654014" text-anchor="middle">SQ</text>
+</g>
+<g data-projection="down" data-expert="11" data-profile="NVQ2J">
+<rect x="1380" y="764" width="103" height="52" rx="7" fill="#d3eee5" stroke="#9ecdbd"/>
+<text x="1432" y="787" font-size="14" font-weight="700" fill="#204f44" text-anchor="middle">NVQ2J</text>
+<text x="1432" y="806" font-size="11" font-weight="500" fill="#204f44" text-anchor="middle">VQ</text>
+</g>
+<text x="76" y="851" font-size="16" font-weight="400" fill="#62758d" text-anchor="start">不同专家可以选不同档位，同一专家的 Gate、Up、Down 也可以独立选择。</text>
+<text x="48" y="909" font-size="17" font-weight="500" fill="#25354a" text-anchor="start">VQ：NVQ 向量格式 · SQ：NINT 标量格式 · 单元格标注实际使用的档位。</text>
+<text x="48" y="944" font-size="16" font-weight="400" fill="#62758d" text-anchor="start">第 0 层、专家 0–11 的真实分配。颜色区分格式档位，不代表敏感度或质量。</text>
+<text x="48" y="975" font-size="16" font-weight="400" fill="#62758d" text-anchor="start">GGUF 对照限定于该配方的打包张量布局；块内量化参数仍可变化。</text>
+<rect x="48" y="997" width="1504" height="43" rx="9" fill="#f4efe7" stroke="none"/>
+<text x="800" y="1026" font-size="19" font-weight="600" fill="#78552d" text-anchor="middle">覆盖 48 层：144 个打包张量分配位置 → 73,728 个专家投影分配位置</text>
+</g></svg>

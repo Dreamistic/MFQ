@@ -78,8 +78,22 @@ vector formats can coexist within the same layer, with independent choices for
 each expert's Gate, Up and Down projections. The native runtimes execute these
 mixed formats directly.
 
+For **Qwen3.8-Flash-Next**, the packed expert tensors in the Unsloth UD
+`IQ3_XXS` recipe select one GGUF format for each layer's Gate, Up and Down
+projections. MFQ `V3-XXS` selects a profile for **each expert projection**:
+**1,536 allocation slots per layer**, compared with **3** in that recipe.
+
+<p align="center">
+  <img src="./docs/figures/qwen38-flash-next-allocation-comparison.svg" alt="Actual layer 0 allocation: Unsloth UD IQ3_XXS shares one format across each packed expert projection; MFQ V3-XXS assigns profiles independently to each expert's Gate, Up and Down" width="1100">
+</p>
+
+The SVG shows actual profiles for layer 0, experts 0–11. For example, expert 9
+uses **NVQ3J-L for Gate and Up** and **NINT4 for Down**. This comparison concerns
+format selection in these packed tensors; GGUF block-level quantization
+parameters can still vary. See the [allocation data and sources](./docs/figures/data/qwen38-flash-next-layer0-allocation.json).
+
 <details>
-<summary>See how precision is distributed across experts</summary>
+<summary>Full-model precision heatmaps</summary>
 
 These **Qwen3.8-Flash-Next V3-XXS** heatmaps show the overall expert average,
 followed by Gate, Up and Down, on a shared color scale.
