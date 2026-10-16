@@ -55,6 +55,15 @@ def test_studio_uses_one_package_for_web_and_desktop_clients():
     assert 'mfq-decode-metal" --self-test-metal' in RELEASE_SCRIPT
 
 
+def test_studio_macos_icons_have_platform_padding():
+    assert "const MACOS_ICON_SCALE: f64 = 0.83;" in BUILD
+    assert 'std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")' in BUILD
+    assert "render(size, MACOS_ICON_SCALE)" in BUILD
+    assert "IconImage::from_rgba_data(size, size, render(size, 1.0))" in BUILD
+    for size in (32, 128, 256):
+        assert f'write_png(&directory.join("{size}x{size}.png"), {size}, png_scale);' in BUILD
+
+
 def test_studio_starts_the_unified_local_server_and_bundled_runtime():
     assert 'Some("mfq-server")' in RUST
     assert "Command::new" in RUST

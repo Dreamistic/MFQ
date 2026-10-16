@@ -92,6 +92,9 @@ struct MfeFfnBatch {
     // All compact E8/D4 resident and transfer views prove local decoder bounds.
     bool compact_nvq=false;
     bool token_group_aligned_gu=false;
+    // Every projection proves the short grouped decoder's arithmetic and
+    // compact expert-local address bounds; raw callers retain the wide path.
+    bool token_group_compact=false;
 };
 inline int mfe_token_group_bound(const MfeFfnBatch& b,int capacity) {
     return b.token_group_buckets ?

@@ -1,6 +1,7 @@
 """Prefill may overwrite expert tails, then decode must use restored weights."""
 import asyncio
 import os
+import re
 from contextlib import suppress
 
 import numpy as np
@@ -73,10 +74,13 @@ def test_prefill_loan_restores_experts_and_retains_graphs(tmp_path, ram_hot, cac
                 await client.status()
                 captures = log_path.read_text(errors='replace').count('runtime_qwen4_graph_capture')
                 outputs = []
-                for index, prompt in enumerate(('ab'*1200, 'ba'*1100, 'abab')):
+                prompts = (('ab'*1200, False), ('ba'*1100, True),
+                           ('ab'*150, False), ('ba'*150, True),
+                           ('ab'*15, False), ('abab', True))
+                for prompt, use_mtp in prompts:
                     async with client.generate({'messages': [{'role':'user', 'content':prompt}],
                         'mfq_preformatted_prompt':prompt, 'temperature':0, 'max_tokens':12,
-                        'enable_mtp':index!=0, 'mtp_max_draft_tokens':3, 'stream':True}) as events:
+                        'enable_mtp':use_mtp, 'mtp_max_draft_tokens':3, 'stream':True}) as events:
                         chunks = [event async for event in events if event]
                     assert not any('error' in event for event in chunks), chunks
                     outputs.append(''.join(choice.get('delta', {}).get('content', '')
@@ -92,7 +96,13 @@ def test_prefill_loan_restores_experts_and_retains_graphs(tmp_path, ram_hot, cac
                     loans = trace.count('runtime_prefill_loan action=borrow')
                     assert loans >= 3
                     assert trace.count('runtime_prefill_loan action=return') == loans
-                    assert trace.count('runtime_prefill_ring split=1') == (0 if cache_only else 1)
+                    assert any(int(value)>0 for value in re.findall(r'cached_arenas=(\d+)',trace)), trace
+                    returns = re.findall(r'action=return restored_bytes=(\d+) restore_bytes=(\d+) selective=(\d+)', trace)
+                    assert len(returns) == loans
+                    assert all(0 <= int(copied) <= int(capacity) and selective == '1'
+                               for capacity, copied, selective in returns), returns
+                    streamed_primes = sum(use_mtp and len(prompt) > 128 for prompt, use_mtp in prompts)
+                    assert trace.count('runtime_prefill_ring split=1') == (0 if cache_only else streamed_primes)
                 else:
                     assert 'runtime_prefill_loan action=borrow' not in trace
                 return outputs

@@ -39,7 +39,6 @@ export function DownloadDirectoryControl({ onDirectoryChange }: { onDirectoryCha
         }
       } catch (cause) {
         if (!disposed && revision === statusRequest.current) {
-          setStorage(null);
           if (initial) toast.error(errorMessage(cause, tr));
         }
       } finally {

@@ -9,6 +9,57 @@
 #include <iostream>
 #include <cstdlib>
 namespace tb=mfq_tensor_backend;
+void early_prefix_rows() {
+    auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
+    std::atomic<int> submissions{0};
+    std::vector<std::shared_ptr<mfq::NintRows>> tables;
+    for(int shard=0;shard<4;++shard)tables.push_back(std::make_shared<mfq::NintRows>(fixture->blob.size(),
+        [fixture](std::size_t off,uint8_t* dst,std::size_t n){std::memcpy(dst,fixture->blob.data()+off,n);},true,
+        [fixture,&submissions](const std::vector<mfq::ReadSpan>& spans) {
+            ++submissions;
+            for(const auto& span:spans)std::memcpy(span.destination,fixture->blob.data()+span.offset,span.size);
+        }));
+    const tb::Device device{tb::kCUDA,0};
+    for(bool matches:{true,false}) {
+        NintRowPipeline pipeline(tables);
+        const std::vector<int64_t> prefix={1,529+2,529*2+3,529*3+4};
+        auto ids=prefix;
+        ids.insert(ids.end(),{5,529+2,529*2+6,529*3+4});
+        if(!matches)ids[0]=7;
+        const auto before=submissions.load();
+        pipeline.issue(prefix,{1,1,4},true);
+        auto actual=pipeline.collect(ids,{1,2,4},device).cpu().contiguous();
+        // Four shards for the hint; only shards zero and two have new rows.
+        if(submissions.load()-before!=6)
+            throw std::runtime_error("PLE prefix was reread or extension missed new rows");
+        auto expected=nint_sharded_embedding_lookup(tables,ids,{1,2,4},device).cpu().contiguous();
+        if(actual.sizes()!=expected.sizes() ||
+           std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.numel()*actual.element_size()))
+            throw std::runtime_error("PLE early prefix changed extended-window output");
+        auto stage=pipeline.make_stage({1,2,4},device);
+        pipeline.upload(*stage,ids,{1,2,4});stage->decode();
+        auto staged=stage->output().cpu().contiguous();
+        if(std::memcmp(staged.data_ptr(),expected.data_ptr(),staged.numel()*staged.element_size()))
+            throw std::runtime_error("PLE early prefix changed graph-stage payload");
+    }
+    {
+        NintRowPipeline pipeline(tables);
+        const std::vector<int64_t> ids={1,531,1061,1591,5,531,1064,1591,1,537,1061,1599};
+        const auto before=submissions.load();
+        pipeline.issue(std::vector<int64_t>(ids.begin(),ids.begin()+4),{1,1,4},true);
+        pipeline.issue(std::vector<int64_t>(ids.begin(),ids.begin()+8),{1,2,4},true);
+        auto actual=pipeline.collect(ids,{1,3,4},device).cpu().contiguous();
+        if(submissions.load()-before!=8)
+            throw std::runtime_error("PLE successive draft prefixes duplicated a row read");
+        auto expected=nint_sharded_embedding_lookup(tables,ids,{1,3,4},device).cpu().contiguous();
+        if(actual.sizes()!=expected.sizes() ||
+           std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.numel()*actual.element_size()))
+            throw std::runtime_error("PLE successive draft prefixes changed output");
+    }
+    // Abandoned hints finish safely without any subsequent target upload.
+    {NintRowPipeline pipeline(tables);pipeline.issue({9,530,1061,1591},{1,1,4},true);}
+    std::cout<<"MFQ PLE early-prefix extension/chain/mismatch/abandon PASS cases=4\n";
+}
 void large_window() {
     auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
     auto table=std::make_shared<mfq::NintRows>(fixture->blob.data(),fixture->blob.size());
@@ -61,6 +112,7 @@ int main(int argc,char** argv)try {
     // the usual driver often reuses the handle, hiding the stale stream.
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
+    early_prefix_rows();
     if(!std::getenv("MFQ_PLE_MAPPED_ROWS")) {
         auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
         auto table=std::make_shared<mfq::NintRows>(fixture->blob.data(),fixture->blob.size());

@@ -19,6 +19,7 @@ class MfeFfnRuntime {
     int quantization_count_=0,quantization_groups_=0;
     bool dispatch_trace_reported_=false;
     bool combined_gate_up_=false;
+    bool split_shared_groups_=false;
     const int32_t* transfer_route_plan_=nullptr;
     mfq_tensor_backend::Tensor primary_cohorts_,cached_snapshot_tags_;
     mfq_tensor_backend::Tensor cached_transfer_routes_;

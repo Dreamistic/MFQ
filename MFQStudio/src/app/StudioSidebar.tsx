@@ -7,6 +7,7 @@ import {
 } from '../features/settings/UpdateManager';
 import { useUiStore } from '../stores/uiStore';
 import { Icon } from './display';
+import mfqMark from '../assets/mfq-mark.svg';
 import { formatNumber } from './formatters';
 import { studioBuild } from '../features/settings/releases';
 import { dashboardPath, labPath, resolveStudioLocation, isStudioPath,
@@ -94,7 +95,7 @@ export function StudioSidebar() {
     <>
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} id="studio-sidebar">
         <div className="brand">
-          <img src="/mfq-mark.svg" alt="" />
+          <img src={mfqMark} alt="" />
           <div><strong>MFQ</strong><span>Studio</span></div>
         </div>
         <div className="sidebar-scroll">

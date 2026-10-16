@@ -27,11 +27,29 @@ void parity_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t st
     }else mfe_ffn_parallel_gate_up_kernel<2,true,Formats,true,false>
         <<<grid,dim3(32,8),0,stream>>>(b,partition);
 }
+template<uint32_t Formats>
+void parity_token_single_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
+    partition|=16;
+    const auto* early=std::getenv("MFQ_MFE_EARLY_GU");
+    if(b.plan_ready && b.resident_plan_overlap && (!early || early[0]!='0'))partition|=8;
+    // Token-group slots already contain their original shared/routed position.
+    // The separate hidden quantizer owns Down metadata and completion.
+    mfe_ffn_gu_prequantized_kernel<Formats,false,true><<<
+        dim3((width+7)/8,mfe_token_group_bound(b,1)),dim3(32,8),0,stream>>>(b,partition);
+}
 }
 // Called only after the ordinary compact launcher proves its full contract.
 void mfe_ffn_parity_read_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
     if(!(b.nvq_format_mask&~0x3f820u))parity_gate_up<0x3f820u>(b,partition,width,stream);
     else parity_gate_up<0x3f922u>(b,partition,width,stream);
+}
+void mfe_ffn_parity_token_single_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
+    if(!(b.nvq_format_mask&~0x3f820u))parity_token_single_gate_up<0x3f820u>(b,partition,width,stream);
+    else parity_token_single_gate_up<0x3f922u>(b,partition,width,stream);
+    static std::atomic<bool> reported{false};
+    if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+        "mfe_token_single_parity_dispatch scope=first_single_group enabled=1 tokens=%d partition=%d mask=%u\n",
+        b.tokens,partition,b.nvq_format_mask);
 }
 void mfe_ffn_parity_transfer_routes(const MfeFfnBatch& b,const int32_t* routes,cudaStream_t stream) {
     const auto grid=dim3((b.intermediate+7)/8,std::min(b.routes,4));

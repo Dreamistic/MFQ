@@ -1,6 +1,6 @@
 <div align="center">
 
-# TyloQuant MFQ
+# MFQ
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./docs/figures/tylogi-ai-lab-lockup-dark.svg">
@@ -12,13 +12,14 @@
 **每一比特，极致保真。**
 
 MFQ 将面向实用率失真前沿设计的神经网络感知 SQ/VQ 格式、高质量的
-细粒度混合精度校准量化，以及高效的 CUDA/Metal 推理融为一体。我们的
-目标是在内存、存储和延迟约束内，让现有硬件运行尽可能高质量的模型。
+细粒度混合精度校准量化，以及高效的 CUDA 和 Metal 推理融为一体。
+ROCm（HIP）支持仍在开发中。我们的目标是在内存、存储和延迟约束内，
+让现有硬件运行尽可能高质量的模型。
 
 <p>
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache 2.0 许可证">
   <img src="https://img.shields.io/badge/runtime-C%2B%2B-black" alt="C++ 运行时">
-  <img src="https://img.shields.io/badge/backends-CUDA%20%7C%20Metal-6b57ff" alt="CUDA 和 Metal">
+  <img src="https://img.shields.io/badge/backends-CUDA%20%7C%20Metal%20%7C%20ROCm%20%28in%20development%29-6b57ff" alt="CUDA 和 Metal；ROCm 开发中">
 </p>
 
 <p>
@@ -26,7 +27,6 @@ MFQ 将面向实用率失真前沿设计的神经网络感知 SQ/VQ 格式、高
 </p>
 
 <p>
-  <a href="#deepseek-v41-raw-hf">DeepSeek V4.1</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#功能特性">功能特性</a> ·
   <a href="#模型">模型</a> ·
@@ -36,34 +36,20 @@ MFQ 将面向实用率失真前沿设计的神经网络感知 SQ/VQ 格式、高
 
 </div>
 
-<a id="deepseek-v41-raw-hf"></a>
-
-## 单台 Mac Studio 直跑 DeepSeek V4.1 raw-HF
-
-> **在一台配备 512 GB 统一内存的 Apple M3 Ultra 上，直接加载并运行
-> 476 GB 的 DeepSeek V4.1 Flash Hugging Face Safetensors，无需先转换为
-> MFQ 容器。** 针对 Metal 优化的路径将主干网络与 MoE 专家完整常驻统一
-> 内存，仅把 Engram 存储卸载到 Mac 内置 SSD。
-
-| 模型 / 硬件 | 放置方式 | 模型加载 | 预填充（约 0.5K / 2K / 16K tokens） | TG，关闭 MTP | TG，高接受率 MTP |
-| --- | --- | ---: | ---: | ---: | ---: |
-| DeepSeek V4.1 Flash raw-HF / Mac Studio M3 Ultra，512 GB | 全量常驻；仅 Engram 使用内置 SSD | **38.6 秒** | **390.2 / 458.6 / 471.1 tok/s** | **18.29 tok/s** | **33.46 tok/s**（**+83.0%**） |
-
-MFQ 覆盖校准、精度分配、量化与推理的完整流程。按张量、专家和投影分配
-混合精度，生成自包含的 `.mfq` 模型，再通过 MFQ Studio 或推理 API 部署。
-
-<p align="center">
-  <img src="./docs/figures/tyloquant-mfq-webui-zh.png" alt="MFQ Studio 运行本地模型" width="900">
-</p>
-
 ## 快速开始
 
 ### 使用预编译包
 
-Apple 芯片上最简单的使用方式是安装预编译的 **MFQ Studio**。预编译包会在
-可用时发布到项目的 [Releases](https://github.com/Tylogi/TyloQuant/releases)，
-其中包含桌面控制台、MFQ Server 和 C++ 运行时。打开 Studio，注册模型目录，
-即可加载任意受支持的 `.mfq` 模型。
+在一个桌面应用中下载和加载模型、配置服务与内存预算、分析量化精度、运行测评。
+应用与 Agent 可以通过 OpenAI 和 Anthropic 兼容 API 接入。
+
+<p align="center">
+  <img src="./docs/figures/mfq-studio-overview-zh.png" alt="MFQ Studio：本地模型服务、实时性能与资源概览" width="1100">
+</p>
+
+从 [Releases](https://github.com/Tylogi/MFQ/releases) 下载 **MFQ Studio**。
+安装包包含桌面应用、MFQ Server 和原生运行时，无需从源码构建。在「下载」中
+获取模型，再从「模型」中加载，也可以直接打开已有的本地 `.mfq` 检查点。
 
 也可以直接为服务器指定预编译的 C++ worker：
 
@@ -76,15 +62,20 @@ uv run mfq serve \
 ### 从源码构建
 
 MFQ 需要 Git、[uv](https://docs.astral.sh/uv/)、CMake 3.26+ 和 C++ 工具链。
-NVIDIA 平台使用 CUDA 12+，Apple 芯片使用 Metal。
+NVIDIA 平台使用 CUDA 12+，Apple 芯片使用 Metal。ROCm/HIP 支持仍在开发中，
+AMD 平台的实验性构建需要 ROCm 6+。
 
 ```bash
-git clone https://github.com/Tylogi/TyloQuant.git MFQ
+git clone https://github.com/Tylogi/MFQ.git MFQ
 cd MFQ
 
 # NVIDIA / CUDA
 uv sync
 uv run mfq build --backend cuda
+
+# AMD / ROCm（HIP，开发中）
+uv sync
+uv run mfq build --backend hip
 
 # Apple 芯片 / Metal
 uv sync --extra metal
@@ -136,33 +127,35 @@ MFQ 还可以量化满精度 MFQ 和 GGUF 源模型，读取逐张量或逐专�
 
 ### 量化
 
-- **细粒度量化与精度虚拟化。** 在统一的 MFQ 格式中，按专家、投影、Chunk 或
+- **细粒度量化。** 在统一的 MFQ 格式中，按专家、投影、Chunk 或
   神经元分配精度，让敏感权重保留更高精度。
 
 - **高质量校准模型与新架构支持。** 提供可直接使用的混合精度模型，并持续
   跟进新模型架构的量化与推理支持。
 
+同一层内可以混用 NINT 标量与 NVQ 向量格式，每个专家的 Gate、Up、Down
+投影都能独立选择格式和精度。下图以 **Qwen3.8-Flash-Next V3-XXS** 为例，
+依次展示专家平均精度以及 Gate、Up、Down 精度，四张热力图使用同一色阶。
+
+<p align="center">
+  <img src="./docs/figures/qwen38-flash-next-expert-precision.png" alt="Qwen3.8-Flash-Next V3-XXS：专家平均精度与 Gate、Up、Down 独立精度热力图" width="1100">
+</p>
+
+我们的校准方法已开源，详见论文
+[Beyond Expert Rankings: Contrast Calibration for Mixed-Precision MoE Quantization](https://arxiv.org/abs/2610.20353)。
+
 ### 推理
 
-- **生产级推理与服务。** 支持连续批处理、带 LRU 的多模型管理、RAM/SSD 分级
-  前缀缓存与 KV Cache，并通过 SSD 流式专家执行运行超出内存容量的 MoE 模型。
+- **资源受限推理。** CUDA 侧联合使用 VRAM、RAM 和 SSD，运行超出显存容量
+  的模型；Metal 侧支持 SSD Streaming，按需加载 MoE 专家与 PLE 表，降低
+  统一内存的常驻需求。
 
-- **高性能 CUDA、ROCm 与 Metal 后端。** 为 CUDA 与 Metal 优化打包权重、
-  注意力、缓存与 I/O 内核；ROCm/HIP 已初步支持 MI300X 上的 Qwen3.5–3.8
-  稠密模型。优化的 CPU 后端正在规划中。
+- **生产级服务。** 支持连续批处理、带 LRU 的多模型管理及 RAM/SSD 分级
+  前缀缓存与 KV Cache，通过 OpenAI 和 Anthropic 兼容 API 为应用与 Agent
+  提供服务。
 
-| 模型 | 模型大小 | 专家预算 | 精度 | 硬件 | 预填充 | 解码 |
-| --- | ---: | ---: | --- | --- | ---: | ---: |
-| DeepSeek-V4-Flash-0731 | ~160 GiB | 85.3 GiB | 官方原生 QAT 精度 | Apple M5 Max, 128 GB | **312.4 tok/s** | **18.6 tok/s** |
-
-MFQ 在当前支持的两种精度粒度下都能保持高效的异构 MoE 执行：
-
-| 模型 | 精度粒度 | 平均 BPW | 预填充 | 解码 |
-| --- | --- | ---: | ---: | ---: |
-| Qwen3.8-Flash-Next | 每个专家一种精度 | **5.80** | **1.13K tok/s** | **25.4 tok/s** |
-| Qwen3.8-Flash-Next | 每个专家的 Gate/Up/Down 分别使用独立精度 | **5.79** | **1.12K tok/s** | **24.4 tok/s** |
-
-*Apple M5 Max（40 核 GPU、128 GB）上的预热端到端吞吐。*
+- **高性能 CUDA 与 Metal 后端。** 为 CUDA 与 Metal 优化打包权重、
+  注意力、缓存与 I/O 内核。ROCm/HIP 支持仍在开发中，优化的 CPU 后端正在规划中。
 
 ## 模型
 
@@ -172,16 +165,16 @@ MFQ 在当前支持的两种精度粒度下都能保持高效的异构 MoE 执�
 
 | 模型 | 已发布精度系列 | 下载 |
 | --- | --- | --- |
+| Qwen3.8-Flash-Next | `V1-S`、`V1-M`、`S2-L`、`V3-XXS`、`S3-L`、`V4-XS`、`S4-L`、`S5-L` | [Hugging Face](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ) · [ModelScope](https://www.modelscope.cn/models/Tylogi/Qwen3.8-Flash-Next-EW-MFQ) |
 | DeepSeek-V4-Flash-0731 | 逐专家 `V2` 档位 | [Hugging Face](https://huggingface.co/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) · [ModelScope](https://www.modelscope.cn/models/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) |
 | Qwen3.8-27B | `V1`–`V4`、`S4`–`S6` 档位 | [ModelScope](https://www.modelscope.cn/models/Tylogi/Qwen3.8-27B-MFQ) |
-| Qwen3.6-27B | `V2`–`V3`、`S2`–`S6` 档位 | [Hugging Face](https://huggingface.co/Tylogi/Qwen3.6-27B-MFQ) |
 | MiniCPM-o 4.5 | `S4`–`S8` 多模态档位 | [ModelScope](https://www.modelscope.cn/models/Tylogi/MiniCPM-o-4_5-MFQ) |
 
 支持的架构系列：
 
 | 架构系列 | 后端 |
 | --- | --- |
-| Qwen3.5–3.8 | CUDA C++、Metal C++ |
+| Qwen3.5–3.8 | CUDA C++、Metal C++、HIP C++（稠密模型，开发中） |
 | Qwen Flash-Next / Qwen4 风格 | CUDA C++、Metal C++ |
 | DeepSeek-V4-Flash Series | CUDA C++、Metal C++ |
 | MiniCPM-o 4.5 | CUDA C++、Metal C++ |
@@ -190,59 +183,57 @@ MFQ 在当前支持的两种精度粒度下都能保持高效的异构 MoE 执�
 
 详细支持范围见[运行时支持矩阵](./docs/runtime-support.md)。
 
-## 工具与 API
-
-| 接口 | 用途 |
-| --- | --- |
-| **MFQ Studio** | 本地模型目录、加载生命周期、推理 Playground、服务器状态与资源控制 |
-| `mfq build` | 检测平台并编译优化的 CUDA 或 Metal C++ worker |
-| `mfq quantize` | 对 HF、GGUF 或满精度 MFQ 源模型应用统一或混合精度，并写出打包 `.mfq` 模型 |
-| `mfq calibrate` / `mfq solve-ew` | 收集激活与损失敏感度数据，评估并验证打包候选格式，并按精确序列化字节预算分配精度 |
-| `mfq serve` | 运行 MFQ Server、Studio/Web UI、模型 worker、Cache 与持久化服务 |
-| `mfq inspect` / `mfq optimize-layout` | 检查容器，并将张量重新打包为针对后端优化的布局 |
-
-MFQ 为应用与工具提供多种接口：
-
-- `/api/v1` 下的 **HTTP 控制 API**，用于管理模型、Session、Response、任务、
-  数据集、评测、Cache 和运行时状态；
-- 用于 token 与任务流式传输的 **Server-Sent Events**；
-- 用于音频与全双工 Session 的 **WebSocket 实时 API**；
-- 由受管 C++ worker 和运行时适配器提供的
-  **OpenAI 兼容 `/v1/models` 与 `/v1/chat/completions` 接口**；
-- 通过推理 API 提供**函数工具调用**；工具由客户端执行并回传结果。
-
-可以从 [HTTP API](./docs/api/http.md)、
-[WebSocket API](./docs/api/websocket.md) 或
-[`mfq serve` 参考](./docs/cli/serve.md)开始。
-
 ## 性能与质量
 
-### DeepSeek-V4-Flash-0731：模型大小与分布保真度
+### Qwen3.8-Flash-Next：本地推理速度
+
+#### Apple
+
+| 档位 | 内存占用 | 设备 | 输入长度 | 提示词处理 | 生成（无 MTP） | 生成（MTP） |
+| :--- | ---: | :--- | ---: | ---: | ---: | ---: |
+| [V1-M](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V1-M) | 43.36 GiB | Apple M5 Max · 40 核 GPU · 128 GB | 4,096 tokens | 2,538.5 tok/s | 71.6 tok/s | 101.2 tok/s |
+| [S2-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S2-L) | 47.41 GiB | Apple M5 Max · 40 核 GPU · 128 GB | 4,096 tokens | 2,538.9 tok/s | 71.0 tok/s | 97.9 tok/s |
+| [V3-XXS](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V3-XXS) | 50.33 GiB | Apple M5 Max · 40 核 GPU · 128 GB | 4,096 tokens | 2,527.6 tok/s | 70.8 tok/s | 105.4 tok/s |
+| [S3-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S3-L) | 57.95 GiB | Apple M5 Max · 40 核 GPU · 128 GB | 4,096 tokens | 2,565.6 tok/s | 68.1 tok/s | 98.2 tok/s |
+| [V4-XS](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V4-XS) | 61.48 GiB | Apple M5 Max · 40 核 GPU · 128 GB | 4,096 tokens | 2,540.1 tok/s | 67.7 tok/s | 96.7 tok/s |
+| [S4-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S4-L) | 78.25 GiB | Apple M5 Max · 40 核 GPU · 128 GB | 4,096 tokens | 2,481.7 tok/s | 63.6 tok/s | 93.6 tok/s |
+
+#### CUDA
+
+| 档位 | 内存占用 | 设备 | 输入长度 | 提示词处理 | 生成（无 MTP） | 生成（MTP） |
+| :--- | ---: | :--- | ---: | ---: | ---: | ---: |
+| [V1-S](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V1-S) | ≈41.04 GiB | 3090Ti + 32GiB RAM | 4,096 tokens | 1,779.7 tok/s | 62.9 tok/s | 87.0 tok/s |
+| [V1-M](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V1-M) | ≈42.90 GiB | 3090Ti + 32GiB RAM | 4,096 tokens | 1,787.2 tok/s | 63.4 tok/s | 77.5 tok/s |
+| [S2-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S2-L) | ≈46.93 GiB | 3090Ti + 32GiB RAM | 4,096 tokens | 1,707.8 tok/s | 58.8 tok/s | 77.8 tok/s |
+| [V3-XXS](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V3-XXS) | ≈49.81 GiB | 3090Ti + 32GiB RAM | 4,096 tokens | 1,626.2 tok/s | 51.7 tok/s | 61.0 tok/s |
+| [S3-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S3-L) | ≈57.28 GiB | 3090Ti + 64GiB RAM | 4,096 tokens | 1,408.5 tok/s | 39.4 tok/s | 42.1 tok/s |
+| [V4-XS](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V4-XS) | ≈60.72 GiB | 3090Ti + 64GiB RAM | 4,096 tokens | 1,317.1 tok/s | 36.0 tok/s | 36.2 tok/s |
+
+PLE 表按需从 SSD 读取，无需常驻内存。例如，V1-M 下载大小为 72.44 GiB，
+其中 PLE 表占 29.54 GiB，实际常驻权重为 43.36 GiB。
+
+### Qwen3.8-Flash-Next：模型大小与 KLD、Top1
+
+WikiText-2 评测：KLD 越低越好，与参考模型的 Top1 一致率越高越好。
 
 <p align="center">
-  <img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash MFQ 与相近大小基线的平均 KLD 对比" width="900">
+  <img src="./docs/figures/qwen38-flash-next-quality.png" alt="Qwen3.8-Flash-Next：MFQ、Unsloth UD 与 GSQ-RCO 的模型大小、KLD 和 Top1 一致率对比" width="1100">
 </p>
 
-评测使用官方 0731 权重和固定 WikiText-2 协议，在 `ctx=512` 下覆盖 573 个片段
-与 146,115 个计分 token。
-
-| 发布档位 | 大小 | 平均 KLD ↓ | Top-1 一致率 ↑ |
+| MFQ 档位 | 权重大小（GB） | KLD ↓ | Top1 一致率 ↑ |
 | --- | ---: | ---: | ---: |
-| `EW-V2-S` | 77.519 GiB | `0.313576` | `82.2913%` |
-| `EW-V2-M` | 88.007 GiB | `0.244488` | `84.5300%` |
-| `EW-V2-L` | 98.007 GiB | `0.201444` | `86.0753%` |
+| `V1-S` | 72.536 | 0.22157 | 83.77% |
+| `V1-M` | 74.529 | 0.19689 | 84.72% |
+| `S2-L` | 78.859 | 0.14630 | 86.54% |
+| `V3-XXS` | 81.952 | 0.12436 | 87.62% |
+| `S3-L` | 89.976 | 0.08698 | 89.55% |
+| `V4-XS` | 93.672 | 0.07524 | 90.36% |
 
-与本次评测中大小最接近的 Unsloth Dynamic 基线相比，MFQ 将平均 KLD 降低了
-**34.24–51.42%**。
+在约 74.5 GB 大小时，相比 Unsloth UD IQ1_M，**V1-M 的 KLD 降低 37.4%，
+Top1 一致率提高 5.03 个百分点**。
 
-### Qwen3.5-9B：相同精度档位对比
-
-<p align="center">
-  <img src="./docs/figures/qwen35-9b-mfq-vs-ud-size-kld.svg" alt="Qwen3.5-9B MFQ 与相近大小基线的平均 KLD 对比" width="900">
-</p>
-
-图中所有档位使用同一个 BF16 教师模型，并采用覆盖完整 145 个片段、148,335 个
-计分 token 的评测。MFQ 在图示每个匹配精度点上都取得了更低的原始平均 KLD。
+本项质量对比中的权重大小不含视觉编码器与 MTP 层，GB = 10⁹ 字节。
+完整对比与档位选择建议见[模型卡](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ)。
 
 ## 文档
 
@@ -250,6 +241,8 @@ MFQ 为应用与工具提供多种接口：
 - [构建 C++ 运行时](./docs/cli/build.md)
 - [量化模型](./docs/cli/quantize.md)
 - [运行 MFQ Server](./docs/cli/serve.md)
+- [HTTP API](./docs/api/http.md)
+- [WebSocket 与实时 API](./docs/api/websocket.md)
 - [运行时支持范围](./docs/runtime-support.md)
 - [MiniCPM-o 4.5 多模态运行时](./docs/minicpmo45.md)
 - [贡献指南与架构规范](./CONTRIBUTING.md)

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <future>
 #include <iostream>
 #include <stdexcept>
@@ -33,6 +34,16 @@ void wait_coalesced(const MoeHostExpertCache& cache,std::promise<void>& release)
 }
 
 int main() try {
+    {
+        MoeHostExpertCache cache(256);
+        check(!cache.find(key(9,-2)),"missing immutable image created a lease");
+        cache.acquire(key(0,-2),128,[]{return weight(128,17);});
+        auto held=cache.find(key(0,-2));bytes_equal(held,17);
+        check(cache.reclaim_optional(128)==0,"active immutable image was reclaimed");
+        cache.erase(key(0,-2));bytes_equal(held,17);
+        check(cache.stats().managed_bytes==128,"erased active image lost its reservation");
+        held.reset();check(cache.stats().managed_bytes==0,"immutable image lease leaked");
+    }
     {
         MoeHostExpertCache cache(1000);
         cache.acquire(key(0),400,[] { return weight(400,1); });
@@ -167,6 +178,53 @@ int main() try {
         check(outgoing->weights.nint.q_packed.data_ptr()==before && cache.stats().managed_bytes==64 &&
             cache.stats().managed_peak_bytes==64 && !cache.contains(key(0)),"tier exchange grew or copied the RAM allocation");
     }
+    {
+        MoeHostExpertCache cache(192);cache.preserve_resident_experts();
+        cache.acquire(key(0),128,[]{return weight(128,1);});
+        auto shadow=cache.acquire(key(0,-2),64,[]{return weight(64,7);});
+        int copies=0;
+        check(!cache.demote(key(1),64,[&]{++copies;return weight(64,2);}) && copies==0,
+            "active prefill backup lost its only CPU copy");
+        shadow.reset();
+        check(cache.demote(key(1),64,[&]{++copies;return weight(64,2);}) && copies==1,
+            "optional prefill backup blocked an expert demotion");
+        check(cache.contains(key(0)) && cache.contains(key(1)) && !cache.contains(key(0,-2)) &&
+            cache.stats().managed_peak_bytes<=192,"prefill backup evicted a last expert copy or exceeded RAM budget");
+    }
+    {
+        MoeHostExpertCache cache(512);cache.preserve_resident_experts();
+        cache.acquire(key(0),192,[]{return weight(192,1);});
+        cache.acquire(key(0,-2),64,[]{return weight(64,2);});
+        cache.acquire(key(1,-2),96,[]{return weight(96,3);});
+        auto active=cache.acquire(key(2,-2),32,[]{return weight(32,4);});
+        cache.acquire(key(0,-2),64,[]{throw std::runtime_error("backup reread");return weight(64,0);});
+        check(cache.stats().optional_bytes==192,"backup accounting includes required experts");
+        check(cache.reclaim_optional(0)==0 && cache.reclaim_optional(1)==96,
+            "pressure reclaim ignored backup LRU order");
+        check(!cache.contains(key(1,-2)) && cache.contains(key(0,-2)) && cache.contains(key(0)),
+            "pressure reclaim released a required expert or the newest backup");
+        check(cache.reclaim_optional(512)==64 && cache.stats().optional_bytes==32,
+            "pressure reclaim freed an active backup lease");
+        bytes_equal(active,4);active.reset();
+        check(cache.reclaim_optional(512)==32 && cache.stats().resident_bytes==192 &&
+            cache.stats().optional_bytes==0 && cache.stats().optional_reclaimed_bytes==192,
+            "pressure reclaim lost bytes or the only ordinary expert copy");
+    }
+    {
+        MoeHostExpertCache cache(128);
+        std::promise<void> started,release;auto gate=release.get_future().share();
+        auto pending=std::async(std::launch::async,[&] {
+            return cache.acquire(key(0,-2),64,[&] {started.set_value();gate.wait();return weight(64,9);});
+        });
+        started.get_future().wait();
+        const auto released=cache.reclaim_optional(128);
+        release.set_value();auto active=pending.get();
+        check(released==0,"pressure reclaim released an unpublished backup");
+        check(cache.reclaim_optional(128)==0,"pressure reclaim released the completed loader's lease");
+        bytes_equal(active,9);active.reset();
+        check(cache.reclaim_optional(128)==64 && cache.stats().managed_bytes==0,
+            "pressure reclaim could not reuse the completed backup allocation");
+    }
     int batch_cases=0;
     for(bool bulk:{false,true})for(int fail_at:{-2,0,1,2,3,-1}) {
         if(!bulk && fail_at==-2)continue;
@@ -205,7 +263,53 @@ int main() try {
         check(cache.stats().managed_bytes==192 && cache.stats().managed_peak_bytes==192,"batch duplicated RAM payloads");
         ++batch_cases;
     }
-    std::cout<<"atomic RAM exchange rollback, reader exclusion and publication checks passed batch_cases="<<batch_cases<<"\n";
+    int keyed_cases=0;
+    if(const auto* option=std::getenv("MFQ_MOE_KEYED_EXCHANGE");option && option[0]=='1')
+      for(bool fail:{false,true}) {
+        MoeHostExpertCache cache(192);cache.preserve_resident_experts();
+        auto held=cache.acquire(key(0),64,[]{return weight(64,1);});
+        cache.acquire(key(7),64,[]{return weight(64,7);});
+        std::promise<void> entered,release;
+        auto released=release.get_future().share();
+        std::vector<MoeHostExpertCache::Exchange> changes={{key(0),key(1),&held,
+            [](const MixedMoePool& original){return original;},
+            [](const MixedMoePool& original){std::memset(original.nint.q_packed.data_ptr(),1,64);}}};
+        auto exchange=std::async(std::launch::async,[&] {
+            try {
+                const bool done=cache.exchange_batch(changes,[&] {
+                    if(fail)throw std::runtime_error("expected keyed publication failure");
+                },[&] {
+                    std::memset(held->weights.nint.q_packed.data_ptr(),9,64);
+                    entered.set_value();released.wait();
+                });
+                return done && !fail;
+            }catch(const std::runtime_error&){return fail;}
+        });
+        entered.get_future().wait();
+        auto unrelated=std::async(std::launch::async,[&] {
+            bytes_equal(cache.acquire(key(7),64,[]{throw std::runtime_error("unrelated reread");return weight(64,0);}),7);
+            bytes_equal(cache.acquire(key(8),64,[]{return weight(64,8);}),8);
+            const auto stats=cache.stats();
+            return stats.resident_entries==3 && stats.managed_bytes==192 && stats.managed_peak_bytes==192;
+        });
+        auto old_reader=std::async(std::launch::async,[&]{return cache.find(key(0));});
+        auto new_reader=std::async(std::launch::async,[&]{return cache.find(key(1));});
+        const bool unrelated_ready=unrelated.wait_for(std::chrono::seconds(1))==std::future_status::ready;
+        const bool old_blocked=old_reader.wait_for(std::chrono::milliseconds(20))==std::future_status::timeout;
+        const bool new_blocked=new_reader.wait_for(std::chrono::milliseconds(20))==std::future_status::timeout;
+        // Release all workers before reporting a failure, including a legacy
+        // global-lock regression; future destruction must never deadlock.
+        release.set_value();
+        check(exchange.get(),"keyed publication/rollback failed");
+        check(unrelated_ready && unrelated.get(),"unrelated host expert was blocked or accounting changed");
+        auto old=old_reader.get(),next=new_reader.get();
+        check(old_blocked && new_blocked,"reader saw partially exchanged RAM");
+        if(fail){bytes_equal(old,1);check(!next,"failed keyed exchange published outgoing payload");}
+        else {check(!old,"keyed exchange retained incoming payload");bytes_equal(next,9);}
+        ++keyed_cases;
+      }
+    std::cout<<"atomic RAM exchange rollback, reader exclusion and publication checks passed batch_cases="<<batch_cases
+        <<" keyed_concurrency_cases="<<keyed_cases<<"\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr<<error.what()<<'\n';

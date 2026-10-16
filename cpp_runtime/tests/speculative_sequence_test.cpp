@@ -138,27 +138,39 @@ struct Ops {
     }
 };
 
-void run(bool dspark) {
+void run(bool dspark,bool metal_policy=false,bool inherited_park=false) {
+    struct PolicyOps : Ops {
+        bool metal_policy;
+        bool metal_mtp_policy() const {return metal_policy;}
+    };
     Model model;
     Predictor mtp;
     mtp.legacy = dspark;
+    if(inherited_park) {
+        mtp::BatchDepthPolicy previous({"previous"},3);
+        previous.start_parked(128);
+        mtp.policy_state.park_batch(previous);
+    }
     InferenceRequest request;
     request.chat = false;
     request.prompt = {0, 0, 0};
-    request.sampling.max_tokens = 256;
+    request.sampling.max_tokens = inherited_park?64:256;
     request.sampling.mtp_max_draft_tokens = 3;
     InferenceOutput output(request, nullptr, "mtp-test");
     Tensor last_hidden;
-    auto generation = speculative_sequence(Ops{model, mtp}, request, output, 512, 0, Tensor{}, &last_hidden);
+    auto generation = speculative_sequence(PolicyOps{Ops{model, mtp},metal_policy}, request, output, 512, 0, Tensor{}, &last_hidden);
     std::vector<int64_t> tokens;
     while (auto step = generation.next()) {
         if (!step.value) continue;
         if (const auto* delta = std::get_if<TokenOutput>(&*step.value))
             tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
     }
-    if (tokens != std::vector<int64_t>(256, 0) || model.cache_pos != 258 || !Ops::defined(last_hidden))
+    if (tokens != std::vector<int64_t>(request.sampling.max_tokens, 0) ||
+            model.cache_pos != request.sampling.max_tokens+2 || !Ops::defined(last_hidden))
         throw std::runtime_error("shared MTP output/cache boundary mismatch");
     const auto& stats = output.metrics.mtp;
+    if(inherited_park && (stats.park_count!=1 || stats.reentry_probes!=0 || stats.standard_tokens==0))
+        throw std::runtime_error("inherited Metal park was omitted from a short response's metrics");
     if (dspark ? stats.park_count != 0 || stats.standard_tokens != 0 :
         stats.park_count == 0 || stats.standard_tokens == 0)
         throw std::runtime_error("shared MTP policy dispatch mismatch");
@@ -382,6 +394,101 @@ void run_batched_greedy(bool penalties) {
         throw std::runtime_error("batched greedy sampling changed rejection/cache/penalty behavior");
 }
 
+void run_committed_route_hooks(bool accept_all,bool cancel_during_target=false,bool partial=false,bool retain_prefix=true) {
+    struct Journal {int pending=0,begins=0,commits=0,cancels=0,rows=0;};
+    struct JournalOps : Ops {
+        Journal* journal;bool accept_all,cancel_target,partial,retain_prefix;InferenceOutput* output;
+        bool retains_partial_target_prefix(int)const{return retain_prefix;}
+        void begin_target_routes(int rows) {
+            if(journal->pending || rows<2)throw std::runtime_error("route journal nested or entered ordinary prefill");
+            journal->pending=rows;++journal->begins;
+        }
+        void resolve_target_routes(int rows,bool cancelled) {
+            if(!journal->pending)return;
+            if(rows<1 || rows>journal->pending)throw std::runtime_error("route journal committed an invalid prefix");
+            if(cancelled)++journal->cancels;
+            else {++journal->commits;journal->rows+=rows;}
+            journal->pending=0;
+        }
+        Tensor target_forward(Tensor ids,Tensor* raw=nullptr,int64_t confirmed=0) {
+            if(confirmed && !journal->pending)throw std::runtime_error("route journal missed verification");
+            auto result=Ops::target_forward(ids,raw,confirmed);
+            if(confirmed && cancel_target)output->result.cancelled=true;
+            return result;
+        }
+        std::vector<int32_t> greedy_tokens(Tensor logits) {
+            std::vector<int32_t> tokens(size(logits,0),accept_all?1:0);
+            if(partial)tokens.front()=1;
+            return tokens;
+        }
+    };
+    Model model;Predictor mtp;mtp.legacy=true;Journal journal;
+    InferenceRequest request;request.chat=false;request.prompt={0,0,0};
+    request.sampling.max_tokens=9;request.sampling.mtp_max_draft_tokens=3;
+    InferenceOutput output(request,nullptr,"route-journal-hooks");
+    auto generation=speculative_sequence(JournalOps{{model,mtp},&journal,accept_all,cancel_during_target,partial,retain_prefix,&output},
+        request,output,512,0,Tensor{},nullptr);
+    while(generation.next().value){}
+    if(journal.pending || !journal.begins || journal.begins!=journal.commits+journal.cancels)
+        throw std::runtime_error("MTP route journal was left pending");
+    if(cancel_during_target ? journal.cancels!=1 || journal.commits!=0 :
+            journal.cancels!=0 || (partial?journal.rows!=(retain_prefix?2:1)*journal.commits:
+                accept_all?journal.rows<=journal.commits:journal.rows!=journal.commits))
+        throw std::runtime_error("MTP route journal lost rejection/cancellation/truncated output semantics");
+    if(!cancel_during_target && model.cache_pos!=int64_t(request.prompt.size())+request.sampling.max_tokens-1)
+        throw std::runtime_error("route journal changed the committed model cache boundary");
+}
+void early_target_prefetch() {
+    struct HintOps : Ops {
+        std::vector<char>* events;
+        static int32_t sample_normal(Tensor,Tensor) {return 0;}
+        void prefetch_target_first(int32_t token) {
+            if(token!=0)throw std::runtime_error("early target hint received an uncommitted proposal");
+            events->push_back('h');
+        }
+        void prefetch_committed_token(int32_t token) {
+            if(token!=0)throw std::runtime_error("PLE publication hint received an uncommitted token");
+            events->push_back('b');
+        }
+        void prefetch_target_prefix(int32_t token,const std::vector<int32_t>& drafts) {
+            if(token!=0 || drafts.empty() || drafts.size()>=3 ||
+               !std::all_of(drafts.begin(),drafts.end(),[](int32_t value){return value==0;}))
+                throw std::runtime_error("PLE draft prefix does not match the upcoming verification");
+            events->push_back('c');
+        }
+        Head predictor_step(Tensor hidden,Tensor ids,Tensor positions) {
+            events->push_back('p');return Ops::predictor_step(hidden,ids,positions);
+        }
+        Tensor target_forward(Tensor ids,Tensor* raw=nullptr,int64_t confirmed=0) {
+            events->push_back('t');return Ops::target_forward(ids,raw,confirmed);
+        }
+    };
+    for(int count:{1,32,96}) {
+        Model model;Predictor mtp;mtp.legacy=count!=96;std::vector<char> events;
+        InferenceRequest request;request.chat=false;request.prompt={0,0,0};
+        request.sampling.max_tokens=count;request.sampling.mtp_max_draft_tokens=3;
+        InferenceOutput output(request,nullptr,"early-target-prefetch");
+        auto generation=speculative_sequence(HintOps{Ops{model,mtp},&events},request,output,512,0,Tensor{},nullptr);
+        while(auto step=generation.next()) {
+            if(step.value && std::get_if<TokenOutput>(&*step.value) && !output.stopped() &&
+               (events.empty() || events.back()!='b'))
+                throw std::runtime_error("PLE hint was issued after token publication");
+        }
+        int hints=0,extensions=0,publications=0;
+        for(char event:events)if(event=='b')++publications;
+        for(std::size_t i=0;i<events.size();++i)if(events[i]=='h' || events[i]=='c') {
+            if(events[i]=='h')++hints;else ++extensions;
+            if(i+1>=events.size() || events[i+1]!='p')
+                throw std::runtime_error("target hint did not precede drafting");
+        }
+        if((count==1 && (hints || extensions || publications)) ||
+           (count>1 && (!hints || !extensions || !publications)) || model.cache_pos!=count+2 ||
+           (count==96 && !output.metrics.mtp.standard_tokens))
+            throw std::runtime_error("early target hint boundary: count="+std::to_string(count)+
+                " hints="+std::to_string(hints)+" extensions="+std::to_string(extensions)+
+                " cache="+std::to_string(model.cache_pos)+" events="+std::string(events.begin(),events.end()));
+    }
+}
 void batch_policy() {
     mtp::BatchDepthPolicy policy({"one", "two"}, 1);
     auto now = mtp::BatchDepthPolicy::Clock::time_point{};
@@ -438,8 +545,10 @@ void batch_policy() {
 }
 }
 
-int main() {
+int main() try {
     run(false);
+    run(false,true);
+    run(false,true,true);
     run(true);
     for(bool streaming:{false,true})for(int reused:{0,4})run_chunked_prompt_history(streaming,reused);
     run_prompt_snapshot_boundary();
@@ -450,6 +559,12 @@ int main() {
     run_history_batching();
     run_batched_greedy(false);
     run_batched_greedy(true);
+    run_committed_route_hooks(false);
+    run_committed_route_hooks(true);
+    run_committed_route_hooks(false,true);
+    run_committed_route_hooks(false,false,true);
+    run_committed_route_hooks(false,false,true,false);
+    early_target_prefetch();
     batch_policy();
     std::cout << "shared speculative sequence output/cache/dispatch tests passed\n";
-}
+}catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}

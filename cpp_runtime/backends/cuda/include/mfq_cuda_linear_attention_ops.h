@@ -60,3 +60,31 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     bool transposed_state,
     mfq_tensor_backend::Tensor workspace={},bool inplace_state=false,
     mfq_tensor_backend::Tensor state_addresses={});
+// Write speculative prefix snapshots with the producing core; no state-copy launches.
+// Batch one speculative sequence (2..8 rows, width128/taps4). The recurrence
+// stays in registers; prefix snapshots retain the existing rollback contract.
+// Recurrent state is updated in place. Returned convolution state is separate
+// and must be committed only after the window kernel completes on its stream.
+std::vector<mfq_tensor_backend::Tensor> gdn_decode_window_cuda(
+    const mfq_tensor_backend::Tensor& qkv,const mfq_tensor_backend::Tensor& output_gate,
+    const mfq_tensor_backend::Tensor& alpha,const mfq_tensor_backend::Tensor& beta,
+    const mfq_tensor_backend::Tensor& convolution_state,const mfq_tensor_backend::Tensor& recurrent_state,
+    const mfq_tensor_backend::Tensor& convolution_weight,const mfq_tensor_backend::Tensor& dt_bias,
+    const mfq_tensor_backend::Tensor& a_log,const mfq_tensor_backend::Tensor& norm_weight,
+    int key_heads,int value_heads,int confirmed,double convolution_eps,double norm_eps,
+    bool silu_gate,bool output_half,bool transposed_state,
+    const std::vector<mfq_tensor_backend::Tensor>& checkpoint_convolution,
+    const std::vector<mfq_tensor_backend::Tensor>& checkpoint_recurrent);
+
+std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_checkpoint_cuda(
+    mfq_tensor_backend::Tensor qkv, mfq_tensor_backend::Tensor output_gate,
+    mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta,
+    mfq_tensor_backend::Tensor convolution_state, mfq_tensor_backend::Tensor recurrent_state,
+    mfq_tensor_backend::Tensor convolution_weight, mfq_tensor_backend::Tensor dt_bias,
+    mfq_tensor_backend::Tensor a_log, mfq_tensor_backend::Tensor norm_weight,
+    int64_t key_heads, int64_t value_heads, int64_t width,
+    double convolution_eps, double norm_eps, bool silu_gate, bool output_half,
+    bool transposed_state,
+    mfq_tensor_backend::Tensor workspace,bool inplace_state,
+    mfq_tensor_backend::Tensor checkpoint_convolution,
+    mfq_tensor_backend::Tensor checkpoint_recurrent);

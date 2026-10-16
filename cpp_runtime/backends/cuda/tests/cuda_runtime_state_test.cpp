@@ -20,6 +20,9 @@
 #include "runtime/kv_expert_loan.h"
 #include "runtime/dma_copy_batch.h"
 
+#include <algorithm>
+#include <cmath>
+#include <numeric>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -32,6 +35,49 @@ using namespace mfq::cuda::internal;
 static void check(bool ok, const char *message) {
     if (!ok)
         throw std::runtime_error(message);
+}
+
+static void check_sampling_fallback() {
+    namespace tb=mfq_tensor_backend;
+    int checks=0;
+    auto context=default_context();const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
+    for(auto [vocab,k]:{std::pair{129,65},std::pair{4096,257},std::pair{4096,1024},std::pair{248320,65}})
+    for(int rows:{1,2})for(auto dtype:{tb::kFloat16,tb::kBFloat16,tb::kFloat32})for(float p:{0.f,.8f,1.f}) {
+        auto cpu=tb::empty({rows,vocab},tb::TensorOptions().device(tb::kCPU).dtype(tb::kFloat32));
+        auto logits=tb::zeros({rows,vocab},cpu.options().device(tb::kCUDA).dtype(dtype));
+        auto random=tb::zeros({rows},logits.options().dtype(tb::kFloat32));
+        tb::Tensor actual;
+        const auto body=[&]{actual={};actual=sample_top_k_top_p_cuda(logits,random,.7,k,p);};
+        {GraphWarmupScope warmup(context,stream);body();}
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));actual={};
+        Graph graph;graph.capture_begin_shared();body();graph.capture_end();
+        for(float u:{0.f,.137f,.731f,.99999994f}) {
+            for(int i=0;i<rows*vocab;++i)cpu.data_ptr<float>()[i]=u==0.f?0.f:std::sin(float(i)*.037f)*5.f;
+            logits.copy_(cpu.to(tb::kCUDA).to(dtype));random.fill_(u);graph.replay();
+            auto sampled=actual.cpu(),values=logits.to(tb::kCPU,tb::kFloat32);
+            for(int row=0;row<rows;++row) {
+                std::vector<int> order(vocab);std::iota(order.begin(),order.end(),0);
+                const auto* v=values.data_ptr<float>()+row*vocab;
+                std::vector<float> scaled(vocab);
+                for(int i=0;i<vocab;++i)scaled[i]=v[i]/.7f;
+                std::partial_sort(order.begin(),order.begin()+k,order.end(),[&](int a,int b){
+                    return scaled[a]>scaled[b] || (scaled[a]==scaled[b] && a<b);
+                });
+                std::vector<float> probabilities(k);float sum=0;
+                for(int i=0;i<k;++i){probabilities[i]=std::exp(scaled[order[i]]-scaled[order[0]]);sum+=probabilities[i];}
+                int keep=k;float keep_sum=sum;
+                if(p>0 && p<1) {
+                    float cumulative=0;
+                    for(int i=0;i<k;++i)if((cumulative+=probabilities[i])>=p*sum){keep=i+1;keep_sum=cumulative;break;}
+                }
+                float cdf=0;int expected=order[keep-1];
+                for(int i=0;i<keep;++i)if((cdf+=probabilities[i])>=u*keep_sum){expected=order[i];break;}
+                check(sampled.data_ptr<int64_t>()[row]==expected,"fallback top-k/top-p differs from CPU distribution");++checks;
+            }
+        }
+    }
+    context->end_graph_pool(stream);
+    std::cout<<"Fallback sampling CPU/graph checks="<<checks<<" top-k65/257/1024, Half/BFloat16/Float, ties and top-p PASS\n";
 }
 
 static void check_sampling_storage() {
@@ -985,6 +1031,93 @@ static void check_kv_expert_loan() {
     check(retired.bytes()==0,"KV growth did not revoke a retired expert field");
     result=destination.cpu().contiguous();
     for(int64_t i=0;i<result.numel();++i)check(result.data_ptr<uint8_t>()[i]==73,"retirement raced a pending expert copy");
+
+    // Non-KV expert pages must be independently reclaimable for graph
+    // widening, without dropping unrelated KV-backed entries or accounting
+    // their bytes as occupied KV storage.
+    KvExpertLoan flexible;
+    flexible.add(tb::zeros({256<<10},options),64,4096,true);
+    check(flexible.copy({10,1,0},source.data_ptr(),destination.data_ptr(),source.nbytes(),copy.get(),hit),
+        "flexible fixture did not cache its KV-backed expert");
+    const auto region=flexible.add(tb::zeros({256<<10},options),256<<10,1,true,1,true,true);
+    check(flexible.copy({10,2,0},source.data_ptr(),destination.data_ptr(),source.nbytes(),copy.get(),hit),
+        "flexible fixture did not fill the remaining KV pages");
+    check(flexible.copy({11,3,0},source.data_ptr(),destination.data_ptr(),source.nbytes(),copy.get(),hit),
+        "flexible expert allocation was not usable");
+    check(flexible.external_bytes()==source.nbytes(),"non-KV expert pages were not accounted separately");
+    const auto other_region=flexible.add(tb::zeros({256<<10},options),256<<10,1,true,1,true,true);
+    for(int expert:{4,5})check(flexible.copy({11,expert,0},source.data_ptr(),destination.data_ptr(),
+        source.nbytes(),copy.get(),hit),"second external expert allocation was not usable");
+    check(flexible.region_bytes(region)==2*source.nbytes() &&
+        flexible.region_bytes(other_region)==source.nbytes() && flexible.external_bytes()==3*source.nbytes(),
+        "independent graph and transfer regions were combined in per-region accounting");
+    flexible.remove(other_region);
+    flexible.remove(region);
+    check(flexible.external_bytes()==0 && flexible.bytes()==2*source.nbytes(),
+        "reclaiming graph capacity erased unrelated KV experts");
+    check(flexible.pin({10,1,0},source.data_ptr(),source.nbytes(),copy.get(),hit) && hit,
+        "reclaiming graph capacity invalidated an unrelated expert address");
+    result=destination.cpu().contiguous();
+    for(int64_t i=0;i<result.numel();++i)check(result.data_ptr<uint8_t>()[i]==73,
+        "graph capacity reclamation raced a pending expert upload");
+    const auto reused=flexible.add(tb::zeros({256<<10},options),256<<10,1,true,1,true,true);
+    check(reused==region,"repeated depth changes leaked expert-region descriptors");
+    check(flexible.copy({11,4,0},source.data_ptr(),destination.data_ptr(),source.nbytes(),copy.get(),hit),
+        "reclaimed graph capacity was not reusable by experts");
+    check(flexible.external_bytes()==source.nbytes(),"reused graph capacity has incorrect accounting");
+    flexible.remove(reused);
+    {
+        KvExpertLoan protected_cache;
+        protected_cache.add(tb::zeros({256<<10},options),256<<10,1,true,1,true,true);
+        for(int expert:{1,2})check(protected_cache.pin({31,expert,0},source.data_ptr(),source.nbytes(),copy.get(),hit),
+            "exchange-read fixture did not fill its cache");
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));
+        const auto* borrowed=protected_cache.find_for_exchange({31,1,0},source.nbytes());
+        std::optional<KvExpertLoan::ExchangeReadGuard> guard(protected_cache.retain_exchange_reads());
+        protected_cache.next_packet();protected_cache.retire_expert(31,1,1);protected_cache.next_packet();
+        check(protected_cache.find_for_exchange({31,1,0},source.nbytes())==borrowed,
+            "predictor packet reclaimed an exchange's retired source");
+        check(!protected_cache.pin({31,3,0},source.data_ptr(),source.nbytes(),copy.get(),hit),
+            "predictor pressure evicted an exchange's source instead of using its wire fallback");
+        guard.reset();protected_cache.next_packet();
+        check(!protected_cache.find_for_exchange({31,1,0},source.nbytes()) &&
+            protected_cache.pin({31,3,0},source.data_ptr(),source.nbytes(),copy.get(),hit),
+            "finished exchange kept blocking ordinary cache reclamation");
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));
+        std::optional<KvExpertLoan::ExchangeReadGuard> growth(protected_cache.retain_exchange_reads());
+        std::atomic<bool> released=false;
+        std::thread releaser([hold=std::move(growth),&released]() mutable {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            released=true;hold.reset();
+        });
+        protected_cache.protect(0,256<<10);
+        const bool respected=released.load();releaser.join();
+        check(respected && !protected_cache.bytes(),"KV growth reclaimed an exchange source before it finished");
+    }
+    {
+        KvExpertLoan scoped;
+        scoped.add(tb::zeros({256<<10},options),256<<10,1,true,1,true,true);
+        for(int expert:{1,2})check(scoped.pin({41,expert,0},source.data_ptr(),source.nbytes(),copy.get(),hit),
+            "scoped exchange fixture could not fill its cache");
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));scoped.next_packet();
+        std::optional<KvExpertLoan::ExchangeReadGuard> guard(scoped.retain_exchange_reads(false));
+        const auto* borrowed=scoped.find_for_exchange({41,1,0},source.nbytes(),&*guard);
+        check(borrowed && scoped.pin({41,3,0},source.data_ptr(),source.nbytes(),copy.get(),hit) &&
+            !scoped.find_for_exchange({41,2,0},source.nbytes()) &&
+            scoped.find_for_exchange({41,1,0},source.nbytes())==borrowed,
+            "scoped exchange pinned unrelated entries or lost its borrowed source");
+        // Nonadjacent repeated pins must balance, including retired entries.
+        check(scoped.find_for_exchange({41,3,0},source.nbytes(),&*guard),"second scoped pin failed");
+        check(scoped.find_for_exchange({41,1,0},source.nbytes(),&*guard)==borrowed,"repeated scoped pin changed address");
+        scoped.retire_expert(41,1,1);scoped.next_packet();
+        check(scoped.find_for_exchange({41,1,0},source.nbytes())==borrowed,
+            "scoped retirement freed a borrowed source");
+        guard.reset();scoped.next_packet();
+        check(!scoped.find_for_exchange({41,1,0},source.nbytes()) &&
+            scoped.pin({41,4,0},source.data_ptr(),source.nbytes(),copy.get(),hit),
+            "released scoped pins kept their retired payloads alive");
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));
+    }
 }
 
 static void check_kv_projection_loan() {
@@ -1042,6 +1175,11 @@ static void check_kv_projection_loan() {
     int late_observed=0;
     loan.observe_projections(7,[&](int64_t,const void* pointer,const auto&){late_observed+=pointer?1:-1;});
     check(late_observed==3,"new observer missed already published projections");
+    auto observer_owner=std::make_shared<int>(0);
+    int scoped_observed=0;
+    loan.observe_projections(7,[&](int64_t,const void*,const auto&){++scoped_observed;},observer_owner);
+    check(scoped_observed==3,"scoped observer missed published projections");
+    observer_owner.reset();
     const std::vector<int64_t> large={192<<10};
     const auto large_fill=[&](void* pointer,const auto&) {++uploads;
         MFQ_NATIVE_CUDA_CHECK(cudaMemsetAsync(pointer,41,192<<10,copy.get()));};
@@ -1051,6 +1189,7 @@ static void check_kv_projection_loan() {
     check(!loan.find_for_exchange({7,12,0},sizes[0]) && !loan.find_for_exchange({7,13,0},sizes[0]),
           "projection LRU did not evict unprotected entries");
     check(visible.size()==1 && invalidations==2 && late_observed==1,"evicted projections stayed GPU-visible");
+    check(scoped_observed==3,"released graph metadata still received projection callbacks");
     loan.retire_expert(7,11,4);loan.retire_expert(7,11,4);
     check(visible.empty() && invalidations==3,"retirement did not invalidate GPU eligibility exactly once");
     check(loan.find_for_exchange({7,11,1},sizes[1])!=nullptr,"retirement freed a live compact field");
@@ -1081,6 +1220,9 @@ static void check_workspace_loan() {
           "prefill did not borrow expert storage");
     check(context->memory_stats().allocated==charged,"loaned bytes were charged twice");
     a.zero_();b.zero_();a={};b={};
+    const auto touched=context->workspace_touched_regions();
+    check(touched.size()==1 && touched[0].first==address && touched[0].second==2048,
+          "prefill restore included unused expert storage or lost a freed slice");
     auto whole=empty({4096},arena.options());
     check(whole.data_ptr()==address,"workspace slices did not coalesce for the next phase");
     bool rejected=false;
@@ -1238,13 +1380,26 @@ void check_dma_copy_buckets() {
 #include "mfe_transfer_bench.h"
 #include "sampling_bench.h"
 #include "transfer_copy_bench.h"
+#include "kv_speculative_lru_test.h"
 int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    if(argc==2 && std::string(argv[1])=="--workspace-loan-check") {
+        check_workspace_loan();check_graph_workspace_reuse();
+        std::cout<<"CUDA workspace loan ranges and graph reuse checks passed\n";return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--kv-expert-loan-check") {
         const auto context=default_context();check_kv_expert_loan();check_kv_projection_loan();return 0;
     }
+    if(argc==2 && std::string(argv[1])=="--kv-speculative-lru-check") {
+        const auto context=default_context();check_kv_speculative_lru();return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--kv-speculative-lru-bench") {
+        const auto context=default_context();benchmark_kv_speculative_lru();return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--sampling-bench") {benchmark_sampling_keys();return 0;}
+    if(argc==2 && std::string(argv[1])=="--conditional-compact-sampling-check") {check_conditional_compact_sampling();return 0;}
+    if(argc==2 && std::string(argv[1])=="--sampling-fallback-check") {check_sampling_fallback();return 0;}
     if(argc==2 && std::string(argv[1])=="--sampling-check") {benchmark_sampling_keys(false);return 0;}
     if(argc==2 && std::string(argv[1])=="--transfer-copy-bench") {benchmark_transfer_copy();return 0;}
     if(argc==2 && std::string(argv[1])=="--transfer-copy-check") {benchmark_transfer_copy(false);return 0;}

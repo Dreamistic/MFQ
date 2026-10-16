@@ -27,6 +27,8 @@ struct Qwen4ExpMtp final : MtpModule {
     uint64_t graph_captures=0;
     uint64_t graph_replays = 0;
     bool graph_initialized = false;
+    bool compact_graph_sampling = true;
+    Tensor graph_compact_topk() const;
     bool take_graph_initialization() noexcept override { return std::exchange(graph_initialized,false); }
     uint64_t graph_replay_count() const noexcept override { return graph_replays; }
 
@@ -51,7 +53,8 @@ struct Qwen4ExpMtp final : MtpModule {
 
     MtpStep step(const MtpTarget &target, Tensor hidden, Tensor ids) override;
     MtpStep step_positioned(const MtpTarget &target, Tensor hidden, Tensor ids, Tensor positions) override;
-    void history_step(const MtpTarget &target, Tensor hidden, Tensor ids, Tensor positions = {});
+    void history_step(const MtpTarget &target, Tensor hidden, Tensor ids, Tensor positions = {},
+                      bool scalar_chain = false);
 
     int64_t cache_position() const noexcept override;
 

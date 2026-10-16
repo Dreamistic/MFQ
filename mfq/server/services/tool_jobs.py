@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import fnmatch
 import json
 import math
 import os
@@ -22,7 +23,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from mfq.server.api.network import download_environment
+from mfq.server.api.network import download_environment, hub_download_url
 from mfq.server.protocol.models import ErrorDetail
 from mfq.server.protocol.quantization import Wt2ReferencePayload
 from mfq.server.services.jobs import JobContext, JobExecutionError, TypedJobHandler
@@ -69,6 +70,7 @@ class HuggingFaceDownloadPayload(_Payload):
     include: list[str] = Field(default_factory=list, max_length=4096)
     exclude: list[str] = Field(default_factory=list, max_length=64)
     max_workers: int = Field(default=8, ge=1, le=16)
+    direct: bool = False
     expected_bytes: int | None = Field(default=None, ge=0)
 
 
@@ -569,7 +571,7 @@ class ToolJobHandlers:
                     argv.extend(["--exclude", pattern])
             else:
                 argv.extend(["--exclude", *request.exclude])
-        env, proxy = await download_environment("https://modelscope.cn", direct=request.direct)
+        env, proxy = await self._download_environment('modelscope', request)
         await context.log("Download connection: proxy" if proxy else "Download connection: direct")
         await context.progress(0.01, message="Starting ModelScope download")
         await self._run_download(context, argv, env, destination, request.expected_bytes)
@@ -613,7 +615,7 @@ class ToolJobHandlers:
         for pattern in request.exclude:
             argv.extend(["--exclude", pattern])
         await context.progress(0.01, message="Starting Hugging Face download")
-        env, proxy = await download_environment(os.environ.get("HF_ENDPOINT", "https://huggingface.co"))
+        env, proxy = await self._download_environment('huggingface', request)
         await context.log("Download connection: proxy" if proxy else "Download connection: direct")
         await self._run_download(context, argv, env, destination, request.expected_bytes)
         return await self._download_result(
@@ -1172,14 +1174,20 @@ class ToolJobHandlers:
             if process.returncode is not None:
                 return
             with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
+                if os.name == 'nt':
+                    process.terminate()
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
             try:
                 await asyncio.wait_for(
                     process.wait(), timeout=_TOOL_TERMINATE_TIMEOUT_SECONDS
                 )
             except asyncio.TimeoutError:
                 with suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
+                    if os.name == 'nt':
+                        process.kill()
+                    else:
+                        os.killpg(process.pid, signal.SIGKILL)
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(
                         process.wait(), timeout=_TOOL_KILL_TIMEOUT_SECONDS
@@ -1188,36 +1196,42 @@ class ToolJobHandlers:
         context.add_cleanup(stop)
         lines: deque[str] = deque(maxlen=_TOOL_OUTPUT_TAIL_LINES)
         assert process.stdout is not None
-        while True:
-            raw = await process.stdout.readline()
-            if not raw:
-                break
-            context.raise_if_cancelled()
-            line = raw.decode("utf-8", errors="replace").rstrip()
-            if not line:
-                continue
-            lines.append(line)
-            await context.log(line[:4096])
-            if progress_parser is not None:
-                parsed = progress_parser(line)
-                if parsed is not None:
-                    progress, message = parsed[:2]
-                    await context.progress(min(0.99, max(0.01, progress)), message=message[:200], data=parsed[2] if len(parsed) == 3 else None)
-            if progress_pattern is not None:
-                match = progress_pattern.search(line)
-                if match:
-                    amount = int(match.group(1))
-                    progress = amount / progress_total if progress_total else amount / 100
-                    await context.progress(min(0.99, max(0.01, progress)), message=line[:200])
-        status = await process.wait()
-        if status != 0:
-            raise self._failure(
-                "tool_process_failed",
-                f"tool process exited with status {status}",
-                retryable=status in {75, 130, 143},
-            )
-        await context.progress(final_progress, message=final_message)
-        return list(lines)
+        try:
+            while True:
+                raw = await process.stdout.readline()
+                if not raw:
+                    break
+                context.raise_if_cancelled()
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if not line:
+                    continue
+                lines.append(line)
+                await context.log(line[:4096])
+                if progress_parser is not None:
+                    parsed = progress_parser(line)
+                    if parsed is not None:
+                        progress, message = parsed[:2]
+                        await context.progress(min(0.99, max(0.01, progress)), message=message[:200], data=parsed[2] if len(parsed) == 3 else None)
+                if progress_pattern is not None:
+                    match = progress_pattern.search(line)
+                    if match:
+                        amount = int(match.group(1))
+                        progress = amount / progress_total if progress_total else amount / 100
+                        await context.progress(min(0.99, max(0.01, progress)), message=line[:200])
+            status = await process.wait()
+            if status != 0:
+                raise self._failure(
+                    "tool_process_failed",
+                    f"tool process exited with status {status}",
+                    retryable=status in {75, 130, 143},
+                )
+            await context.progress(final_progress, message=final_message)
+            return list(lines)
+        except BaseException:
+            # Download reservations close before JobContext cleanup. Reap the
+            # child here so it cannot hold disk-budget locks during that close.
+            await stop()
+            raise
 
 
     @staticmethod
@@ -1301,9 +1315,58 @@ class ToolJobHandlers:
             raise self._failure("input_not_found", f"input does not exist: {value}")
         return path
 
-    def _download_output(self, value: str, directory: str | None) -> Path:
+    async def _download_environment(self, provider: str, request) -> tuple[dict[str, str], bool]:
+        endpoint = os.environ.get('HF_ENDPOINT', 'https://huggingface.co') if provider == 'huggingface' else os.environ.get('MODELSCOPE_ENDPOINT', 'https://modelscope.cn')
+        filename = next((name for name in request.include if not any(char in name for char in '*?[')
+            and name.lower().endswith(('.mfq', '.safetensors', '.gguf', '.bin'))), None)
+        options = {'direct': True} if request.direct else {}
+        if filename and not request.direct:
+            options['sample_url'] = hub_download_url(provider, request.repo_id, request.revision, filename)
+        return await download_environment(endpoint, **options)
+
+    def download_request(self, kind: str, payload: dict[str, Any]):
+        model = HuggingFaceDownloadPayload if kind == 'download.huggingface' else ModelScopeDownloadPayload
+        request = model.model_validate(payload)
+        destination = self._download_output(request.destination, request.download_directory, create=False)
+        return request, destination
+
+    def download_destinations(self, kind: str, request) -> list[Path]:
+        destinations = [self._download_output(request.destination, request.download_directory, create=False)]
+        provider = kind.split('.')[1]
+        parts = Path(request.destination).parts
+        prefix = ('models', provider, *request.repo_id.split('/'))
+        if parts[:len(prefix)] == prefix:
+            mirror = 'modelscope' if provider == 'huggingface' else 'huggingface'
+            relative = str(Path('models', mirror, *parts[2:]))
+            destinations.append(self._download_output(relative, request.download_directory, create=False))
+        return destinations
+
+    @staticmethod
+    def download_files_present(destination: Path, request, files, *, mfq_only: bool = False) -> bool:
+        selected = [item for item in files if (not request.include or any(fnmatch.fnmatchcase(item.name, pattern) for pattern in request.include))
+            and not any(fnmatch.fnmatchcase(item.name, pattern) for pattern in request.exclude)]
+        if mfq_only:
+            weights = [item for item in selected if item.name.lower().endswith(('.mfq', '.gguf'))]
+            if weights:
+                selected = weights
+        if not selected:
+            return False
+        for item in selected:
+            path = (destination / item.name).resolve()
+            try:
+                complete = path.is_relative_to(destination) and path.is_file() and path.stat().st_size == item.byte_size
+            except OSError:
+                complete = False
+            if not complete:
+                return False
+        return True
+
+    def _download_output(self, value: str, directory: str | None, *, create: bool = True) -> Path:
         if directory is None:
-            return self._output(value, directory=True)
+            path = self._resolve(value)
+            if create:
+                path.mkdir(parents=True, exist_ok=True)
+            return path
         try:
             root = self.download_directories.directory(directory)
         except ValueError as error:
@@ -1316,7 +1379,8 @@ class ToolJobHandlers:
         destination = (root / relative).resolve()
         if destination == root or not destination.is_relative_to(root):
             raise self._failure("path_outside_workspace", "download destination must stay inside its folder")
-        destination.mkdir(parents=True, exist_ok=True)
+        if create:
+            destination.mkdir(parents=True, exist_ok=True)
         return destination
 
     def _output(self, value: str, *, directory: bool = False) -> Path:

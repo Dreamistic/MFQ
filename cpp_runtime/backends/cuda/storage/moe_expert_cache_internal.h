@@ -12,16 +12,32 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <future>
 
 struct MoeFfnPrefillHostWorkspace;
+struct CudaProfiler;
 class MoeExpertCache {
 public:
+    struct PrefillCopySubmission {
+        int layer=-1,slot=-1;
+        int copies=0,direct_copies=0;
+        int64_t direct_bytes=0,total_bytes=0,gate_up_bytes=0,down_bytes=0;
+        bool phased=false;
+        std::shared_ptr<CudaProfiler> profile;
+    };
+    void record_prefill_copy(const PrefillCopySubmission&);
+    PrefillCopySubmission finish_prefill_copy(int slot);
+    void finish_prefill_copies();
     std::shared_ptr<mfq::cuda::KvExpertLoan> kv_expert_loan_;
+    void prepare_direct_transfer_cache();
+    void release_direct_transfer_cache();
     std::size_t begin_prefill_loan(std::size_t workspace_bytes);
     void suspend_prefill_loan();
     void end_prefill_loan();
     bool prefill_loan_active() const {return bool(prefill_loan_);}
     std::size_t prefill_transfer_bytes(bool predictor=false) const;
+    std::optional<std::size_t> available_host_ram() const;
+    std::size_t reclaim_optional_host(std::size_t allocation_bytes);
     void set_workspace_reservation(std::function<void(std::size_t)> reserve,
                                    std::function<void(std::size_t)> reserve_ram={}) {
         reserve_workspace_=std::move(reserve);reserve_ram_workspace_=std::move(reserve_ram);
@@ -87,6 +103,9 @@ public:
     }
 
     ~MoeExpertCache() {
+        try{finish_prefill_copies();}catch(const std::exception& error) {
+            std::cerr<<"runtime_prefill_copy destructor_error="<<error.what()<<'\n';
+        }
         if(prefill_loan_)try{end_prefill_loan();}catch(const std::exception& e) {
             std::cerr<<"runtime_prefill_loan destructor_error="<<e.what()<<'\n';
         }
@@ -97,6 +116,9 @@ public:
             (void)cudaMemPoolSetAttribute(pipeline_prefill_pool_,cudaMemPoolAttrReleaseThreshold,
                 &pipeline_prefill_pool_previous_threshold_);
         moe_residency_.reset();
+        try {release_direct_transfer_cache();}catch(const std::exception& error) {
+            std::cerr<<"runtime_direct_expert_cache destructor_error="<<error.what()<<'\n';
+        }
         if(pipeline_pool_context_) {
             (void)cudaStreamSynchronize(pipeline_pool_stream_);
         }
@@ -337,6 +359,7 @@ public:
     bool complete_residency() const noexcept { return complete_residency_; }
     double ram_pcie_fraction() const noexcept { return ram_pcie_fraction_; }
     void finish_pipeline_exchanges() { if(moe_residency_)moe_residency_->apply_pending(); }
+    void prepare_predictor_exchange() { if(moe_residency_)moe_residency_->prepare_predictor(); }
     void prepare_decode_residency() { if(moe_residency_)moe_residency_->prepare_decode(); }
 
     void begin_route_experts(
@@ -454,6 +477,7 @@ public:
 
     void print_stats(std::ostream & stream) const {
         const auto host=host_experts_->stats();
+        const auto kv_spec=kv_expert_loan_?kv_expert_loan_->speculative_stats():mfq::cuda::KvExpertLoan::SpeculativeStats{};
         stream << "moe_cache_stats"
                << " budget_bytes=" << budget_bytes_
                << " allocated_bytes=" << allocated_bytes_
@@ -505,6 +529,8 @@ public:
                << " ram_pcie_experts=" << stats_.ram_pcie_experts
                << " ram_pcie_bytes=" << stats_.ram_pcie_bytes
                << " pipeline_serves=" << stats_.pipeline_serves
+               << " pipeline_prefill_cpu_copy_jobs=" << stats_.pipeline_prefill_cpu_copy_jobs
+               << " pipeline_prefill_cpu_copy_join_ns=" << stats_.pipeline_prefill_cpu_copy_join_ns
                << " pipeline_two_stage_serves=" << stats_.pipeline_two_stage_serves
                << " pipeline_route_wait_ns=" << stats_.pipeline_route_wait_ns
                << " pipeline_plan_ns=" << stats_.pipeline_plan_ns
@@ -518,6 +544,14 @@ public:
                << " pipeline_window_fetch_ns=" << stats_.pipeline_window_fetch_ns
                << " pipeline_window_cpu_ns=" << stats_.pipeline_window_cpu_ns
                << " pipeline_window_gpu_ns=" << stats_.pipeline_window_gpu_ns
+               << " pipeline_small_window_groups_1=" << stats_.pipeline_small_window_groups[1]
+               << " pipeline_small_window_groups_2=" << stats_.pipeline_small_window_groups[2]
+               << " pipeline_small_window_groups_3=" << stats_.pipeline_small_window_groups[3]
+               << " pipeline_small_window_groups_4=" << stats_.pipeline_small_window_groups[4]
+               << " pipeline_small_window_hot_groups_1=" << stats_.pipeline_small_window_hot_groups[1]
+               << " pipeline_small_window_hot_groups_2=" << stats_.pipeline_small_window_hot_groups[2]
+               << " pipeline_small_window_hot_groups_3=" << stats_.pipeline_small_window_hot_groups[3]
+               << " pipeline_small_window_hot_groups_4=" << stats_.pipeline_small_window_hot_groups[4]
                << " pipeline_dma_copies=" << stats_.pipeline_dma_copies
                << " pipeline_window_dma_copies=" << stats_.pipeline_window_dma_copies
                << " pipeline_window_dma_bytes=" << stats_.pipeline_window_dma_bytes
@@ -558,12 +592,22 @@ public:
                << " pipeline_kv_projection_early_hits=" << stats_.pipeline_kv_projection_early_hits
                << " pipeline_kv_gpu_resident_experts=" << stats_.pipeline_kv_gpu_resident_experts
                << " pipeline_kv_gpu_resident_bytes=" << stats_.pipeline_kv_gpu_resident_bytes
+               << " kv_mtp_lru_windows=" << kv_spec.windows
+               << " kv_mtp_lru_kept=" << kv_spec.kept
+               << " kv_mtp_lru_reverted_hits=" << kv_spec.reverted_hits
+               << " kv_mtp_lru_cold_insertions=" << kv_spec.cold_insertions
+               << " kv_mtp_lru_cancels=" << kv_spec.cancels
+               << " kv_mtp_lru_disabled=" << kv_spec.disabled
                << " pipeline_kv_gpu_early_gu_experts=" << stats_.pipeline_kv_gpu_early_gu_experts
                << " pipeline_reader_fence_reuses=" << stats_.pipeline_reader_fence_reuses
                << " pipeline_host_packet_serves=" << stats_.pipeline_host_packet_serves
+               << " pipeline_direct_packet_serves=" << stats_.pipeline_direct_packet_serves
+               << " pipeline_direct_packet_batch_serves=" << stats_.pipeline_direct_packet_batch_serves
                << " pipeline_host_packet_descriptor_bytes=" << stats_.pipeline_host_packet_descriptor_bytes
                << " pipeline_cached_phase_publishes=" << stats_.pipeline_cached_phase_publishes
                << " pipeline_kv_early_gu_serves=" << stats_.pipeline_kv_early_gu_serves
+               << " pipeline_gu_build_overlap_serves=" << stats_.pipeline_gu_build_overlap_serves
+               << " pipeline_gu_build_overlap_copies=" << stats_.pipeline_gu_build_overlap_copies
                << " pipeline_native_dma_batches=" << stats_.pipeline_native_dma_batches
                << " pipeline_native_dma_copies=" << stats_.pipeline_native_dma_copies
                << " pipeline_native_dma_fallbacks=" << stats_.pipeline_native_dma_fallbacks
@@ -587,6 +631,19 @@ public:
                << " residency_observed_routes=" << (moe_residency_?moe_residency_->stats().observed_routes:0)
                << " residency_rounds=" << (moe_residency_?moe_residency_->stats().scheduled_rounds:0)
                << " residency_candidates=" << (moe_residency_?moe_residency_->stats().candidate_bundles:0)
+               << " residency_staging_budget_skips=" << (moe_residency_?moe_residency_->stats().staging_budget_skips:0)
+               << " residency_plan_ns=" << (moe_residency_?moe_residency_->stats().plan_ns:0)
+               << " residency_decode_plan_ns=" << (moe_residency_?moe_residency_->stats().decode_plan_ns:0)
+               << " residency_speculative_windows=" << (moe_residency_?moe_residency_->stats().speculative_route_windows:0)
+               << " residency_speculative_committed_routes=" << (moe_residency_?moe_residency_->stats().speculative_routes_committed:0)
+               << " residency_speculative_heat_routes=" << (moe_residency_?moe_residency_->stats().speculative_heat_routes:0)
+               << " residency_speculative_discarded_routes=" << (moe_residency_?moe_residency_->stats().speculative_routes_discarded:0)
+               << " residency_speculative_cancels=" << (moe_residency_?moe_residency_->stats().speculative_route_cancels:0)
+               << " residency_shadow_backup_bytes=" << (moe_residency_?moe_residency_->stats().shadow_backup_bytes:0)
+               << " residency_shadow_backup_fields=" << (moe_residency_?moe_residency_->stats().shadow_backup_fields:0)
+               << " residency_shadow_index_rebuilds=" << (moe_residency_?moe_residency_->stats().shadow_index_rebuilds:0)
+               << " residency_shadow_index_matches=" << (moe_residency_?moe_residency_->stats().shadow_index_matches:0)
+               << " residency_shadow_index_backup_bytes=" << (moe_residency_?moe_residency_->stats().shadow_index_backup_bytes:0)
                << " residency_planned_bundles=" << (moe_residency_?moe_residency_->stats().planned_bundles:0)
                << " residency_committed_bundles=" << (moe_residency_?moe_residency_->stats().committed_bundles:0)
                << " residency_memory_rejections=" << (moe_residency_?moe_residency_->stats().memory_rejections:0)
@@ -701,6 +758,7 @@ public:
 
     std::vector<std::pair<std::string, double>> memory_metrics() const {
         const auto host = host_experts_->stats();
+        const auto residency=moe_residency_?moe_residency_->stats():MoeResidencyManager::Stats{};
         const auto resident = std::size_t(std::max<int64_t>(0, host_bytes_)) + host.resident_bytes;
         std::size_t gpu_weights=0;
         for(const auto& [signature,arena]:arenas_)
@@ -713,13 +771,54 @@ public:
         return {{"ram_expert_enabled", resident > 0 ? 1.0 : 0.0},
             {"resident_expert_cache_bytes",double(gpu_weights+(kv_expert_loan_?kv_expert_loan_->bytes():0))},
             {"expert_decode_transfer_bytes",double(transfer_bytes)},
+            {"expert_direct_cache_capacity_bytes",double(tensor_nbytes(pipeline_direct_cache_storage_))},
+            {"expert_wire_fallback_cells",double(pipeline_wire_fallback_cells_)},
+            {"expert_wire_fallback_bytes",double(pipeline_wire_fallback_bytes_)},
+            {"expert_gu_build_overlap_serves",double(stats_.pipeline_gu_build_overlap_serves)},
             {"ram_expert_payload_bytes", double(resident)},
+            {"ram_expert_optional_backup_bytes",double(host.optional_bytes)},
+              {"ram_expert_optional_reclaimed_bytes",double(host.optional_reclaimed_bytes)},
+              {"residency_shadow_backup_bytes",double(residency.shadow_backup_bytes)},
+              {"residency_shadow_backup_fields",double(residency.shadow_backup_fields)},
+              {"residency_shadow_index_rebuilds",double(residency.shadow_index_rebuilds)},
+              {"residency_shadow_index_matches",double(residency.shadow_index_matches)},
+              {"residency_shadow_index_backup_bytes",double(residency.shadow_index_backup_bytes)},
+              {"residency_scheduled_rounds",double(residency.scheduled_rounds)},
+              {"residency_predictor_overlap_rounds",double(residency.predictor_overlap_rounds)},
+              {"residency_predictor_overlap_serves",double(residency.predictor_overlap_serves)},
+              {"residency_committed_projections",double(residency.committed_projections)},
+              {"residency_exchange_bytes",double(residency.direct_exchange_bytes)},
+              {"residency_decode_plan_ms",double(residency.decode_plan_ns)/1e6},
+              {"residency_decode_join_ms",double(residency.decode_join_ns)/1e6},
+              {"residency_decode_dma_wait_ms",double(residency.decode_dma_wait_ns)/1e6},
+              {"residency_speculative_committed_routes",double(residency.speculative_routes_committed)},
+              {"residency_speculative_heat_routes",double(residency.speculative_heat_routes)},
+              {"decode_window_pcie_payload_bytes",double(stats_.pipeline_window_pcie_payload_bytes)},
+              {"decode_window_serves",double(stats_.pipeline_window_serves)},
+              {"prefill_cpu_copy_jobs",double(stats_.pipeline_prefill_cpu_copy_jobs)},
+              {"small_window_groups_1",double(stats_.pipeline_small_window_groups[1])},
+              {"small_window_groups_2",double(stats_.pipeline_small_window_groups[2])},
+              {"small_window_groups_3",double(stats_.pipeline_small_window_groups[3])},
+              {"small_window_groups_4",double(stats_.pipeline_small_window_groups[4])},
+              {"small_window_hot_groups_1",double(stats_.pipeline_small_window_hot_groups[1])},
+              {"small_window_hot_groups_2",double(stats_.pipeline_small_window_hot_groups[2])},
+              {"small_window_hot_groups_3",double(stats_.pipeline_small_window_hot_groups[3])},
+              {"small_window_hot_groups_4",double(stats_.pipeline_small_window_hot_groups[4])},
+              {"prefill_cpu_copy_join_ms",double(stats_.pipeline_prefill_cpu_copy_join_ns)/1e6},
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+            {"host_tensor_allocated_bytes",double(mfq::cuda::tensor_host_bytes.load())},
+#endif
             {"ram_expert_pcie_read_bytes", double(stats_.ram_pcie_bytes)}};
     }
 
 private:
     struct PrefillLoan {
-        struct Arena {MoeGpuArena* arena;int first;std::vector<mfq_tensor_backend::Tensor> saved;};
+        struct Arena {
+            MoeGpuArena* arena;int first;std::vector<mfq_tensor_backend::Tensor> saved;
+            MoeHostExpertCache::Lease owner;
+            mfq_tensor_backend::Tensor keys;
+            std::vector<std::pair<int,int>> refresh;
+        };
         struct Cohort {std::vector<int32_t> experts;std::vector<int64_t> fields;};
         struct Copy {const uint8_t* source;std::size_t offset,bytes;};
         struct Layer {std::size_t bytes=0;std::vector<Copy> copies;};
@@ -837,6 +936,9 @@ private:
     friend class MoeResidencyManager;
     friend void release_moe_prefill_buffers(MoeExpertCache* cache);
     friend void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);
+    friend void begin_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&,int);
+    friend void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&,int);
+    friend void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&) noexcept;
     friend bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
     friend struct MoeResidencyTestAccess;
     friend void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>&,bool);
@@ -846,6 +948,10 @@ private:
     std::unique_ptr<MoeResidencyManager> moe_residency_;
     std::vector<std::array<int,3>> pipeline_bundles_;
     std::unordered_map<std::string,std::unique_ptr<MoeGpuArena>> pipeline_stages_;
+    std::size_t pipeline_direct_cache_budget_=0;
+    mfq_tensor_backend::Tensor pipeline_direct_cache_storage_;
+    std::optional<std::size_t> pipeline_direct_cache_region_;
+    uint64_t pipeline_wire_fallback_cells_=0,pipeline_wire_fallback_bytes_=0;
     std::vector<std::function<void()>> pipeline_decode_release_;
     // Eager prefill projections execute in order on pipeline_pool_stream_.
     // Their quantization scratch can be reused across projections and layers.
@@ -865,6 +971,10 @@ private:
     std::array<cudaEvent_t,2> pipeline_prefill_layer_ready_{};
     std::array<cudaEvent_t,2> pipeline_prefill_layer_gate_up_ready_{};
     std::array<std::optional<int>,2> pipeline_prefill_layer_loaded_{};
+    std::array<std::future<PrefillCopySubmission>,2> pipeline_prefill_copy_tasks_;
+    std::array<std::optional<int>,2> pipeline_prefill_copy_targets_{};
+    int pipeline_prefill_copy_pending_=0;
+    bool pipeline_prefill_cpu_reported_=false;
     int pipeline_prefill_layer_last_served_=-1;
     std::array<cudaEvent_t,2> pipeline_prefill_layer_read_done_{};
     std::array<bool,2> pipeline_prefill_layer_read_recorded_{};

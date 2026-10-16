@@ -2,7 +2,9 @@
 #include "dma_copy_batch.h"
 #include <cuda.h>
 #include <array>
+#include <atomic>
 #include <cstddef>
+#include <cstdio>
 
 namespace mfq::cuda {
 // CUDA 13 Driver API, resolved by ABI version while retaining CUDA 12 builds.
@@ -43,33 +45,60 @@ public:
     // base to the device-visible alias once, before the consumer graph starts.
     template<class Alias>
     static bool submit(const std::vector<DmaCopy>& copies,cudaStream_t stream,int mode,Alias&& alias) {
-        if(!mode || copies.size()<2 || copies.size()>128 || !entry())return false;
-        std::array<CUdeviceptr,128> destinations{},sources{};
-        std::array<std::size_t,128> sizes{};
+        if(!mode || copies.size()<2 || !entry())return false;
+        constexpr std::size_t capacity=128;
+        if(copies.size()>capacity) {
+            const auto* multiple=std::getenv("MFQ_MOE_NATIVE_DMA_MULTI_BATCH");
+            if(multiple && multiple[0]=='0')return false;
+        }
+        struct Packet {
+            std::array<CUdeviceptr,capacity> destinations{},sources{};
+            std::array<std::size_t,capacity> sizes{};
+        } first_packet;
+        std::vector<Packet> extra_packets((copies.size()-1)/capacity);
+        const auto packet=[&](std::size_t index) -> Packet& {
+            return index?extra_packets[index-1]:first_packet;
+        };
+        // Validate every owner and alias before queuing any copy. An invalid
+        // field in a later packet must leave the entire fallback untouched.
         for(std::size_t i=0;i<copies.size();++i) {
             const auto& copy=copies[i];
             if(!copy.destination || !copy.source || !copy.bytes)
                 throw std::invalid_argument("empty native DMA field");
-            sources[i]=alias(copy.source,copy.bytes);
-            if(!sources[i])return false;
-            destinations[i]=reinterpret_cast<CUdeviceptr>(copy.destination);sizes[i]=copy.bytes;
+            auto& p=packet(i/capacity);const auto index=i%capacity;
+            p.sources[index]=alias(copy.source,copy.bytes);
+            if(!p.sources[index])return false;
+            p.destinations[index]=reinterpret_cast<CUdeviceptr>(copy.destination);p.sizes[index]=copy.bytes;
         }
         Attributes attributes;attributes.flags=mode>=2?1u:0u;
-        std::size_t first=0;
-        const auto result=entry()(destinations.data(),sources.data(),sizes.data(),copies.size(),
-            &attributes,&first,1,reinterpret_cast<CUstream>(stream));
-        if(result==CUDA_ERROR_NOT_SUPPORTED)return false;
-        if(result!=CUDA_SUCCESS) {
-            std::string detail="CUDA native DMA batch failed: "+std::to_string(result)+" copies="+std::to_string(copies.size());
-            for(std::size_t i=0;i<std::min<std::size_t>(copies.size(),12);++i) {
-                cudaPointerAttributes src{},dst{};
-                const auto source_status=cudaPointerGetAttributes(&src,copies[i].source);
-                const auto destination_status=cudaPointerGetAttributes(&dst,copies[i].destination);
-                detail+=" ["+std::to_string(i)+" bytes="+std::to_string(sizes[i])+" src="+std::to_string(sources[i])+
-                    " dst="+std::to_string(destinations[i])+" type="+std::to_string(int(src.type))+"/"+
-                    std::to_string(int(dst.type))+" query="+std::to_string(source_status)+"/"+std::to_string(destination_status)+"]";
+        for(std::size_t begin=0;begin<copies.size();begin+=capacity) {
+            auto& p=packet(begin/capacity);const auto count=std::min(capacity,copies.size()-begin);
+            std::size_t first=0;
+            const auto result=entry()(p.destinations.data(),p.sources.data(),p.sizes.data(),count,
+                &attributes,&first,1,reinterpret_cast<CUstream>(stream));
+            // Once a packet has been queued, a later failure must enter the
+            // caller's recovery path, never silently retry a partially queued list.
+            if(result==CUDA_ERROR_NOT_SUPPORTED && !begin)return false;
+            if(result!=CUDA_SUCCESS) {
+                std::string detail="CUDA native DMA batch failed: "+std::to_string(result)+
+                    " copies="+std::to_string(copies.size())+" offset="+std::to_string(begin);
+                for(std::size_t i=0;i<std::min<std::size_t>(count,12);++i) {
+                    const auto& copy=copies[begin+i];
+                    cudaPointerAttributes src{},dst{};
+                    const auto source_status=cudaPointerGetAttributes(&src,copy.source);
+                    const auto destination_status=cudaPointerGetAttributes(&dst,copy.destination);
+                    detail+=" ["+std::to_string(begin+i)+" bytes="+std::to_string(p.sizes[i])+" src="+std::to_string(p.sources[i])+
+                        " dst="+std::to_string(p.destinations[i])+" type="+std::to_string(int(src.type))+"/"+
+                        std::to_string(int(dst.type))+" query="+std::to_string(source_status)+"/"+std::to_string(destination_status)+"]";
+                }
+                throw std::runtime_error(detail);
             }
-            throw std::runtime_error(detail);
+        }
+        if(!extra_packets.empty()) {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                "moe_native_dma_multibatch_dispatch copies=%zu packets=%zu capacity=%zu\n",
+                copies.size(),extra_packets.size()+1,capacity);
         }
         return true;
     }

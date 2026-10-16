@@ -489,7 +489,10 @@ __global__ void sample_top_k_top_p_kernel(
     }
     if (threadIdx.x != 0) return;
     float max_v = top_vals[0];
-    float probs[SAMPLE_MAX_TOP_K];
+    // Selection is complete; reuse its shared values for probabilities. A
+    // 1024-float thread-local array grows the context's device stack backing
+    // even though only thread zero samples, costing hundreds of MiB on Ampere.
+    float* probs = top_vals;
     float sum = 0.0f;
     for (int j = 0; j < top_k; ++j) {
         probs[j] = expf(top_vals[j] - max_v);
@@ -616,8 +619,9 @@ mfq_tensor_backend::Tensor sample_softmax_cuda(mfq_tensor_backend::Tensor logits
     return out;
 }
 
-mfq_tensor_backend::Tensor sample_top_k_compact_cuda(
-    mfq_tensor_backend::Tensor logits,int64_t top_k) {
+template<bool Conditional>
+static mfq_tensor_backend::Tensor sample_top_k_compact_impl(
+    mfq_tensor_backend::Tensor logits,int64_t top_k,const volatile int32_t* enabled) {
     MFQ_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.dim()==2,
         "sample_top_k_compact: logits must be contiguous CUDA [B,V]");
     MFQ_RUNTIME_CHECK(logits.scalar_type()==mfq_tensor_backend::kFloat32 ||
@@ -636,23 +640,32 @@ mfq_tensor_backend::Tensor sample_top_k_compact_cuda(
     const auto stream=mfq_current_cuda_stream();
     MFQ_DISPATCH_FLOATING_TYPES_AND2(mfq_dispatch_half,mfq_dispatch_bfloat16,
         logits.scalar_type(),"sample_top_k_compact",[&] {
-            if(items==8)sample_radix_keys_first<scalar_t,8,true><<<dim3(blocks,B),SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k));
-            else if(items==4)sample_radix_keys_first<scalar_t,4,true><<<dim3(blocks,B),SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k));
-            else sample_radix_keys_first<scalar_t,1,true><<<dim3(blocks,B),SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k));
+            if(items==8)sample_radix_keys_first<scalar_t,8,true,Conditional><<<dim3(blocks,B),SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k),enabled);
+            else if(items==4)sample_radix_keys_first<scalar_t,4,true,Conditional><<<dim3(blocks,B),SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k),enabled);
+            else sample_radix_keys_first<scalar_t,1,true,Conditional><<<dim3(blocks,B),SAMPLE_BD,0,stream>>>(logits.data_ptr<scalar_t>(),first,V,int(top_k),enabled);
         });
     int count=blocks*int(top_k);
     while(count>SAMPLE_BD) {
         const int next=(count+SAMPLE_BD-1)/SAMPLE_BD;
-        sample_radix_keys_reduce<true,true><<<dim3(next,B),SAMPLE_BD,0,stream>>>(first,second,count,int(top_k));
+        sample_radix_keys_reduce<true,true,Conditional><<<dim3(next,B),SAMPLE_BD,0,stream>>>(first,second,count,int(top_k),enabled);
         std::swap(first,second);count=next*int(top_k);
     }
     MFQ_DISPATCH_FLOATING_TYPES_AND2(mfq_dispatch_half,mfq_dispatch_bfloat16,
         logits.scalar_type(),"sample_top_k_compact_finish",[&] {
-            sample_radix_compact_finish<scalar_t,true><<<dim3(1,B),SAMPLE_BD,0,stream>>>(
-                first,logits.data_ptr<scalar_t>(),reinterpret_cast<uint64_t*>(out.data_ptr<int64_t>()),count,V,int(top_k));
+            sample_radix_compact_finish<scalar_t,true,Conditional><<<dim3(1,B),SAMPLE_BD,0,stream>>>(
+                first,logits.data_ptr<scalar_t>(),reinterpret_cast<uint64_t*>(out.data_ptr<int64_t>()),count,V,int(top_k),enabled);
         });
     MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
     return out;
+}
+
+mfq_tensor_backend::Tensor sample_top_k_compact_cuda(mfq_tensor_backend::Tensor logits,int64_t top_k) {
+    return sample_top_k_compact_impl<false>(std::move(logits),top_k,nullptr);
+}
+mfq_tensor_backend::Tensor sample_top_k_compact_if_cuda(
+        mfq_tensor_backend::Tensor logits,int64_t top_k,const volatile int32_t* enabled) {
+    MFQ_RUNTIME_CHECK(enabled,"sample_top_k_compact_if: null replay flag");
+    return sample_top_k_compact_impl<true>(std::move(logits),top_k,enabled);
 }
 
 mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(

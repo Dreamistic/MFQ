@@ -9,6 +9,7 @@
 #include "mlx_sampling.h"
 #include "mlx_ssd_expert_cache.h"
 #include "mlx_qsa_kv_offload.h"
+#include "mlx_grid_vision.h"
 
 #include "mfq/token_constraint.h"
 
@@ -70,6 +71,9 @@ struct Qwen4Config {
     std::vector<std::int64_t> rope_sections;
     std::vector<std::int64_t> ple_layer_ids;
     std::vector<std::string> layer_types;
+    std::optional<GridVisionConfig> vision;
+    std::optional<std::int64_t> image_token_id;
+    std::optional<std::int64_t> video_token_id;
 
     static Qwen4Config from_json(std::string_view payload);
     static Qwen4Config from_mfq(const MfqContainer& model);
@@ -172,6 +176,18 @@ public:
         int prefill_chunk_size = 2048,
         const MlxPrefixCacheHooks& prefix_cache = {});
 
+    MlxPreparedPrompt prepare_multimodal_prompt(
+        const std::vector<std::int64_t>& prompt,
+        const MlxGridMediaInput& media) const;
+    std::int32_t generate_prepared(
+        const MlxPreparedPrompt& prompt,
+        const MlxSamplingParams& sampling,
+        std::int32_t max_tokens,
+        const std::function<bool(std::int64_t)>& callback = {},
+        const std::function<void(std::size_t, double)>& prefill_callback = {},
+        const MfqTokenConstraintPtr& token_constraint = {});
+    std::string_view multimodal_input_contract() const noexcept;
+
     const Qwen4Config& config() const noexcept;
     std::size_t layer_count() const noexcept;
     int cache_position() const noexcept;
@@ -192,7 +208,7 @@ public:
     std::size_t dynamic_weight_bytes() const noexcept;
     std::size_t ssd_ple_payload_bytes() const noexcept;
     std::size_t ssd_expert_payload_bytes() const noexcept;
-    bool supports_multimodal() const noexcept { return false; }
+    bool supports_multimodal() const noexcept;
     bool supports_text_session_state() const noexcept { return true; }
     MlxQwen4TextSessionState capture_text_session_state(
         const std::vector<std::int64_t>& tokens, bool detached = true) const;
@@ -209,6 +225,16 @@ public:
     std::vector<std::pair<std::string, double>> mtp_session_metrics() const;
 
 private:
+    std::int32_t generate_prepared_impl(
+        const MlxPreparedPrompt& prompt,
+        const MlxSamplingParams& sampling,
+        std::int32_t max_tokens,
+        const std::function<bool(std::int64_t)>& callback,
+        const std::function<void(std::size_t, double)>& prefill_callback,
+        const MfqTokenConstraintPtr& token_constraint,
+        std::optional<std::size_t> stable_prefix_tokens,
+        int prefill_chunk_size,
+        const MlxPrefixCacheHooks& prefix_cache);
     std::pair<mlx::core::array, mlx::core::array> forward_requests(
         const std::vector<std::shared_ptr<MlxQwen4RequestCache>>& caches,
         const std::vector<std::int64_t>& tokens, int rows, bool speculative);

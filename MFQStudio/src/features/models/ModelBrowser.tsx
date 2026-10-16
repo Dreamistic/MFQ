@@ -16,6 +16,7 @@ import type {
   OfficialModelSource,
 } from '../../shared/api/types';
 import { jobsApi } from '../../shared/api/resources/jobs';
+import { errorMessage } from '../../app/formatters';
 import { modelsApi } from '../../shared/api/resources/models';
 import { openStudioExternal } from '../../shared/platform/studio';
 import { BackendBadge } from './BackendBadge';
@@ -277,6 +278,8 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   const [officialSelection, setOfficialSelection] = useState<string | null>(null);
   const [officialSource, setOfficialSource] = useState<OfficialModelSource | null>(null);
   const [officialSourceInfo, setOfficialSourceInfo] = useState<HubModelInfo | null>(null);
+  const [automaticSource, setAutomaticSource] = useState<OfficialModelSource | null>(null);
+  const [sourceProbing, setSourceProbing] = useState(false);
   const [provider, setProvider] = useState<HubModelSummary["provider"]>("huggingface");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<HubModelSummary[]>([]);
@@ -292,6 +295,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   const catalogTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const catalogController = useRef<AbortController | null>(null);
   const communityRequest = useRef(0);
+  const sourceProbeRequest = useRef(0);
 
   const selectedOfficial = useMemo(
     () => official?.data.find((item) => item.id === officialSelection) ?? official?.data[0] ?? null,
@@ -299,7 +303,29 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   );
   const selectedSource = selectedOfficial?.sources.find((source) =>
     source.provider === officialSource?.provider && source.repo_id === officialSource.repo_id)
+    ?? selectedOfficial?.sources.find((source) => source.provider === automaticSource?.provider && source.repo_id === automaticSource.repo_id)
     ?? selectedOfficial?.selected_source ?? null;
+  const sourceProbeKey = selectedOfficial?.sources.filter(source => source.available)
+    .map(source => `${source.provider}:${source.repo_id}:${source.revision ?? ''}`).join('|') ?? '';
+
+  useEffect(() => {
+    const request = ++sourceProbeRequest.current;
+    const controller = new AbortController();
+    const sources = selectedOfficial?.sources.filter(source => source.available) ?? [];
+    if (officialSource || sources.length < 2) { setSourceProbing(false); return; }
+    setSourceProbing(true);
+    void modelsApi.probeDownloadSources(sources.map(({ provider, repo_id, revision }) => ({ provider, repo_id, revision })), controller.signal)
+      .then(async result => {
+        if (request !== sourceProbeRequest.current) return;
+        const fastest = result.data.filter(item => item.bytes_per_second > 0)
+          .sort((a, b) => b.bytes_per_second - a.bytes_per_second)[0];
+        const source = sources.find(item => item.provider === fastest?.provider && item.repo_id === fastest.repo_id);
+        if (source) await chooseOfficialSource(source, true);
+      }).catch(() => {}).finally(() => {
+        if (request === sourceProbeRequest.current) setSourceProbing(false);
+      });
+    return () => { controller.abort(); sourceProbeRequest.current += 1; };
+  }, [selectedOfficial?.id, sourceProbeKey, officialSource === null]);
   const sourceInfoMatches = !!officialSourceInfo && officialSourceInfo.provider === selectedSource?.provider
     && officialSourceInfo?.repo_id === selectedSource?.repo_id
     && (!selectedSource?.revision || officialSourceInfo?.revision === selectedSource.revision);
@@ -368,13 +394,19 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
     officialRequest.current += 1;
     setOfficialSelection(item.id);
     setOfficialSource(null);
+    setAutomaticSource(null);
     setOfficialSourceInfo(null);
     setOfficialLoading(false);
   }
 
-  async function chooseOfficialSource(source: OfficialModelSource) {
+  async function chooseOfficialSource(source: OfficialModelSource, automatic = false) {
     const request = ++officialRequest.current;
-    setOfficialSource(source);
+    if (automatic) setAutomaticSource(source);
+    else {
+      sourceProbeRequest.current += 1;
+      setSourceProbing(false);
+      setOfficialSource(source);
+    }
     setOfficialSourceInfo(null);
     if (!source.available) {
       setOfficialLoading(false);
@@ -390,7 +422,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
       if (request === officialRequest.current) setOfficialSourceInfo(info);
     } catch (cause) {
       if (request === officialRequest.current) {
-        setOfficialSource(null);
+        if (automatic) setAutomaticSource(null); else setOfficialSource(null);
         onError(cause instanceof Error ? cause.message : String(cause));
       }
     } finally {
@@ -458,7 +490,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
       });
       onJobCreated(created, origin);
     } catch (cause) {
-      onError(cause instanceof Error ? cause.message : String(cause));
+      onError(errorMessage(cause, tr));
     } finally {
       setDownloading(null);
     }
@@ -522,10 +554,15 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                   <div><dt>{tr("发布时间", "Published")}</dt><dd>{formatDate(selectedOfficial.published_at || selectedOfficial.updated_at)}</dd></div>
                 </dl>
                 <KvCachePlanner key={`kv:${officialPlanKey}`} profile={selectedMetadata?.cache_profile} appliedContext={officialContext} onApply={(context) => applyPlan(officialPlanKey, context)} tr={tr} />
-                <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => { const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source); }} value={String(Math.max(0, selectedOfficial.sources.findIndex((item) => item.provider === selectedSource.provider && item.repo_id === selectedSource.repo_id)))}>{selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
+                <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => {
+                  if (event.target.value === 'auto') { setOfficialSource(null); return; }
+                  const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source);
+                }} value={officialSource ? String(Math.max(0, selectedOfficial.sources.findIndex((item) => item.provider === selectedSource.provider && item.repo_id === selectedSource.repo_id))) : 'auto'}>
+                  <option value="auto">{sourceProbing ? tr('自动 · 正在测速…', 'Auto · testing speed…') : `${tr('自动', 'Auto')} · ${selectedSource.provider === 'huggingface' ? 'Hugging Face' : 'ModelScope'}`}</option>
+                  {selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
                 <div className="repository-line"><button onClick={() => void openStudioExternal(selectedSource.url).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{selectedSource.repo_id}</button><span>{officialVariants.length} {tr("个精度版本", "variants")}</span></div>
                 <p className="model-weight-pressure-note">{tr('下方压力条与百分比表示常驻权重对当前剩余显存、内存或统一内存推理预算的压力，不是磁盘占用。', 'The bars and percentages below show resident-weight pressure on the currently available VRAM, RAM or unified-memory inference budget, not disk usage.')}<br />{tr('基于不同模型架构的推理特性，在非统一内存设备上，MoE 模型的推理预算统计内存 + 显存，Dense 模型的推理预算仅统计显存。', 'Because inference characteristics vary by architecture, on devices without unified memory, MoE inference budgets include RAM + VRAM, while Dense inference budgets include only VRAM.')}</p>
-                <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={plannedOfficialVariants} cacheBytes={officialCacheBytes} system={official?.system} moe={(parameters?.routed_experts ?? 0) > 0 || selectedOfficial.capabilities.includes('MoE')} />
+                <VariantList disabled={officialLoading || sourceProbing || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={plannedOfficialVariants} cacheBytes={officialCacheBytes} system={official?.system} moe={(parameters?.routed_experts ?? 0) > 0 || selectedOfficial.capabilities.includes('MoE')} />
                 {sourceInfoMatches && <RepositoryFiles key={`${selectedSource.provider}:${selectedSource.repo_id}:${officialSourceInfo!.revision}`}
                   files={officialSourceInfo!.files} disabled={officialLoading || !canDownload(selectedSource.provider) || downloading !== null} tr={tr}
                   onDownload={(files, label, origin) => void download(officialSourceInfo!, {

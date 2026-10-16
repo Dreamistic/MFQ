@@ -76,6 +76,83 @@ beforeEach(() => {
 });
 
 describe('useModelCatalog', () => {
+  it('removes deleted checkpoints on the next fresh scan without a job change', async () => {
+    vi.useFakeTimers();
+    try {
+      state.ready = true;
+      const { result, unmount } = renderHook(useModelCatalog, { wrapper: Wrapper });
+      await act(async () => { await Promise.resolve(); });
+      expect(modelsApi.modelArtifacts).toHaveBeenLastCalledWith(true);
+      expect(result.current.artifacts).toEqual([artifact]);
+      vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(result.current.artifacts).toEqual([]);
+      expect(result.current.filteredArtifacts).toEqual([]);
+      unmount();
+      const calls = vi.mocked(modelsApi.modelArtifacts).mock.calls.length;
+      await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+      expect(modelsApi.modelArtifacts).toHaveBeenCalledTimes(calls);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('rescans on focus or visibility without overlapping catalog reads', async () => {
+    vi.useFakeTimers();
+    try {
+      const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+      state.ready = true;
+      let resolve!: (items: ModelArtifact[]) => void;
+      vi.mocked(modelsApi.modelArtifacts).mockReturnValue(new Promise(done => { resolve = done; }));
+      const { result, unmount } = renderHook(useModelCatalog, { wrapper: Wrapper });
+      await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+      expect(modelsApi.modelArtifacts).not.toHaveBeenCalled();
+      hidden.mockReturnValue(false);
+      act(() => { document.dispatchEvent(new Event('visibilitychange')); });
+      act(() => { window.dispatchEvent(new Event('focus')); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+      expect(modelsApi.modelArtifacts).toHaveBeenCalledTimes(1);
+      await act(async () => { resolve([artifact]); await Promise.resolve(); });
+      expect(result.current.artifacts).toEqual([artifact]);
+      vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([]);
+      await act(async () => { window.dispatchEvent(new Event('focus')); await Promise.resolve(); });
+      expect(modelsApi.modelArtifacts).toHaveBeenCalledTimes(2);
+      expect(result.current.artifacts).toEqual([]);
+      unmount();
+      act(() => { window.dispatchEvent(new Event('focus')); });
+      expect(modelsApi.modelArtifacts).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not resurrect an old catalog response after changing servers', async () => {
+    state.ready = true;
+    let resolve!: (items: ModelArtifact[]) => void;
+    vi.mocked(modelsApi.modelArtifacts).mockReturnValueOnce(new Promise(done => { resolve = done; }))
+      .mockResolvedValue([]);
+    const { result, rerender } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    setApiBaseUrl('http://other-server:8090');
+    state.connectionRevision++;
+    rerender();
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { resolve([artifact]); await Promise.resolve(); });
+    expect(result.current.artifacts).toEqual([]);
+  });
+
+  it('does not overwrite a newly registered catalog with an older poll', async () => {
+    state.ready = true;
+    let resolve!: (items: ModelArtifact[]) => void;
+    vi.mocked(modelsApi.modelArtifacts).mockReturnValueOnce(new Promise(done => { resolve = done; }))
+      .mockResolvedValue([artifact]);
+    vi.spyOn(modelsApi, 'modelDirectories').mockResolvedValue({ current_id: 'folder', current_name: 'models',
+      current_path: '/models', parent_id: null, model_file_count: 1, data: [] });
+    vi.spyOn(modelsApi, 'registerModelDirectory').mockResolvedValue([artifact]);
+    vi.spyOn(modelsApi, 'loadModel').mockResolvedValue({ operation_id: 'load', status: 'accepted' });
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await act(async () => result.current.chooseModelDirectory());
+    await act(async () => result.current.registerCurrentModelDirectory());
+    expect(result.current.artifacts).toEqual([artifact]);
+    await act(async () => { resolve([{ ...artifact, id: 'deleted', name: 'Deleted model' }]); await Promise.resolve(); });
+    expect(result.current.artifacts).toEqual([artifact]);
+  });
+
   it('does not continue registration or save the old folder after changing server', async () => {
     vi.spyOn(modelsApi, 'modelDirectories').mockResolvedValue({ current_id: 'old-folder', current_name: 'models',
       current_path: '/old/models', parent_id: null, model_file_count: 1, data: [] });

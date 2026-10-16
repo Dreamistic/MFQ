@@ -80,6 +80,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/ple_fused.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm5_next.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gated_delta_net.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/gdn_decode_window.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
     ${MFQ_CUDA_KERNEL_ROOT}/paged_kv.cu
@@ -110,6 +111,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
 add_library(mfq-cuda-native-kernels STATIC
     ${MFQ_CUDA_KERNEL_SOURCES}
     ${MFQ_CUDA_ROOT}/kernels/float_projection.cu
+    ${MFQ_CUDA_ROOT}/kernels/gr_prefill_blas.cu
     ${MFQ_CUDA_ROOT}/kernels/kv_quantization.cu
     ${MFQ_CUDA_ROOT}/kernels/kv_hot_cache.cu
     ${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu
@@ -255,6 +257,9 @@ if(BUILD_TESTING)
         ${MFQ_REPOSITORY_ROOT})
     mfq_add_cuda_test(mfq-native-tensor-cuda-test
         ${MFQ_CUDA_ROOT}/tests/mfq_native_tensor_cuda_test.cu)
+    add_test(NAME mfq-contiguous-convert-test
+        COMMAND mfq-native-tensor-cuda-test --contiguous-convert-check)
+    set_tests_properties(mfq-contiguous-convert-test PROPERTIES SKIP_RETURN_CODE 77)
     mfq_add_cuda_test(mfq-cuda-storage-offset-test
         ${MFQ_CUDA_ROOT}/tests/mfq_cuda_storage_offset_test.cu
         mfq-cuda-native-kernels)
@@ -614,6 +619,11 @@ if(BUILD_TESTING)
         CUDA_RUNTIME_LIBRARY Shared)
     add_test(NAME mfq-cuda-warp-multi-sum-test COMMAND mfq-cuda-warp-multi-sum-test)
     add_executable(mfq-window-attention-test ${MFQ_CUDA_ROOT}/tests/decode_window_attention_test.cpp)
+    add_executable(mfq-gdn-decode-window-test ${MFQ_CUDA_ROOT}/tests/gdn_decode_window_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-gdn-decode-window-test)
+    target_compile_definitions(mfq-gdn-decode-window-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-gdn-decode-window-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-gdn-decode-window-test COMMAND mfq-gdn-decode-window-test)
     mfq_configure_cuda_runtime_target(mfq-window-attention-test)
     target_compile_definitions(mfq-window-attention-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
@@ -646,6 +656,7 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-float-projection-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-float-projection-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-float-projection-test COMMAND mfq-float-projection-test)
+    add_test(NAME mfq-gr-prefill-blas-test COMMAND mfq-float-projection-test --prefill-blas-check)
 endif()
 target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver

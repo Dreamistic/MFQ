@@ -14,6 +14,7 @@
 #include "gr_prefill_half2.cuh"
 #include "gr_prefill_decode.cuh"
 #include "gr_prefill_pipeline.cuh"
+#include "gr_prefill_blas.h"
 #include "gr_prefill_matmul.cuh"
 #include "gr_prefill_mix.cuh"
 #include "kernel_dispatch_trace.h"
@@ -499,6 +500,9 @@ mfq_tensor_backend::Tensor nint_float_projection_mix_cuda(const NintWeight& weig
         weight.ng==(weight.neuron_len+weight.gs-1)/weight.gs,"packed residual mixing geometry/device disagree");
     const auto rows=input.numel()/weight.neuron_len,hidden=weight.out/streams;
     if(gr_prefill_selected(input)) {
+        if(gr_prefill_blas_selected(weight,input) && normalized.is_contiguous() &&
+                (normalized.scalar_type()==tb::kFloat16 || normalized.scalar_type()==tb::kFloat32))
+            return gr_prefill_blas_mix(weight,input,normalized,streams);
         if(gr_prefill_mix_selected(weight,input,normalized,streams))return gr_prefill_fused_mix(weight,input,normalized);
         auto projected=gr_prefill_matmul(weight,input);
         if(input.scalar_type()==tb::kFloat16)projected=projected.to(tb::kFloat16);

@@ -1,4 +1,5 @@
 #include "mfq/mfe_quant_expert_store.h"
+#include "mfq/host_parallel.h"
 #include "mfq/packed_nint_expert_store.h"
 #include "mfq/model_source.h"
 #include "nint_row_fixture.h"
@@ -143,6 +144,21 @@ void self_test() {
                 leaves[i].second.dtype==expected.dtype && leaves[i].second.payload==expected.payload,
                 "startup sequential pool differs from canonical independent expert slices");
         }
+        mfq::HostParallelPool workers({},false);
+        std::vector<mfq::MfeQuantExpert> parallel(leaves.size());
+        const auto visit=[&](int expert,mfq::MfeQuantExpert encoded) {
+            const auto& ids=store.pool_expert_ids(pool);
+            const auto row=std::find(ids.begin(),ids.end(),expert)-ids.begin();
+            parallel.at(row)=std::move(encoded);
+        };
+        store.visit_pool_experts(pool,visit,&workers,4);
+        for(std::size_t i=0;i<leaves.size();++i)
+            require(parallel[i].dtype==leaves[i].second.dtype && parallel[i].payload==leaves[i].second.payload,
+                "parallel startup slicing changed canonical expert bytes");
+        rejected([&] {store.visit_pool_experts(pool,[](int,mfq::MfeQuantExpert) {
+            throw std::runtime_error("parallel visitor failed");
+        },&workers,4);});
+        store.visit_pool_experts(pool,visit,&workers,4);
     }
     rejected([&] { store.visit_pool_experts(store.pool_count(),[](int,mfq::MfeQuantExpert) {}); });
     rejected([&] { store.visit_pool_experts(0,{}); });

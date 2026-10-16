@@ -4,7 +4,7 @@ import { mockStudioServer } from './mockServer';
 test('load context defaults reach the model load request and remain readable in both themes', async ({ page }, testInfo) => {
   await mockStudioServer(page, { language: 'zh-CN' });
   const writes: Record<string, unknown>[] = [];
-  await page.route('**/api/v1/models', route => route.fulfill({ json: { data: [{ id: 'local', name: 'Qwen3.5',
+  await page.route(/\/api\/v1\/models(?:\?.*)?$/, route => route.fulfill({ json: { data: [{ id: 'local', name: 'Qwen3.5',
     architecture: 'qwen3_5', format: 'mfq', shard_count: 1, total_bytes: 40 * 2 ** 30,
     estimated_resident_weight_bytes: 8 * 2 ** 30, context_capacity: 131072, tensor_count: 1,
     record_count: 1, dtypes: [], complete: true, loadable: true, modified_at: '2026-10-14T00:00:00Z' }] } }));

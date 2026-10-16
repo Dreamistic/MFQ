@@ -42,6 +42,11 @@ export const modelsApi = {
   configureDownloadReclaim(evictPrefixCache: boolean): Promise<DownloadDirectoryStatus> {
     return request('/api/v1/hub/download-directory', { method: 'PUT', body: JSON.stringify({ evict_prefix_cache: evictPrefixCache }) });
   },
+  probeDownloadSources(sources: { provider: HubModelSummary['provider']; repo_id: string; revision?: string | null }[], signal?: AbortSignal): Promise<{
+    data: { provider: HubModelSummary['provider']; repo_id: string; bytes_per_second: number; route?: 'direct' | 'proxy' }[];
+  }> {
+    return request('/api/v1/hub/download-sources/probe', { method: 'POST', body: JSON.stringify({ sources }), signal });
+  },
   /** 列出模型资产；refresh 为真时要求服务重新扫描。 */
   async modelArtifacts(refresh = false): Promise<ModelArtifact[]> {
     return (

@@ -10,6 +10,8 @@
 #include "nvq_group.h"
 #include "cpu_projection_rows.h"
 #include "nvq_dense_pack.h"
+#include <atomic>
+#include <cstdio>
 
 namespace {
 NvqWorkspace& resident_nvq_workspace(const NvqWeight& weight,int rows) {
@@ -1733,11 +1735,18 @@ NvqWeight to_device_nvq(
     }
     // Retain the immutable map before upload. Decode and graph capture must
     // never copy codebook metadata back from the device.
-    if ((w.kernel_format==5 || w.kernel_format==13 || w.kernel_format==14) &&
+    if ((w.kernel_format==5 || w.kernel_format==13 || w.kernel_format==14 ||
+         w.kernel_format==10 || w.kernel_format==12 || w.kernel_format==15) &&
         w.codebook.numel()>=64) {
         const auto* metadata=w.codebook.data_ptr<int8_t>();
         for(unsigned state=0;state<16;++state)
             w.bank_map|=uint32_t(uint8_t(metadata[36+state])&3u)<<(2*state);
+        if((w.kernel_format==12 || w.kernel_format==15) && metadata[1]==2 && metadata[3]==1) {
+            static std::atomic<uint32_t> reported{0};const uint32_t bit=1u<<w.kernel_format;
+            if(!(reported.fetch_or(bit,std::memory_order_relaxed)&bit))std::fprintf(stderr,
+                "mfe_d4_analytic_scale_metadata scope=first_validated_table format=%d banks=2 mode=1\n",
+                int(w.kernel_format));
+        }
     }
     if (cuda) {
         const auto target = mfq_tensor_backend::Device(

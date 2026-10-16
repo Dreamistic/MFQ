@@ -29,6 +29,12 @@ matches what you want to do.
 
 ## APIs
 
+MFQ provides OpenAI-compatible `/v1/models` and `/v1/chat/completions`,
+Anthropic-compatible `/v1/messages`, and an HTTP control API under `/api/v1`.
+Token and job updates stream over SSE; audio and realtime sessions use
+WebSocket. Function tools are executed by the client and their results returned
+through the inference API.
+
 - [HTTP API](api/http.md)
 - [WebSocket and realtime API](api/websocket.md)
 

@@ -20,6 +20,8 @@ struct MoeHostExpert {
 
 struct MoeHostExpertCacheStats {
     std::size_t budget_bytes=0, resident_bytes=0, resident_entries=0;
+    std::size_t optional_bytes=0;
+    std::uint64_t optional_reclaimed_bytes=0;
     std::size_t managed_bytes=0, managed_peak_bytes=0;
     std::size_t transient_bytes=0, transient_peak_bytes=0;
     std::uint64_t hits=0, misses=0, coalesced=0, evictions=0;
@@ -29,6 +31,8 @@ struct MoeHostExpertCacheStats {
 // Engine-wide, byte-bounded LRU for immutable CPU expert fields. CPU leases
 // and GPU-upload leases share one source key. GPU residents are removed from
 // this cache; their eviction can publish a copy without rereading the source.
+// Negative source IDs hold optional prefill backups, evictable even when the
+// last copies of ordinary experts must remain resident.
 class MoeHostExpertCache {
 public:
     using Lease=std::shared_ptr<const MoeHostExpert>;
@@ -42,7 +46,12 @@ public:
     bool demote(mfq::MoeCacheKey key,std::size_t bytes,const Load& copy);
     void promote(mfq::MoeCacheKey key);
     void erase(mfq::MoeCacheKey key);
+    // Drop only idle negative-key backup images, oldest first. Active leases
+    // and the last CPU copies of routed experts are never reclaimed here.
+    std::size_t reclaim_optional(std::size_t bytes);
     bool contains(mfq::MoeCacheKey key) const;
+    // Read an already cached immutable image without invoking a loader.
+    Lease find(mfq::MoeCacheKey key);
     MoeHostExpertCacheStats stats() const;
     // Complete-residency mode cannot evict the last copy of an expert.
     void preserve_resident_experts();
@@ -57,10 +66,12 @@ public:
     // Validate all readers and allocate every lookup entry before reusing RAM.
     // The publication callback must undo its own changes if it throws.
     // Optional prepare runs under reader exclusion and may modify every reused
-    // payload. Any later failure restores all payloads before releasing the lock.
+    // payload. Failure restores every payload before releasing reader exclusion.
+    // MFQ_MOE_KEYED_EXCHANGE=1 limits exclusion to these incoming/outgoing keys;
+    // unrelated immutable acquisitions can proceed during copying/publication.
     bool exchange_batch(const std::vector<Exchange>& changes,
                         const std::function<void()>& publish = {},
-                        const std::function<void()>& prepare = {});
+                        const std::function<void()>& prepare = {},bool independent_readers=false);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

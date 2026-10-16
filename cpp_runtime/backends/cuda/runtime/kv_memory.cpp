@@ -368,8 +368,8 @@ std::vector<std::pair<std::string,double>> KvMemoryManager::metrics() const {
     }
     return {{"kv_memory_supported",capacity?1.0:0.0},{"kv_memory_dynamic",options_.dynamic?1.0:0.0},
         {"kv_memory_preallocated",options_.dynamic?0.0:1.0},{"kv_memory_capacity_bytes",double(capacity)},
-        {"kv_memory_gpu_bytes",double(gpu+(offload_?offload_->expert_loan_bytes():0)-(expert_loan_?expert_loan_->bytes():0))},{"kv_memory_ram_bytes",double(ram)},
-        {"kv_memory_expert_loan_bytes",double(expert_loan_?expert_loan_->bytes():0)},
+        {"kv_memory_gpu_bytes",double(gpu+(offload_?offload_->expert_loan_bytes():0)-(expert_loan_?expert_loan_->bytes()-expert_loan_->external_bytes():0))},{"kv_memory_ram_bytes",double(ram)},
+        {"kv_memory_expert_loan_bytes",double(expert_loan_?expert_loan_->bytes()-expert_loan_->external_bytes():0)},
         {"kv_memory_expert_loan_hit_bytes",double(expert_loan_?expert_loan_->hits():0)},
         {"kv_memory_expert_loan_lookup_us",expert_loan_?expert_loan_->lookup_us():0},
         {"kv_memory_gpu_budget_bytes",double(gpu_budget_)},{"kv_memory_cold_required_bytes",double(ram_required_)},

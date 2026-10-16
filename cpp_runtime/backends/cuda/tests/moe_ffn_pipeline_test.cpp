@@ -9,6 +9,7 @@
 #include "runtime/kv_expert_loan.h"
 #include "storage/moe_quant_range_source.h"
 #include "storage/moe_expert_cache.h"
+#include "storage/moe_expert_cache_internal.h"
 #include "storage/weight_loader.h"
 #include "moe.h"
 #include "core/rope.h"
@@ -45,7 +46,7 @@ QuantLinear linear(const MixedMoePool& pool,int output,int width) {
 
 void verify_nvq_bank_map(const std::filesystem::path& root) {
     int cases=0;
-    for(const char* format:{"nvq2j","nvq2j-l","nvq2j-xl"})
+    for(const char* format:{"nvq2j","nvq2j-l","nvq2j-xl","nvq3j","nvq3j-512","nvq3j-l"})
     for(const char* shape:{"-640-2560.mfq","-2560-640.mfq"}) {
         auto value=source(root/(std::string(format)+shape));
         for(const auto& pool:value->metadata()->pools) {
@@ -62,7 +63,7 @@ void verify_nvq_bank_map(const std::filesystem::path& root) {
         if(expert.nvq.bank_map!=value->metadata()->pools[0].nvq.bank_map)
             throw std::runtime_error("expert slice lost cached JSC map");
     }
-    std::cout<<"nvq_bank_map_cases="<<cases<<" states=16 expert_slices=6 PASS\n";
+    std::cout<<"nvq_bank_map_cases="<<cases<<" states=16 expert_slices=12 PASS\n";
 }
 
 void verify_nvq_dense_default(const std::filesystem::path& root) {
@@ -469,7 +470,121 @@ void verify_mapped_refill_descriptors() {
     }
     std::cout<<"mapped_refill_descriptor_cases="<<cases<<" changing pointers/counts/unaligned tails/guards exact PASS\n";
 }
+void verify_speculative_route_prefix(const std::filesystem::path& root) {
+    CudaExecutionContext execution;auto& config=execution.config;
+    config.moe_residency_warm=true;config.moe_residency_adapt=true;
+    config.moe_pipeline=true;config.moe_ram_pcie=true;
+    config.moe_preload_all=true;config.moe_assert_resident=true;config.moe_residency_projection_heat=false;
+    std::array<std::shared_ptr<MoeQuantRangeSource>,3> sources={source(root/"nint5-640-2560.mfq"),
+        source(root/"nint5-640-2560.mfq"),source(root/"nint5-2560-640.mfq")};
+    std::size_t bundle=0;for(const auto& item:sources)bundle+=bytes(item->metadata()->pools[0]);
+    config.moe_host_cache_bytes=3*bundle;auto cache=make_moe_expert_cache(bundle,config);
+    std::array<std::shared_ptr<MfeWeight>,3> weights;
+    for(int p=0;p<3;++p)weights[p]=std::make_shared<MfeWeight>(
+        cache_quant_moe_weight(cache,std::to_string(p),sources[p],1,0,std::to_string(p)));
+    auto forward=make_moe_ffn_pipeline({weights[0],weights[1]},{weights[2]});
+    finalize_moe_expert_cache(cache);MoeResidencyManager manager(cache.get());
+    const auto* heat_option=std::getenv("MFQ_MOE_MTP_WINDOW_HEAT");
+    const int heat_mode=heat_option?std::clamp(std::atoi(heat_option),0,2):2;
+    const bool window_heat=heat_mode!=0;
+    for(int i=0;i<3;++i) {
+        manager.begin_speculative_routes(4);
+        manager.after_layer(0,{1,2,2,2},4);
+        if(manager.stats().observed_routes!=std::uint64_t(i))
+            throw std::runtime_error("unverified routes entered expert heat");
+        manager.commit_speculative_routes(1);
+    }
+    manager.begin_speculative_routes(4);manager.after_layer(0,{2,2,2,2},4);
+    manager.discard_speculative_routes();manager.discard_speculative_routes();
+    manager.begin_speculative_routes(4);
+    manager.after_layer(0,{2,2},2);manager.after_layer(0,{1,2,2,2},4);
+    manager.commit_speculative_routes(1);
+    manager.begin_speculative_routes(4);manager.after_layer(0,{1,1,2,2},4);
+    manager.commit_speculative_routes(2);
+    manager.begin_speculative_routes(3);manager.after_layer(0,{1,2,2},3);
+    bool rejected=false;
+    try{manager.commit_speculative_routes(4);}catch(const std::invalid_argument&){rejected=true;}
+    if(!rejected)throw std::runtime_error("invalid accepted route prefix was committed");
+    manager.discard_speculative_routes();
+    manager.begin_speculative_routes(4);rejected=false;
+    try{manager.after_layer(0,{1,2,2,2},4,false,true);}catch(const std::logic_error&){rejected=true;}
+    if(!rejected)throw std::runtime_error("independent sequences entered speculative journal");
+    manager.discard_speculative_routes();
+    manager.begin_speculative_routes(4);rejected=false;
+    try{manager.after_layer(0,{1,INT32_MAX,2,2},4);}catch(const std::out_of_range&){rejected=true;}
+    if(!rejected)throw std::runtime_error("invalid expert entered speculative journal");
+    manager.discard_speculative_routes();
+    manager.after_layer(0,{0},1);
+    const auto stats=manager.stats();
+    if(stats.observed_routes!=7 || stats.speculative_route_windows!=5 ||
+            stats.speculative_routes_committed!=6 || stats.speculative_routes_discarded!=21 ||
+            stats.speculative_route_cancels!=4 || stats.speculative_heat_routes!=(window_heat?5:6))
+        throw std::runtime_error("accepted route prefix accounting changed");
+    // Rejected expert 2 appeared more often than accepted expert 1. Actual
+    // residency must follow the committed prefix rather than those drafts.
+    manager.apply_pending();
+    manager.after_layer(0,{},32);manager.apply_pending();
+    for(const auto& source:sources)
+        if(!source->gpu_resident(1) || source->gpu_resident(2))
+            throw std::runtime_error("rejected draft routes drove expert promotion");
+    manager.begin_speculative_routes(4);manager.after_layer(0,{0,1,2,1},4);
+    manager.commit_speculative_routes(4);manager.apply_pending();
+    const auto full=manager.stats();
+    if(full.observed_routes!=11 || full.speculative_route_windows!=6 ||
+            full.speculative_routes_committed!=10 || full.speculative_routes_discarded!=21 ||
+            full.speculative_heat_routes!=(window_heat?8:10))
+        throw std::runtime_error("fully accepted route window lost observations");
+    // A single verification's repeated use does not pay for four transfers.
+    // Check actual residency, including the legacy policy used for the A/B.
+    for(int p=0;p<3;++p)sources[p]=source(root/(p==2?"nint5-2560-640.mfq":"nint5-640-2560.mfq"));
+    auto repeated_cache=make_moe_expert_cache(bundle,config);
+    std::array<std::shared_ptr<MfeWeight>,3> repeated_weights;
+    for(int p=0;p<3;++p)repeated_weights[p]=std::make_shared<MfeWeight>(
+        cache_quant_moe_weight(repeated_cache,std::to_string(p),sources[p],1,0,std::to_string(p)));
+    auto repeated_forward=make_moe_ffn_pipeline({repeated_weights[0],repeated_weights[1]},{repeated_weights[2]});
+    finalize_moe_expert_cache(repeated_cache);MoeResidencyManager repeated(repeated_cache.get());
+    repeated.begin_speculative_routes(4);repeated.after_layer(0,{1,1,1,1},4);
+    repeated.commit_speculative_routes(4);repeated.apply_pending();
+    repeated.after_layer(0,{},32);repeated.apply_pending();
+    for(const auto& source:sources)if(source->gpu_resident(1)==(heat_mode==1))
+        throw std::runtime_error("one repeated draft window used token frequency for transfer heat");
+    for(int step=0;step<2;++step) {
+        repeated.begin_speculative_routes(4);repeated.after_layer(0,{2,2,2,2},4);
+        repeated.commit_speculative_routes(4);repeated.apply_pending();
+    }
+    repeated.after_layer(0,{},32);repeated.apply_pending();
+    for(const auto& source:sources)if(!source->gpu_resident(2))
+        throw std::runtime_error("repeated committed windows did not promote their hot expert");
+    for(int p=0;p<3;++p)sources[p]=source(root/(p==2?"nint5-2560-640.mfq":"nint5-640-2560.mfq"));
+    auto mixed_cache=make_moe_expert_cache(bundle,config);
+    std::array<std::shared_ptr<MfeWeight>,3> mixed_weights;
+    for(int p=0;p<3;++p)mixed_weights[p]=std::make_shared<MfeWeight>(
+        cache_quant_moe_weight(mixed_cache,std::to_string(p),sources[p],1,0,std::to_string(p)));
+    auto mixed_forward=make_moe_ffn_pipeline({mixed_weights[0],mixed_weights[1]},{mixed_weights[2]});
+    finalize_moe_expert_cache(mixed_cache);MoeResidencyManager mixed(mixed_cache.get());
+    mixed.begin_speculative_routes(4);mixed.after_layer(0,{1,1,1,2},4);
+    mixed.commit_speculative_routes(4);mixed.apply_pending();
+    mixed.after_layer(0,{},32);mixed.apply_pending();
+    // Both experts save one transfer. Normalized heat ranks their equal gain
+    // by the stable expert tie-break; legacy token heat picks repeated expert 1.
+    for(const auto& source:sources)
+        if(source->gpu_resident(1)!=(heat_mode==0) || source->gpu_resident(2)!=(heat_mode==2))
+            throw std::runtime_error("mixed route multiplicity changed transfer ranking or hysteresis scale");
+    std::cout<<"speculative_route_prefix pending/partial/full-prefix, cancel/reset, repeated graph setup, ordinary routes and actual promoted expert PASS\n";
+}
 void verify_short_decode_residency_interval(const std::filesystem::path& root) {
+    struct Interval {
+        std::string saved;
+        Interval(){if(const auto* value=std::getenv("MFQ_MOE_RESIDENCY_INTERVAL"))saved=value;set("4");}
+        static void set(const char* value) {
+#ifdef _WIN32
+            _putenv_s("MFQ_MOE_RESIDENCY_INTERVAL",value);
+#else
+            if(*value)setenv("MFQ_MOE_RESIDENCY_INTERVAL",value,1);else unsetenv("MFQ_MOE_RESIDENCY_INTERVAL");
+#endif
+        }
+        ~Interval(){set(saved.c_str());}
+    } interval;
     int checks=0;
     for(bool independent:{false,true})for(int tokens:{1,2,3,4,5,6,8,31}) {
         CudaExecutionContext execution;auto& config=execution.config;config.moe_residency_warm=true;
@@ -490,13 +605,13 @@ void verify_short_decode_residency_interval(const std::filesystem::path& root) {
             manager.after_layer(0,std::vector<int32_t>(tokens,step%2),tokens,false,independent);
             manager.apply_pending();
             const auto stats=manager.stats();
-            if(stats.scheduled_rounds!=std::uint64_t(tokens==1 || (independent && tokens<=8)?step/4:step) ||
+            if(stats.scheduled_rounds!=std::uint64_t(tokens<=8?step/4:step) ||
                 stats.observed_routes!=std::uint64_t(tokens*step))
                 throw std::runtime_error("short decode interval lost route observations or scheduled too often");
             ++checks;
         }
     }
-    std::cout<<"short_decode_residency_interval checks="<<checks<<" independent rows1-6/8, MTP and prefill unchanged, all route observations retained PASS\n";
+    std::cout<<"short_decode_residency_interval checks="<<checks<<" independent and speculative rows1-6/8, prefill unchanged, all route observations retained PASS\n";
 }
 int verify_warm_residency(const std::filesystem::path& root, bool shared_cases=true) {
     int cases=0,phase_cases=0,async_cases=0,window_cases=0,fence_cases=0;
@@ -699,6 +814,8 @@ int verify_warm_residency(const std::filesystem::path& root, bool shared_cases=t
         if(limited) {
             if(stats.committed_bundles || stats.planned_bundles || stats.memory_rejections!=std::uint64_t(count))
                 throw std::runtime_error("warm residency exceeded injected physical memory bound");
+            if(!stats.staging_budget_skips || stats.staging_budget_skips!=stats.projection_memory_rejections)
+                throw std::runtime_error("insufficient staging still prepared RAM leases and GPU replacements");
         } else if(stats.committed_bundles!=std::uint64_t(count) || stats.planned_bundles!=std::uint64_t(count))
             throw std::runtime_error("warm residency retained an arbitrary expert count cap");
         if(shared && (!stats.shared_backup_bytes || stats.backup_peak_bytes!=stats.shared_backup_bytes))
@@ -1482,13 +1599,16 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
     } environment(input_views?"MFQ_MFE_WINDOW_INPUT_VIEWS":"MFQ_MOE_EARLY_NO_CPU_READY");
     const bool check_transfer_poll=std::getenv("MFQ_TEST_TRANSFER_POLL")!=nullptr;
     const bool check_kv_direct=std::getenv("MFQ_TEST_KV_DIRECT_READ")!=nullptr;
+    const bool check_wire_fallback=std::getenv("MFQ_TEST_WIRE_FALLBACK")!=nullptr;
     const bool adaptive_kv_direct=check_kv_direct && std::getenv("MFQ_TEST_KV_DIRECT_ADAPT");
     const bool trace_kv_direct=std::getenv("MFQ_TRACE_KV_DIRECT_READ")!=nullptr;
     const bool force_direct_off=std::getenv("MFQ_TEST_KV_DIRECT_FORCE_OFF")!=nullptr;
     const int route_count=std::getenv("MFQ_TEST_KV_WIDE_ROUTES")?10:2;
     const bool partial_gu=std::getenv("MFQ_TEST_KV_PARTIAL_GU")!=nullptr;
+    const bool speculative_lru=std::getenv("MFQ_TEST_MTP_KV_LRU")!=nullptr;
     Environment notification_environment("MFQ_MOE_POLL_TRANSFER_READY");
     Environment direct_environment("MFQ_MOE_KV_DIRECT_READ");
+    Environment lru_environment("MFQ_MOE_MTP_KV_LRU");
     int cases=0,cpu_groups=0,gpu_only=0,cancelled=0;
     const std::array<MfqCudaStream,2> streams={mfq_get_stream_from_pool(),mfq_get_current_cuda_stream()};
     for(const std::string format:{"nint5","nvq3j-512"}) {
@@ -1616,6 +1736,12 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
                 weights.copy_(weight_tensor(.125f+.025f*cases,.875f-.013f*cases));
             }
             ids.copy_(route_tensor(route[0],route[1]));
+            if(speculative_lru) {
+                std::vector<int32_t> per_row(tokens*route_count);
+                for(int row=0;row<tokens;++row)for(int r=0;r<route_count;++r)
+                    per_row[row*route_count+r]=row?route[1]:route[0];
+                ids.copy_(tb::tensor(per_row).reshape({tokens,route_count}).to(tb::kCUDA));
+            }
 
             mfq_cuda_synchronize();
 
@@ -1627,7 +1753,8 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
                     // Force staging misses while retaining the loan cache,
                     // then reuse the filled staging slots in the second pass.
                     if(!repeat && !adaptive_kv_direct)prepare_moe_pipeline_comparison(caches[mode],false);
-                    else if(repeat && route==routes.front())loans[mode]->ensure(loan_bytes[mode]/2);
+                    else if(repeat && route==routes.front())loans[mode]->ensure(
+                        check_wire_fallback?loan_bytes[mode]:loan_bytes[mode]/2);
                     if(partial_gu && mode && gpu_cold) {
                         // This fixture registers GU/Down as source 0/1/2,
                         // followed by the second layer's 3/4/5. Prior output
@@ -1641,7 +1768,19 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
                 if(adaptive_kv_direct && trace_kv_direct)std::fprintf(stderr,"kv_direct_adapt repeat=%d case=%d mode=%d route=%d,%d phase=replay\n",
                     repeat,cases,mode,route[0],route[1]);
 
-                environment.set(mode?"1":"0");windows[mode]->run();
+                environment.set(mode?"1":"0");
+                if(speculative_lru) {
+                    lru_environment.set(mode?"1":"0");begin_moe_speculative_routes(caches[mode],tokens);
+                }
+                try {
+                    windows[mode]->run();
+                    if(speculative_lru) {
+                        if(cases%5==4)discard_moe_speculative_routes(caches[mode]);
+                        else commit_moe_speculative_routes(caches[mode],1+cases%tokens);
+                    }
+                }catch(...) {
+                    if(speculative_lru)discard_moe_speculative_routes(caches[mode]);throw;
+                }
 
                 actual[mode]=outputs[mode].cpu().contiguous();
                 // Finish this independent cache before the other comparison
@@ -1672,6 +1811,18 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
             std::cout<<"transfer_poll format="<<format<<" gpu_cold="<<gpu_cold
                 <<" baseline="<<baseline<<" candidate="<<candidate<<" exact PASS\n";
         }
+        if(check_wire_fallback) {
+            const auto metric=[](const std::shared_ptr<MoeExpertCache>& cache,const char* key) {
+                for(const auto& item:moe_expert_memory_metrics(cache))if(item.first==key)return item.second;
+                throw std::runtime_error("wire fallback metric missing");
+            };
+            if(metric(caches[0],"expert_wire_fallback_cells") ||
+                    !metric(caches[1],"expert_wire_fallback_cells") ||
+                    !metric(caches[1],"expert_wire_fallback_bytes"))
+                throw std::runtime_error("forced KV exhaustion did not execute the direct wire fallback");
+            std::cout<<"wire_fallback format="<<format<<" tokens="<<tokens
+                <<" bytes="<<metric(caches[1],"expert_wire_fallback_bytes")<<" exact PASS\n";
+        }
         if(check_kv_direct) {
             const auto baseline=counter(caches[0],"pipeline_kv_direct_read_bytes");
             const auto candidate=counter(caches[1],"pipeline_kv_direct_read_bytes");
@@ -1680,6 +1831,15 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
             std::cout<<"kv_direct_read format="<<format<<" tokens="<<tokens<<" gpu_cold="<<gpu_cold
                 <<" baseline_bytes="<<baseline<<" candidate_bytes="<<candidate
                 <<" loan_hits="<<loans[1]->hits()<<" staged_reuse_and_growth exact PASS\n";
+        }
+        if(speculative_lru) {
+            const auto control=loans[0]->speculative_stats(),candidate=loans[1]->speculative_stats();
+            if(control.windows || !candidate.windows || !candidate.kept ||
+               !(candidate.reverted_hits+candidate.cold_insertions) || candidate.disabled)
+                throw std::runtime_error("MTP KV LRU comparison did not execute accepted/rejected cache routes");
+            std::cout<<"mtp_kv_lru format="<<format<<" tokens="<<tokens<<" windows="<<candidate.windows
+                <<" kept="<<candidate.kept<<" reverted="<<candidate.reverted_hits<<" cold="<<candidate.cold_insertions
+                <<" cancels="<<candidate.cancels<<" exact PASS\n";
         }
         if(const auto* native=std::getenv("MFQ_MOE_RESIDENCY_NATIVE_DMA");native && native[0]=='1' && adaptive_kv_direct) {
             const auto batches=counter(caches[1],"residency_native_dma_batches");
@@ -1705,6 +1865,14 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
                 <<" hits="<<hits<<" misses="<<misses<<" small_hit_bytes="<<small
                 <<" fallbacks="<<counter(caches[1],"pipeline_kv_projection_fallbacks")<<" exact PASS\n";
         }
+        if(std::getenv("MFQ_TEST_GU_BUILD_OVERLAP") && check_kv_direct) {
+            const auto baseline=counter(caches[0],"pipeline_gu_build_overlap_serves");
+            const auto candidate=counter(caches[1],"pipeline_gu_build_overlap_serves");
+            if(baseline || ((gpu_cold && !force_direct_off)?!candidate:bool(candidate)))
+                throw std::runtime_error("GU upload did not overlap Down page preparation");
+            std::cout<<"gu_build_overlap format="<<format<<" tokens="<<tokens<<" gpu_cold="<<gpu_cold
+                <<" candidate="<<candidate<<" exact PASS\n";
+        }
         if(const auto* early=std::getenv("MFQ_MOE_KV_EARLY_GU");early && early[0]=='1' && check_kv_direct) {
             const auto baseline=counter(caches[0],"pipeline_kv_early_gu_serves");
             const auto candidate=counter(caches[1],"pipeline_kv_early_gu_serves");
@@ -1729,6 +1897,17 @@ void verify_early_no_cpu_ready(const std::filesystem::path& root,bool input_view
                 throw std::runtime_error("host cache packet never published a cached phase without DMA");
             std::cout<<"kv_host_packet format="<<format<<" tokens="<<tokens<<" gpu_cold="<<gpu_cold
                 <<" serves="<<served<<" descriptor_bytes="<<bytes<<" cached_phase_publishes="<<cached<<" exact PASS\n";
+        }
+        if(std::getenv("MFQ_TEST_DIRECT_PACKET_BATCH") && check_kv_direct) {
+            const auto* option=std::getenv("MFQ_MOE_NATIVE_DIRECT_PACKET");
+            const bool expected=gpu_cold && !force_direct_off && tokens<=8 && (!option || option[0]!='0');
+            const auto served=counter(caches[1],"pipeline_direct_packet_serves");
+            const auto batched=counter(caches[1],"pipeline_direct_packet_batch_serves");
+            if(counter(caches[0],"pipeline_direct_packet_serves") || bool(served)!=expected ||
+                    bool(batched)!=(expected && tokens>1))
+                throw std::runtime_error("short-window direct packet dispatch was not exercised or ignored its opt-out");
+            std::cout<<"direct_packet_batch format="<<format<<" tokens="<<tokens
+                <<" serves="<<served<<" batch_serves="<<batched<<" exact PASS\n";
         }
         if(const auto* first=std::getenv("MFQ_MOE_KV_LOOKUP_FIRST");first && first[0]=='1' && check_kv_direct) {
             const auto baseline=counter(caches[0],"pipeline_kv_projection_early_hits");
@@ -1947,10 +2126,72 @@ void verify_router_lookahead_inputs() {
     std::cout<<"router_lookahead_input_samples=3 layer_rows=9 warmup_samples=0 guards=4 original_bytes_exact=1 PASS\n";
 }
 #include "residency_direct_exchange_test.h"
+void verify_predictor_residency(const std::filesystem::path& root,bool prefer_resident=false) {
+    struct Preference {
+        std::string previous=std::getenv("MFQ_MTP_RESIDENT_EXPERTS")?std::getenv("MFQ_MTP_RESIDENT_EXPERTS"):"";
+        static void set(const char* value) {
+#ifdef _WIN32
+            _putenv_s("MFQ_MTP_RESIDENT_EXPERTS",value);
+#else
+            if(*value)setenv("MFQ_MTP_RESIDENT_EXPERTS",value,1);else unsetenv("MFQ_MTP_RESIDENT_EXPERTS");
+#endif
+        }
+        ~Preference(){set(previous.c_str());}
+    } preference;
+    Preference::set(prefer_resident?"1":"0");
+    CudaExecutionContext execution;auto& config=execution.config;
+    config.moe_pipeline=true;config.moe_preload_all=true;config.moe_assert_resident=true;
+    config.moe_residency_warm=true;config.moe_residency_projection_heat=true;
+    config.moe_ram_pcie=true;config.moe_ram_pcie_fraction=1;config.moe_direct_ram=true;
+    config.moe_two_stage_ffn=prefer_resident;
+    const int main_layers=prefer_resident?10:1,predictor_source=main_layers*3;
+    std::vector<std::shared_ptr<MoeQuantRangeSource>> sources(predictor_source+2);
+    std::size_t gpu_bytes=0;
+    for(int p=0;p<int(sources.size());++p) {
+        const bool down=p<predictor_source?p%3==2:p==predictor_source+1;
+        sources[p]=source(root/(std::string("nint5")+(down?"-2560-640.mfq":"-640-2560.mfq")));
+        gpu_bytes+=bytes(sources[p]->metadata()->pools[0]);
+    }
+    config.moe_host_cache_bytes=3*gpu_bytes;
+    auto cache=make_moe_expert_cache(gpu_bytes,config);
+    std::vector<MfeWeight> weights(sources.size());
+    for(int p=0;p<int(sources.size());++p)weights[p]=cache_quant_moe_weight(cache,std::to_string(p),sources[p],1,p<predictor_source?p/3:-1,std::to_string(p));
+    // Exercise the physical cache topology independently of FFN dimensions:
+    // predictor Gate and Up alias one source, while Down owns another.
+    std::vector<std::array<int,3>> bundles;
+    for(int layer=0;layer<main_layers;++layer)bundles.push_back({layer*3,layer*3+1,layer*3+2});
+    bundles.push_back({predictor_source,predictor_source,predictor_source+1});
+    MoeResidencyTestAccess::bundles(*cache,std::move(bundles));
+    finalize_moe_expert_cache(cache);
+    if(prefer_resident) {
+        for(int p=predictor_source;p<int(sources.size());++p)for(int e=0;e<3;++e)
+            if(!sources[p]->gpu_resident(e))throw std::runtime_error("predictor preference left an expert in RAM");
+        std::cout<<"predictor_residency preferred=1 all_predictor_experts_on_GPU=1 shared_budget=1 PASS\n";
+        return;
+    }
+    const auto before=sources[predictor_source]->host_cache()->stats();
+    MoeResidencyManager manager(cache.get());
+    manager.after_layer(-1,std::vector<int32_t>(100,2),100);
+    manager.after_layer(0,{},100);
+    manager.apply_pending();
+    const auto stats=manager.stats();
+    if(!sources[3]->gpu_resident(2) || !sources[4]->gpu_resident(2) ||
+            stats.committed_projections!=2 || stats.committed_bundles!=1 || stats.observed_routes!=100)
+        throw std::runtime_error("combined predictor did not promote exactly its two physical projections");
+    const auto after=sources[3]->host_cache()->stats();
+    if(before.managed_bytes!=after.managed_bytes || before.managed_peak_bytes!=after.managed_peak_bytes)
+        throw std::runtime_error("predictor promotion duplicated RAM weights");
+    for(const auto& source:sources)if(source->expert_disk_reads_after_preload())
+        throw std::runtime_error("predictor promotion reread SSD weights");
+    std::cout<<"predictor_residency combined_gate_up=1 physical_promotions=2 routes=100 RAM_bytes_unchanged=1 SSD_reads=0 PASS\n";
+}
 #include "prefill_pipeline_test.h"
 #include "compact_prefill_mma_test.h"
 #include "nvq_prefill_k_tile_test.h"
 #include "mfe_token_group_test.h"
+#include "d4_bank_map_test.h"
+#include "mfe_wide_compact_test.h"
+#include "d4_analytic_scale_test.h"
 void verify_yarn() {
     // Independent values for dim=64, theta=10000, original context=4096,
     // factor=4. The ramp spans pairs 10..23 (32 and 1 full rotations).
@@ -2174,9 +2415,28 @@ int main(int argc,char** argv)try {
         if(std::string(argv[2])=="--online-budget-check") {verify_online_expert_budget(root);return 0;}
         if(std::string(argv[2])=="--yarn-check") {verify_yarn();return 0;}
         if(std::string(argv[2])=="--nvq-bank-map-check") {verify_nvq_bank_map(root);return 0;}
+        if(std::string(argv[2])=="--d4-bank-map-check") {verify_d4_bank_map(root);return 0;}
+        if(std::string(argv[2])=="--d4-bank-map-memory-check") {verify_d4_bank_map(root,false);return 0;}
+        if(std::string(argv[2])=="--d4-bank-map-stages") {verify_d4_bank_map(root,2);return 0;}
+        if(std::string(argv[2])=="--mfe-wide-compact-check") {verify_mfe_wide_compact(root);return 0;}
+        if(std::string(argv[2])=="--mfe-wide-compact-memory-check") {verify_mfe_wide_compact(root,false);return 0;}
+        if(std::string(argv[2])=="--mfe-aligned-compact-check") {verify_mfe_wide_compact(root,true,true);return 0;}
+        if(std::string(argv[2])=="--mfe-aligned-compact-memory-check") {verify_mfe_wide_compact(root,false,true);return 0;}
+        if(std::string(argv[2])=="--mfe-wide-legacy-memory-check") {verify_mfe_wide_compact(root,false,false,true);return 0;}
+        if(std::string(argv[2])=="--mfe-shared-quad-check") {verify_mfe_wide_compact(root,true,true,false,true);return 0;}
+        if(std::string(argv[2])=="--mfe-shared-quad-memory-check") {verify_mfe_wide_compact(root,false,true,false,true);return 0;}
+        if(std::string(argv[2])=="--mfe-shared-split-check") {verify_mfe_wide_compact(root,true,true,false,true,true);return 0;}
+        if(std::string(argv[2])=="--mfe-shared-split-memory-check") {verify_mfe_wide_compact(root,false,true,false,true,true);return 0;}
+        if(std::string(argv[2])=="--mfe-aligned-warps-check") {verify_mfe_wide_compact(root,true,true,false,false,false,true);return 0;}
+        if(std::string(argv[2])=="--mfe-aligned-warps-memory-check") {verify_mfe_wide_compact(root,false,true,false,false,false,true);return 0;}
+        if(std::string(argv[2])=="--mfe-nonaligned-quad-check") {verify_mfe_wide_compact(root,true,true,false,true,false,false,true);return 0;}
+        if(std::string(argv[2])=="--mfe-nonaligned-quad-memory-check") {verify_mfe_wide_compact(root,false,true,false,true,false,false,true);return 0;}
+        if(std::string(argv[2])=="--d4-analytic-scale-check") {verify_d4_analytic_scales(root);return 0;}
+        if(std::string(argv[2])=="--d4-analytic-scale-memory-check") {verify_d4_analytic_scales(root,false);return 0;}
         if(std::string(argv[2])=="--memory-phase-check") {verify_memory_phase_reuse(root);return 0;}
         if(std::string(argv[2])=="--prefill-quota-recovery-check") {verify_prefill_quota_recovery(root);return 0;}
         if(std::string(argv[2])=="--mfe-token-group-check") {verify_mfe_token_groups(root);return 0;}
+        if(std::string(argv[2])=="--speculative-route-prefix-check") {verify_speculative_route_prefix(root);return 0;}
         if(std::string(argv[2])=="--mfe-token-group-pipeline-check") {
             for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,false,false,true);
             return 0;
@@ -2202,6 +2462,8 @@ int main(int argc,char** argv)try {
         if(std::string(argv[2])=="--copy-overlap-check") {verify_copy_kernel_overlap();return 0;}
         if(std::string(argv[2])=="--mapped-refill-check") {verify_mapped_refill_descriptors();return 0;}
         if(std::string(argv[2])=="--direct-exchange-check") {verify_direct_exchange(root);return 0;}
+        if(std::string(argv[2])=="--indexed-shadow-check") {verify_indexed_shadow_exchange(root);return 0;}
+        if(std::string(argv[2])=="--prefill-cpu-prefetch-check") {verify_prefill_cpu_prefetch(root);return 0;}
         if(std::string(argv[2])=="--transfer-promotion-check") {
             const auto* mode=std::getenv("MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER");
             if(!mode || (mode[0]!='1' && mode[0]!='2'))throw std::runtime_error("promotion check requires explicit candidate mode");
@@ -2244,6 +2506,9 @@ int main(int argc,char** argv)try {
         if(std::string(argv[2])=="--short-decode-residency-interval-check") {
             verify_short_decode_residency_interval(root);return 0;
         }
+        if(std::string(argv[2])=="--predictor-residency-check") {
+            verify_predictor_residency(root);verify_predictor_residency(root,true);return 0;
+        }
         if(std::string(argv[2])=="--warm-residency-dedicated-check") {
             verify_warm_residency(root,false);return 0;
         }
@@ -2252,6 +2517,9 @@ int main(int argc,char** argv)try {
         }
         if(std::string(argv[2])=="--router-lookahead-input-check") {
             verify_router_lookahead_inputs();return 0;
+        }
+        if(std::string(argv[2])=="--predictor-exchange-overlap-check") {
+            verify_predictor_exchange_overlap(root);return 0;
         }
         if(std::string(argv[2])=="--transfer-comparison-check") {
             verify_two_stage_shared(root,true,true);return 0;
@@ -2281,11 +2549,18 @@ int main(int argc,char** argv)try {
         }
         if(std::string(argv[2])=="--kv-direct-read-check") {
             if(!std::getenv("MFQ_TEST_KV_DIRECT_READ"))throw std::runtime_error("missing direct KV comparison option");
-            for(int tokens:{1,2,6})for(bool gpu_cold:{true,false}) {
+            const std::vector<int> token_groups=std::getenv("MFQ_TEST_DIRECT_PACKET_BATCH")?
+                std::vector<int>{1,2,3,4,6,8}:std::vector<int>{1,2,6};
+            for(int tokens:token_groups)for(bool gpu_cold:{true,false}) {
                 if(!gpu_cold && std::getenv("MFQ_TEST_KV_DIRECT_GPU_ONLY"))continue;
                 verify_early_no_cpu_ready(root,true,false,gpu_cold,tokens);
             }
             return 0;
+        }
+        if(std::string(argv[2])=="--mtp-kv-lru-check") {
+            if(!std::getenv("MFQ_TEST_KV_DIRECT_READ") || !std::getenv("MFQ_TEST_MTP_KV_LRU"))
+                throw std::runtime_error("missing speculative KV LRU comparison options");
+            for(int tokens:{2,4,6})verify_early_no_cpu_ready(root,true,false,true,tokens);return 0;
         }
         if(std::string(argv[2])=="--kv-direct-read-serial-check") {
             if(!std::getenv("MFQ_TEST_KV_DIRECT_READ"))throw std::runtime_error("missing serial direct KV comparison option");

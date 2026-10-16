@@ -89,6 +89,8 @@ load_runtime_components(
 
 namespace mfq::cuda::internal {
 
+void prepare_sampling_runtime(int64_t vocabulary);
+
 template <typename F>
 auto with_loaded_cuda_model(
         CudaExecutionContext& execution,
@@ -108,6 +110,8 @@ auto with_loaded_cuda_model(
             source);
         auto runtime_components =
             load_runtime_components(model, load_optional_components);
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+            prepare_sampling_runtime(model.vocab_size());
         if(execution.kv_memory) {
             execution.kv_memory->finalize(moe_expert_cache_minimum_bytes(execution.moe_expert_cache));
             set_moe_kv_expert_loan(execution.moe_expert_cache,execution.kv_memory->expert_loan());
@@ -115,8 +119,15 @@ auto with_loaded_cuda_model(
         }
         if (moe_expert_cache_has_sources(execution.moe_expert_cache) &&
                 !moe_expert_cache_finalized(execution.moe_expert_cache)) {
+            std::size_t graph_reserve=0;
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                graph_reserve=qwen4_mtp_graph_reserve(model,runtime_components.mtp.get());
+                if(graph_reserve)std::cerr<<"runtime_mtp_flexible_budget maximum_depth="
+                    <<runtime_components.mtp->maximum_draft_depth()<<" bytes="<<graph_reserve
+                    <<" initial_depth=3 lend_unused_to_experts=1\n";
+            }
             finalize_moe_expert_cache(execution.moe_expert_cache,
-                execution.kv_memory?execution.kv_memory->growth_reserve():0,
+                (execution.kv_memory?execution.kv_memory->growth_reserve():0)+graph_reserve,
                 execution.kv_memory?execution.kv_memory->expert_budget_charge():0);
         }
         mfq_cuda_synchronize();

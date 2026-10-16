@@ -2,6 +2,7 @@
 #include "cuda_execution.h"
 
 #include "mfq_cuda_quant_ops.h"
+#include "mfe_ffn_token_groups.h"
 
 #include <algorithm>
 #include <charconv>
@@ -1273,6 +1274,7 @@ std::optional<int> mfe_token_group_capacity() {
         if (mode == "2") return 2;
         if (mode == "4") return 4;
         if (mode == "8") return 8;
+        if (mode == "shared4") return mfq::cuda::kMfeSharedGroupEncoding + 4;
         if (mode == "auto") return 0;
     }
     return std::nullopt;

@@ -1,5 +1,6 @@
 #include "mfq/mfe_quant_expert_store.h"
 #include "mfq/packed_nint_expert_store.h"
+#include "mfq/host_parallel.h"
 #include "mfq_format_compat.h"
 
 #include <algorithm>
@@ -159,7 +160,8 @@ MfeQuantExpert MfeQuantExpertStore::read_expert(int expert) const {
 }
 
 void MfeQuantExpertStore::visit_pool_experts(std::size_t index,
-        const std::function<void(int, MfeQuantExpert)>& visitor) const {
+        const std::function<void(int, MfeQuantExpert)>& visitor,
+        HostParallelPool* workers,int threads) const {
     if (!visitor) throw std::invalid_argument("missing expert preload visitor");
     const auto& pool=pools_.at(index);
     std::vector<std::uint8_t> payload(pool.bytes);
@@ -171,12 +173,20 @@ void MfeQuantExpertStore::visit_pool_experts(std::size_t index,
     };
     if (pool.nint) {
         NintRows rows(payload.size(),memory);
-        for (std::size_t local=0; local<pool.ids.size(); ++local)
-            visitor(pool.ids[local],{pool.dtype,rows.slice_rows_blob(local*output_,(local+1)*output_)});
+        const auto visit=[&](int64_t begin,int64_t end) {
+            for(auto local=begin;local<end;++local)
+                visitor(pool.ids[local],{pool.dtype,rows.slice_rows_blob(local*output_,(local+1)*output_)});
+        };
+        if(workers)workers->run(0,pool.ids.size(),1,threads,visit);
+        else visit(0,pool.ids.size());
     } else {
         NvqRows rows(payload.size(),memory);
-        for (std::size_t local=0; local<pool.ids.size(); ++local)
-            visitor(pool.ids[local],{pool.dtype,rows.slice_rows_blob(local*output_,(local+1)*output_)});
+        const auto visit=[&](int64_t begin,int64_t end) {
+            for(auto local=begin;local<end;++local)
+                visitor(pool.ids[local],{pool.dtype,rows.slice_rows_blob(local*output_,(local+1)*output_)});
+        };
+        if(workers)workers->run(0,pool.ids.size(),1,threads,visit);
+        else visit(0,pool.ids.size());
     }
 }
 

@@ -39,6 +39,7 @@ template <typename Model> struct CudaGenerationOps {
     DecodeGraphCache &graph;
     const MfqTokenConstraintPtr &constraint;
     mfq_tensor_backend::Tensor pending, counts;
+    mfq_tensor_backend::Tensor known_token_host;
     mfq::cuda::Sampler sampler;
     bool has_penalties;
     const CudaPreparedPrompt *prepared;
@@ -75,19 +76,43 @@ template <typename Model> struct CudaGenerationOps {
     double prefill(const mfq::engine::PrefillChunk &chunk) {
         using Tensor = mfq_tensor_backend::Tensor;
         PrefillCudaTimer timer;
+        bool prefill_finished=false;
+        const auto finish_prefill=[&] {
+            if(prefill_finished)return;
+            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+            prefill_finished=true;
+        };
         auto ids = full_ids.narrow(1, chunk.offset, chunk.count).contiguous();
         Tensor hidden;
-        bool layer_major=false;
+        bool layer_major=false,short_windows=false;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
-            if((!prepared || !prepared->transformed()) &&
+            if((!prepared || !prepared->transformed()) && model.reuse_decode_graphs &&
+                    model.graph_registry && chunk.count<=128) {
+                // The same bounded prompt windows as MTP avoid materializing
+                // a whole expert layer before a short prompt has any scratch.
+                short_windows=true;
+                for(int64_t offset=0;offset<chunk.count;) {
+                    if(output && output->stopped())break;
+                    const auto rows=model.cache_pos==0?int64_t(1):std::min<int64_t>(4,chunk.count-offset);
+                    auto part=ids.narrow(1,offset,rows);
+                    Tensor window_logits;
+                    if(auto result=qwen4_decode_graph_hidden(model,part,nullptr,rows>1?1:0,
+                            nullptr,{},&window_logits))
+                        hidden=std::move(*result);
+                    else hidden=model.hidden_forward(part,mfq_nullopt,mfq_nullopt,nullptr,
+                        mfq_nullopt,nullptr,rows>1?1:0);
+                    if(rows>1)model.commit_speculative();
+                    offset+=rows;
+                }
+            } else if((!prepared || !prepared->transformed()) &&
                 qwen4_layer_major_prefill_eligible(model,chunk.count)) {
                 layer_major=true;
                 hidden=qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,true,
-                    [&] {return output && output->stopped();});
+                    [&] {return output && output->stopped();},nullptr,false,finish_prefill);
             }
         }
         if(output && output->stopped()) {
-            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+            finish_prefill();
             return timer.elapsed_ms();
         }
         if (hidden.defined()) {
@@ -105,6 +130,7 @@ template <typename Model> struct CudaGenerationOps {
                 nullptr,
                 mfq_nullopt,
                 true);
+            finish_prefill();
             if(borrowed) {
                 workspace.suspend();
                 hidden=hidden.narrow(1,hidden.size(1)-1,1).clone();
@@ -117,20 +143,25 @@ template <typename Model> struct CudaGenerationOps {
                 length = mfq_tensor_backend::full({1}, chunk.offset + 1, full_ids.options());
             hidden = model.hidden_forward(ids, mfq_nullopt, length);
         }
+        // Match prompt-progress timing: first-token head/sampling and expert
+        // restoration remain in TTFT, outside reported prefill throughput.
+        finish_prefill();
         if (chunk.offset + chunk.count == full_ids.size(1)) {
             auto logits = model
                               .logits_from_hidden(hidden.index({Slice(), -1, Slice()})
                                       .to(mfq_tensor_backend::kFloat16)
                                       .contiguous())
                               .reshape({1, -1});
-            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
             pending = mfq::cuda::sample_logits(sampler, std::move(logits), counts, constraint);
-        } else
-            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
+                if(model.restore_decode_workspace)model.restore_decode_workspace();
+        }
         const auto elapsed=timer.elapsed_ms();
         if(graph_config.trace)std::cerr<<"runtime_prefill_chunk offset="<<chunk.offset
             <<" tokens="<<chunk.count<<" layer_major="<<layer_major
-            <<" compute_chunk="<<prefill_compute_chunk<<" elapsed_ms="<<elapsed<<'\n';
+            <<" short_windows="<<short_windows
+            <<" compute_chunk="<<prefill_compute_chunk<<" elapsed_ms="<<elapsed
+            <<" timing=before_cache_restore"<<'\n';
         return elapsed;
     }
     std::int64_t first_token() { return pending.template item<int64_t>(); }
@@ -241,6 +272,16 @@ template <typename Model> struct CudaGenerationOps {
     }
     std::int64_t advance() {
         if (!graph_active) {
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                if(known_token_host.defined()) {
+                    const bool greedy=sampler.greedy() && !has_penalties && !constraint;
+                    if(auto result=qwen4_decode_graph_logits(model,pending.reshape({1,1}),greedy?2:1,known_token_host)) {
+                        pending=greedy?std::move(*result):mfq::cuda::sample_logits(sampler,
+                            result->contiguous().view({1,-1}),counts,constraint);
+                        return pending.template item<int64_t>();
+                    }
+                }
+            }
             pending = sample_token(model, pending.reshape({1, 1}), sampler, counts, constraint);
             return pending.template item<int64_t>();
         }
@@ -265,9 +306,24 @@ template <typename Model> struct CudaGenerationOps {
         ++model.cache_pos;
         return token;
     }
-    void accept(std::int64_t) {
+    void accept(std::int64_t token) {
         if (has_penalties && !graph_active) {
             sample_token_counts_add_cuda(counts, pending.contiguous());
+        }
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            const auto* option=std::getenv("MFQ_DECODE_EARLY_PLE");
+            if((option && option[0]=='0') || !model.reuse_decode_graphs || !model.graph_registry ||
+               (prepared && prepared->transformed()) || (output && output->stopped()))return;
+            if(!known_token_host.defined())known_token_host=mfq_tensor_backend::empty({1,1},
+                mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kInt64));
+            known_token_host.template data_ptr<int64_t>()[0]=token;
+            if(qwen4_prefetch_decode_ple(model,known_token_host)) {
+                static bool reported=false;
+                if(!reported) {
+                    reported=true;
+                    std::cerr<<"runtime_decode_early_ple enabled=1 host_token_reuse=1\n";
+                }
+            }
         }
     }
 };

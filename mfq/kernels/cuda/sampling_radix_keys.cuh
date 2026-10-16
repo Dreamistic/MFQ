@@ -2,8 +2,10 @@
 
 // The low 32 bits of each sort key already encode the token ID. Keeping only
 // keys removes the duplicate radix payload and the inter-stage re-encoding.
-template<typename Scalar,int Items,bool CompactRows=false>
-__global__ void sample_radix_keys_first(const Scalar* logits,uint64_t* output,int vocab,int top_k) {
+template<typename Scalar,int Items,bool CompactRows=false,bool Conditional=false>
+__global__ void sample_radix_keys_first(const Scalar* logits,uint64_t* output,int vocab,int top_k,
+        const volatile int32_t* enabled=nullptr) {
+    if constexpr(Conditional)if(!*enabled)return;
     using Sort=cub::BlockRadixSort<uint64_t,SAMPLE_BD,Items>;
     __shared__ typename Sort::TempStorage temporary;
     if constexpr(CompactRows) {
@@ -50,8 +52,10 @@ __device__ __forceinline__ uint64_t sample_bitonic_key(uint64_t key,uint64_t* sh
     return key;
 }
 
-template<bool Bitonic,bool CompactRows=false>
-__global__ void sample_radix_keys_reduce(const uint64_t* input,uint64_t* output,int count,int top_k) {
+template<bool Bitonic,bool CompactRows=false,bool Conditional=false>
+__global__ void sample_radix_keys_reduce(const uint64_t* input,uint64_t* output,int count,int top_k,
+        const volatile int32_t* enabled=nullptr) {
+    if constexpr(Conditional)if(!*enabled)return;
     using Sort=cub::BlockRadixSort<uint64_t,SAMPLE_BD,1>;
     __shared__ typename Sort::TempStorage temporary;
     if constexpr(CompactRows) {
@@ -115,9 +119,10 @@ __global__ void sample_radix_keys_finish(const uint64_t* input,const float* rand
 
 // Compact MTP top-k packet: original f32 logit bits and uint32 token ID.
 // Values/IDs travel together in one D2H transfer; sampling stays on the CPU.
-template<typename Scalar,bool Bitonic>
+template<typename Scalar,bool Bitonic,bool Conditional=false>
 __global__ void sample_radix_compact_finish(const uint64_t* input,const Scalar* logits,
-        uint64_t* output,int count,int vocab,int top_k) {
+        uint64_t* output,int count,int vocab,int top_k,const volatile int32_t* enabled=nullptr) {
+    if constexpr(Conditional)if(!*enabled)return;
     using Sort=cub::BlockRadixSort<uint64_t,SAMPLE_BD,1>;
     __shared__ typename Sort::TempStorage temporary;
     const int row=blockIdx.y;
