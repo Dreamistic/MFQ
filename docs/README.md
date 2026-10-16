@@ -9,7 +9,7 @@ matches what you want to do.
 - [Build the C++ runtime](cli/build.md)
 - [Run MFQ Server and Studio](cli/serve.md)
 - [Create a self-contained release](packaging.md)
-- [Check model and backend support](runtime/runtime-support.md)
+- [Check model and backend support](runtime/support.md)
 
 ## Quantize and calibrate
 
@@ -17,15 +17,17 @@ matches what you want to do.
 - [Collect reusable calibration artifacts](cli/calibrate.md)
 - [Solve an Expert-Wise precision budget](quantization/ew-joint-solver.md)
 - [AlphaQ calibration-free allocation](quantization/alphaq.md)
-- [Embed runtime sampling profiles](runtime/runtime-sampling-profiles.md)
+- [Embed runtime sampling profiles](runtime/sampling-profiles.md)
 - [Utility commands](cli/utilities.md)
 
 ## Models and runtimes
 
-- [Runtime support matrix](runtime/runtime-support.md)
-- [Python/C++ runtime transport](runtime/runtime-transport.md)
+- [Runtime support matrix](runtime/support.md)
+- [Python/C++ runtime transport](runtime/transport.md)
+- [CUDA KV memory policies](runtime/cuda-kv-memory.md)
+- [Flash-Next continuous batching](runtime/cuda-continuous-batching.md)
 - [MiniCPM-o 4.5 multimodal runtime](runtime/minicpmo45.md)
-- [HIP runtime validation](hip-native-runtime-validation.md)
+- [HIP runtime validation](runtime/hip-validation.md)
 - [C++ runtime layout](../cpp_runtime/README.md)
 
 ## APIs

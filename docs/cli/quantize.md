@@ -189,6 +189,6 @@ numbered shards as one model family.
 
 [`mfq calibrate`](calibrate.md) creates reusable activation imatrices.
 `--sampling-profile` embeds a versioned
-[runtime sampling profile](../runtime/runtime-sampling-profiles.md).
+[runtime sampling profile](../runtime/sampling-profiles.md).
 
 Full options: `uv run mfq quantize --help`.

@@ -228,6 +228,9 @@ uv run mfq serve \
 - `--context-size 0` leaves context sizing to the native runtime.
 - `--prefill-chunk-size` is forwarded to the Metal worker; the CUDA worker does
   not receive this option.
+- `--max-requests-per-runtime N` enables continuous batching on supported
+  native paths; capacity limits and scheduling behavior are documented in
+  [Flash-Next continuous batching](../runtime/cuda-continuous-batching.md).
 - `--runtime-startup-timeout` covers native worker startup and model loading.
 
 Persistent Session KV caching is configured with `--prefix-cache-dir`,

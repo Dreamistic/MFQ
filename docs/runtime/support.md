@@ -28,7 +28,7 @@ The HIP column reflects MI300X validation of the early HIP backend: dense
 Qwen3.5–3.8 models (BF16 and quantized `S4` tiers) run end to end, Qwen
 Flash-Next loads but generation is blocked by a known logits-dtype defect, and
 the other families are not yet ported. See
-[hip-native-runtime-validation.md](../hip-native-runtime-validation.md).
+[hip-validation.md](hip-validation.md).
 
 The top-level architecture family is not used to force optional features on or
 off. Vision and MTP are resolved from the graph, declared weight roots, backend
@@ -98,7 +98,7 @@ Known gaps: multi-tile MFMA attention fails above 32 query tokens, so set
 `MFQ_DISABLE_MMA_ATTENTION=1` to route prefill through the flash FMA path;
 quantized GEMM uses a scalar dot-product fallback ahead of native MFMA ports;
 and several families (DeepSeek V4, GLM DSA sparse, MiniCPM-o 4.5) remain
-stubbed. See the [HIP validation report](../hip-native-runtime-validation.md).
+stubbed. See the [HIP validation report](hip-validation.md).
 
 MiniCPM-o setup and modality details are in the
 [MiniCPM-o 4.5 runtime guide](minicpmo45.md).

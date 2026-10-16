@@ -192,7 +192,7 @@ Supported architecture groups:
 | GLM5–5.3 | CUDA C++; Metal reference runtime |
 | Gemma 4 | CUDA C++; Metal reference runtime |
 
-See the [runtime support matrix](./docs/runtime/runtime-support.md) for details.
+See the [runtime support matrix](./docs/runtime/support.md) for details.
 
 ## Benchmarks
 
@@ -257,7 +257,7 @@ for the full comparison and tier selection guide.
 - [Run MFQ Server](./docs/cli/serve.md)
 - [HTTP API](./docs/api/http.md)
 - [WebSocket and realtime API](./docs/api/websocket.md)
-- [Runtime support](./docs/runtime/runtime-support.md)
+- [Runtime support](./docs/runtime/support.md)
 - [MiniCPM-o 4.5 multimodal runtime](./docs/runtime/minicpmo45.md)
 - [Contributing and architecture rules](./CONTRIBUTING.md)
 
