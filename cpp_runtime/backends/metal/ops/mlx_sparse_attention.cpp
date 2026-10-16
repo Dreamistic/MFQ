@@ -637,6 +637,25 @@ struct SparseCircularMlaParams {
     float scale = 0.0f;
 };
 
+int sdpa_decode_partitions(mlx::core::Stream stream, int keys, int gqa) {
+    const auto& architecture = kernel_device(stream.device).get_architecture();
+    if (architecture.empty()) return 0;
+    const char family = architecture.back();
+    const bool two_pass = family == 'd' ? keys >= 1024
+        : (family == 's' && keys >= 1024) || (gqa > 1 && keys >= 4096);
+    if (!two_pass) return 0;
+    if (family == 's') {
+        if (keys > 1024 && gqa > 4)
+            return keys <= 8192 ? 128 : keys <= 32768 ? 256 : keys <= 65536 ? 512 : 1024;
+        return 64;
+    }
+    if (family == 'd') {
+        const int scaled = ((keys + 255) / 256 + 31) / 32 * 32;
+        return std::min(256, std::max(keys >= 4096 ? 64 : 32, scaled));
+    }
+    return gqa >= 4 ? 64 : 32;
+}
+
 class SparseBlockGqaPrimitive final
     : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
 public:
@@ -647,15 +666,37 @@ public:
         bool vector_decode = false)
         : UnaryPrimitive(stream),
           params_(params),
-          dtype_(dtype), vector_decode_(vector_decode) {}
+          dtype_(dtype), vector_decode_(vector_decode) {
+        if (vector_decode_) {
+            decode_keys_ = params.selected_blocks * params.block_size +
+                (params.queries == 1 ? (params.query_offset + 1) % params.block_size : params.block_size - 1);
+            partitions_ = sdpa_decode_partitions(stream, decode_keys_, params.gqa_factor);
+        }
+    }
 
-    std::string preparation_key() const override { return "mfq_sparse_block_gqa_" + mlx::core::type_to_name(dtype_) + "_" + std::to_string(vector_decode_); }
+    std::string preparation_key() const override { return "mfq_sparse_block_gqa_" + mlx::core::type_to_name(dtype_) + "_" + std::to_string(vector_decode_) + "_" + std::to_string(partitions_) + "_bs" + std::to_string(params_.block_size); }
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
         auto& device = kernel_device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
+        if (vector_decode_) {
+            auto* library = device.get_library("mfq_sdpa_decode_v1", options, sdpa_decode_source);
+            const bool yes = true, no = false;
+            mlx::core::metal::MTLFCList constants{
+                {&no, MTL::DataType::DataTypeBool, 20}, {&no, MTL::DataType::DataTypeBool, 21},
+                {&no, MTL::DataType::DataTypeBool, 22}, {&no, MTL::DataType::DataTypeBool, 23},
+                {&no, MTL::DataType::DataTypeBool, 24}, {&no, MTL::DataType::DataTypeBool, 25},
+                {&partitions_, MTL::DataType::DataTypeInt, 26}, {&yes, MTL::DataType::DataTypeBool, 27},
+                {&params_.block_size, MTL::DataType::DataTypeInt, 28},
+            };
+            const std::string type = dtype_ == mlx::core::float16 ? "f16" : "bf16";
+            (void)device.get_kernel("mfq_sdpa_decode_2pass_2_" + type + "_256", library);
+            const std::string name = "mfq_sdpa_decode_sparse_" + type + "_256";
+            return mlx::core::metal::device(stream().device).get_kernel(
+                name, library, name + "_sparse_" + std::to_string(partitions_) + "_bs" + std::to_string(params_.block_size), constants);
+        }
         auto* library = device.get_library(
             "mfq_sparse_attention_v1",
             options,
@@ -663,14 +704,6 @@ public:
         const char* kernel_name = dtype_ == mlx::core::float16
             ? "mfq_sparse_block_gqa_f16_bk64_dc64_gqa12_d256_wm2"
             : "mfq_sparse_block_gqa_bf16_bk64_dc64_gqa12_d256_wm2";
-        if (vector_decode_) {
-            kernel_name = dtype_ == mlx::core::float16
-                ? "mfq_sparse_block_gqa_vector_f16"
-                : "mfq_sparse_block_gqa_vector_bf16";
-        }
-
-        if (vector_decode_) (void)device.get_kernel(dtype_ == mlx::core::float16
-            ? "sdpa_vector_2pass_2_float16_t_256" : "sdpa_vector_2pass_2_bfloat16_t_256");
         return device.get_kernel(kernel_name, library);
     }
 
@@ -704,25 +737,34 @@ public:
         }
         encoder.set_bytes(params, 5);
         if (vector_decode_) {
-            constexpr int partitions = 128;
+            const int partitions = partitions_;
             const int rows = params.batch * params.queries * params.query_heads;
-            array partial(Shape{rows, partitions, 256}, dtype_, nullptr, {});
+            array partial(Shape{rows, partitions, 256}, mlx::core::float32, nullptr, {});
             array maximum(Shape{rows, partitions}, mlx::core::float32, nullptr, {});
             array denominator(Shape{rows, partitions}, mlx::core::float32, nullptr, {});
             for (auto* temporary : {&partial, &maximum, &denominator}) {
                 temporary->set_data(mlx::core::allocator::malloc(temporary->nbytes()));
                 encoder.add_temporary(*temporary);
             }
-            encoder.set_output_array(partial, 4);
-            encoder.set_output_array(maximum, 6);
-            encoder.set_output_array(denominator, 7);
+            encoder.set_output_array(partial, 3);
+            encoder.set_output_array(denominator, 4);
+            encoder.set_output_array(maximum, 5);
+            encoder.set_input_array(inputs[3], 6);
+            encoder.set_bytes(decode_keys_, 7);
+            const std::size_t strides[]{std::size_t(params.key_strides[1]), std::size_t(params.key_strides[2]),
+                std::size_t(params.value_strides[1]), std::size_t(params.value_strides[2])};
+            for (int index = 0; index < 4; ++index) encoder.set_bytes(strides[index], 8 + index);
+            encoder.set_bytes(params.scale, 12);
+            encoder.set_bytes(params, 19);
             encoder.dispatch_threadgroups(
-                MTL::Size(params.queries * partitions, params.kv_heads, params.batch),
+                MTL::Size(params.kv_heads, params.batch * params.queries, partitions),
                 MTL::Size(32, 12, 1));
-            const char* reduce_name = dtype_ == mlx::core::float16
-                ? "sdpa_vector_2pass_2_float16_t_256"
-                : "sdpa_vector_2pass_2_bfloat16_t_256";
-            encoder.set_compute_pipeline_state(device.get_kernel(reduce_name));
+            const std::string reduce_name = dtype_ == mlx::core::float16
+                ? "mfq_sdpa_decode_2pass_2_f16_256" : "mfq_sdpa_decode_2pass_2_bf16_256";
+            CompileOptions options;
+            options.math_mode = MathMode::Fast;
+            auto* library = device.get_library("mfq_sdpa_decode_v1", options, sdpa_decode_source);
+            encoder.set_compute_pipeline_state(device.get_kernel(reduce_name, library));
             encoder.set_input_array(partial, 0);
             encoder.set_input_array(denominator, 1);
             encoder.set_input_array(maximum, 2);
@@ -773,6 +815,8 @@ private:
     SparseBlockGqaParams params_;
     mlx::core::Dtype dtype_;
     bool vector_decode_;
+    int partitions_ = 0;
+    int decode_keys_ = 0;
 };
 
 class SparseSelectedMlaPrimitive final
@@ -1118,7 +1162,10 @@ static array sparse_block_gqa_attention_impl(
         const int valid_blocks = std::min(blocks.shape(2), complete);
         const int selected = valid_blocks * block_size +
             (queries == 1 ? visible % block_size : block_size - 1);
-        if (!prefill && selected >= 1024 && selected_key.strides(3) == 1 && selected_value.strides(3) == 1) {
+        const int decode_keys = params.selected_blocks * block_size +
+            (queries == 1 ? visible % block_size : block_size - 1);
+        if (!prefill && selected >= 1024 && sdpa_decode_partitions(stream, decode_keys, params.gqa_factor) > 0 &&
+            aligned(selected_query) && aligned(selected_key) && aligned(selected_value)) {
             return array(Shape{params.batch, queries, params.query_heads, 256}, attention_dtype,
                 std::make_shared<SparseBlockGqaPrimitive>(stream, params, attention_dtype, true),
                 {selected_query, selected_key, selected_value, blocks});
@@ -1139,8 +1186,7 @@ static array sparse_block_gqa_attention_impl(
                 mlx::core::transpose(selected_query, {0, 2, 1, 3}),
                 Shape{rows, selected_query.shape(1), 1, 256});
             auto output = mlx::core::fast::scaled_dot_product_attention(
-                query_rows, gathered[0], gathered[1], selected_scale,
-                "", gathered[2]);
+                query_rows, gathered[0], gathered[1], selected_scale, "", gathered[2]);
             return mlx::core::reshape(output,
                 Shape{selected_query.shape(0), queries, selected_query.shape(1), 256});
         }
