@@ -1,10 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="660" viewBox="0 0 1600 660" role="img" aria-labelledby="title desc" xml:lang="en">
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="740" viewBox="0 0 1600 740" role="img" aria-labelledby="title desc" xml:lang="en">
 <title id="title">Expert × projection precision</title>
 <desc id="desc">Qwen3.8-Flash-Next, layer 0, experts 0–11. This packed GGUF recipe uses one format per projection tensor; MFQ selects profiles per expert projection. Colors distinguish profiles. GGUF block-level parameters can still vary.</desc>
-<metadata>{&quot;model&quot;:&quot;Qwen3.8-Flash-Next&quot;,&quot;layer&quot;:0,&quot;expert_ids&quot;:[0,1,2,3,4,5,6,7,8,9,10,11],&quot;mfq_revision&quot;:&quot;3cdfba425c44177019d3fdac94fbfa5d17379505&quot;,&quot;gguf_revision&quot;:&quot;38bb39ee97821de2c9009abb7e93950eec396e66&quot;,&quot;source&quot;:&quot;data/qwen38-flash-next-layer0-allocation.json&quot;}</metadata>
-<rect x="0" y="0" width="1600" height="660" rx="0" fill="#ffffff" stroke="none"/>
+<metadata>{&quot;model&quot;:&quot;Qwen3.8-Flash-Next&quot;,&quot;layer&quot;:0,&quot;expert_ids&quot;:[0,1,2,3,4,5,6,7,8,9,10,11],&quot;mfq_revision&quot;:&quot;3cdfba425c44177019d3fdac94fbfa5d17379505&quot;,&quot;gguf_revision&quot;:&quot;38bb39ee97821de2c9009abb7e93950eec396e66&quot;,&quot;repository&quot;:&quot;https://github.com/Tylogi/MFQ&quot;,&quot;source&quot;:&quot;data/qwen38-flash-next-layer0-allocation.json&quot;}</metadata>
+<rect x="0" y="0" width="1600" height="740" rx="0" fill="#ffffff" stroke="none"/>
 <g font-family="Noto Sans CJK SC, Noto Sans, Arial, sans-serif">
 <text x="48" y="49" font-size="32" font-weight="700" fill="#14243a" text-anchor="start">Expert × projection precision</text>
+<text x="48" y="81" font-size="18" font-weight="400" fill="#62758d" text-anchor="start">Qwen3.8-Flash-Next · Layer 0 · Experts 0–11 / 512</text>
+<g transform="translate(0 36)">
 <rect x="48" y="78" width="1504" height="244" rx="16" fill="#f6f8fb" stroke="#dce3ec"/>
 <text x="76" y="120" font-size="26" font-weight="700" fill="#25354a" text-anchor="start">GGUF · Unsloth UD IQ3_XXS</text>
 <text x="1496" y="118" font-size="32" font-weight="700" fill="#52647b" text-anchor="end">3</text>
@@ -233,4 +235,7 @@
 <rect x="1380" y="580" width="103" height="40" rx="7" fill="#d3eee5" stroke="#9ecdbd"/>
 <text x="1432" y="607" font-size="15" font-weight="700" fill="#204f44" text-anchor="middle">NVQ2J</text>
 </g>
-</g></svg>
+</g>
+<a id="repository-url" href="https://github.com/Tylogi/MFQ">
+<text x="1552" y="716" font-size="14" font-weight="400" fill="#62758d" text-anchor="end">https://github.com/Tylogi/MFQ</text>
+</a></g></svg>

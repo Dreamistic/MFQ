@@ -13,6 +13,7 @@ const expertIds = Array.from({length: 12}, (_, id) => id);
 const projections = ['gate', 'up', 'down'];
 const nExperts = data.mfq.experts_per_layer;
 const nLayers = data.mfq.layer_count;
+const repositoryUrl = 'https://github.com/Tylogi/MFQ';
 assert.equal(nExperts, 512);
 assert.equal(nLayers, 48);
 assert.equal(recipe.revision, data.gguf.revision);
@@ -50,6 +51,7 @@ for (const projection of data.mfq.projections) {
 const language = {
   en: {
     title: 'Expert × projection precision',
+    context: `${data.mfq.model} · Layer ${data.mfq.layer} · Experts ${expertIds[0]}–${expertIds.at(-1)} / ${nExperts}`,
     description: 'Qwen3.8-Flash-Next, layer 0, experts 0–11. This packed GGUF recipe uses one format per projection tensor; MFQ selects profiles per expert projection. Colors distinguish profiles. GGUF block-level parameters can still vary.',
     gguf: 'GGUF · Unsloth UD IQ3_XXS',
     slots: 'slots / layer',
@@ -58,6 +60,7 @@ const language = {
   },
   'zh-CN': {
     title: '专家 × 投影精度分配',
+    context: `${data.mfq.model} · 第 ${data.mfq.layer} 层 · 专家 ${expertIds[0]}–${expertIds.at(-1)} / ${nExperts}`,
     description: 'Qwen3.8-Flash-Next 第 0 层、专家 0–11 的真实档位。该 GGUF 配方的每个打包投影张量共用一种格式，MFQ 则按专家投影分配档位。颜色区分档位，GGUF 块内参数仍可变化。',
     gguf: 'GGUF · Unsloth UD IQ3_XXS',
     slots: '个分配位置／层',
@@ -74,13 +77,15 @@ for (const [locale, t] of Object.entries(language)) {
   const rect = (x, y, width, height, fill, stroke = 'none', radius = 8) =>
     parts.push(`<rect x="${x}" y="${y}" width="${width}" height="${height}" rx="${radius}" fill="${fill}" stroke="${stroke}"/>`);
 
-  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="660" viewBox="0 0 1600 660" role="img" aria-labelledby="title desc" xml:lang="${locale}">`);
+  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="740" viewBox="0 0 1600 740" role="img" aria-labelledby="title desc" xml:lang="${locale}">`);
   parts.push(`<title id="title">${xml(t.title)}</title>`);
   parts.push(`<desc id="desc">${xml(t.description)}</desc>`);
-  parts.push(`<metadata>${xml(JSON.stringify({model:data.mfq.model, layer:data.mfq.layer, expert_ids:expertIds, mfq_revision:data.mfq.revision, gguf_revision:data.gguf.revision, source:'data/qwen38-flash-next-layer0-allocation.json'}))}</metadata>`);
-  rect(0, 0, 1600, 660, '#ffffff', 'none', 0);
+  parts.push(`<metadata>${xml(JSON.stringify({model:data.mfq.model, layer:data.mfq.layer, expert_ids:expertIds, mfq_revision:data.mfq.revision, gguf_revision:data.gguf.revision, repository:repositoryUrl, source:'data/qwen38-flash-next-layer0-allocation.json'}))}</metadata>`);
+  rect(0, 0, 1600, 740, '#ffffff', 'none', 0);
   parts.push('<g font-family="Noto Sans CJK SC, Noto Sans, Arial, sans-serif">');
   text(48, 49, t.title, 32, 700, '#14243a');
+  text(48, 81, t.context, 18, 400, '#62758d');
+  parts.push('<g transform="translate(0 36)">');
 
   const gridX = 190, cellWidth = 108, gridWidth = 12*cellWidth;
   rect(48, 78, 1504, 244, '#f6f8fb', '#dce3ec', 16);
@@ -125,7 +130,10 @@ for (const [locale, t] of Object.entries(language)) {
       parts.push('</g>');
     }
   }
-  parts.push('</g></svg>');
+  parts.push('</g>');
+  parts.push(`<a id="repository-url" href="${repositoryUrl}">`);
+  text(1552, 716, repositoryUrl, 14, 400, '#62758d', 'end');
+  parts.push('</a></g></svg>');
   const suffix = locale === 'en' ? '' : '.zh-CN';
   const output = new URL(`./qwen38-flash-next-allocation-comparison${suffix}.svg`, import.meta.url);
   fs.writeFileSync(output, parts.join('\n')+'\n');

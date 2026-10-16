@@ -20,6 +20,7 @@ from matplotlib.ticker import FuncFormatter
 
 ROOT = Path(__file__).resolve().parent
 DATA = json.loads((ROOT / "data/qwen38-flash-next-inference-speed.json").read_text())
+REPOSITORY_URL = "https://github.com/Tylogi/MFQ"
 
 # Register the local CJK fonts when available. SVG glyphs are saved as paths,
 # so the exported files do not depend on the viewer having these fonts.
@@ -50,24 +51,28 @@ COLORS = {"plain": "#68839f", "mtp": "#ac783b", "prefill": "#42877f"}
 LANGUAGES = {
     "en": {
         "title": "Inference speed",
-        "subtitle": "Qwen3.8-Flash-Next · 4,096-token input · Published MFQ tiers",
+        "subtitle": f"{DATA['model']} · {DATA['input_tokens']:,}-token input",
         "generation": "Generation (tok/s)",
         "prefill": "Prefill (tok/s)",
         "plain": "MTP off",
         "mtp": "MTP on",
         "metal": "M5 Max · Metal",
+        "metal_details": "40-core GPU · 128 GB",
         "cuda": "RTX 3090 Ti · CUDA",
+        "cuda_details": "RAM: 32 GiB · S3-L / V4-XS: 64 GiB",
         "footnote2": "Generation bars compare MTP settings. Hardware and RAM configurations are part of each result.",
     },
     "zh-CN": {
         "title": "推理速度",
-        "subtitle": "Qwen3.8-Flash-Next · 输入 4,096 tokens · 已发布 MFQ 档位",
+        "subtitle": f"{DATA['model']} · 输入 {DATA['input_tokens']:,} tokens",
         "generation": "生成速度（tok/s）",
         "prefill": "提示词处理（tok/s）",
         "plain": "关闭 MTP",
         "mtp": "开启 MTP",
         "metal": "M5 Max · Metal",
+        "metal_details": "40 核 GPU · 128 GB",
         "cuda": "RTX 3090 Ti · CUDA",
+        "cuda_details": "内存：32 GiB · S3-L / V4-XS：64 GiB",
         "footnote2": "生成速度的两根柱分别对应 MTP 开关；硬件与内存配置是各项结果的一部分。",
     },
 }
@@ -118,21 +123,27 @@ def panel(fig, bounds, backend, metric):
 
 
 def generate(locale, text):
-    fig = plt.figure(figsize=(14, 10.6), facecolor="white")
+    fig = plt.figure(figsize=(14, 11), facecolor="white")
     fig.text(0.065, 0.96, text["title"], fontsize=25, weight="bold")
-    fig.text(0.065, 0.905, text["generation"], fontsize=15, weight="bold")
+    fig.text(0.065, 0.928, text["subtitle"], fontsize=11.5, color="#64758c")
+    fig.text(0.065, 0.88, text["generation"], fontsize=15, weight="bold")
     fig.legend(
         [Patch(color=COLORS["plain"]), Patch(color=COLORS["mtp"])],
         [text["plain"], text["mtp"]],
         loc="center right", bbox_to_anchor=(0.975, 0.965), ncol=2,
         frameon=False, fontsize=11.5, handlelength=1.8, columnspacing=2,
     )
-    fig.text(0.065, 0.445, text["prefill"], fontsize=15, weight="bold")
+    fig.text(0.065, 0.415, text["prefill"], fontsize=15, weight="bold")
 
     for left, backend in zip((0.08, 0.585), DATA["backends"]):
-        fig.text(left, 0.855, text[backend["id"]], fontsize=14, weight="bold")
-        panel(fig, (left, 0.52, 0.375, 0.30), backend, "generation")
-        panel(fig, (left, 0.08, 0.375, 0.305), backend, "prefill")
+        fig.text(left, 0.835, text[backend["id"]], fontsize=14, weight="bold")
+        fig.text(left, 0.809, text[f"{backend['id']}_details"], fontsize=9.5, color="#64758c")
+        panel(fig, (left, 0.49, 0.375, 0.285), backend, "generation")
+        panel(fig, (left, 0.075, 0.375, 0.285), backend, "prefill")
+
+    repository_label = fig.text(0.965, 0.018, REPOSITORY_URL, fontsize=9, color="#64758c", ha="right")
+    repository_label.set_gid("repository-url")
+    repository_label.set_url(REPOSITORY_URL)
 
     suffix = "" if locale == "en" else ".zh-CN"
     target = ROOT / f"qwen38-flash-next-inference-speed{suffix}.svg"
@@ -140,7 +151,8 @@ def generate(locale, text):
     svg = target.read_text()
     svg = svg.replace("<svg ", '<svg role="img" aria-labelledby="title desc" ', 1)
     svg = svg.replace(" <title>", ' <title id="title">', 1)
-    svg = svg.replace(" <metadata>", f' <desc id="desc">{escape(text["subtitle"] + ". " + text["footnote2"])}</desc>\n <metadata>', 1)
+    description = ". ".join((text["subtitle"], text["metal"], text["metal_details"], text["cuda"], text["cuda_details"], text["footnote2"], REPOSITORY_URL))
+    svg = svg.replace(" <metadata>", f' <desc id="desc">{escape(description)}</desc>\n <metadata>', 1)
     target.write_text("\n".join(line.rstrip() for line in svg.splitlines()) + "\n")
     preview = Path(f"/tmp/mfq-inference-speed{suffix or '.en'}.png")
     fig.savefig(preview, dpi=120, facecolor="white")
