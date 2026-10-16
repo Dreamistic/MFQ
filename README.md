@@ -7,16 +7,15 @@
   <img src="./docs/figures/tylogi-ai-lab-lockup-light.svg" alt="Tylogi AI Lab" width="420">
 </picture>
 
-### Next-generation quantization & inference infrastructure
+### High-fidelity quantization and local inference
 
 **Every Bit. Maximum Fidelity.**
 
-MFQ combines neural-network-aware SQ and VQ formats designed to approach the
-practical rate-distortion frontier, high-quality, fine-grained mixed-precision
-calibration and quantization, and efficient CUDA and Metal inference.
-ROCm (HIP) support is in development. The goal is
-to deliver the best model quality possible on existing hardware within its
-memory, storage, and latency limits.
+MFQ is a quantization and inference system for running large models on local
+hardware. It co-designs fine-grained mixed-precision calibration, compact weight
+formats, and native CUDA/Metal runtimes to preserve model quality within your
+memory, storage, and latency budgets. Download and run models in **MFQ Studio**,
+or connect applications and agents through OpenAI- and Anthropic-compatible APIs.
 
 <p>
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache 2.0 license">
@@ -29,8 +28,9 @@ memory, storage, and latency limits.
 </p>
 
 <p>
+  <a href="#results">Results</a> ·
+  <a href="#why-mfq">Why MFQ</a> ·
   <a href="#quick-start">Quick start</a> ·
-  <a href="#features">Features</a> ·
   <a href="#models">Models</a> ·
   <a href="#benchmarks">Benchmarks</a> ·
   <a href="./docs/README.md">Documentation</a>
@@ -38,71 +38,128 @@ memory, storage, and latency limits.
 
 </div>
 
+<a id="results"></a>
+
+## Results at a glance
+
+The following results use **Qwen3.8-Flash-Next**, with the model tier and
+measurement conditions shown for each result.
+
+| What matters | Measured result | Configuration |
+| --- | --- | --- |
+| Quantization quality | **37.4% lower KLD**; Top1 agreement **up 5.03 percentage points** | V1-M vs. Unsloth UD IQ1_M on WikiText-2, at approximately 74.5 GB weight size |
+| Weight residency | **43.36 GiB resident weights** | V1-M on Metal, with the PLE table read from SSD |
+| Apple / Metal generation | **101.2 tok/s** | V1-M; M5 Max, 40-core GPU, 128 GB; 4,096-token input; MTP enabled |
+| NVIDIA / CUDA generation | **87.0 tok/s** | V1-S; RTX 3090 Ti + 32 GiB RAM; 4,096-token input; MTP enabled |
+
+Weight residency excludes KV cache and runtime allocations. Full speed and
+quality measurements are in [Benchmarks](#benchmarks).
+
+The quality comparison below shows model size against agreement with the
+reference model: lower KL divergence (KLD) and higher Top1 agreement are better.
+
+<p align="center">
+  <img src="./docs/figures/qwen38-flash-next-quality.png" alt="Qwen3.8-Flash-Next: MFQ, Unsloth UD and GSQ-RCO model size versus KLD and Top1 agreement" width="1100">
+</p>
+
+Quality-comparison weight sizes exclude the vision encoder and MTP head;
+GB = 10⁹ bytes. See the [model card](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ)
+for the full comparison and tier selection guide.
+
+<a id="features"></a>
+
+## Why MFQ
+
+### Preserve quality with fine-grained precision
+
+MFQ assigns precision to individual experts, projections, chunks, or neurons,
+retaining higher precision where the model needs it most. NINT scalar and NVQ
+vector formats can coexist within the same layer, with independent choices for
+each expert's Gate, Up and Down projections. The native runtimes execute these
+mixed formats directly.
+
+<details>
+<summary>See how precision is distributed across experts</summary>
+
+These **Qwen3.8-Flash-Next V3-XXS** heatmaps show the overall expert average,
+followed by Gate, Up and Down, on a shared color scale.
+
+<p align="center">
+  <img src="./docs/figures/qwen38-flash-next-expert-precision.png" alt="Qwen3.8-Flash-Next V3-XXS: average expert precision and separate Gate, Up and Down heatmaps" width="1100">
+</p>
+
+</details>
+
+Our calibration method is open source; see
+[Beyond Expert Rankings: Contrast Calibration for Mixed-Precision MoE Quantization](https://arxiv.org/abs/2610.20353).
+
+### Run large models within your hardware budget
+
+CUDA combines VRAM, system RAM and SSD to run models that exceed GPU memory
+capacity. Metal supports bounded expert residency and SSD streaming for MoE
+experts and PLE tables. CUDA and Metal kernels operate on the packed weights,
+with optimized attention, caching and I/O.
+
+Feature availability depends on the model and backend; see the
+[runtime support matrix](./docs/runtime/support.md). ROCm/HIP support is in
+development, and optimized CPU backends are planned.
+
+### Download, run, and serve from one app
+
+**MFQ Studio** brings model downloads, loading, memory budgets, quantization
+inspection and benchmarks into one desktop app. MFQ Server exposes OpenAI- and
+Anthropic-compatible APIs for applications and agents. It manages multiple
+models with LRU eviction and stores prefix and KV caches across RAM and SSD.
+Continuous batching is available on supported native paths.
+
 ## Quick start
 
-### Use a prebuilt package
+### Run a published model with MFQ Studio
 
-Download and load models, configure serving and memory budgets, inspect
-quantization, and run benchmarks from one desktop app. Applications and agents
-can connect through OpenAI- and Anthropic-compatible APIs.
+1. Download **MFQ Studio** from [Releases](https://github.com/Tylogi/MFQ/releases).
+   The package includes the desktop app, MFQ Server and native runtime.
+2. Get a model from **Downloads**, then load it from **Models**. You can also
+   open an existing local `.mfq` checkpoint.
+3. Use the loaded model locally or connect an application through the compatible
+   APIs. No source build is needed.
 
 <p align="center">
   <img src="./docs/figures/mfq-studio-overview-en.png" alt="MFQ Studio: local model serving, live performance and resource overview" width="1100">
 </p>
 
-Download **MFQ Studio** from [Releases](https://github.com/Tylogi/MFQ/releases).
-The package includes the desktop app, MFQ Server, and native runtime; no source
-build is needed. Download a model from **Downloads**, then load it from
-**Models**, or open an existing local `.mfq` checkpoint.
-
-Prebuilt C++ workers can also be supplied directly to the server:
-
-```bash
-uv run mfq serve \
-  --running-executable /path/to/mfq-decode-metal \
-  --model /models/model.mfq
-```
-
 ### Build from source
 
 MFQ requires Git, [uv](https://docs.astral.sh/uv/), CMake 3.26+, and a
 C++ toolchain. Use CUDA 12+ on NVIDIA systems or Metal on Apple silicon.
-ROCm/HIP support is in development; experimental AMD builds require ROCm 6+.
+On Apple silicon, replace `uv sync` below with `uv sync --extra metal`.
 
 ```bash
 git clone https://github.com/Tylogi/MFQ.git MFQ
 cd MFQ
 
-# NVIDIA / CUDA
 uv sync
-uv run mfq build --backend cuda
-
-# AMD / ROCm (HIP, in development)
-uv sync
-uv run mfq build --backend hip
-
-# Apple silicon / Metal
-uv sync --extra metal
-uv run mfq build --backend metal
-```
-
-Start an empty local server and open <http://127.0.0.1:8090/>:
-
-```bash
+uv run mfq build --backend auto
 uv run mfq serve
 ```
 
-Detailed requirements and custom CMake options are in the
-[`mfq build` guide](./docs/cli/build.md).
+Open <http://127.0.0.1:8090/> to load a model. To load an existing checkpoint
+at startup, use `uv run mfq serve --model /models/model.mfq`.
 
-## Quantize and run a model
+Custom build options are in [`mfq build`](./docs/cli/build.md), and prebuilt
+worker configuration is in [`mfq serve`](./docs/cli/serve.md).
+Experimental AMD builds require ROCm 6+; see the
+[HIP validation notes](./docs/runtime/hip-validation.md).
 
-Use the MFQ **`S4-M` mixed-precision preset**. It keeps sensitive tensors at
-higher precision and leaves Vision and MTP components at source precision by
-default.
+<a id="quantize-and-run-a-model"></a>
+
+### Quantize your own model
+
+For an HF Safetensors checkpoint, start with the **`S4-M` mixed-precision
+preset**. It keeps sensitive tensors at higher precision and leaves vision and
+MTP components at source precision by default.
 
 ```bash
-# Quantization dependencies
+# On Apple silicon, use: uv sync --extra metal --extra train
 uv sync --extra train
 
 # Hugging Face safetensors -> self-contained MFQ
@@ -111,62 +168,17 @@ uv run mfq quantize \
   /models/Qwen3.8-27B-MFQ-S4-M.mfq \
   --preset S4-M \
   --backend auto
-```
 
-Load and serve the result:
-
-```bash
-uv sync                                # add --extra metal on Apple silicon
-uv run mfq build --backend auto
+# Load and serve the quantized model
 uv run mfq serve \
   --model /models/Qwen3.8-27B-MFQ-S4-M.mfq \
   --context-size 32768
 ```
 
-MFQ can also quantize full-precision MFQ and GGUF sources, consume per-tensor or
-Expert-Wise precision maps and activation importance matrices, and write
-sharded output. See
+The quantizer also supports full-precision MFQ and GGUF sources, per-tensor or
+Expert-Wise precision maps, activation importance matrices, and sharded output. See
 [`mfq quantize`](./docs/cli/quantize.md) and
 [`mfq calibrate`](./docs/cli/calibrate.md).
-
-## Features
-
-### Quantization
-
-- **Fine-Grained Quantization.** Assign precision
-  to individual experts, projections, chunks, or neurons within unified MFQ
-  formats, retaining higher precision where the model needs it most.
-
-- **High-Quality Calibrated Models & Rapid Architecture Support.** Download
-  ready-to-run mixed-precision models, with quantization and inference support
-  for new architectures added regularly.
-
-Scalar NINT and vector NVQ formats can coexist within the same layer, with
-independent choices for each expert's Gate, Up and Down projections. The
-heatmaps below use **Qwen3.8-Flash-Next V3-XXS** as an example: the overall
-expert average, followed by Gate, Up and Down, on a shared color scale.
-
-<p align="center">
-  <img src="./docs/figures/qwen38-flash-next-expert-precision.png" alt="Qwen3.8-Flash-Next V3-XXS: average expert precision and separate Gate, Up and Down heatmaps" width="1100">
-</p>
-
-Our calibration method is open source; see
-[Beyond Expert Rankings: Contrast Calibration for Mixed-Precision MoE Quantization](https://arxiv.org/abs/2610.20353).
-
-### Inference
-
-- **Resource-Constrained Inference.** CUDA combines VRAM, system RAM and SSD
-  to run models beyond GPU memory capacity. Metal supports SSD Streaming for
-  MoE experts and PLE tables, loading weights on demand to reduce unified-memory
-  residency.
-
-- **Production Serving.** Continuous Batching, LRU-managed multi-model loading,
-  and tiered RAM/SSD Prefix and KV caches serve applications and agents through
-  OpenAI- and Anthropic-compatible APIs.
-
-- **High-Performance CUDA & Metal Backends.** Optimized packed-weight,
-  attention, cache, and I/O kernels for CUDA and Metal. ROCm/HIP support is
-  in development; optimized CPU backends are planned.
 
 ## Models
 
@@ -181,7 +193,8 @@ Published `.mfq` models are available from
 | Qwen3.8-27B | `V1`–`V4`, `S4`–`S6` tiers | [ModelScope](https://www.modelscope.cn/models/Tylogi/Qwen3.8-27B-MFQ) |
 | MiniCPM-o 4.5 | `S4`–`S8` multimodal tiers | [ModelScope](https://www.modelscope.cn/models/Tylogi/MiniCPM-o-4_5-MFQ) |
 
-Supported architecture groups:
+<details>
+<summary>Supported architectures and backends</summary>
 
 | Architecture group | Backends |
 | --- | --- |
@@ -192,13 +205,20 @@ Supported architecture groups:
 | GLM5–5.3 | CUDA C++; Metal reference runtime |
 | Gemma 4 | CUDA C++; Metal reference runtime |
 
+</details>
+
 See the [runtime support matrix](./docs/runtime/support.md) for details.
 
 ## Benchmarks
 
-### Qwen3.8-Flash-Next: local inference speed
+All measurements below use **Qwen3.8-Flash-Next**. Expand a table to compare
+tiers; use the [model card](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ)
+to choose a tier for your memory and quality budget.
 
-#### Apple
+<details>
+<summary>Inference speed: all measured tiers</summary>
+
+### Apple / Metal
 
 | Tier | RAM Usage | Device | Input Size | Prompt Processing | Generation (no MTP) | Generation (MTP) |
 | :--- | ---: | :--- | ---: | ---: | ---: | ---: |
@@ -209,7 +229,7 @@ See the [runtime support matrix](./docs/runtime/support.md) for details.
 | [V4-XS](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V4-XS) | 61.48 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,540.1 tok/s | 67.7 tok/s | 96.7 tok/s |
 | [S4-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S4-L) | 78.25 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,481.7 tok/s | 63.6 tok/s | 93.6 tok/s |
 
-#### CUDA
+### NVIDIA / CUDA
 
 | Tier | RAM Usage | Device | Input Size | Prompt Processing | Generation (no MTP) | Generation (MTP) |
 | :--- | ---: | :--- | ---: | ---: | ---: | ---: |
@@ -224,14 +244,13 @@ The PLE table stays on SSD; it does not need to occupy resident memory.
 For example, V1-M downloads 72.44 GiB, including 29.54 GiB of PLE, while its
 resident weights occupy 43.36 GiB.
 
-### Qwen3.8-Flash-Next: model size vs. KLD and Top1
+</details>
+
+<details>
+<summary>Quantization quality: all measured tiers</summary>
 
 WikiText-2 evaluation: lower KLD is better; higher Top1 agreement with the
 reference model is better.
-
-<p align="center">
-  <img src="./docs/figures/qwen38-flash-next-quality.png" alt="Qwen3.8-Flash-Next: MFQ, Unsloth UD and GSQ-RCO model size versus KLD and Top1 agreement" width="1100">
-</p>
 
 | MFQ Tier | Weight size (GB) | KLD ↓ | Top1 agreement ↑ |
 | --- | ---: | ---: | ---: |
@@ -242,12 +261,10 @@ reference model is better.
 | `S3-L` | 89.976 | 0.08698 | 89.55% |
 | `V4-XS` | 93.672 | 0.07524 | 90.36% |
 
-At approximately 74.5 GB, **V1-M reduces KLD by 37.4% and improves Top1
-agreement by 5.03 percentage points** over Unsloth UD IQ1_M.
-
 Weight sizes in this comparison exclude the vision encoder and MTP head;
-GB = 10⁹ bytes. See the [model card](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ)
-for the full comparison and tier selection guide.
+GB = 10⁹ bytes. See [Results at a glance](#results) for the comparison plot.
+
+</details>
 
 ## Documentation
 
