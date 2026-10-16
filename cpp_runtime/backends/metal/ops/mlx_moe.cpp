@@ -11344,9 +11344,6 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
     const int decode_k_lanes = impl_->k_lanes_override != 0
         ? impl_->k_lanes_override
         : 16;
-    const int down_k_lanes = down.impl_->k_lanes_override != 0
-        ? down.impl_->k_lanes_override
-        : (tokens == 1 && impl_->neuron_len > intermediate ? 32 : decode_k_lanes);
     constexpr int kGateRowsPerSimd = 1;
     const int gate_rows_per_workgroup =
         (folded ? kMfeFoldedGateSimdPairs : 1) *
@@ -11359,6 +11356,10 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
             ((std::uint32_t{1} << kFamilyNint) |
              (std::uint32_t{1} << kFamilyVq));
     const int down_rows_per_simd = mixed_decode_two_rows ? 2 : 1;
+    const int down_k_lanes = down.impl_->k_lanes_override != 0
+        ? down.impl_->k_lanes_override
+        : (tokens == 1 && impl_->neuron_len > intermediate && down_rows_per_simd > 1
+            ? 32 : decode_k_lanes);
     const int down_rows_per_workgroup =
         (32 / down_k_lanes) * down_rows_per_simd;
     const int down_tiles =
