@@ -1961,16 +1961,10 @@ NintInputQuantizationScope::~NintInputQuantizationScope() {
     if(!groups.empty())prepared_input_scope=previous;
 }
 
-bool nint_late_scale_enabled(int64_t input_width,int bits,int device) {
+bool nint_late_scale_enabled(int64_t input_width,int bits,int /*device*/) {
     if(const auto* setting=std::getenv("MFQ_NINT_LATE_SCALE"))return setting[0]!='0';
     if(input_width<2048 || bits<5 || bits>6)return false;
-    thread_local int cached_device=-1,major=0,minor=0;
-    if(device!=cached_device) {
-        MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device));
-        MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device));
-        cached_device=device;
-    }
-    return major==8 && minor==6;
+    return true;
 }
 
 static void nint_moe_grouped_matmul_dispatch_cuda(

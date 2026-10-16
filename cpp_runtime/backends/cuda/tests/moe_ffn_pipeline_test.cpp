@@ -2191,6 +2191,7 @@ void verify_predictor_residency(const std::filesystem::path& root,bool prefer_re
 #include "mfe_token_group_test.h"
 #include "d4_bank_map_test.h"
 #include "mfe_wide_compact_test.h"
+#include "mfe_shape_dispatch_test.h"
 #include "d4_analytic_scale_test.h"
 void verify_yarn() {
     // Independent values for dim=64, theta=10000, original context=4096,
@@ -2419,6 +2420,7 @@ int main(int argc,char** argv)try {
         if(std::string(argv[2])=="--d4-bank-map-memory-check") {verify_d4_bank_map(root,false);return 0;}
         if(std::string(argv[2])=="--d4-bank-map-stages") {verify_d4_bank_map(root,2);return 0;}
         if(std::string(argv[2])=="--mfe-wide-compact-check") {verify_mfe_wide_compact(root);return 0;}
+        if(std::string(argv[2])=="--mfe-shape-dispatch-check") {verify_mfe_shape_dispatch(root);return 0;}
         if(std::string(argv[2])=="--mfe-wide-compact-memory-check") {verify_mfe_wide_compact(root,false);return 0;}
         if(std::string(argv[2])=="--mfe-aligned-compact-check") {verify_mfe_wide_compact(root,true,true);return 0;}
         if(std::string(argv[2])=="--mfe-aligned-compact-memory-check") {verify_mfe_wide_compact(root,false,true);return 0;}
