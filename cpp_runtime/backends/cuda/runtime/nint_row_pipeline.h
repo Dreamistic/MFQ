@@ -18,7 +18,7 @@ class NintRowPipeline {
 public:
     explicit NintRowPipeline(std::vector<std::shared_ptr<mfq::NintRows>>);
     ~NintRowPipeline();
-    void issue(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape);
+    void issue(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,bool early_prefix=false);
     mfq_tensor_backend::Tensor collect(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,
         const mfq_tensor_backend::Device& device);
     std::shared_ptr<NintRowStage> make_stage(const std::vector<int64_t>& shape,

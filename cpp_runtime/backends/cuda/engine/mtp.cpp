@@ -62,6 +62,7 @@ template <class Model> struct CudaMtpOps {
           .dtype(mfq_tensor_backend::kInt64);
   Tensor input_ids, counts;
   Tensor known_ids_host, known_ids_device;
+  Tensor early_ple_ids_host;
   Tensor projected_target_hidden, projected_target_logits;
   Tensor projected_predictor_hidden, projected_predictor_logits;
   Tensor projected_target_compact,projected_predictor_compact;
@@ -72,8 +73,75 @@ template <class Model> struct CudaMtpOps {
   bool penalties = false;
   bool target_maintenance = false;
   std::uint64_t target_transfer_bytes=0;
+  std::shared_ptr<MoeExpertCache> target_route_cache;
+  CudaMtpOps(CudaMtpOps&&)=default;
+  ~CudaMtpOps() {
+    if(target_route_cache)discard_moe_speculative_routes(target_route_cache);
+  }
+  void begin_target_routes(int rows) {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      begin_moe_speculative_routes(model.execution->moe_expert_cache,rows);
+      target_route_cache=model.execution->moe_expert_cache;
+    }
+  }
+  void resolve_target_routes(int rows,bool cancelled) {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      if(!target_route_cache)return;
+      if(cancelled)discard_moe_speculative_routes(target_route_cache);
+      else commit_moe_speculative_routes(target_route_cache,rows);
+      target_route_cache.reset();
+    }
+  }
   bool take_target_maintenance() { return std::exchange(target_maintenance,false); }
   bool gradual_mtp_warmup() const {return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>;}
+  bool metal_mtp_policy() const {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      const auto* option=std::getenv("MFQ_MTP_METAL_POLICY");
+      return !option || option[0]!='0';
+    }
+    return false;
+  }
+  bool prefetch_target_ids(int32_t token,const std::vector<int32_t>& drafts) {
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+      const auto* option=std::getenv("MFQ_MTP_EARLY_PLE");
+      if((option && option[0]=='0') || !model.reuse_decode_graphs || !model.graph_registry || drafts.size()>=8)return false;
+      if(!early_ple_ids_host.defined())early_ple_ids_host=mfq_tensor_backend::empty(
+          {1,8},options.device(mfq_tensor_backend::kCPU));
+      auto* ids=early_ple_ids_host.template data_ptr<int64_t>();ids[0]=token;
+      for(std::size_t i=0;i<drafts.size();++i)ids[i+1]=drafts[i];
+      const int tokens=1+int(drafts.size());
+      if(mfq::cuda::qwen4_prefetch_decode_ple(model,early_ple_ids_host.narrow(1,0,tokens))) {
+        static bool reported=false;
+        if(!reported) {
+          reported=true;std::cerr<<"runtime_mtp_early_ple enabled=1 prefix_tokens=1\n";
+        }
+        if(tokens>1) {
+          static unsigned reported_prefixes=0;const auto bit=1u<<tokens;
+          if(!(reported_prefixes&bit)) {
+            reported_prefixes|=bit;
+            std::cerr<<"runtime_mtp_ple_draft_prefix enabled=1 prefix_tokens="<<tokens<<'\n';
+          }
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+  void prefetch_target_first(int32_t token) {prefetch_target_ids(token,{});}
+  void prefetch_target_prefix(int32_t token,const std::vector<int32_t>& drafts) {
+    const auto* option=std::getenv("MFQ_MTP_PLE_DRAFT_PREFIX");
+    if(!option || option[0]!='0')prefetch_target_ids(token,drafts);
+  }
+  void prefetch_committed_token(int32_t token) {
+    const auto* option=std::getenv("MFQ_MTP_PLE_PUBLICATION");
+    if(option && option[0]=='0')return;
+    if(prefetch_target_ids(token,{})) {
+      static bool reported=false;
+      if(!reported) {
+        reported=true;std::cerr<<"runtime_mtp_ple_publication enabled=1\n";
+      }
+    }
+  }
   bool stream_prompt_history(int64_t tokens) const {
     const auto* option=std::getenv("MFQ_MTP_STREAM_PROMPT_HISTORY");
     return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm> && tokens>16384 && (!option || option[0]!='0');
@@ -121,7 +189,7 @@ template <class Model> struct CudaMtpOps {
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       const auto* option=std::getenv("MFQ_PROFILE_MTP");
       const bool profile=option && option[0]=='1';
-      if((profile && cycle<=128) || (!profile && cycle<=32 && draft_ms+verify_ms+commit_ms>=55.0))
+      if(profile || (cycle<=32 && draft_ms+verify_ms+commit_ms>=55.0))
         std::cerr<<(profile?"runtime_mtp_cycle_profile cycle=":"runtime_mtp_slow_cycle cycle=")<<cycle<<" depth="<<depth<<" accepted="<<accepted
             <<" draft_ms="<<draft_ms<<" verify_ms="<<verify_ms<<" commit_ms="<<commit_ms
             <<" target_transfer_mb="<<target_transfer_bytes/1048576.0<<'\n';
@@ -141,11 +209,20 @@ template <class Model> struct CudaMtpOps {
     input_ids = ids_for(prompt);
     sampler_.emplace(sampling);
     penalties = sampler().has_penalties();
+    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+      if(auto* predictor=dynamic_cast<mfq::cuda::qwen4_exp::Qwen4ExpMtp*>(&mtp))
+        predictor->compact_graph_sampling=captured_compact_requested();
     if (penalties) {
       counts = mfq::cuda::SamplingOps::token_counts(input_ids, model.vocab_size());
     }
   }
   auto &sampler() { return *sampler_; }
+  bool captured_compact_requested() const {
+    const auto* option=std::getenv("MFQ_MTP_CONDITIONAL_TOPK");
+    if(option && option[0]=='0')return true;
+    const auto& parameters=sampler_->params();
+    return !sampler_->greedy() && !penalties && parameters.top_k>0 && parameters.top_k<=64;
+  }
   static void add_counts(Tensor counts, const Tensor &ids) {
     sample_token_counts_add_cuda(counts, ids);
   }
@@ -186,7 +263,7 @@ template <class Model> struct CudaMtpOps {
             ids.data_ptr() == known_ids_device.data_ptr() && ids.sizes() == known_ids_device.sizes()
             ? known_ids_host : Tensor{};
         Tensor logits;
-        if(auto hidden=mfq::cuda::qwen4_decode_graph_hidden(model,ids,raw,confirmed,&initialized,host_ids,&logits,&projected_target_greedy)) {
+        if(auto hidden=mfq::cuda::qwen4_decode_graph_hidden(model,ids,raw,confirmed,&initialized,host_ids,&logits,&projected_target_greedy,captured_compact_requested())) {
           target_transfer_bytes=moe_expert_streamed_bytes(model.execution->moe_expert_cache)-transfer_before;
           target_maintenance=target_maintenance || initialized;
           projected_target_hidden = *hidden; projected_target_logits = std::move(logits);
@@ -318,9 +395,18 @@ template <class Model> struct CudaMtpOps {
 #endif
         // Earlier teacher-forced rows contribute only predictor attention KV.
         // Their FFN/readout has no consumer; draft from the final row alone.
-        for(int64_t row=0;row<prefix;++row)
-          predictor_history_step(hidden.narrow(1,row,1),ids.narrow(1,row,1),
-              positions.defined()?positions.narrow(-1,row,1):Tensor{});
+        const auto* chain_option=std::getenv("MFQ_MTP_HISTORY_CHAIN");
+        if(prefix>1 && (!chain_option || chain_option[0]!='0')) {
+          predictor_history_step(hidden.narrow(1,0,prefix),ids.narrow(1,0,prefix),
+              positions.defined()?positions.narrow(-1,0,prefix):Tensor{},true);
+          static bool reported=false;
+          if(!reported) {
+            reported=true;std::cerr<<"runtime_mtp_history_chain enabled=1 rows="<<prefix
+                <<" scalar_projections=1\n";
+          }
+        } else for(int64_t row=0;row<prefix;++row)
+            predictor_history_step(hidden.narrow(1,row,1),ids.narrow(1,row,1),
+                positions.defined()?positions.narrow(-1,row,1):Tensor{});
         auto result=predictor_step(hidden.narrow(1,prefix,1),ids.narrow(1,prefix,1),
             positions.defined()?positions.narrow(-1,prefix,1):Tensor{});
 #ifdef MFQ_MTP_VERIFY_HISTORY_TAIL
@@ -388,14 +474,14 @@ template <class Model> struct CudaMtpOps {
         ? result.sample_hidden.narrow(1, result.sample_hidden.size(1)-1, 1).contiguous() : Tensor{};
     return result;
   }
-  void predictor_history_step(Tensor hidden, Tensor ids, Tensor positions) {
+  void predictor_history_step(Tensor hidden, Tensor ids, Tensor positions,bool scalar_chain=false) {
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       if(auto* predictor=dynamic_cast<mfq::cuda::qwen4_exp::Qwen4ExpMtp*>(&mtp);
           predictor && model.reuse_decode_graphs && model.graph_registry && ids.size(1)<=128) {
         for(int64_t offset=0;offset<ids.size(1);offset+=4) {
           const auto rows=std::min<int64_t>(4,ids.size(1)-offset);
           predictor->history_step(target,hidden.narrow(1,offset,rows),ids.narrow(1,offset,rows),
-              positions.defined()?positions.narrow(-1,offset,rows):Tensor{});
+              positions.defined()?positions.narrow(-1,offset,rows):Tensor{},scalar_chain);
         }
         target_maintenance=mtp.take_graph_initialization() || target_maintenance;
         return;

@@ -155,6 +155,19 @@ __device__ Destination convert_value(Source value) {
 }
 
 template <typename Destination, typename Source>
+__global__ void convert_contiguous_kernel(
+    Destination* __restrict__ output,
+    const Source* __restrict__ input,
+    std::int64_t elements) {
+    for (std::int64_t linear =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < elements;
+         linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
+        output[linear] = convert_value<Destination>(input[linear]);
+    }
+}
+
+template <typename Destination, typename Source>
 __global__ void convert_strided_kernel(
     TensorView destination,
     TensorView source,
@@ -333,6 +346,16 @@ void launch_convert(
             MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
             return;
         }
+    }
+    const char* contiguous_disabled =
+        std::getenv("MFQ_DISABLE_NATIVE_CONTIGUOUS_CONVERT");
+    if (source.is_contiguous() && destination.is_contiguous() &&
+            (contiguous_disabled == nullptr || contiguous_disabled[0] != '1')) {
+        convert_contiguous_kernel<Destination, Source><<<blocks, threads, 0, stream>>>(
+            static_cast<Destination*>(destination.data_ptr()),
+            static_cast<const Source*>(source.data_ptr()), source.numel());
+        MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+        return;
     }
     convert_strided_kernel<Destination, Source><<<blocks, threads, 0, stream>>>(
         destination.view_descriptor(), source.view_descriptor(), source.numel());

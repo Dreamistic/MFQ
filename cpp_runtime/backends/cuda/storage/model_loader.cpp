@@ -10,6 +10,7 @@
 
 #include "cuda_execution.h"
 #include "mfq_cuda_sampling_ops.h"
+#include "kernels/gr_prefill_blas.h"
 #include "storage/moe_expert_cache.h"
 
 #include <algorithm>
@@ -37,6 +38,7 @@ void prepare_sampling_runtime(int64_t vocabulary) {
             (void)sample_apply_penalties_cuda(logits,counts,.2,.05,1.0);
             if(vocabulary>=64)(void)sample_top_k_compact_cuda(logits,64);
         }
+        prepare_gr_prefill_blas_runtime();
     }
     context->reclaim_idle_memory();
     std::cerr<<"runtime_sampling_prepare vocab="<<vocabulary<<" local_before="<<before

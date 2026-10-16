@@ -20,6 +20,137 @@ template<class F> void rejects(F&& fn) {
 int main() {
     using namespace mfq::engine::mtp;
     {
+        // The CUDA bridge must make the same decisions as Metal's real batch
+        // policy, including host gaps, excluded maintenance, parking and retry.
+        using Clock=BatchDepthPolicy::Clock;
+        GenerationPolicy<DsparkDepthController> policy(3,false,nullptr,true,true);
+        BatchDepthPolicy metal({"cuda-mtp"},3);
+        Clock::time_point cursor{};
+        std::uint64_t reentries=0;
+        for(int cycle=0;cycle<1600;++cycle) {
+            require(policy.depth()==metal.depth());
+            const int depth=policy.depth();
+            const bool parked=metal.remaining()!=0;
+            const bool valid=cycle%31!=17;
+            const double ms=!valid?9000.0:depth==0?20.0:cycle<500?10.0+2.0*depth:35.0+30.0*depth;
+            const auto started=cursor+std::chrono::microseconds(400);
+            cursor=started+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double,std::milli>(ms));
+            const std::array<int,1> accepted{depth};
+            metal.observe(depth,accepted,started,cursor,valid,false);
+            if(parked)policy.observe_plain_window(started,cursor,valid);
+            else policy.observe_window(depth,depth,started,cursor,valid);
+            if(parked && !metal.remaining())++reentries;
+            require(policy.depth()==metal.depth() && policy.parked()==bool(metal.remaining()));
+            require(policy.parks()==metal.parks() && policy.reentries()==reentries);
+            for(int width=0;width<=3;++width)require(policy.measured_cycle_ms(width)==metal.cost(width));
+            if(cycle==499)require(policy.parks()==0);
+        }
+        require(policy.parks()>0 && policy.reentries()>0);
+        std::cout<<"Metal-policy CUDA bridge matches 1600 timed windows, exclusions and retries\n";
+    }
+    {
+        // Wide-window caches can warm without a 10% change in scalar cost.
+        // Use complete four-cycle costs, including the periodic expensive
+        // exchange, before comparing speculation with the unchanged baseline.
+        for(int phase=0;phase<4;++phase)for(bool profitable:{false,true}) {
+            DepthController controller(3,nullptr,7.0,1.03,true);
+            while(controller.warming_up()) {
+                const int depth=controller.depth();
+                controller.observe(depth,depth,depth?40.0+30.0*depth:20.0);
+            }
+            for(int i=0;i<128;++i)controller.observe(3,3,130.0);
+            const double normal=profitable?48.0:68.0,expected=normal*1.25;
+            for(int i=0;i<4;++i) {
+                controller.observe(3,3,(i+phase)%4==3?normal*2:normal);
+                const auto measured=*controller.measured_cycle_ms(3);
+                controller.observe(3,3,9000.0,false);
+                require(*controller.measured_cycle_ms(3)==measured);
+            }
+            std::cout<<"wide cache-warm cost phase="<<phase<<" measured="<<*controller.measured_cycle_ms(3)
+                <<" expected="<<expected<<" losing="<<controller.speculation_losing()<<std::endl;
+            require(std::abs(*controller.measured_cycle_ms(3)-expected)<1e-12);
+            require(controller.speculation_losing()!=profitable);
+        }
+    }
+    {
+        // Scalar decode warms substantially after the first wide replay.
+        // Revalidate that old wide cost before parking against a hot baseline.
+        for(bool profitable:{false,true}) {
+        DepthController controller(3,nullptr,7.0,1.03,true);
+        while(controller.warming_up()) {
+            const int depth=controller.depth();
+            controller.observe(depth,depth,depth==0?30.0:depth==1?40.0:depth==2?55.0:70.0);
+        }
+        require(*controller.measured_cycle_ms(3)==70.0);
+        for(int i=0;i<4;++i)controller.observe(0,0,15.0);
+        for(int i=0;i<24;++i) {
+            const int depth=controller.depth();
+            controller.observe(depth,depth,depth==0?15.0:profitable?(depth==1?24.0:depth==2?34.0:40.0):
+                depth==1?40.0:depth==2?55.0:70.0);
+        }
+        std::cout<<"cache-warm revalidation baseline="<<*controller.measured_cycle_ms(0)
+            <<" wide="<<*controller.measured_cycle_ms(3)<<" depth="<<controller.depth()<<std::endl;
+        require(*controller.measured_cycle_ms(3)==(profitable?40.0:70.0) &&
+            controller.speculation_losing()!=profitable && (controller.depth()>0)==profitable);
+        }
+        DepthController stable(3,nullptr,7.0,1.03,true);
+        while(stable.warming_up()) {
+            const int depth=stable.depth();stable.observe(depth,depth,depth==0?30.0:40.0+10.0*depth);
+        }
+        for(int i=0;i<4;++i)stable.observe(0,0,27.6);
+        for(int i=0;i<12;++i) {
+            const int depth=stable.depth();stable.observe(depth,depth,depth==0?27.6:40.0+10.0*depth);
+        }
+        require(*stable.measured_cycle_ms(3)==70.0);
+    }
+    {
+        // The plain loop also pays the four-window expert-exchange cycle.
+        // A median-based loop tax must not make profitable MTP park again.
+        for(int phase=0;phase<4;++phase)for(double speculative_ms:{38.0,44.0}) {
+            PolicyState state;
+            // Isolate time comparison from a fresh 60% acceptance prior.
+            DepthController seed(1,nullptr,7.0,1.03,true);
+            while(seed.warming_up()) {
+                const int depth=seed.depth();seed.observe(depth,depth,depth?100.0:20.0);
+            }
+            for(int i=0;i<128;++i)seed.observe(1,1,100.0);
+            state.remember(seed);
+            GenerationPolicy<DsparkDepthController> policy(1,false,&state,true);
+            for(int cycle=0;cycle<256 && !policy.parked();++cycle) {
+                const int depth=policy.depth();policy.observe(depth,depth,depth?100.0:20.0);
+            }
+            require(policy.parked());
+            for(int i=0;i<128;++i)policy.observe_plain((i+phase)%4==3?32.0:16.0);
+            require(!policy.parked() && policy.reentries()==1);
+            int baseline=0;
+            for(int cycle=0;cycle<128 && !policy.parked();++cycle) {
+                const int depth=policy.depth();
+                policy.observe(depth,depth,depth?speculative_ms:(++baseline%4?16.0:32.0));
+            }
+            std::cout<<"periodic plain-loop tax speculative_ms="<<speculative_ms
+                <<" parked="<<policy.parked()<<std::endl;
+            require(policy.parked()==(speculative_ms>40.0));
+        }
+    }
+    {
+        GenerationPolicy<DsparkDepthController> policy(3,false,nullptr,true);
+        for(int cycle=0;cycle<300 && !policy.parked();++cycle) {
+            const auto depth=policy.depth();
+            policy.observe(depth,depth,depth?80.0+30.0*depth:20.0);
+        }
+        require(policy.parked() && *policy.measured_cycle_ms(0)==20.0);
+        for(int i=0;i<64;++i)policy.observe_plain(40.0);
+        require(policy.parked() && *policy.measured_cycle_ms(0)>39.9);
+        const auto baseline=*policy.measured_cycle_ms(0);
+        policy.observe_plain(9000.0,false);
+        require(*policy.measured_cycle_ms(0)==baseline);
+        for(int i=0;i<62;++i)policy.observe_plain(40.0);
+        require(policy.parked() && policy.reentries()==0);
+        policy.observe_plain(40.0);
+        require(!policy.parked() && policy.reentries()==1 && policy.depth()==1);
+        require(*policy.measured_cycle_ms(0)>39.9);
+    }
+    {
         DepthController controller(3);
         const std::array<int, 9> sweep{3, 2, 1, 0, 0, 0, 3, 2, 1};
         for (int depth : sweep) {
@@ -117,7 +248,7 @@ int main() {
         require(latency.depth()==0);
         latency.observe(0,0,1.0,false); // Maintenance cannot advance calibration.
         require(latency.depth()==0 && !latency.measured_cycle_ms(0));
-        for(int i=0;i<3;++i)latency.observe(0,0,30.0);
+        for(int i=0;i<4;++i)latency.observe(0,0,30.0);
         require(latency.depth()==1);
         latency.observe(1,1,39.0);
         require(latency.depth()==2);
@@ -133,7 +264,7 @@ int main() {
             sampled.observe(depth,0,depth?38.0:25.0);
             ++calibration;
         }
-        require(calibration<12 && !sampled.warming_up() && sampled.depth()==0);
+        require(calibration<14 && !sampled.warming_up() && sampled.depth()==0);
         require(!sampled.measured_cycle_ms(2) && !sampled.measured_cycle_ms(3));
         for(int i=0;i<5;++i) {
             require(!sampled.should_exit());sampled.observe(0,0,25.0);
@@ -152,12 +283,12 @@ int main() {
         int baselines=0;
         while(refreshed.warming_up()) {
             const int depth=refreshed.depth();
-            const double ms=depth?50.0+depth*5.0:(++baselines<=3?60.0:25.0);
+            const double ms=depth?50.0+depth*5.0:(++baselines<=4?60.0:25.0);
             refreshed.observe(depth,0,ms);
         }
-        require(baselines==6 && *refreshed.measured_cycle_ms(0)==25.0 && refreshed.depth()==0);
+        require(baselines==8 && *refreshed.measured_cycle_ms(0)==25.0 && refreshed.depth()==0);
         DepthController gradual(3,nullptr,7.0,1.15,true);
-        const std::array<int,16> sweep{1,0,0,0,1,2,3,3,2,1,3,2,1,0,0,0};
+        const std::array<int,18> sweep{1,0,0,0,0,1,2,3,3,2,1,3,2,1,0,0,0,0};
         int step=0;
         for(int depth:sweep) {
             require(gradual.depth()==depth);
@@ -170,7 +301,7 @@ int main() {
         require(!gradual.warming_up() && gradual.depth()>1);
         require(*gradual.measured_cycle_ms(3)==35.0);
         DepthController continuation(3,&gradual,7.0,1.15,true);
-        for(int depth:std::array<int,13>{1,0,0,0,1,2,3,3,2,1,0,0,0}) {
+        for(int depth:std::array<int,15>{1,0,0,0,0,1,2,3,3,2,1,0,0,0,0}) {
             require(continuation.depth()==depth);
             continuation.observe(depth,depth,20.0+5.0*depth);
         }
@@ -183,6 +314,47 @@ int main() {
         require(policy.parked());
         for(int i=0;i<128;++i)policy.observe_plain(20.0);
         require(!policy.parked() && policy.depth()==1);
+    }
+    {
+        // One maintenance-sized exchange every four windows is real decode
+        // work. Its average is 20 ms, so a 19 ms/token speculative path wins.
+        // Taking the minimum 16 ms incorrectly parks that profitable path.
+        for(const double speculative_ms:{38.0,45.0}) {
+            DepthController periodic(1,nullptr,7.0,1.03,true);
+            int baseline=0;
+            while(periodic.warming_up()) {
+                const auto depth=periodic.depth();
+                periodic.observe(depth,depth,9000.0,false);
+                periodic.observe(depth,depth,depth?speculative_ms:(++baseline%4?16.0:32.0));
+            }
+            require(*periodic.measured_cycle_ms(0)==20.0);
+            for(int i=0;i<128;++i)periodic.observe(1,1,speculative_ms);
+            require(periodic.speculation_losing()==(speculative_ms>40.0));
+            DepthController inherited(1,&periodic,7.0,1.03,true);
+            baseline=0;
+            while(inherited.warming_up()) {
+                const auto depth=inherited.depth();
+                inherited.observe(depth,depth,depth?speculative_ms:(++baseline%4?16.0:32.0));
+            }
+            require(*inherited.measured_cycle_ms(0)==20.0);
+        }
+    }
+    {
+        // Cold calibration says 25 ms; a warm scalar path actually takes
+        // 10 ms. It is initially too far behind to be selected as a rival.
+        // A mandatory periodic probe must discover that speculation loses.
+        DepthController warmed(1,nullptr,7.0,1.03,true);
+        while(warmed.warming_up()) {
+            const auto depth=warmed.depth();warmed.observe(depth,depth,depth?35.0:25.0);
+        }
+        int plain_probes=0;
+        for(int cycle=0;cycle<100;++cycle) {
+            const auto depth=warmed.depth();
+            plain_probes+=depth==0;
+            warmed.observe(depth,depth,depth?35.0:10.0);
+        }
+        require(plain_probes>=4 && *warmed.measured_cycle_ms(0)==10.0);
+        require(warmed.depth()==0 && warmed.speculation_losing());
     }
     {
         // A shared predictor cost makes depth-one extrapolation pessimistic:

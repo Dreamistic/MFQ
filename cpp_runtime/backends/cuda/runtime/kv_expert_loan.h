@@ -6,11 +6,14 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <condition_variable>
 #include <chrono>
+#include <cstdio>
 #include <unordered_map>
 #include <functional>
 #include <memory>
 #include <limits>
+#include <utility>
 
 namespace mfq::cuda {
 // Cache immutable expert fields in pages of KV storage that have never held
@@ -19,13 +22,72 @@ namespace mfq::cuda {
 // route publication; next_packet() is called only after that reader boundary.
 // KV growth is prepared before a window or at its ordered KV service boundary.
 class KvExpertLoan {
+    struct Entry;
     struct ProjectionLayout {
         std::array<std::size_t,8> bytes{},offsets{};
         int fields=0;std::size_t logical_bytes=0;
     };
 public:
     using Key=std::array<int64_t,3>; // source, expert, field
+    class ExchangeReadGuard {
+        friend class KvExpertLoan;
+        KvExpertLoan* owner_;
+        bool all_;
+        std::vector<Entry*> pins_;
+        explicit ExchangeReadGuard(KvExpertLoan* owner,bool all,std::size_t reserve):owner_(owner),all_(all) {
+            pins_.reserve(reserve);
+        }
+    public:
+        ExchangeReadGuard(const ExchangeReadGuard&)=delete;
+        ExchangeReadGuard(ExchangeReadGuard&& other) noexcept:owner_(std::exchange(other.owner_,nullptr)),
+            all_(other.all_),pins_(std::move(other.pins_)){}
+        ~ExchangeReadGuard(){if(owner_)owner_->release_exchange_reads(*this);}
+    };
+    // Concurrent predictor packets may reclaim unrelated pages. Only addresses
+    // retained by an exchange (or an explicit whole-cache guard) stay pinned.
+    ExchangeReadGuard retain_exchange_reads(bool all=true,std::size_t reserve=0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ExchangeReadGuard guard(this,all,reserve);
+        ++exchange_readers_;exchange_freezes_+=all;
+        return guard;
+    }
+    struct SpeculativeStats {uint64_t windows=0,kept=0,reverted_hits=0,cold_insertions=0,cancels=0,disabled=0;};
     static constexpr std::size_t page=64<<10;
+    void begin_speculative(int rows) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(speculative_rows_)throw std::logic_error("nested KV expert speculation");
+        if(rows<1 || rows>32)throw std::invalid_argument("invalid KV expert speculative rows");
+        if(rows==1)return;
+        speculative_keys_.clear();packet_sources_={};packet_masks_.clear();
+        try {speculative_keys_.reserve(std::max(speculative_keys_.capacity(),lru_.size()+64));}
+        catch(const std::bad_alloc&){++speculative_stats_.disabled;return;}
+        if(++speculative_epoch_==0) {
+            for(auto* entries:{&lru_,&retired_})for(auto& entry:*entries)entry.epoch=0;
+            speculative_epoch_=1;
+        }
+        // Assign the current order once. Ordinary cache use needs no timestamp
+        // maintenance; speculative execution keeps the original live LRU.
+        access_order_=0;
+        for(auto it=lru_.rbegin();it!=lru_.rend();++it)it->order=++access_order_;
+        speculative_rows_=rows;
+    }
+    void speculative_packet(const std::array<int64_t,3>& sources,const int32_t* ids,int rows,int routes,int experts) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        speculative_packet_locked(sources,ids,rows,routes,experts);
+    }
+    void commit_speculative(int rows) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(!speculative_rows_)return;
+        if(rows<0 || rows>speculative_rows_)throw std::invalid_argument("invalid KV expert committed prefix");
+        finish_speculative(rows,false);
+    }
+    void discard_speculative() noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(speculative_rows_)finish_speculative(0,true);
+        }catch(...){}
+    }
+    SpeculativeStats speculative_stats() const {std::lock_guard<std::mutex> lock(mutex_);return speculative_stats_;}
     std::size_t add(mfq_tensor_backend::Tensor owner,int64_t capacity,std::size_t row_bytes,bool prefix,int64_t ratio=1,bool manual=false,bool external=false) {
         std::lock_guard<std::mutex> lock(mutex_);
         Region region;region.owner=std::move(owner);region.capacity=capacity;region.row_bytes=row_bytes;region.prefix=prefix;region.ratio=ratio;
@@ -44,7 +106,8 @@ public:
     // Called at a completed request/window boundary. Revoke published expert
     // addresses and drain their uploads before returning this allocation.
     void remove(std::size_t region) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        exchange_finished_.wait(lock,[&]{return !exchange_readers_;});
         auto& r=regions_.at(region);
         for(auto* entries:{&lru_,&retired_})for(auto it=entries->begin();it!=entries->end();) {
             if(it->region==region){auto old=it++;erase(old);}else ++it;
@@ -54,24 +117,32 @@ public:
         r=Region{};
     }
     void ensure(int64_t tokens) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         if(tokens<=high_water_)return;high_water_=tokens;
+        if(exchange_readers_ && std::any_of(regions_.begin(),regions_.end(),[&](const Region& r) {
+                return r.owner.defined() && bounds(r,tokens)!=std::pair{r.begin,r.end};
+            }))exchange_finished_.wait(lock,[&]{return !exchange_readers_;});
         // Most token appends stay inside the same 64 KiB protection pages.
         // Only changed page boundaries can invalidate a cached expert.
         if(update_bounds())revoke();
     }
     void protect(std::size_t region,int64_t rows) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         auto& r=regions_.at(region);if(rows<=r.manual_live)return;
+        if(exchange_readers_ && bounds(r,high_water_,rows)!=std::pair{r.begin,r.end})
+            exchange_finished_.wait(lock,[&]{return !exchange_readers_;});
         r.manual_live=rows;if(update_bounds())revoke();
     }
-    void next_packet() {
+    void next_packet(const std::array<int64_t,3>& sources={},const int32_t* ids=nullptr,int rows=0,int routes=0,int experts=0) {
         std::lock_guard<std::mutex> lock(mutex_);
         if(++packet_==0){for(auto& e:lru_)e.packet=0;packet_=1;}
         // The next route publication fences readers of the previous packet,
         // exactly as for ordinary LRU eviction. Retirement itself never frees
         // an address that an already submitted graph can still be reading.
-        while(!retired_.empty()){retired_bytes_+=retired_.front().bytes;erase(retired_.begin());}
+        if(!exchange_freezes_)for(auto it=retired_.begin();it!=retired_.end();) {
+            if(it->exchange_pins){++it;continue;}
+            retired_bytes_+=it->bytes;auto old=it++;erase(old);
+        }
         // The previous route's consumers have finished before this boundary.
         // Publish only now: an allocated projection may still have DMA pending
         // during its first use and must not enter the next prepare's hot set.
@@ -80,6 +151,7 @@ public:
             if(!entry.retired && !entry.published){entry.published=true;notify_projection(entry,true);}
         }
         pending_publications_.clear();
+        if(ids)speculative_packet_locked(sources,ids,rows,routes,experts);
     }
     // Pin every known member of this packet before an allocation can evict a
     // later routed projection. Actual pin() calls still update LRU recency.
@@ -112,6 +184,7 @@ public:
             if(sizes[f]<0 || std::size_t(sizes[f])!=it->projection->bytes[f])
                 throw std::logic_error("KV existing projection field geometry changed");
         if(it->retired)pending_publications_.push_back(it->key);
+        note_access(*it,it->retired);
         lru_.splice(lru_.begin(),it->retired?retired_:lru_,it);it->retired=false;it->packet=packet_;
         offsets=it->projection->offsets;logical_bytes=it->projection->logical_bytes;hits_+=logical_bytes;
         return pointer(*it);
@@ -142,20 +215,32 @@ public:
     }
     // Residency exchange holds the completed window and joins before the next
     // packet/KV growth. It may reuse these bytes until that exchange finishes.
-    const void* find_for_exchange(const Key& key,std::size_t bytes) const {
+    const void* find_for_exchange(const Key& key,std::size_t bytes,ExchangeReadGuard* guard=nullptr) const {
         std::lock_guard<std::mutex> lock(mutex_);
+        const auto retain=[&](Entry& entry) {
+            if(!guard)return;
+            if(guard->owner_!=this)throw std::logic_error("KV exchange guard belongs to another cache");
+            if(guard->all_)return;
+            // Complete projection fields are adjacent lookups. A repeated
+            // nonadjacent lookup may hold another pin; release balances both.
+            if(guard->pins_.empty() || guard->pins_.back()!=&entry) {
+                guard->pins_.push_back(&entry);++entry.exchange_pins;
+            }
+        };
         const auto found=entries_.find(key);
         if(found!=entries_.end()) {
-            const auto& entry=*found->second;
+            auto& entry=*found->second;
             if(entry.bytes!=bytes)throw std::logic_error("KV exchange field geometry changed");
+            retain(entry);
             return pointer(entry);
         }
         const auto projection=entries_.find({key[0],key[1],-1});
         if(projection==entries_.end())return nullptr;
-        const auto& entry=*projection->second;
+        auto& entry=*projection->second;
         if(!entry.projection || key[2]<0 || key[2]>=entry.projection->fields ||
                 entry.projection->bytes[std::size_t(key[2])]!=bytes)
             throw std::logic_error("KV exchange projection field geometry changed");
+        retain(entry);
         return static_cast<const uint8_t*>(pointer(entry))+entry.projection->offsets[std::size_t(key[2])];
     }
     const void* pin(const Key& key,const void* source,std::size_t bytes,cudaStream_t stream,bool& hit,std::vector<DmaCopy>* batch=nullptr,
@@ -182,9 +267,63 @@ public:
         for(const auto* entries:{&lru_,&retired_})for(const auto& e:*entries)if(e.region==region)result+=e.bytes;return result;
     }
 private:
+    void speculative_packet_locked(const std::array<int64_t,3>& sources,const int32_t* ids,int rows,int routes,int experts) {
+        if(!speculative_rows_)return;
+        if(rows!=speculative_rows_ || !ids || routes<=0 || experts<=0) {disable_speculative();return;}
+        try {packet_masks_.assign(experts,0);}
+        catch(const std::bad_alloc&){disable_speculative();return;}
+        packet_sources_=sources;
+        for(int row=0;row<rows;++row)for(int route=0;route<routes;++route) {
+            const auto expert=ids[row*routes+route];
+            if(unsigned(expert)<unsigned(experts))packet_masks_[expert]|=uint32_t(1)<<row;
+        }
+    }
     struct Region {mfq_tensor_backend::Tensor owner;int64_t capacity=0,ratio=1,manual_live=-1;std::size_t row_bytes=0,begin=0,end=0,largest_free=0;bool prefix=false,external=false;std::map<std::size_t,std::size_t> free;};
     struct Entry {Key key;std::size_t region,first,pages,bytes;uint64_t packet=0;bool retired=false,published=false;
-        std::unique_ptr<ProjectionLayout> projection;};
+        uint64_t order=0,prior_order=0,epoch=0;uint32_t used_rows=0;
+        std::unique_ptr<ProjectionLayout> projection;std::size_t exchange_pins=0;};
+    void disable_speculative() {
+        speculative_rows_=0;speculative_keys_.clear();packet_sources_={};packet_masks_.clear();++speculative_stats_.disabled;
+    }
+    void note_access(Entry& entry,bool fresh=false) {
+        if(!speculative_rows_)return;
+        const auto expert=entry.key[1];
+        const auto mask=expert>=0 && std::size_t(expert)<packet_masks_.size() &&
+            std::find(packet_sources_.begin(),packet_sources_.end(),entry.key[0])!=packet_sources_.end()?
+                packet_masks_[std::size_t(expert)]:0;
+        if(mask) {
+            if(entry.epoch!=speculative_epoch_) {
+                try {speculative_keys_.push_back(entry.key);}
+                catch(const std::bad_alloc&){disable_speculative();return;}
+                entry.epoch=speculative_epoch_;entry.prior_order=fresh?0:entry.order;entry.used_rows=0;
+            }
+            entry.used_rows|=mask;
+        }
+        entry.order=++access_order_;
+    }
+    void finish_speculative(int rows,bool cancelled) {
+        const uint32_t accepted=rows==32?UINT32_MAX:(uint32_t(1)<<rows)-1;
+        bool reordered=false;uint64_t hits=0,insertions=0;
+        for(const auto& key:speculative_keys_)if(auto found=entries_.find(key);found!=entries_.end()) {
+            auto& entry=*found->second;if(entry.epoch!=speculative_epoch_)continue;
+            entry.epoch=0;
+            if(entry.used_rows&accepted) {++speculative_stats_.kept;continue;}
+            entry.order=entry.prior_order;reordered=true;
+            if(entry.prior_order)++hits;else ++insertions;
+        }
+        // Rejected hits recover their pre-window recency. New rejected entries
+        // become cold. Do not free, unpublish or move any payload here: a later
+        // ordinary packet boundary remains the sole eviction/read fence.
+        if(reordered)lru_.sort([](const Entry& a,const Entry& b){return a.order>b.order;});
+        ++speculative_stats_.windows;speculative_stats_.reverted_hits+=hits;
+        speculative_stats_.cold_insertions+=insertions;speculative_stats_.cancels+=cancelled;
+        if(reordered && !speculative_reported_) {
+            speculative_reported_=true;
+            std::fprintf(stderr,"moe_kv_mtp_lru_dispatch enabled=1 rows=%d window_rows=%d reverted_hits=%llu cold_insertions=%llu\n",
+                rows,speculative_rows_,static_cast<unsigned long long>(hits),static_cast<unsigned long long>(insertions));
+        }
+        speculative_rows_=0;speculative_keys_.clear();packet_sources_={};packet_masks_.clear();
+    }
     struct KeyHash {
         std::size_t operator()(const Key& key) const noexcept {
             std::size_t hash=0;
@@ -206,6 +345,7 @@ private:
                     projection->bytes!=it->projection->bytes))
                 throw std::logic_error("KV expert projection geometry changed");
             if(it->retired && it->projection)pending_publications_.push_back(it->key);
+            note_access(*it,it->retired);
             lru_.splice(lru_.begin(),it->retired?retired_:lru_,it);it->retired=false;
             it->packet=packet_;hit=true;hits_+=projection?projection->logical_bytes:bytes;
             return pointer(*it);
@@ -213,10 +353,13 @@ private:
         const auto pages=(bytes+page-1)/page;
         if(std::none_of(regions_.begin(),regions_.end(),[&](const Region& r){return r.end>=r.begin && r.end-r.begin>=pages;}))return nullptr;
         auto room=find(pages);
+        if(room.first==regions_.size() && exchange_freezes_)return nullptr;
         while(room.first==regions_.size()) {
             auto candidate=lru_.end();
-            while(candidate!=lru_.begin()){--candidate;if(candidate->packet!=packet_)break;}
-            if(candidate==lru_.end() || candidate->packet==packet_)break;
+            for(auto it=lru_.end();it!=lru_.begin();) {
+                --it;if(it->packet!=packet_ && !it->exchange_pins){candidate=it;break;}
+            }
+            if(candidate==lru_.end())break;
             erase(candidate);room=find(pages);
         }
         if(room.first==regions_.size())return nullptr;
@@ -238,18 +381,29 @@ private:
         if(previous==r.largest_free) {
             r.largest_free=0;for(const auto& [begin,size]:r.free)r.largest_free=std::max(r.largest_free,size);
         }
+        note_access(entry,true);
         lru_.push_front(std::move(entry));entries_[key]=lru_.begin();bytes_+=bytes;copy_stream_=stream;
         if(projection)pending_publications_.push_back(key);
         return cache;
     }
 
+    static std::pair<std::size_t,std::size_t> bounds(const Region& r,int64_t high_water,int64_t manual=-2) {
+        const auto protected_rows=manual==-2?r.manual_live:manual;
+        const auto live=std::min(r.capacity,protected_rows>=0?protected_rows:(high_water+r.ratio-1)/r.ratio);
+        return {r.prefix?0:(std::size_t(live)*r.row_bytes+page-1)/page,
+            r.prefix?std::size_t(r.capacity-live)*r.row_bytes/page:r.owner.nbytes()/page};
+    }
+    void release_exchange_reads(const ExchangeReadGuard& guard) noexcept {
+        {std::lock_guard<std::mutex> lock(mutex_);
+            for(auto* entry:guard.pins_)--entry->exchange_pins;
+            --exchange_readers_;exchange_freezes_-=guard.all_;}
+        exchange_finished_.notify_all();
+    }
     bool update_bounds() {
         bool changed=false;
         for(auto& r:regions_) {
             if(!r.owner.defined())continue;
-            const auto live=std::min(r.capacity,r.manual_live>=0?r.manual_live:(high_water_+r.ratio-1)/r.ratio);
-            const auto begin=r.prefix?0:(std::size_t(live)*r.row_bytes+page-1)/page;
-            const auto end=r.prefix?std::size_t(r.capacity-live)*r.row_bytes/page:r.owner.nbytes()/page;
+            const auto [begin,end]=bounds(r,high_water_);
             if(begin==r.begin && end==r.end)continue;
             r.begin=begin;r.end=end;changed=true;
             for(auto it=r.free.begin();it!=r.free.end();) {
@@ -287,6 +441,7 @@ private:
         }
     }
     void erase(std::list<Entry>::iterator it) {
+        if(it->exchange_pins)throw std::logic_error("reclaiming a pinned KV exchange source");
         if(it->published)notify_projection(*it,false);
         auto& r=regions_[it->region];
         auto begin=std::max(it->first,r.begin),end=std::min(it->first+it->pages,r.end);
@@ -301,6 +456,8 @@ private:
         (it->retired?retired_:lru_).erase(it);
     }
     mutable std::mutex mutex_;
+    std::condition_variable exchange_finished_;
+    std::size_t exchange_readers_=0,exchange_freezes_=0;
     std::vector<Region> regions_;
     std::list<Entry> lru_,retired_;
     std::unordered_map<Key,std::list<Entry>::iterator,KeyHash> entries_;
@@ -308,6 +465,12 @@ private:
     std::unordered_map<int64_t,std::vector<Observer>> observers_;
     std::vector<Key> pending_publications_;
     uint64_t packet_=1;
+    int speculative_rows_=0;uint64_t speculative_epoch_=0,access_order_=0;
+    std::array<int64_t,3> packet_sources_{};
+    std::vector<uint32_t> packet_masks_;
+    std::vector<Key> speculative_keys_;
+    SpeculativeStats speculative_stats_;
+    bool speculative_reported_=false;
     std::size_t bytes_=0,hits_=0,retired_bytes_=0;
     double lookup_us_=0;
     int64_t high_water_=0;

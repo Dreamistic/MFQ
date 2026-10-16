@@ -9,6 +9,7 @@
 #include "mfq_cuda_nint_route_hint.h"
 #include "runtime/decode_window.h"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -49,6 +50,13 @@ View pool_view(const MixedMoePool& pool,int rows,std::vector<tb::Tensor>& owners
         result.d4_dense_groups=w.dense_groups && d4;
         const auto bank_map_option=mfq::cuda::runtime_options::mfe_nvq_bank_map();
         result.nvq_bank_map=bank_map_option && !*bank_map_option?0:w.bank_map;
+        if(d4 && result.nvq_bank_map) {
+            static std::atomic<uint32_t> reported{0};
+            const uint32_t bit=1u<<result.format;
+            if(!(reported.fetch_or(bit,std::memory_order_relaxed)&bit))std::fprintf(stderr,
+                "mfe_d4_bank_map_dispatch scope=first_descriptor enabled=1 format=%d map=0x%08x\n",
+                result.format,result.nvq_bank_map);
+        }
         result.nvec=(result.input_width+(d4?3:7))/(d4?4:8);result.nsign=(result.input_width+7)/8;
         const std::array<tb::Tensor,5> fields={w.indices_packed,w.aux_packed,w.sub_scale_packed,w.neuron_scale,w.codebook};
         for(int i=0;i<5;++i){result.fields[i]=fields[i].data_ptr();owners.push_back(fields[i]);}
@@ -222,6 +230,15 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
             views[index]=projection_view(1,views[index]);
         }
     }
+    constexpr uint32_t grouped_formats=0xfd22u;
+    batch_.token_group_compact=!combined_gate_up_ && batch_.default_math &&
+        !batch_.shared_dense_math && !batch_.warp_multi_sum &&
+        !(batch_.nvq_format_mask&~grouped_formats) &&
+        (!(batch_.nvq_format_mask&compact_formats) || batch_.compact_nvq) &&
+        std::all_of(views.begin(),views.end(),[](const View& d) {
+            return d.family==2 || (d.family==1 &&
+                (d.group_size==24 || d.group_size==28 || d.group_size==32));
+        });
     descriptors_=upload(views);cohorts_=tb::tensor(mapping).to(tb::kCUDA);
     std::vector<mfq::cuda::MfeInputQuantization> quantization;
     for(const auto& entry:quantizers) {
@@ -253,17 +270,26 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
     // independent eight-row decode tiles may request expert reuse explicitly.
     if(batch_.tokens>=2 && batch_.tokens<=32 &&
        (batch_.nvq_format_mask || batch_.tokens>8 || token_group_capacity_hint>=4)) {
-        // Routed short batches retain the measured pair-sized groups.
-        // Shared-expert reuse has a separate plan and launch bounds.
-        batch_.token_group_capacity=batch_.tokens<=8?2:8;
+        // Three/four-row compact batches reuse decoded weights across the
+        // complete small window. Other shapes retain their previous capacity.
+        const auto* wide_compact=std::getenv("MFQ_MFE_TOKEN_WIDE_COMPACT");
+        const bool wide_default=(!wide_compact || wide_compact[0]!='0') && batch_.token_group_compact &&
+            batch_.input_width==2560 && batch_.intermediate==640 && batch_.output_width==2560 &&
+            batch_.routes==10 && (batch_.tokens==3 || batch_.tokens==4);
+        batch_.token_group_capacity=batch_.tokens<=8?(wide_default?4:2):8;
         if(token_group_capacity_hint==4 || token_group_capacity_hint==8)
             batch_.token_group_capacity=token_group_capacity_hint;
         if(const auto capacity=mfq::cuda::runtime_options::mfe_token_group_capacity()) {
-            if(*capacity>0)batch_.token_group_capacity=*capacity;
+            if(*capacity>mfq::cuda::kMfeSharedGroupEncoding)
+                batch_.token_group_capacity=shared[0] && batch_.tokens>=3 && batch_.tokens<=8?*capacity:2;
+            else if(*capacity>0)batch_.token_group_capacity=*capacity;
             else if(batch_.tokens>=3 && batch_.tokens<=6)
                 batch_.token_group_capacity=batch_.tokens<=4?4:8;
         }
-        const int plan_capacity=batch_.token_group_capacity>mfq::cuda::kMfeSharedGroupEncoding?
+        const auto* split_shared=std::getenv("MFQ_MFE_SPLIT_SHARED_GROUPS");
+        split_shared_groups_=shared[0] && batch_.token_group_capacity==4 && batch_.tokens<=8 &&
+            split_shared && split_shared[0]!='0';
+        const int plan_capacity=split_shared_groups_ || batch_.token_group_capacity>mfq::cuda::kMfeSharedGroupEncoding?
             2:batch_.token_group_capacity;
         batch_.token_groups=batch_.tokens*batch_.routes+
             (shared[0]?(batch_.tokens+plan_capacity-1)/plan_capacity:0);
@@ -272,16 +298,34 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         batch_.token_group_counts=token_group_counts_.data_ptr<int32_t>();
         batch_.token_group_slots=token_group_slots_.data_ptr<int32_t>();
         const auto aligned_gu=mfq::cuda::runtime_options::mfe_token_aligned_gu();
-        // The aligned CTA saves work at four rows. Other short shapes retain
-        // the more parallel Gate/Up split; an explicit setting can compare it.
+        // Short compact mixed batches are dominated by singleton/pair groups.
+        // Their smaller independent Gate/Up CTAs outperform the aligned CTA,
+        // including its fused quantizer. Keep the existing explicit override.
+        const bool short_compact=batch_.tokens==4 && batch_.token_group_compact && batch_.nvq_format_mask &&
+            batch_.input_width==2560 && batch_.intermediate==640 && batch_.output_width==2560 && batch_.routes==10;
         batch_.token_group_aligned_gu=batch_.tokens<=8 &&
-            (aligned_gu?*aligned_gu:batch_.tokens==4);
+            (aligned_gu?*aligned_gu:batch_.tokens==4 && !short_compact);
+        if(short_compact && !aligned_gu && !batch_.token_group_aligned_gu) {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                "mfe_short_gu_dispatch scope=first_eligible_batch enabled=1 tokens=4 aligned=0 capacity=%d mask=%u\n",
+                batch_.token_group_capacity,batch_.nvq_format_mask);
+        }
         const auto aligned_down=[](const View& d) {
             return d.group_size>=2 && d.group_size<=32 && d.group_size%2==0;
         };
         for(int i=0;i<batch_.projection_counts[2];++i)
             batch_.token_group_aligned_gu &= aligned_down(views[batch_.projection_offsets[2]+i]);
         if(shared[0])batch_.token_group_aligned_gu &= aligned_down(views.back());
+        // Shared-only wide kernels use the separate hidden quantizer. Their
+        // CTAs own individual outputs rather than complete quantization groups.
+        batch_.token_group_aligned_gu &= batch_.token_group_capacity<=mfq::cuda::kMfeSharedGroupEncoding;
+        if(batch_.token_group_capacity>mfq::cuda::kMfeSharedGroupEncoding) {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                "mfe_shared_group_dispatch scope=first_encoded_batch enabled=1 tokens=%d routed_capacity=2 shared_capacity=%d\n",
+                batch_.tokens,batch_.token_group_capacity-mfq::cuda::kMfeSharedGroupEncoding);
+        }
         const auto compact_plan=mfq::cuda::runtime_options::mfe_token_compact_plan();
         if(!compact_plan || *compact_plan) {
             token_group_buckets_=tb::empty({4,batch_.token_groups+1},input.options().dtype(tb::kInt32));
@@ -518,8 +562,10 @@ void MfeFfnRuntime::prepare(int32_t* published_ids,uint32_t* ready){
         published_ids,ready,mfq_current_cuda_stream());
     else prepare(prepared,quantization,quantization_count_,quantization_groups_,mfq_current_cuda_stream());
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
-    if(shared_plan && prepared.token_group_counts) {
-        mfq::cuda::mfe_ffn_token_group_shared_plan(batch_,mfq_current_cuda_stream());
+    if((shared_plan || split_shared_groups_) && prepared.token_group_counts) {
+        auto shared_batch=batch_;
+        if(split_shared_groups_)shared_batch.token_group_capacity=mfq::cuda::kMfeSharedGroupEncoding+2;
+        mfq::cuda::mfe_ffn_token_group_shared_plan(shared_batch,mfq_current_cuda_stream());
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }

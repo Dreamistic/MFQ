@@ -62,12 +62,13 @@ void qwen4_begin_router_lookahead_audit(Qwen4CausalLm&,int samples);
 void qwen4_finish_router_lookahead_audit(Qwen4CausalLm&,const std::string& prefix);
 void qwen4_set_rotary_fusion(Qwen4CausalLm&, bool enabled);
 void qwen4_set_attention_grouping(Qwen4CausalLm&, bool enabled);
+bool qwen4_prefetch_decode_ple(Qwen4CausalLm&,const mfq_tensor_backend::Tensor& host_ids);
 std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_logits(
-    Qwen4CausalLm&,mfq_tensor_backend::Tensor,int);
+    Qwen4CausalLm&,mfq_tensor_backend::Tensor,int,const mfq_tensor_backend::Tensor& host_ids={});
 std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
     Qwen4CausalLm&,mfq_tensor_backend::Tensor,mfq_tensor_backend::Tensor* raw_hidden,int64_t confirmed=0,
     bool* initialized=nullptr,const mfq_tensor_backend::Tensor& host_ids={},
-    mfq_tensor_backend::Tensor* logits=nullptr,std::vector<int32_t>* greedy_tokens=nullptr);
+    mfq_tensor_backend::Tensor* logits=nullptr,std::vector<int32_t>* greedy_tokens=nullptr,bool compact_sampling=true);
 void qwen4_report_decode_graph(const Qwen4CausalLm&,std::ostream&);
 mfq_tensor_backend::Tensor qwen4_decode_graph_compact_topk(const Qwen4CausalLm&);
 void qwen4_release_decode_graphs(Qwen4CausalLm&,MtpModule*);

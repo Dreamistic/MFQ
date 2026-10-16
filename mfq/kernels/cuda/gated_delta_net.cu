@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda/atomic>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include "mfq_tensor_backend.h"

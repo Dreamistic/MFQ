@@ -157,7 +157,9 @@ struct CudaEngineState {
                 cuda_has_separate_memory()) {
         initial_expert_budget=moe_expert_cache_budget_bytes(execution->moe_expert_cache);
         if (execution->qsa_kv_store)
-            execution->qsa_kv_store->set_ram_reservation([this](std::size_t bytes) { cache.reserve_ram(bytes); });
+            execution->qsa_kv_store->set_ram_reservation([this](std::size_t bytes) {
+                cache.reserve_ram(bytes);reclaim_moe_optional_host(execution->moe_expert_cache,bytes);
+            });
         allocation_ceiling=mfq::cuda::default_context(execution->layer_placement.primary_device())->memory_stats().limit;
         if (config.continuous_batch.max_sequences) {
             if constexpr (std::is_same_v<Model, Qwen35CausalLm> || std::is_same_v<Model,Qwen4CausalLm>)
@@ -176,7 +178,9 @@ struct CudaEngineState {
             language.restore_decode_workspace=[this]{restore_graph_expert_space();};
             set_moe_workspace_reservation(execution->moe_expert_cache,
                 [this](std::size_t bytes) {reclaim_prefix_workspace(bytes);},
-                [this](std::size_t bytes) {cache.reserve_ram(bytes);});
+                [this](std::size_t bytes) {
+                    cache.reserve_ram(bytes);reclaim_moe_optional_host(execution->moe_expert_cache,bytes);
+                });
             language.reserve_kv_workspace = [this](std::size_t bytes) {
                 const auto device = execution->layer_placement.primary_device();
                 auto context = mfq::cuda::default_context(device);
@@ -359,7 +363,8 @@ struct CudaEngineState {
             Metrics metrics{
                 {"mtp_graph_prepared_depth",double(graph_draft_depth)},
                 {"mtp_flexible_expert_capacity_bytes",double(graph_expert_storage.defined()?graph_expert_storage.nbytes():0)},
-                {"mtp_flexible_expert_used_bytes",double(graph_expert_loan?graph_expert_loan->external_bytes():0)},
+                {"mtp_flexible_expert_used_bytes",double(graph_expert_loan && graph_expert_region?
+                    graph_expert_loan->region_bytes(*graph_expert_region):0)},
                 {"kv_memory_supported",std::is_same_v<Model,Qwen4CausalLm>?1.0:0.0},
                 {"kv_quantization_supported",(std::is_same_v<Model,Qwen4CausalLm>||std::is_same_v<Model,Qwen35CausalLm>)?1.0:0.0},
                 {"kv_quantization_bits",(std::is_same_v<Model,Qwen4CausalLm>||std::is_same_v<Model,Qwen35CausalLm>)?cuda_kv_quantization().bits:0.0},

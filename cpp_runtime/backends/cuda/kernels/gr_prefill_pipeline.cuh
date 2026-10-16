@@ -162,7 +162,8 @@ void launch_gr_prefill_pipeline(const NintWeight& weight,const mfq_tensor_backen
             output.data_ptr<Output>(),int(rows),int(weight.neuron_len),int(weight.out),int(weight.ng),int(weight.gs));
     };
     const auto* option=std::getenv(Mix?"MFQ_GR_PREFILL_FUSED_MIX":"MFQ_GR_PREFILL_MATMUL");
-    const int mode=option?std::atoi(option):(Mix?(std::is_same_v<Input,__half>?12:10):31);
+    int mode=option?std::atoi(option):(Mix?(std::is_same_v<Input,__half>?12:10):31);
+    if constexpr(!Mix)if(mode==32)mode=31;
     if constexpr(!Mix) {
         if((mode==29 || mode==31) && weight.out<=4) {
             launch(std::integral_constant<int,1>{},std::integral_constant<int,2>{},

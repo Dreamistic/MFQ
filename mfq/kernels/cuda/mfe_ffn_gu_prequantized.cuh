@@ -5,14 +5,19 @@ namespace {
 // The following hidden-quantization node owns completion and Down geometry.
 // One warp reads the immutable route classification and descriptors before
 // their common CTA barrier. Other warps do not duplicate those reads.
-template<uint32_t Formats,bool SimpleM1>
+template<uint32_t Formats,bool SimpleM1,bool TokenSingles=false>
 __global__ void __launch_bounds__(512,2) mfe_ffn_gu_prequantized_kernel(MfeFfnBatch b,int partition) {
     const bool shared_first=(partition&4)!=0,early_gu=(partition&8)!=0;
     partition&=3;
     const int all_routes=b.routes+int(b.shared!=nullptr);
-    const int token=SimpleM1?0:int(blockIdx.y);
+    int token=SimpleM1?0:int(blockIdx.y);
     int tile=int(blockIdx.x),route;
-    if constexpr(SimpleM1) {
+    if constexpr(TokenSingles) {
+        const int group=token_group_index<1>(b,blockIdx.y);
+        if(group<0 || b.token_group_counts[group]!=1)return;
+        const int original=b.token_group_slots[group*8];
+        token=original/all_routes;route=original%all_routes;
+    }else if constexpr(SimpleM1) {
         const int position=int(blockIdx.y);
         route=position+(shared_first?(position?-1:b.routes):0);
     }else {

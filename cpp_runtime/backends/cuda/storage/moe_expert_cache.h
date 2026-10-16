@@ -66,10 +66,16 @@ void resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache, std::
 // Reclaim lower-priority cache storage before reducing prefill transfer overlap.
 void set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCache>& cache,
     std::function<void(std::size_t)> reserve,std::function<void(std::size_t)> reserve_ram={});
+std::size_t reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cache,
+    std::size_t allocation_bytes=0);
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);
 std::uint64_t moe_expert_streamed_bytes(const std::shared_ptr<MoeExpertCache>& cache);
 // Finish the adaptive transaction before a session reset or a prefill loan.
 void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache);
+void prepare_moe_predictor_exchange(const std::shared_ptr<MoeExpertCache>& cache);
+void begin_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,int rows);
+void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,int rows);
+void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache) noexcept;
 void prepare_moe_decode_residency(const std::shared_ptr<MoeExpertCache>& cache);
 // Target, predictor and request batches share the MFE pool on their compute stream.
 bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);

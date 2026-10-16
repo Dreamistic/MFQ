@@ -10,6 +10,7 @@
 #include <vector>
 
 namespace mfq {
+class HostParallelPool;
 class MfeQuantRangeUnsupported : public std::runtime_error {
 public: using std::runtime_error::runtime_error;
 };
@@ -37,8 +38,11 @@ public:
     MfeQuantExpert read_expert(int expert) const;
     // Startup-only sequential pool read; the temporary canonical pool is
     // released before advancing to the next pool. Visitors own each leaf.
+    // An optional executor slices immutable pool bytes concurrently; callers
+    // must provide a thread-safe visitor and join before returning.
     void visit_pool_experts(std::size_t pool,
-        const std::function<void(int, MfeQuantExpert)>& visitor) const;
+        const std::function<void(int, MfeQuantExpert)>& visitor,
+        HostParallelPool* workers=nullptr,int threads=1) const;
     std::size_t payload_nbytes() const noexcept { return bytes_; }
 private:
     struct Pool {
