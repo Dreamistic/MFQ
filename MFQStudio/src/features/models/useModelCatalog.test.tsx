@@ -259,20 +259,38 @@ describe('useModelCatalog', () => {
     expect(state.refreshRuntime).not.toHaveBeenCalled();
   });
 
-  it('opens the browsed directory in Finder without loading, registering, or changing the saved folder', async () => {
+  it.each([
+    { can_open_directory: true, can_open_in_finder: true },
+    { can_open_directory: true, can_open_in_finder: false },
+    { can_open_in_finder: true },
+  ])('opens the browsed directory without loading, registering, or changing the saved folder (%j)', async (capability) => {
     saveModelDirectory('/chosen/models');
-    const open = vi.spyOn(modelsApi, 'openModelDirectoryInFinder').mockResolvedValue({ opened: true });
+    const open = vi.spyOn(modelsApi, 'openModelDirectory').mockResolvedValue({ opened: true });
     const register = vi.spyOn(modelsApi, 'registerModelDirectory');
     const load = vi.spyOn(modelsApi, 'loadModel');
     vi.spyOn(modelsApi, 'modelDirectories').mockResolvedValue({ current_id: 'folder', current_name: 'models',
-      current_path: '/chosen/models', parent_id: null, model_file_count: 0, data: [], can_open_in_finder: true, files: [] });
+      current_path: '/chosen/models', parent_id: null, model_file_count: 0, data: [], ...capability, files: [] });
     const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
     await act(async () => result.current.chooseModelDirectory());
-    await act(async () => result.current.openCurrentDirectoryInFinder());
+    await act(async () => result.current.openCurrentDirectory());
     expect(open).toHaveBeenCalledWith('folder');
     expect(register).not.toHaveBeenCalled();
     expect(load).not.toHaveBeenCalled();
     expect(readModelDirectory()).toBe('/chosen/models');
+    expect(result.current.busy).toBe(false);
+  });
+
+  it.each([
+    { can_open_directory: false, can_open_in_finder: false },
+    { can_open_directory: false, can_open_in_finder: true },
+  ])('does not launch a file manager when unavailable (%j)', async (capability) => {
+    const open = vi.spyOn(modelsApi, 'openModelDirectory').mockResolvedValue({ opened: true });
+    vi.spyOn(modelsApi, 'modelDirectories').mockResolvedValue({ current_id: 'folder', current_name: 'models',
+      current_path: '/chosen/models', parent_id: null, model_file_count: 0, data: [], ...capability });
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await act(async () => result.current.chooseModelDirectory());
+    await act(async () => result.current.openCurrentDirectory());
+    expect(open).not.toHaveBeenCalled();
     expect(result.current.busy).toBe(false);
   });
 

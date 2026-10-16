@@ -1020,10 +1020,12 @@
             "type": "string"
           },
           "metadata": {
+            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
           "parameters": {
+            "additionalProperties": true,
             "title": "Parameters",
             "type": "object"
           },
@@ -1218,6 +1220,7 @@
             "type": "string"
           },
           "graph": {
+            "additionalProperties": true,
             "title": "Graph",
             "type": "object"
           },
@@ -1520,6 +1523,7 @@
             "type": "string"
           },
           "metadata": {
+            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -1599,6 +1603,7 @@
             "title": "Context Size"
           },
           "metadata": {
+            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -1632,7 +1637,7 @@
             "type": "string"
           },
           "settings": {
-            "$ref": "#/components/schemas/ResponseRequestSettings-Input"
+            "$ref": "#/components/schemas/ResponseRequestSettings"
           }
         },
         "required": [
@@ -1651,6 +1656,7 @@
             "type": "string"
           },
           "payload": {
+            "additionalProperties": true,
             "title": "Payload",
             "type": "object"
           }
@@ -1860,7 +1866,7 @@
         "additionalProperties": false,
         "properties": {
           "load": {
-            "$ref": "#/components/schemas/ModelLoadRequest-Input"
+            "$ref": "#/components/schemas/ModelLoadRequest"
           },
           "name": {
             "maxLength": 64,
@@ -1880,6 +1886,7 @@
         "additionalProperties": false,
         "properties": {
           "metadata": {
+            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -1960,6 +1967,7 @@
             "type": "string"
           },
           "metadata": {
+            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -2110,6 +2118,7 @@
             "type": "string"
           },
           "details": {
+            "additionalProperties": true,
             "title": "Details",
             "type": "object"
           },
@@ -2283,10 +2292,12 @@
             "title": "Dataset Id"
           },
           "dataset_manifest": {
+            "additionalProperties": true,
             "title": "Dataset Manifest",
             "type": "object"
           },
           "hardware_identity": {
+            "additionalProperties": true,
             "title": "Hardware Identity",
             "type": "object"
           },
@@ -2311,6 +2322,7 @@
             "type": "string"
           },
           "metrics": {
+            "additionalProperties": true,
             "title": "Metrics",
             "type": "object"
           },
@@ -2321,10 +2333,12 @@
             "type": "string"
           },
           "parameters": {
+            "additionalProperties": true,
             "title": "Parameters",
             "type": "object"
           },
           "runtime_identity": {
+            "additionalProperties": true,
             "title": "Runtime Identity",
             "type": "object"
           }
@@ -2367,6 +2381,7 @@
           },
           "task_benchmarks": {
             "additionalProperties": {
+              "additionalProperties": true,
               "type": "object"
             },
             "title": "Task Benchmarks",
@@ -2528,6 +2543,7 @@
             "type": "string"
           },
           "metadata": {
+            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -2557,7 +2573,7 @@
             "type": "string"
           },
           "settings": {
-            "$ref": "#/components/schemas/ResponseRequestSettings-Output"
+            "$ref": "#/components/schemas/ResponseRequestSettings"
           },
           "updated_at": {
             "format": "date-time",
@@ -2573,6 +2589,62 @@
           "updated_at"
         ],
         "title": "GenerationPresetResource",
+        "type": "object"
+      },
+      "HubDownloadProbeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/HubDownloadSource"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Sources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sources"
+        ],
+        "title": "HubDownloadProbeRequest",
+        "type": "object"
+      },
+      "HubDownloadSource": {
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "enum": [
+              "huggingface",
+              "modelscope"
+            ],
+            "title": "Provider",
+            "type": "string"
+          },
+          "repo_id": {
+            "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+            "title": "Repo Id",
+            "type": "string"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          }
+        },
+        "required": [
+          "provider",
+          "repo_id"
+        ],
+        "title": "HubDownloadSource",
         "type": "object"
       },
       "HubMemoryPool": {
@@ -3498,6 +3570,7 @@
             "type": "string"
           },
           "data": {
+            "additionalProperties": true,
             "title": "Data",
             "type": "object"
           },
@@ -3588,6 +3661,7 @@
             "type": "string"
           },
           "payload_schema": {
+            "additionalProperties": true,
             "title": "Payload Schema",
             "type": "object"
           }
@@ -3661,6 +3735,7 @@
             "type": "string"
           },
           "payload": {
+            "additionalProperties": true,
             "title": "Payload",
             "type": "object"
           },
@@ -3671,12 +3746,14 @@
             "type": "number"
           },
           "progress_data": {
+            "additionalProperties": true,
             "title": "Progress Data",
             "type": "object"
           },
           "result": {
             "anyOf": [
               {
+                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -3765,6 +3842,7 @@
             "type": "string"
           },
           "schema": {
+            "additionalProperties": true,
             "title": "Schema",
             "type": "object"
           },
@@ -4625,6 +4703,11 @@
       "ModelDirectoryList": {
         "additionalProperties": false,
         "properties": {
+          "can_open_directory": {
+            "default": false,
+            "title": "Can Open Directory",
+            "type": "boolean"
+          },
           "can_open_in_finder": {
             "default": false,
             "title": "Can Open In Finder",
@@ -4778,232 +4861,7 @@
         "title": "ModelLoadContextSettings",
         "type": "object"
       },
-      "ModelLoadRequest-Input": {
-        "additionalProperties": false,
-        "properties": {
-          "artifact_uri": {
-            "anyOf": [
-              {
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Artifact Uri"
-          },
-          "context_management": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ModelLoadContextSettings"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "context_size": {
-            "anyOf": [
-              {
-                "maximum": 2147483647.0,
-                "minimum": 512.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Context Size"
-          },
-          "device_ids": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Device Ids",
-            "type": "array"
-          },
-          "idle_ttl_seconds": {
-            "anyOf": [
-              {
-                "minimum": 0.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Idle Ttl Seconds"
-          },
-          "kv_memory": {
-            "$ref": "#/components/schemas/KvMemorySettings"
-          },
-          "kv_quantization": {
-            "$ref": "#/components/schemas/KvQuantizationSettings"
-          },
-          "model": {
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Model",
-            "type": "string"
-          },
-          "moe_gpu_cache_gb": {
-            "anyOf": [
-              {
-                "minimum": 0.0,
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Moe Gpu Cache Gb"
-          },
-          "pin": {
-            "default": false,
-            "title": "Pin",
-            "type": "boolean"
-          },
-          "prefill_chunk_size": {
-            "default": 2048,
-            "minimum": 1.0,
-            "title": "Prefill Chunk Size",
-            "type": "integer"
-          },
-          "prefix_cache_block_tokens": {
-            "anyOf": [
-              {
-                "maximum": 65536.0,
-                "minimum": 1.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prefix Cache Block Tokens"
-          },
-          "prefix_cache_disk_bytes": {
-            "anyOf": [
-              {
-                "minimum": 0.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prefix Cache Disk Bytes"
-          },
-          "prefix_cache_enabled": {
-            "default": true,
-            "title": "Prefix Cache Enabled",
-            "type": "boolean"
-          },
-          "prefix_cache_hot_bytes": {
-            "anyOf": [
-              {
-                "minimum": 0.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prefix Cache Hot Bytes"
-          },
-          "prefix_cache_max_bytes": {
-            "anyOf": [
-              {
-                "minimum": 0.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prefix Cache Max Bytes"
-          },
-          "prefix_cache_max_sessions": {
-            "anyOf": [
-              {
-                "minimum": 0.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prefix Cache Max Sessions"
-          },
-          "prefix_cache_max_snapshots_per_session": {
-            "anyOf": [
-              {
-                "minimum": 0.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prefix Cache Max Snapshots Per Session"
-          },
-          "prefix_cache_pending_bytes": {
-            "anyOf": [
-              {
-                "minimum": 0.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prefix Cache Pending Bytes"
-          },
-          "prefix_cache_ram_bytes": {
-            "anyOf": [
-              {
-                "minimum": 0.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prefix Cache Ram Bytes"
-          },
-          "qsa_kv_offload": {
-            "$ref": "#/components/schemas/QsaKvOffloadPolicy"
-          },
-          "sampling_defaults": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/SamplingParams"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "yarn_enabled": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Yarn Enabled"
-          }
-        },
-        "required": [
-          "model"
-        ],
-        "title": "ModelLoadRequest",
-        "type": "object"
-      },
-      "ModelLoadRequest-Output": {
+      "ModelLoadRequest": {
         "additionalProperties": false,
         "properties": {
           "artifact_uri": {
@@ -5792,6 +5650,7 @@
           "document": {
             "anyOf": [
               {
+                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -5820,81 +5679,7 @@
         "title": "PortableMedia",
         "type": "object"
       },
-      "PortableMessage-Input": {
-        "additionalProperties": false,
-        "properties": {
-          "created_at": {
-            "format": "date-time",
-            "title": "Created At",
-            "type": "string"
-          },
-          "parts": {
-            "items": {
-              "discriminator": {
-                "mapping": {
-                  "audio": "#/components/schemas/AudioPart",
-                  "document": "#/components/schemas/DocumentPart",
-                  "generated_audio": "#/components/schemas/GeneratedAudioPart",
-                  "image": "#/components/schemas/ImagePart",
-                  "reasoning": "#/components/schemas/ReasoningPart",
-                  "text": "#/components/schemas/TextPart",
-                  "tool_call": "#/components/schemas/ToolCallPart",
-                  "tool_result": "#/components/schemas/ToolResultPart",
-                  "transcript": "#/components/schemas/TranscriptPart",
-                  "video": "#/components/schemas/VideoPart"
-                },
-                "propertyName": "type"
-              },
-              "oneOf": [
-                {
-                  "$ref": "#/components/schemas/TextPart"
-                },
-                {
-                  "$ref": "#/components/schemas/ReasoningPart"
-                },
-                {
-                  "$ref": "#/components/schemas/ImagePart"
-                },
-                {
-                  "$ref": "#/components/schemas/VideoPart"
-                },
-                {
-                  "$ref": "#/components/schemas/AudioPart"
-                },
-                {
-                  "$ref": "#/components/schemas/TranscriptPart"
-                },
-                {
-                  "$ref": "#/components/schemas/DocumentPart"
-                },
-                {
-                  "$ref": "#/components/schemas/ToolCallPart"
-                },
-                {
-                  "$ref": "#/components/schemas/ToolResultPart"
-                },
-                {
-                  "$ref": "#/components/schemas/GeneratedAudioPart"
-                }
-              ]
-            },
-            "minItems": 1,
-            "title": "Parts",
-            "type": "array"
-          },
-          "role": {
-            "$ref": "#/components/schemas/MessageRole"
-          }
-        },
-        "required": [
-          "role",
-          "parts",
-          "created_at"
-        ],
-        "title": "PortableMessage",
-        "type": "object"
-      },
-      "PortableMessage-Output": {
+      "PortableMessage": {
         "additionalProperties": false,
         "properties": {
           "created_at": {
@@ -6595,6 +6380,7 @@
             "title": "Last Checked At"
           },
           "metrics": {
+            "additionalProperties": true,
             "title": "Metrics",
             "type": "object"
           },
@@ -7075,91 +6861,7 @@
         "title": "ResponseReasoningDelta",
         "type": "object"
       },
-      "ResponseRequestSettings-Input": {
-        "additionalProperties": false,
-        "properties": {
-          "include_reasoning_history": {
-            "default": true,
-            "title": "Include Reasoning History",
-            "type": "boolean"
-          },
-          "input_role": {
-            "default": "user",
-            "enum": [
-              "user",
-              "tool"
-            ],
-            "title": "Input Role",
-            "type": "string"
-          },
-          "response_format": {
-            "discriminator": {
-              "mapping": {
-                "json_object": "#/components/schemas/JsonObjectResponseFormat",
-                "json_schema": "#/components/schemas/JsonSchemaResponseFormat",
-                "text": "#/components/schemas/TextResponseFormat"
-              },
-              "propertyName": "type"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/TextResponseFormat"
-              },
-              {
-                "$ref": "#/components/schemas/JsonObjectResponseFormat"
-              },
-              {
-                "$ref": "#/components/schemas/JsonSchemaResponseFormat"
-              }
-            ],
-            "title": "Response Format"
-          },
-          "sampling": {
-            "$ref": "#/components/schemas/SamplingParams"
-          },
-          "system_prompt": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "System Prompt"
-          },
-          "tool_choice": {
-            "anyOf": [
-              {
-                "enum": [
-                  "auto",
-                  "none",
-                  "required"
-                ],
-                "type": "string"
-              },
-              {
-                "$ref": "#/components/schemas/NamedToolChoice"
-              }
-            ],
-            "default": "auto",
-            "title": "Tool Choice"
-          },
-          "tools": {
-            "items": {
-              "$ref": "#/components/schemas/ToolDefinition"
-            },
-            "title": "Tools",
-            "type": "array"
-          }
-        },
-        "required": [
-          "sampling"
-        ],
-        "title": "ResponseRequestSettings",
-        "type": "object"
-      },
-      "ResponseRequestSettings-Output": {
+      "ResponseRequestSettings": {
         "additionalProperties": false,
         "properties": {
           "include_reasoning_history": {
@@ -7377,7 +7079,7 @@
           "settings": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/ResponseRequestSettings-Output"
+                "$ref": "#/components/schemas/ResponseRequestSettings"
               },
               {
                 "type": "null"
@@ -8257,6 +7959,7 @@
             "type": "string"
           },
           "fields": {
+            "additionalProperties": true,
             "title": "Fields",
             "type": "object"
           },
@@ -8837,6 +8540,7 @@
             "type": "integer"
           },
           "values": {
+            "additionalProperties": true,
             "title": "Values",
             "type": "object"
           }
@@ -9017,7 +8721,7 @@
             "type": "string"
           },
           "load": {
-            "$ref": "#/components/schemas/ModelLoadRequest-Output"
+            "$ref": "#/components/schemas/ModelLoadRequest"
           },
           "name": {
             "title": "Name",
@@ -9459,7 +9163,7 @@
         "title": "SamplingParams",
         "type": "object"
       },
-      "SessionArchive-Input": {
+      "SessionArchive": {
         "additionalProperties": false,
         "properties": {
           "format": {
@@ -9477,41 +9181,7 @@
           },
           "messages": {
             "items": {
-              "$ref": "#/components/schemas/PortableMessage-Input"
-            },
-            "title": "Messages",
-            "type": "array"
-          },
-          "session": {
-            "$ref": "#/components/schemas/SessionResource"
-          }
-        },
-        "required": [
-          "session",
-          "messages"
-        ],
-        "title": "SessionArchive",
-        "type": "object"
-      },
-      "SessionArchive-Output": {
-        "additionalProperties": false,
-        "properties": {
-          "format": {
-            "const": "mfq-session-v1",
-            "default": "mfq-session-v1",
-            "title": "Format",
-            "type": "string"
-          },
-          "media": {
-            "items": {
-              "$ref": "#/components/schemas/PortableMedia"
-            },
-            "title": "Media",
-            "type": "array"
-          },
-          "messages": {
-            "items": {
-              "$ref": "#/components/schemas/PortableMessage-Output"
+              "$ref": "#/components/schemas/PortableMessage"
             },
             "title": "Messages",
             "type": "array"
@@ -9592,6 +9262,7 @@
             "type": "string"
           },
           "metadata": {
+            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -9847,6 +9518,7 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
+            "additionalProperties": true,
             "title": "Arguments",
             "type": "object"
           },
@@ -9916,6 +9588,7 @@
             "type": "string"
           },
           "parameters": {
+            "additionalProperties": true,
             "title": "Parameters",
             "type": "object"
           },
@@ -10042,6 +9715,7 @@
             "title": "Context Size"
           },
           "metadata": {
+            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -10075,7 +9749,7 @@
             "type": "string"
           },
           "settings": {
-            "$ref": "#/components/schemas/ResponseRequestSettings-Input"
+            "$ref": "#/components/schemas/ResponseRequestSettings"
           }
         },
         "required": [
@@ -10157,7 +9831,7 @@
         "additionalProperties": false,
         "properties": {
           "load": {
-            "$ref": "#/components/schemas/ModelLoadRequest-Input"
+            "$ref": "#/components/schemas/ModelLoadRequest"
           },
           "name": {
             "maxLength": 64,
@@ -10179,6 +9853,7 @@
           "metadata": {
             "anyOf": [
               {
+                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -10457,6 +10132,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Delete Workspace Artifact Api V1 Artifacts Remove Post",
                   "type": "object"
                 }
@@ -11992,6 +11668,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Voice Output Component Status Api V1 Components Voice Output Get",
                   "type": "object"
                 }
@@ -12124,6 +11801,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Activate Voice Output Component Api V1 Components Voice Output Activate Post",
                   "type": "object"
                 }
@@ -14096,6 +13774,149 @@
           }
         },
         "summary": "Configure Download Directory",
+        "tags": [
+          "models"
+        ]
+      }
+    },
+    "/api/v1/hub/download-sources/probe": {
+      "post": {
+        "operationId": "probe_download_sources_api_v1_hub_download_sources_probe_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HubDownloadProbeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Probe Download Sources Api V1 Hub Download Sources Probe Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Probe Download Sources",
         "tags": [
           "models"
         ]
@@ -17124,7 +16945,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ModelLoadRequest-Input"
+                "$ref": "#/components/schemas/ModelLoadRequest"
               }
             }
           },
@@ -19268,6 +19089,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Clear Runtime Cache Api V1 Runtime Cache Clear Post",
                   "type": "object"
                 }
@@ -19514,6 +19336,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Prefix Cache Entries Api V1 Runtime Cache Entries Get",
                   "type": "object"
                 }
@@ -19689,6 +19512,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Prefix Cache Text Api V1 Runtime Cache Entries  Namespace   Block  Text Get",
                   "type": "object"
                 }
@@ -19831,6 +19655,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Purge Prefix Cache Api V1 Runtime Cache Purge Post",
                   "type": "object"
                 }
@@ -19980,6 +19805,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Trim Runtime Cache Api V1 Runtime Cache Trim Post",
                   "type": "object"
                 }
@@ -21227,6 +21053,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Runtime Listener Api V1 Runtime Listener Get",
                   "type": "object"
                 }
@@ -21367,6 +21194,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Configure Runtime Listener Api V1 Runtime Listener Put",
                   "type": "object"
                 }
@@ -21694,6 +21522,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Memory Policy Api V1 Runtime Memory Policy Get",
                   "type": "object"
                 }
@@ -22414,6 +22243,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Runtime Models Api V1 Runtime Models Get",
                   "type": "object"
                 }
@@ -23568,6 +23398,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Qsa Kv Offload Info Api V1 Runtime Qsa Kv  Instance Id  Get",
                   "type": "object"
                 }
@@ -23700,6 +23531,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Realtime Capabilities Api V1 Runtime Realtime Capabilities Get",
                   "type": "object"
                 }
@@ -23842,6 +23674,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Reload Runtime Api V1 Runtime Reload Post",
                   "type": "object"
                 }
@@ -24124,6 +23957,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Runtime Status Api V1 Runtime Status Get",
                   "type": "object"
                 }
@@ -24268,6 +24102,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Yarn Context Info Api V1 Runtime Yarn  Instance Id  Get",
                   "type": "object"
                 }
@@ -24694,7 +24529,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SessionArchive-Input"
+                "$ref": "#/components/schemas/SessionArchive"
               }
             }
           },
@@ -25276,7 +25111,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SessionArchive-Output"
+                  "$ref": "#/components/schemas/SessionArchive"
                 }
               }
             },

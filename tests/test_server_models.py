@@ -1232,7 +1232,9 @@ def test_catalog_discovers_and_registers_mfq_files_shown_by_the_browser(tmp_path
 
 
 @pytest.mark.parametrize("failure", [None, OSError("failed"), subprocess.TimeoutExpired("open", 5)])
-def test_finder_opens_only_a_browsed_directory_by_opaque_id(tmp_path: Path, monkeypatch, failure) -> None:
+@pytest.mark.parametrize("platform,display", [("darwin", "DISPLAY"), ("win32", "DISPLAY"),
+    ("linux", "DISPLAY"), ("linux", "WAYLAND_DISPLAY")])
+def test_file_manager_opens_only_a_browsed_directory_by_opaque_id(tmp_path: Path, monkeypatch, failure, platform, display) -> None:
     async def run() -> None:
         directory = tmp_path / "models ; spaces"
         directory.mkdir()
@@ -1243,12 +1245,19 @@ def test_finder_opens_only_a_browsed_directory_by_opaque_id(tmp_path: Path, monk
             calls.append((command, kwargs))
             if failure is not None:
                 raise failure
-        monkeypatch.setattr("mfq.server.services.service.sys.platform", "darwin")
+        monkeypatch.setattr("mfq.server.services.desktop.sys.platform", platform)
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.setenv(display, ":0")
+        monkeypatch.setattr("mfq.server.services.desktop.shutil.which", lambda name: "/usr/bin/xdg-open")
+        monkeypatch.setattr("mfq.server.services.desktop.os.startfile",
+            lambda path, operation: open_directory([path, operation]), raising=False)
         monkeypatch.setattr("mfq.server.services.service.subprocess.run", open_directory)
         try:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(service)), base_url="http://test") as client:
                 listing = (await client.get("/api/v1/models/directories", params={"path": str(directory)})).json()
-                assert listing["can_open_in_finder"] is True
+                assert listing["can_open_directory"] is True
+                assert listing["can_open_in_finder"] is (platform == "darwin")
                 invalid = await client.post("/api/v1/models/directories/open", json={"directory_id": "0" * 32})
                 assert invalid.status_code == 404 and not calls
                 arbitrary = await client.post("/api/v1/models/directories/open", json={"path": str(directory)})
@@ -1257,8 +1266,13 @@ def test_finder_opens_only_a_browsed_directory_by_opaque_id(tmp_path: Path, monk
                 assert response.status_code == (200 if failure is None else 503)
                 if failure is None:
                     assert response.json() == {"opened": True}
-                assert calls[0][0] == ["/usr/bin/open", "-a", "Finder", str(directory.resolve())]
-                assert calls[0][1]["timeout"] == 5 and calls[0][1]["check"] is True
+                if platform == "win32":
+                    assert calls[0][0] == [str(directory.resolve()), "explore"]
+                else:
+                    expected = (["/usr/bin/open", "-a", "Finder", str(directory.resolve())] if platform == "darwin"
+                        else ["/usr/bin/xdg-open", str(directory.resolve())])
+                    assert calls[0][0] == expected
+                    assert calls[0][1]["timeout"] == 5 and calls[0][1]["check"] is True
                 assert not calls[0][1].get("shell", False)
                 assert not (tmp_path / MODEL_FILE_INDEX).exists()
         finally:
@@ -1266,19 +1280,36 @@ def test_finder_opens_only_a_browsed_directory_by_opaque_id(tmp_path: Path, monk
     asyncio.run(run())
 
 
-def test_finder_is_disabled_on_non_macos_servers(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("platform,display,opener", [
+    ("linux", None, "/usr/bin/xdg-open"),
+    ("linux", ":0", None),
+    ("win32", None, None),
+    ("freebsd", None, None),
+])
+def test_file_manager_is_disabled_without_a_desktop_opener(tmp_path: Path, monkeypatch, platform, display, opener) -> None:
     async def run() -> None:
         catalog = ModelCatalog([tmp_path])
         service = ServerService(SessionStore(tmp_path / "server.sqlite3"), IdleBackend(), catalog=catalog)
-        monkeypatch.setattr("mfq.server.services.service.sys.platform", "linux")
+        monkeypatch.setattr("mfq.server.services.desktop.sys.platform", platform)
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        if display:
+            monkeypatch.setenv("DISPLAY", display)
+        monkeypatch.delattr("mfq.server.services.desktop.os.startfile", raising=False)
+        monkeypatch.setattr("mfq.server.services.desktop.shutil.which", lambda name: opener)
+        calls = []
+        monkeypatch.setattr("mfq.server.services.desktop.subprocess.run", lambda *args, **kwargs: calls.append(args))
         try:
             listing = await service.model_directories(path=str(tmp_path))
+            assert not listing.can_open_directory
             assert not listing.can_open_in_finder
             from mfq.server.protocol.models import OpenModelDirectoryRequest
             from mfq.server.services.service import ServiceError
             with pytest.raises(ServiceError) as error:
                 await service.open_model_directory(OpenModelDirectoryRequest(directory_id=listing.current_id))
-            assert error.value.detail.code == "finder_unavailable"
+            assert error.value.status_code == 501
+            assert error.value.detail.code == "file_manager_unavailable"
+            assert not calls
         finally:
             await service.aclose()
     asyncio.run(run())

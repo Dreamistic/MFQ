@@ -75,7 +75,7 @@ export const modelsApi = {
     return request(`/api/v1/models/${encodeURIComponent(modelId)}/cache-profile${includeRecurrent ? '?include_recurrent=true' : ''}`, { signal });
   },
 
-  openModelDirectoryInFinder(directoryId: string): Promise<{ opened: boolean }> {
+  openModelDirectory(directoryId: string): Promise<{ opened: boolean }> {
     return request('/api/v1/models/directories/open', {
       method: 'POST', body: JSON.stringify({ directory_id: directoryId }),
     });

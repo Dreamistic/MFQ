@@ -160,6 +160,7 @@ export interface ModelDirectoryList {
   parent_id: string | null;
   model_file_count: number;
   files?: Array<{ name: string; byte_size: number }>;
+  can_open_directory?: boolean;
   can_open_in_finder?: boolean;
   data: ModelDirectoryEntry[];
 }

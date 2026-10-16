@@ -181,7 +181,7 @@ MFQ 还可以量化满精度 MFQ 和 GGUF 源模型，读取逐张量或逐专�
 | GLM5–5.3 | CUDA C++；Metal 参考运行时 |
 | Gemma 4 | CUDA C++；Metal 参考运行时 |
 
-详细支持范围见[运行时支持矩阵](./docs/runtime-support.md)。
+详细支持范围见[运行时支持矩阵](./docs/runtime/support.md)。
 
 ## 性能与质量
 
@@ -243,8 +243,8 @@ Top1 一致率提高 5.03 个百分点**。
 - [运行 MFQ Server](./docs/cli/serve.md)
 - [HTTP API](./docs/api/http.md)
 - [WebSocket 与实时 API](./docs/api/websocket.md)
-- [运行时支持范围](./docs/runtime-support.md)
-- [MiniCPM-o 4.5 多模态运行时](./docs/minicpmo45.md)
+- [运行时支持范围](./docs/runtime/support.md)
+- [MiniCPM-o 4.5 多模态运行时](./docs/runtime/minicpmo45.md)
 - [贡献指南与架构规范](./CONTRIBUTING.md)
 
 ## 致谢

@@ -326,12 +326,12 @@ export function useModelCatalog() {
     }
   }
 
-  async function openCurrentDirectoryInFinder() {
+  async function openCurrentDirectory() {
     const current = connectionScope();
-    if (busy || !modelBrowser?.current_id || !modelBrowser.can_open_in_finder) return;
+    if (busy || !modelBrowser?.current_id || !(modelBrowser.can_open_directory ?? modelBrowser.can_open_in_finder)) return;
     setBusy(true);
     try {
-      await modelsApi.openModelDirectoryInFinder(modelBrowser.current_id);
+      await modelsApi.openModelDirectory(modelBrowser.current_id);
     } catch (cause) {
       if (current()) reportError(cause);
     } finally {
@@ -390,7 +390,7 @@ export function useModelCatalog() {
     jumpToModelDirectory,
     openModelDirectory,
     openModelFiles,
-    openCurrentDirectoryInFinder,
+    openCurrentDirectory,
     registerCurrentModelDirectory,
     unloadInstance,
     loadArtifact,
