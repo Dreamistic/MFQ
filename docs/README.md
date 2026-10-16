@@ -24,6 +24,7 @@ matches what you want to do.
 - [MiniCPM-o 4.5 multimodal runtime](minicpmo45.md)
 - [CUDA runtime validation](cuda-native-runtime-validation.md)
 - [HIP runtime validation](hip-native-runtime-validation.md)
+- [HIP model benchmarks](hip-model-benchmarks.md)
 - [C++ runtime layout](../cpp_runtime/README.md)
 - [Python/C++ runtime transport](runtime-transport.md)
 
