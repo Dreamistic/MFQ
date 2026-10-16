@@ -1,3 +1,4 @@
+#include <math_constants.h>
 #include "common.cuh"
 #include "cp-async.cuh"
 #include "mma.cuh"
@@ -600,7 +601,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_make_causal_mask(
         const int key_min = max(0, query_key_min + index / nbatch_fa);
         tile_mask[(index / nbatch_fa) * (nbatch_fa + 8) +
                   index % nbatch_fa] = key >= key_min && key <= query
-            ? __float2half(0.0f) : __float2half(-INFINITY);
+            ? __float2half(0.0f) : __float2half(-CUDART_INF_F);
     }
 }
 

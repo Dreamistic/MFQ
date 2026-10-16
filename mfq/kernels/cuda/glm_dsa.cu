@@ -1,3 +1,4 @@
+#include <math_constants.h>
 #include <cuda_fp16.h>
 #include "mfq_tensor_backend.h"
 #include <cuda_runtime.h>
@@ -214,7 +215,7 @@ __global__ void glm_indexer_scores_kernel(
                 ? query_offset + query : visible_k - M + query;
             out[(static_cast<int64_t>(batch) * M + query) * K + key] =
                 key < visible_k && key <= absolute_query
-                    ? sum * weight_scale : -INFINITY;
+                    ? sum * weight_scale : -CUDART_INF_F;
         }
     }
 #else

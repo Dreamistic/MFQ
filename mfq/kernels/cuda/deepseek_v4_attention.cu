@@ -1,3 +1,4 @@
+#include <math_constants.h>
 #include <cuda_runtime.h>
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq_tensor_backend.h"
@@ -147,10 +148,10 @@ __global__ void dsv4_compress_kernel(
     const int d = threadIdx.x;
     if (b >= B || d >= HEAD_DIM) return;
 
-    float max_score = -INFINITY;
+    float max_score = -CUDART_INF_F;
     const int candidates = overlap ? 2 * ratio : ratio;
     for (int i = 0; i < candidates; ++i) {
-        float score = -INFINITY;
+        float score = -CUDART_INF_F;
         if (!overlap) {
             const int64_t idx =
                 (((static_cast<int64_t>(b) * W + w) * ratio + i) * out_dim + d);
@@ -183,7 +184,7 @@ __global__ void dsv4_compress_kernel(
     float denominator = 0.0f;
     for (int i = 0; i < candidates; ++i) {
         float value = 0.0f;
-        float score = -INFINITY;
+        float score = -CUDART_INF_F;
         if (!overlap) {
             const int64_t idx =
                 (((static_cast<int64_t>(b) * W + w) * ratio + i) * out_dim + d);
@@ -361,9 +362,9 @@ __global__ void dsv4_decode_pool_update_kernel(
     if (pool_index >= pool_capacity) return;
     const bool have_previous = pool_index > 0;
     const int candidates = overlap ? 2 * ratio : ratio;
-    float max_score = -INFINITY;
+    float max_score = -CUDART_INF_F;
     for (int i = 0; i < candidates; ++i) {
-        float score = -INFINITY;
+        float score = -CUDART_INF_F;
         if (!overlap) {
             const int64_t idx =
                 (static_cast<int64_t>(b) * ratio + i) * out_dim + d;
@@ -391,7 +392,7 @@ __global__ void dsv4_decode_pool_update_kernel(
     float denominator = 0.0f;
     for (int i = 0; i < candidates; ++i) {
         float value = 0.0f;
-        float score = -INFINITY;
+        float score = -CUDART_INF_F;
         if (!overlap) {
             const int64_t idx =
                 (static_cast<int64_t>(b) * ratio + i) * out_dim + d;
@@ -631,7 +632,7 @@ __global__ void dsv4_indexer_scores_kernel(
             out[(static_cast<int64_t>(batch) * M + query) * K + key] =
                 key < visible
                     ? __float2half_rn(sum * score_scale)
-                    : __float2half(-INFINITY);
+                    : __float2half(-CUDART_INF_F);
         }
     }
 #else
@@ -789,7 +790,7 @@ __global__ void dsv4_prefill_plan_kernel(
             }
         }
         indices[linear] = index;
-        mask[linear] = valid ? __float2half(0.0f) : __float2half(-INFINITY);
+        mask[linear] = valid ? __float2half(0.0f) : __float2half(-CUDART_INF_F);
     }
 }
 
@@ -834,7 +835,7 @@ __global__ void dsv4_decode_plan_kernel(
             }
         }
         indices[linear] = index;
-        mask[linear] = valid ? __float2half(0.0f) : __float2half(-INFINITY);
+        mask[linear] = valid ? __float2half(0.0f) : __float2half(-CUDART_INF_F);
     }
 }
 

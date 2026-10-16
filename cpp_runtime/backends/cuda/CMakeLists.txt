@@ -183,6 +183,11 @@ if(BUILD_TESTING)
         target_compile_options(${target} PRIVATE
             "$<$<COMPILE_LANGUAGE:CUDA>:-UNDEBUG>"
             "$<$<COMPILE_LANGUAGE:CXX>:$<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>>")
+        if(MSVC)
+            target_compile_options(${target} PRIVATE
+                "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
+                "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
+        endif()
         add_test(NAME ${target} COMMAND ${target})
         set_tests_properties(${target} PROPERTIES SKIP_RETURN_CODE 77)
     endfunction()

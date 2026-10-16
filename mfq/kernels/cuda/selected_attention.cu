@@ -1,4 +1,5 @@
 // Shared dense and index-selected attention mechanics.
+#include <math_constants.h>
 #include "selected_attention.h"
 #include "mfq_sparse_attn_mma_f16.cuh"
 
@@ -71,7 +72,7 @@ __global__ void prepare_sparse_indices_kernel(
             : -1;
         const bool valid = index >= 0 && index < cache_length;
         indices[linear] = valid ? index : 0;
-        mask[linear] = valid ? __float2half(0.0f) : __float2half(-INFINITY);
+        mask[linear] = valid ? __float2half(0.0f) : __float2half(-CUDART_INF_F);
     }
 }
 
@@ -137,7 +138,7 @@ __global__ void sparse_attention_kernel(
         for (int64_t d = tid; d < width; d += 256) output[ob + d] = 0.f;
     }
     if (tid == 0) {
-        online[0] = -INFINITY;
+        online[0] = -CUDART_INF_F;
         online[1] = online[2] = online[3] = 0.f;
     }
     __syncthreads();
@@ -178,7 +179,7 @@ __global__ void sparse_attention_kernel(
         if (tid == 0) {
             float score = 0.f;
             for (int group = 0; group < 8; ++group) score += partials[group];
-            score = valid ? score * scale : -INFINITY;
+            score = valid ? score * scale : -CUDART_INF_F;
             const float old_max = online[0];
             const float next_max = fmaxf(old_max, score);
             const float old_scale = isfinite(old_max) ? expf(old_max - next_max) : 0.f;
@@ -458,7 +459,7 @@ __global__ void prepare_causal_attention_kernel(const void* q, bool half_query,
             : static_cast<const int32_t*>(positions)[token];
         const bool valid = index < columns && index <= end && index < capacity;
         indices[linear] = valid ? int32_t(index) : 0;
-        mask[linear] = __float2half_rn(valid ? 0.f : -INFINITY);
+        mask[linear] = __float2half_rn(valid ? 0.f : -CUDART_INF_F);
     }
 }
 

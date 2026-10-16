@@ -29,21 +29,21 @@ __global__ void gated_residual_prepare_up_half_kernel(MhcMatrix down,const float
             const int column=warp*48+lane;
             gr_prepare_up_half_values<OnePlane>(activate(column),lane<16?activate(column+32):0.f,q,sample,warp,lane);
         }
-        return;
-    }
-    __shared__ float low[Rank];
-    for(int row=tid;row<Rank;row+=256) {
-        float sum;
-        if constexpr(VectorParts)sum=gr_reduce_down_parts<false>(parts,size_t(sample)*stride,row,down_splits);
-        else {
-            sum=down_splits==1?parts[size_t(sample)*stride+row]:0.f;
-            if(down_splits>1)for(int split=0;split<down_splits;++split)
-                sum+=parts[size_t(sample)*stride+row*down_splits+split];
+    }else {
+        __shared__ float low[Rank];
+        for(int row=tid;row<Rank;row+=256) {
+            float sum;
+            if constexpr(VectorParts)sum=gr_reduce_down_parts<false>(parts,size_t(sample)*stride,row,down_splits);
+            else {
+                sum=down_splits==1?parts[size_t(sample)*stride+row]:0.f;
+                if(down_splits>1)for(int split=0;split<down_splits;++split)
+                    sum+=parts[size_t(sample)*stride+row*down_splits+split];
+            }
+            low[row]=mhc_activated(sum,half,4,false);
         }
-        low[row]=mhc_activated(sum,half,4,false);
+        __syncthreads();
+        if(warp<Groups)gr_prepare_up_half_group<OnePlane>(low,q,sample,warp,lane);
     }
-    __syncthreads();
-    if(warp<Groups)gr_prepare_up_half_group<OnePlane>(low,q,sample,warp,lane);
 }
 
 __device__ __forceinline__ int gr_up_half_weight_pair(const uint8_t* source) {
@@ -88,10 +88,10 @@ __global__ void __launch_bounds__(128,6) gated_residual_up_half_mma_kernel(
             mhc_write(injection,tid,mhc_activated(sum,half && !inject.dense,Streams,true),half && !inject.dense);
         }
     }
-    __shared__ float local_low[LocalPrepare?Rank:1];
-    __shared__ __align__(16) __half local_values[LocalPrepare?Elements*(OnePlane?1:2):1];
-    __shared__ float2 local_statistics[LocalPrepare?Groups:1];
     if constexpr(LocalPrepare) {
+        __shared__ float local_low[Rank];
+        __shared__ __align__(16) __half local_values[Elements*(OnePlane?1:2)];
+        __shared__ float2 local_statistics[Groups];
         static_assert(Rows==1);
         for(int row=tid;row<Rank;row+=128) {
             float sum=down_splits==1?parts[row]:0.f;
@@ -100,7 +100,9 @@ __global__ void __launch_bounds__(128,6) gated_residual_up_half_mma_kernel(
             local_low[row]=mhc_activated(sum,half,Streams,false);
         }
         __syncthreads();
-        q={local_values,OnePlane?nullptr:local_values+Elements,local_statistics};
+        q.high=local_values;
+        q.low=OnePlane?nullptr:local_values+Elements;
+        q.statistics=local_statistics;
         for(int group=stream;group<Groups;group+=Streams)
             gr_prepare_up_half_group<OnePlane>(local_low,q,0,group,lane);
         __syncthreads();

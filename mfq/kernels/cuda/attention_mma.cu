@@ -1,3 +1,4 @@
+#include <math_constants.h>
 #include <cuda_fp16.h>
 #include "mfq_tensor_backend.h"
 #include <cuda_runtime.h>
@@ -169,7 +170,7 @@ __global__ void mfq_decode_mask_kernel(
         const int length = max(
             0, min(mask_stride, (int)seq_len[batch]));
         const int key = (int)(i % mask_stride);
-        mask[i] = key < length ? __float2half(0.0f) : __float2half(-INFINITY);
+        mask[i] = key < length ? __float2half(0.0f) : __float2half(-CUDART_INF_F);
     }
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
          i < B; i += gridDim.x * blockDim.x) {
@@ -190,7 +191,7 @@ __global__ void mfq_glm_mla_mask_kernel(
         const int query = static_cast<int>(i / mask_stride);
         const int key = static_cast<int>(i - static_cast<size_t>(query) * mask_stride);
         const bool visible = key < logical_k && key <= query_offset + query;
-        mask[i] = visible ? __float2half(0.0f) : __float2half(-INFINITY);
+        mask[i] = visible ? __float2half(0.0f) : __float2half(-CUDART_INF_F);
     }
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
          i < B * query_tiles; i += gridDim.x * blockDim.x) {

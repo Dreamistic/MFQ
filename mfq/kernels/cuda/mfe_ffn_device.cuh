@@ -993,7 +993,7 @@ __global__ void __launch_bounds__(64) mfe_ffn_prepare_kernel(MfeFfnBatch b,
 }
 template<bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
 __global__ void __launch_bounds__(128) mfe_ffn_gate_up_kernel(MfeFfnBatch b,int partition) {
-    const bool grouped=(partition&16)!=0;partition&=3;
+    partition&=3;
     const int all_routes=b.routes+(b.shared?1:0),slot=blockIdx.y;
     const int token=slot/all_routes,route=slot%all_routes;
     const bool shared=route==b.routes;
@@ -1044,7 +1044,6 @@ __global__ void __launch_bounds__(128) mfe_ffn_gate_up_kernel(MfeFfnBatch b,int 
 }
 template<int MinimumBlocks,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false,bool TokenSingles=false>
 __global__ void __launch_bounds__(512,MinimumBlocks) mfe_ffn_parallel_gate_up_kernel(MfeFfnBatch b,int partition) {
-    const bool grouped=(partition&16)!=0;
     const bool shared_first=(partition&4)!=0;
     const bool early_gu=(partition&8)!=0;
     partition&=3;
@@ -1160,7 +1159,7 @@ __global__ void mfe_ffn_transfer_ready_kernel(MfeFfnBatch b) {
 }
 template<bool UnifiedProjection,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
 __global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel(MfeFfnBatch b,int partition) {
-    const bool grouped=(partition&16)!=0;partition&=3;
+    partition&=3;
     const int token=blockIdx.y,first=int(blockIdx.x)*2,lane=threadIdx.x;
     if(first>=b.output_width)return;
     const int all_routes=b.routes+(b.shared?1:0);
@@ -1246,7 +1245,7 @@ __global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel(MfeFfnBatch b
 }
 template<bool UnifiedProjection,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
 __global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel_quad(MfeFfnBatch b,int partition) {
-    const bool grouped=(partition&16)!=0;partition&=3;
+    partition&=3;
     const int token=blockIdx.y,first=int(blockIdx.x)*4,lane=threadIdx.x;
     if(first>=b.output_width)return;
     const int all_routes=b.routes+(b.shared?1:0);
