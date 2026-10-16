@@ -3466,13 +3466,14 @@ struct MfeNintDecodeConfig {
     int shared_down_group_size = 0;
     int shared_down_groups = 0;
     int k_lanes = 16;
+    int down_k_lanes = 16;
     int down_rows_per_simd = 1;
     int stage_one_workgroups = 0;
     int stage_two_workgroups = 0;
 };
 
 bool mfe_paired_nint_down(const MfeNintDecodeConfig& config) {
-    return config.tokens == 1 && config.k_lanes == 16 &&
+    return config.tokens == 1 && config.down_k_lanes == 16 &&
         config.down_rows_per_simd == 2 && config.hidden > config.intermediate;
 }
 
@@ -3506,7 +3507,7 @@ std::string mfe_decode_kernel_name(
              {"_df", config.down_family_mask}, {"_dv", config.down_vq_profile_mask},
              {"_ggs", config.shared_gate_group_size}, {"_gg", config.shared_gate_groups},
              {"_dgs", config.shared_down_group_size}, {"_dg", config.shared_down_groups},
-             {"_kl", config.k_lanes}, {"_dr", config.down_rows_per_simd},
+             {"_kl", stage == 1 ? config.k_lanes : config.down_k_lanes}, {"_dr", config.down_rows_per_simd},
              {"_gt", static_cast<int>((stage == 2 && config.shared_router_group_size
                  ? mlx::core::float16 : config.shared_gate_dtype).val())}}}) {
         name.append(field.first);
@@ -3619,7 +3620,8 @@ void append_mfe_decode_constants(
         << "constexpr int FUSED_SWIGLU = " << (gate_up ? 1 : 0) << ";\n"
         << "constexpr int K = "
         << (gate_up ? config.hidden : config.intermediate) << ";\n"
-        << "constexpr int K_LANES_VALUE = " << config.k_lanes << ";\n"
+        << "constexpr int K_LANES_VALUE = "
+        << (gate_up ? config.k_lanes : config.down_k_lanes) << ";\n"
         << "constexpr int ROWS_PER_SIMD_VALUE = "
         << (gate_up ? 1 : config.down_rows_per_simd) << ";\n"
         << "constexpr int DESCRIPTOR_SIZE = "
@@ -11341,6 +11343,9 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
     const int decode_k_lanes = impl_->k_lanes_override != 0
         ? impl_->k_lanes_override
         : 16;
+    const int down_k_lanes = down.impl_->k_lanes_override != 0
+        ? down.impl_->k_lanes_override
+        : (tokens == 1 && impl_->neuron_len > intermediate ? 32 : decode_k_lanes);
     constexpr int kGateRowsPerSimd = 1;
     const int gate_rows_per_workgroup =
         (folded ? kMfeFoldedGateSimdPairs : 1) *
@@ -11354,7 +11359,7 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
              (std::uint32_t{1} << kFamilyVq));
     const int down_rows_per_simd = mixed_decode_two_rows ? 2 : 1;
     const int down_rows_per_workgroup =
-        (32 / decode_k_lanes) * down_rows_per_simd;
+        (32 / down_k_lanes) * down_rows_per_simd;
     const int down_tiles =
         (down.impl_->out_per_expert + down_rows_per_workgroup - 1) /
         down_rows_per_workgroup;
@@ -11409,6 +11414,7 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
         .shared_down_group_size = shared_down.group_size(),
         .shared_down_groups = shared_down.groups(),
         .k_lanes = decode_k_lanes,
+        .down_k_lanes = down_k_lanes,
         .down_rows_per_simd = down_rows_per_simd,
         .stage_one_workgroups = 1 + (routes + 1) * gate_tiles,
         .stage_two_workgroups = down_tiles,
