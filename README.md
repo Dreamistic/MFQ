@@ -87,10 +87,11 @@ projections. MFQ `V3-XXS` selects a profile for **each expert projection**:
   <img src="./docs/figures/qwen38-flash-next-allocation-comparison.svg" alt="Actual layer 0 allocation: Unsloth UD IQ3_XXS shares one format across each packed expert projection; MFQ V3-XXS assigns profiles independently to each expert's Gate, Up and Down" width="1100">
 </p>
 
-The SVG shows actual profiles for layer 0, experts 0–11. For example, expert 9
-uses **NVQ3J-L for Gate and Up** and **NINT4 for Down**. This comparison concerns
-format selection in these packed tensors; GGUF block-level quantization
-parameters can still vary. See the [allocation data and sources](./docs/figures/data/qwen38-flash-next-layer0-allocation.json).
+The figure shows **Qwen3.8-Flash-Next, layer 0, experts 0–11**. Colors identify
+the selected profiles. Expert 9 uses **NVQ3J-L for Gate and Up** and **NINT4 for
+Down**. The **512×** ratio compares allocation slots per layer for MFQ and this
+GGUF recipe; GGUF block-level quantization parameters can still vary. See the
+[allocation data and sources](./docs/figures/data/qwen38-flash-next-layer0-allocation.json).
 
 <details>
 <summary>Full-model precision heatmaps</summary>
@@ -112,17 +113,17 @@ For BibTeX, see [Citation](#citation).
 
 MFQ's native kernels make this granularity practical by grouping compatible
 expert work while preserving each projection's selected format. The **V3-XXS**
-tier shown above reaches **105.4 tok/s on M5 Max** and
-**61.0 tok/s on RTX 3090 Ti + 32 GiB RAM**, with MTP enabled and a 4,096-token
-input. The charts below show generation with and without MTP, followed by
-prompt processing across published tiers.
+tier shown above reaches **105.4 tok/s on M5 Max** and **61.0 tok/s on
+RTX 3090 Ti + 32 GiB RAM**, with MTP enabled.
 
 <p align="center">
   <img src="./docs/figures/qwen38-flash-next-inference-speed.svg" alt="MFQ Qwen3.8-Flash-Next horizontal speed charts: Apple Metal and NVIDIA CUDA generation with MTP off and on, plus prompt processing; V3-XXS is highlighted" width="1100">
 </p>
 
-All results use a **4,096-token input**. CUDA system RAM is listed per tier;
-the shaded rows identify the same `V3-XXS` tier used in the allocation figure.
+All measurements use **Qwen3.8-Flash-Next with 4,096-token inputs**. Metal runs
+on an **M5 Max (40-core GPU, 128 GB)**. CUDA runs on an **RTX 3090 Ti**, with
+**32 GiB RAM** for V1-S, V1-M, S2-L and V3-XXS, and **64 GiB RAM** for S3-L and
+V4-XS. Shading marks `V3-XXS`; paired generation bars compare MTP off and on.
 See [Benchmarks](#benchmarks) for the complete table and
 [chart data](./docs/figures/data/qwen38-flash-next-inference-speed.json) for the plotted values.
 

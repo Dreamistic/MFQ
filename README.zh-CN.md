@@ -81,8 +81,9 @@ Gate、Up、Down 打包专家张量各选择一种 GGUF 格式；MFQ `V3-XXS` �
   <img src="./docs/figures/qwen38-flash-next-allocation-comparison.zh-CN.svg" alt="第 0 层真实分配对比：Unsloth UD IQ3_XXS 在每个打包专家投影内共用一种格式，MFQ V3-XXS 则为每个专家的 Gate、Up、Down 独立分配档位" width="1100">
 </p>
 
-SVG 展示第 0 层、专家 0–11 的真实档位。例如，专家 9 的 **Gate、Up 使用
-NVQ3J-L，Down 使用 NINT4**。这里对比的是这些打包张量中的格式选择粒度，
+图中展示 **Qwen3.8-Flash-Next 第 0 层、专家 0–11** 的真实档位，颜色用于
+区分所选格式。专家 9 的 **Gate、Up 使用
+NVQ3J-L，Down 使用 NINT4**。**512 倍**指上述打包张量配方的分配位置之比，
 GGUF 的块内量化参数仍可变化。具体分配与来源见[数据记录](./docs/figures/data/qwen38-flash-next-layer0-allocation.json)。
 
 <details>
@@ -104,18 +105,19 @@ BibTeX 格式见[引用](#引用)。
 ### 细粒度精度分配，也能高效推理
 
 为高效执行这些混合档位，MFQ 的原生内核将兼容的专家计算分组调度，同时保留
-各投影所选的量化格式。上一张图中的
-**V3-XXS** 档位，在输入 4,096 tokens、开启 MTP 时，生成速度达到
+各投影所选的量化格式。上一张图中的 **V3-XXS** 档位在开启 MTP 时，生成速度达到
 **M5 Max 上的 105.4 tok/s**，以及 **RTX 3090 Ti + 32 GiB RAM 上的
-61.0 tok/s**。下图先展示各档位在 MTP 关闭和开启时的生成速度，再展示
-提示词处理速度。
+61.0 tok/s**。
 
 <p align="center">
   <img src="./docs/figures/qwen38-flash-next-inference-speed.zh-CN.svg" alt="MFQ Qwen3.8-Flash-Next 推理速度横向柱状图：Apple Metal 与 NVIDIA CUDA 的 MTP 开关生成速度和提示词处理速度，底纹突出 V3-XXS" width="1100">
 </p>
 
-全部结果均使用 **4,096 tokens 输入**，CUDA 各档位的系统内存配置标在行标签中。
-浅色底纹标出与精度分配图相同的 `V3-XXS` 档位。完整表格见[性能与质量](#性能与质量)，
+全部结果均使用 **Qwen3.8-Flash-Next，输入长度为 4,096 tokens**。
+Metal 平台为 **M5 Max（40 核 GPU、128 GB）**。CUDA 平台为 **RTX 3090 Ti**，
+其中 V1-S、V1-M、S2-L、V3-XXS 配备 **32 GiB RAM**，S3-L、V4-XS 配备
+**64 GiB RAM**。浅色底纹标出 `V3-XXS`，生成速度的两根柱分别对应 MTP 关闭和开启。
+完整表格见[性能与质量](#性能与质量)，
 绘图数值见[图表数据](./docs/figures/data/qwen38-flash-next-inference-speed.json)。
 
 CUDA 侧联合使用 VRAM、RAM 和 SSD，运行超出显存容量的模型；Metal 侧支持
