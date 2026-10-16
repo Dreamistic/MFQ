@@ -12,7 +12,7 @@ http://127.0.0.1:8090
 ```
 
 The versioned API root is `http://127.0.0.1:8090/api/v1`. The current OpenAPI
-contract contains 85 HTTP paths and 107 operations. The unversioned `/health`
+contract contains 88 HTTP paths and 112 operations. The unversioned `/health`
 endpoint and the compatibility endpoints under `/v1` are not part of OpenAPI.
 
 The running server exposes Swagger and the live schema at:
@@ -131,6 +131,13 @@ parameters and field constraints.
 | `POST` | `/api/v1/auth/keys` | `CreateApiKeyRequest` | `201 ApiKeySecretResource` |
 | `POST` | `/api/v1/auth/keys/{key_id}/revoke` | — | `200 ApiKeyResource` |
 | `POST` | `/api/v1/auth/keys/{key_id}/rotate` | — | `200 ApiKeySecretResource` |
+| `GET` | `/api/v1/auth/policy` | — | `200 Object` |
+| `PUT` | `/api/v1/auth/policy` | `AuthenticationPolicyRequest` | `200 Object` |
+
+The policy routes report and change runtime authentication state. `PUT` may
+enable authentication and set a new root key, or disable it; disabling is
+rejected with `400 authentication_required` while the server listens on a
+non-loopback address, and the change is persisted across restarts.
 
 ### 2.2 Sessions
 
@@ -206,6 +213,9 @@ jobs.
 | `POST` | `/api/v1/models/unload` | `ModelUnloadRequest` | `202 OperationAccepted` |
 | `GET` | `/api/v1/hub/official` | — | `200 OfficialModelList` |
 | `POST` | `/api/v1/hub/resolve` | `HubReferenceRequest` | `200 HubModelInfo` |
+| `GET` | `/api/v1/hub/download-directory` | — | `200 Object` |
+| `PUT` | `/api/v1/hub/download-directory` | `ConfigureDownloadDirectoryRequest` | `200 Object` |
+| `POST` | `/api/v1/hub/download-sources/probe` | `HubDownloadProbeRequest` | `200 Object` |
 | `POST` | `/api/v1/models/directories/open` | `OpenModelDirectoryRequest` | `200 OpenModelDirectoryResult` |
 | `GET` | `/api/v1/models/{model_id}/analysis` | — | `200 CheckpointAnalysis` |
 | `GET` | `/api/v1/models/{model_id}/cache-profile` | — | `200 ModelCacheProfile` or `200 null` |
@@ -219,6 +229,11 @@ model roots.
 ignore the cached copy. `POST /api/v1/hub/resolve` accepts a free-form
 `reference` (a `provider/owner/name` path or a URL) with an optional fallback
 provider and returns the resolved hub model.
+`POST /api/v1/hub/download-sources/probe` checks candidate download sources
+before a download. The download-directory routes report where hub downloads
+land and select it by registered directory id; selecting a different directory
+can evict the prefix cache, and an unknown id returns `400
+invalid_download_directory`.
 `POST /api/v1/models/directories/open` probes a registered directory. For a
 registered artifact, `GET /api/v1/models/{model_id}/directory` lists its
 files, `/analysis` returns checkpoint composition, and `/cache-profile`
