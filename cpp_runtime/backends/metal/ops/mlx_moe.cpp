@@ -71,6 +71,7 @@ using mlx::core::Shape;
 using mlx::core::array;
 
 constexpr int kDescriptorSize = 32;
+constexpr int kMfeFoldedGateSimdPairs = 4;
 
 constexpr int kFamily = 0;
 constexpr int kLocalExpert = 1;
@@ -3494,6 +3495,10 @@ std::string mfe_decode_kernel_name(
         name.append(buffer, result.ptr);
     };
     integer(stage);
+    if (stage == 1 && config.folded_topk) {
+        name.append("_gp");
+        integer(kMfeFoldedGateSimdPairs);
+    }
     for (const auto& field : std::array<std::pair<const char*, int>, 15>{{
              {"_r", config.routes}, {"_e", config.experts},
              {"_h", config.hidden}, {"_i", config.intermediate},
@@ -3825,7 +3830,9 @@ std::string make_mfe_nint_gate_up_source(
         << "constexpr bool SPLIT_SWIGLU = true;\n"
         << "constexpr bool PACKED_SWIGLU = false;\n"
         << "constexpr uint MATRIX_ROWS = ROWS_PER_SIMD;\n"
-        << "constexpr uint ROWS_PER_PHYSICAL_SIMD = LANE_GROUPS * ROWS_PER_SIMD;\n"
+        << "constexpr uint ROWS_PER_PHYSICAL_SIMD = "
+        << (config.folded_topk ? kMfeFoldedGateSimdPairs : 1)
+        << "u * LANE_GROUPS * ROWS_PER_SIMD;\n"
         << "constexpr uint ROWS_PER_TG = ROWS_PER_PHYSICAL_SIMD;\n"
         << "constexpr uint OUTPUT_TILES = (uint(OUT) + ROWS_PER_TG - 1u) / ROWS_PER_TG;\n"
         << "constexpr uint ROUTED_SIZE = uint(ROUTES) * uint(OUT);\n"
@@ -3833,13 +3840,13 @@ std::string make_mfe_nint_gate_up_source(
         << "constexpr uint GATE_OFFSET = SHARED_OFFSET + uint(OUT);\n"
         << "uint lane = thread_index_in_simdgroup;\n"
         << "uint k_lane = lane & (K_LANES - 1u);\n"
-        << "uint lane_group = lane / K_LANES;\n"
-        << "uint simd_group = simdgroup_index_in_threadgroup;\n"
+        << "uint lane_group = lane / K_LANES + (simdgroup_index_in_threadgroup >> 1u) * LANE_GROUPS;\n"
+        << "uint simd_group = simdgroup_index_in_threadgroup & 1u;\n"
         << "uint workgroup = threadgroup_position_in_grid."
         << (config.tokens > 1 ? "y" : "x") << ";\n"
         << "if (workgroup == 0u) {\n"
-        << (config.folded_topk ? "  if (simd_group == 1u) mfq_topk_write<uint(EXPERTS), uint(ROUTES)>(router_logits, lane, routing);\n" : "")
-        << "  if (simd_group == 0u) {\n";
+        << (config.folded_topk ? "  if (simdgroup_index_in_threadgroup == 1u) mfq_topk_write<uint(EXPERTS), uint(ROUTES)>(router_logits, lane, routing);\n" : "")
+        << "  if (simdgroup_index_in_threadgroup == 0u) {\n";
     if (config.shared_router_group_size) {
         if (config.tokens == 1)
             source << "    mfq_shared_router<true>(shared_gate_weight, x, y + GATE_OFFSET, lane, 0u);\n";
@@ -3900,9 +3907,15 @@ std::string make_mfe_nint_gate_up_source(
         source << "uint grouped_route = token_row * uint(ROUTES) + route;\n"
                << "uint2 route_group = uint2(*(device const packed_uint2*)(route_groups + grouped_route * 8u));\n"
                << "int logical_expert = int(route_group.x);\n";
-    else source << (config.folded_topk
-        ? "int logical_expert = int(mfq_topk_nth<uint(EXPERTS)>(router_logits, lane, route));\n"
-        : "int logical_expert = expert_ids[route];\n");
+    else if (config.folded_topk)
+        source << "threadgroup uint selected_expert;\n"
+               << "if (simdgroup_index_in_threadgroup == 0u) {\n"
+               << "  uint selected = mfq_topk_nth<uint(EXPERTS)>(router_logits, lane, route);\n"
+               << "  if (lane == 0u) selected_expert = selected;\n"
+               << "}\n"
+               << "threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+               << "int logical_expert = int(selected_expert);\n";
+    else source << "int logical_expert = expert_ids[route];\n";
     source << "int expert = logical_expert;\n";
     if (config.packed_gate_up) {
         source
@@ -4174,7 +4187,7 @@ public:
                 1),
             MTL::Size(
                 stage_ == 1
-                    ? 64
+                    ? 64 * (config_.folded_topk ? kMfeFoldedGateSimdPairs : 1)
                     : (config_.routes + 1) * 32,
                 1,
                 1));
@@ -11330,6 +11343,7 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
         : 16;
     constexpr int kGateRowsPerSimd = 1;
     const int gate_rows_per_workgroup =
+        (folded ? kMfeFoldedGateSimdPairs : 1) *
         (32 / decode_k_lanes) * kGateRowsPerSimd;
     const int gate_tiles =
         (intermediate + gate_rows_per_workgroup - 1) /
