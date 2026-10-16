@@ -202,16 +202,16 @@ See the [runtime support matrix](./docs/runtime-support.md) for details.
 
 | Tier | RAM Usage | Device | Input Size | Prompt Processing | Generation (no MTP) | Generation (MTP) | MTP Acceptance |
 | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
-| [V1-M](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V1-M) | 42.91 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,530.1 tok/s | 67.4 tok/s | 94.7 tok/s | 86.5% |
-| [S2-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S2-L) | 46.95 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,503.4 tok/s | 67.7 tok/s | 93.3 tok/s | 83.7% |
-| [V3-XXS](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V3-XXS) | 49.85 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,497.0 tok/s | 64.3 tok/s | 93.2 tok/s | 85.6% |
-| [S3-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S3-L) | 57.50 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,556.6 tok/s | 65.6 tok/s | 93.9 tok/s | 84.3% |
-| [V4-XS](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V4-XS) | 61.02 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,532.0 tok/s | 65.3 tok/s | 89.0 tok/s | 77.7% |
-| [S4-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S4-L) | 78.19 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,420.6 tok/s | 60.3 tok/s | 87.6 tok/s | 82.6% |
+| [V1-M](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V1-M) | 43.36 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,538.5 tok/s | 71.6 tok/s | 101.2 tok/s | 88.5% |
+| [S2-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S2-L) | 47.41 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,538.9 tok/s | 71.0 tok/s | 97.9 tok/s | 83.5% |
+| [V3-XXS](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V3-XXS) | 50.33 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,527.6 tok/s | 70.8 tok/s | 105.4 tok/s | 92.9% |
+| [S3-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S3-L) | 57.95 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,565.6 tok/s | 68.1 tok/s | 98.2 tok/s | 81.7% |
+| [V4-XS](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/V4-XS) | 61.48 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,540.1 tok/s | 67.7 tok/s | 96.7 tok/s | 84.1% |
+| [S4-L](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ/tree/main/S4-L) | 78.25 GiB | Apple M5 Max · 40-core GPU · 128 GB | 4,096 tokens | 2,481.7 tok/s | 63.6 tok/s | 93.6 tok/s | 82.6% |
 
 The PLE table stays on SSD; it does not need to occupy resident memory.
 For example, V1-M downloads 72.44 GiB, including 29.54 GiB of PLE, while its
-resident weights occupy 42.91 GiB.
+resident weights occupy 43.36 GiB.
 
 ### Qwen3.8-Flash-Next: model size vs. KLD and Top1
 
