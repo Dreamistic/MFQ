@@ -92,6 +92,7 @@ followed by Gate, Up and Down, on a shared color scale.
 
 Our calibration method is open source; see
 [Beyond Expert Rankings: Contrast Calibration for Mixed-Precision MoE Quantization](https://arxiv.org/abs/2610.20353).
+For BibTeX, see [Citation](#citation).
 
 ### Run large models within your hardware budget
 
@@ -277,6 +278,24 @@ GB = 10⁹ bytes. See [Results at a glance](#results) for the comparison plot.
 - [Runtime support](./docs/runtime/support.md)
 - [MiniCPM-o 4.5 multimodal runtime](./docs/runtime/minicpmo45.md)
 - [Contributing and architecture rules](./CONTRIBUTING.md)
+
+## Citation
+
+If you use MFQ in your research, please cite our
+[paper on mixed-precision MoE calibration](https://arxiv.org/abs/2610.20353):
+
+```bibtex
+@misc{xie2026contrastcalibration,
+  title         = {Beyond Expert Rankings: Contrast Calibration for Mixed-Precision {MoE} Quantization},
+  author        = {Xie, Renjie and Yang, Juncheng and Hu, Aoting and Liang, Yan and
+                   Zhang, Mingxi and Hong, Zheheng and Xu, Wei and Chen, Yanzhi},
+  year          = {2026},
+  eprint        = {2610.20353},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2610.20353}
+}
+```
 
 ## Acknowledgements
 

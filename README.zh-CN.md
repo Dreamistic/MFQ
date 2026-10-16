@@ -86,6 +86,7 @@ Gate、Up、Down 精度，四张热力图使用同一色阶。
 
 我们的校准方法已开源，详见论文
 [Beyond Expert Rankings: Contrast Calibration for Mixed-Precision MoE Quantization](https://arxiv.org/abs/2610.20353)。
+BibTeX 格式见[引用](#引用)。
 
 ### 在现有硬件预算下运行大模型
 
@@ -263,6 +264,24 @@ WikiText-2 评测：KLD 越低越好，与参考模型的 Top1 一致率越高�
 - [运行时支持范围](./docs/runtime/support.md)
 - [MiniCPM-o 4.5 多模态运行时](./docs/runtime/minicpmo45.md)
 - [贡献指南与架构规范](./CONTRIBUTING.md)
+
+## 引用
+
+如果你在研究中使用 MFQ，欢迎引用我们的
+[混合精度 MoE 校准论文](https://arxiv.org/abs/2610.20353)：
+
+```bibtex
+@misc{xie2026contrastcalibration,
+  title         = {Beyond Expert Rankings: Contrast Calibration for Mixed-Precision {MoE} Quantization},
+  author        = {Xie, Renjie and Yang, Juncheng and Hu, Aoting and Liang, Yan and
+                   Zhang, Mingxi and Hong, Zheheng and Xu, Wei and Chen, Yanzhi},
+  year          = {2026},
+  eprint        = {2610.20353},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2610.20353}
+}
+```
 
 ## 致谢
 
