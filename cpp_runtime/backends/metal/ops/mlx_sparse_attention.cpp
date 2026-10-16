@@ -668,13 +668,14 @@ public:
           params_(params),
           dtype_(dtype), vector_decode_(vector_decode) {
         if (vector_decode_) {
+            nax_decode_ = params.block_size == 4 && sparse_block_nax_available();
             decode_keys_ = params.selected_blocks * params.block_size +
                 (params.queries == 1 ? (params.query_offset + 1) % params.block_size : params.block_size - 1);
-            partitions_ = sdpa_decode_partitions(stream, decode_keys_, params.gqa_factor);
+            partitions_ = nax_decode_ ? 64 : sdpa_decode_partitions(stream, decode_keys_, params.gqa_factor);
         }
     }
 
-    std::string preparation_key() const override { return "mfq_sparse_block_gqa_" + mlx::core::type_to_name(dtype_) + "_" + std::to_string(vector_decode_) + "_" + std::to_string(partitions_) + "_bs" + std::to_string(params_.block_size); }
+    std::string preparation_key() const override { return "mfq_sparse_block_gqa_" + mlx::core::type_to_name(dtype_) + "_" + std::to_string(vector_decode_) + "_" + std::to_string(partitions_) + "_bs" + std::to_string(params_.block_size) + "_nax" + std::to_string(nax_decode_); }
     void prepare_gpu() override { (void)prepared_kernel(); }
 
     MTL::ComputePipelineState* prepared_kernel() {
@@ -683,6 +684,11 @@ public:
         options.math_mode = MathMode::Fast;
         if (vector_decode_) {
             auto* library = device.get_library("mfq_sdpa_decode_v1", options, sdpa_decode_source);
+            if (nax_decode_) {
+                (void)device.get_kernel(dtype_ == mlx::core::float16
+                    ? "mfq_sdpa_decode_2pass_2_f16_256" : "mfq_sdpa_decode_2pass_2_bf16_256", library);
+                return prepared_nax_kernel();
+            }
             const bool yes = true, no = false;
             mlx::core::metal::MTLFCList constants{
                 {&no, MTL::DataType::DataTypeBool, 20}, {&no, MTL::DataType::DataTypeBool, 21},
@@ -746,19 +752,28 @@ public:
                 temporary->set_data(mlx::core::allocator::malloc(temporary->nbytes()));
                 encoder.add_temporary(*temporary);
             }
-            encoder.set_output_array(partial, 3);
-            encoder.set_output_array(denominator, 4);
-            encoder.set_output_array(maximum, 5);
-            encoder.set_input_array(inputs[3], 6);
-            encoder.set_bytes(decode_keys_, 7);
-            const std::size_t strides[]{std::size_t(params.key_strides[1]), std::size_t(params.key_strides[2]),
-                std::size_t(params.value_strides[1]), std::size_t(params.value_strides[2])};
-            for (int index = 0; index < 4; ++index) encoder.set_bytes(strides[index], 8 + index);
-            encoder.set_bytes(params.scale, 12);
-            encoder.set_bytes(params, 19);
-            encoder.dispatch_threadgroups(
-                MTL::Size(params.kv_heads, params.batch * params.queries, partitions),
-                MTL::Size(32, 12, 1));
+            if (nax_decode_) {
+                encoder.set_output_array(partial, 4);
+                encoder.set_output_array(maximum, 6);
+                encoder.set_output_array(denominator, 7);
+                encoder.dispatch_threadgroups(
+                    MTL::Size(params.queries * partitions, params.kv_heads, params.batch),
+                    MTL::Size(32, 2, 1));
+            } else {
+                encoder.set_output_array(partial, 3);
+                encoder.set_output_array(denominator, 4);
+                encoder.set_output_array(maximum, 5);
+                encoder.set_input_array(inputs[3], 6);
+                encoder.set_bytes(decode_keys_, 7);
+                const std::size_t strides[]{std::size_t(params.key_strides[1]), std::size_t(params.key_strides[2]),
+                    std::size_t(params.value_strides[1]), std::size_t(params.value_strides[2])};
+                for (int index = 0; index < 4; ++index) encoder.set_bytes(strides[index], 8 + index);
+                encoder.set_bytes(params.scale, 12);
+                encoder.set_bytes(params, 19);
+                encoder.dispatch_threadgroups(
+                    MTL::Size(params.kv_heads, params.batch * params.queries, partitions),
+                    MTL::Size(32, 12, 1));
+            }
             const std::string reduce_name = dtype_ == mlx::core::float16
                 ? "mfq_sdpa_decode_2pass_2_f16_256" : "mfq_sdpa_decode_2pass_2_bf16_256";
             CompileOptions options;
@@ -790,6 +805,7 @@ public:
         return primitive != nullptr
             && primitive->dtype_ == dtype_
             && primitive->vector_decode_ == vector_decode_
+            && primitive->nax_decode_ == nax_decode_
             && primitive->params_.batch == params_.batch
             && primitive->params_.query_heads == params_.query_heads
             && primitive->params_.kv_heads == params_.kv_heads
@@ -812,9 +828,48 @@ public:
     }
 
 private:
+    MTL::ComputePipelineState* prepared_nax_kernel() {
+        auto& device = kernel_device(stream().device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        const std::string name = "mfq_sparse_block_gqa_split_nax_f32_" + mlx::core::type_to_name(dtype_);
+        auto* library = device.get_library(name, options, [this, name] {
+            std::string source = "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n";
+            source += sparse_attention_source();
+            source += "\n#define UNROLL _Pragma(\"clang loop unroll(full)\")\n"
+                "#define MFQ_QSA_SPLIT_PARTITIONS 64\n#define GQA 12\n"
+                "#define TOPK configuration.selected_blocks\n";
+            source += "template<typename T> [[kernel, max_total_threads_per_threadgroup(64)]] void "
+                + name + "(const device T* q_data [[buffer(0)]], const device T* k_data [[buffer(1)]], "
+                "const device T* v_data [[buffer(2)]], const device int* sel [[buffer(3)]], "
+                "device float* out [[buffer(4)]], constant MfqSparseBlockGqaParams& configuration [[buffer(5)]], "
+                "device float* partial_maximum [[buffer(6)]], device float* partial_denominator [[buffer(7)]], "
+                "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], "
+                "ushort simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
+                "ushort thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {\n";
+            source += R"MSL(
+                const device T* q = q_data;
+                const device T* k = k_data;
+                const device T* v = v_data;
+                const long q_strides[] = {configuration.query_strides[0], configuration.query_strides[1], configuration.query_strides[2]};
+                const long k_strides[] = {configuration.key_strides[0], configuration.key_strides[1], configuration.key_strides[2]};
+                const long v_strides[] = {configuration.value_strides[0], configuration.value_strides[1], configuration.value_strides[2]};
+                const int params[] = {configuration.query_offset, configuration.keys, configuration.queries};
+                const float scale[] = {configuration.scale};
+            )MSL";
+            source += kSparseBlockNaxSource;
+            source += "\n}\ntemplate [[host_name(\"" + name + "\")]] [[kernel]] decltype("
+                + name + "<" + (dtype_ == mlx::core::float16 ? "half" : "bfloat") + ">) "
+                + name + "<" + (dtype_ == mlx::core::float16 ? "half" : "bfloat") + ">;\n";
+            return source;
+        });
+        return device.get_kernel(name, library);
+    }
+
     SparseBlockGqaParams params_;
     mlx::core::Dtype dtype_;
     bool vector_decode_;
+    bool nax_decode_ = false;
     int partitions_ = 0;
     int decode_keys_ = 0;
 };
