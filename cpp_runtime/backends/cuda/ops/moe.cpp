@@ -1646,13 +1646,7 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
             const auto& w=pools[nint_dispatch->pools.front()].nint;
             if(neuron_len==2560 && out_per_expert==640 && w.gs==28 && w.bits==5 &&
                     nint_late_scale_enabled(neuron_len,int(w.bits),x.get_device())) {
-                thread_local int cached_device=-1,major=0,minor=0;
-                if(cached_device!=x.get_device()) {
-                    MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,x.get_device()));
-                    MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,x.get_device()));
-                    cached_device=x.get_device();
-                }
-                request_rows=major==8 && minor==6;
+                request_rows=true;
             }
         }
         bool prepare_rows=request_rows && nint_dispatch->pools.size()==1 &&

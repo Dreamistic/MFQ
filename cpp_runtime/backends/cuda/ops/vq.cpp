@@ -116,18 +116,11 @@ enum class NvqMatmulPath {
 };
 
 static NvqMatmulPath select_nvq_matmul_path(const NvqWeight & w, int M) {
-    // Small expert matrices underfill the multi-column GEMV on SM86.
-    // The vector decoder plus FP32-accumulating GEMM is faster from M=9.
+    // Short batches of small expert matrices use vector decode followed by
+    // FP32-accumulating GEMM. The decision depends on matrix geometry.
     if (M >= 9 && M <= 16 && w.out <= 4096 && w.neuron_len <= 4096 &&
             !mfq::cuda::runtime_options::nvq_dense_reference()) {
-        thread_local int cached_device = -1, major = 0, minor = 0;
-        const int device = w.indices_packed.get_device();
-        if (device != cached_device) {
-            MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
-            MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
-            cached_device = device;
-        }
-        if (major == 8 && minor == 6) return NvqMatmulPath::DequantGemm;
+        return NvqMatmulPath::DequantGemm;
     }
     const bool e8_family =
         w.format == 2 || w.format == 5 || w.format == 7 ||

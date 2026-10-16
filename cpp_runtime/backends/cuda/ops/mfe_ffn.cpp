@@ -274,8 +274,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         // complete small window. Other shapes retain their previous capacity.
         const auto* wide_compact=std::getenv("MFQ_MFE_TOKEN_WIDE_COMPACT");
         const bool wide_default=(!wide_compact || wide_compact[0]!='0') && batch_.token_group_compact &&
-            batch_.input_width==2560 && batch_.intermediate==640 && batch_.output_width==2560 &&
-            batch_.routes==10 && (batch_.tokens==3 || batch_.tokens==4);
+            (batch_.tokens==3 || batch_.tokens==4);
         batch_.token_group_capacity=batch_.tokens<=8?(wide_default?4:2):8;
         if(token_group_capacity_hint==4 || token_group_capacity_hint==8)
             batch_.token_group_capacity=token_group_capacity_hint;
@@ -301,8 +300,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         // Short compact mixed batches are dominated by singleton/pair groups.
         // Their smaller independent Gate/Up CTAs outperform the aligned CTA,
         // including its fused quantizer. Keep the existing explicit override.
-        const bool short_compact=batch_.tokens==4 && batch_.token_group_compact && batch_.nvq_format_mask &&
-            batch_.input_width==2560 && batch_.intermediate==640 && batch_.output_width==2560 && batch_.routes==10;
+        const bool short_compact=batch_.tokens==4 && batch_.token_group_compact && batch_.nvq_format_mask;
         batch_.token_group_aligned_gu=batch_.tokens<=8 &&
             (aligned_gu?*aligned_gu:batch_.tokens==4 && !short_compact);
         if(short_compact && !aligned_gu && !batch_.token_group_aligned_gu) {
