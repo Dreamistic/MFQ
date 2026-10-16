@@ -5268,6 +5268,57 @@ void test_grouped_mmq_prefill() {
     }
 }
 
+void test_grouped_mmq_sparse_plan_bounds() {
+    for (const int experts : {1, 32, 512}) {
+        auto fixture = make_moe_fixture(std::vector<std::string>(experts, "NINTv2"), 4, 24, 0, 24);
+        const auto weight = mfq::metal::MlxMfeWeight::from_blob(fixture.blob);
+        for (const int count : {1, 10, 31, 32, 33, 257, 1024, 4096}) {
+            for (const bool skewed : {false, true}) {
+                std::vector<std::int32_t> ids(count);
+                std::vector<int> counts(experts, 0);
+                for (int row = 0; row < count; ++row) {
+                    ids[row] = skewed ? 0 : (row * 37 + row / 3) % experts;
+                    ++counts[ids[row]];
+                }
+                auto sorted = ids;
+                std::sort(sorted.begin(), sorted.end());
+                const auto routes = mlx::core::array(ids.begin(), mlx::core::Shape{count, 1});
+                const auto order = mlx::core::astype(mlx::core::argsort(mlx::core::reshape(
+                    routes, mlx::core::Shape{count})), mlx::core::int32);
+                for (const int rows : {32, 48, 64, 80, 96, 128}) {
+                    const auto plan = weight.build_grouped_mmq_plan(routes, order, rows);
+                    require(plan.max_blocks == std::min(count, experts + (count + rows - 1) / rows),
+                        "grouped block capacity exceeds the routed-row bound");
+                    mlx::core::eval(plan.block_meta, plan.block_count);
+                    const int actual = plan.block_count.data<std::int32_t>()[0];
+                    int expected = 0;
+                    for (const int population : counts) expected += (population + rows - 1) / rows;
+                    require(actual == expected && actual <= plan.max_blocks,
+                        "grouped block count does not cover the expert populations");
+                    require(plan.block_meta.shape() == mlx::core::Shape{plan.max_blocks, 3},
+                        "grouped block metadata has the wrong capacity");
+                    std::vector<int> covered(count, 0);
+                    const auto* metadata = plan.block_meta.data<std::int32_t>();
+                    for (int block = 0; block < actual; ++block) {
+                        const int first = metadata[block * 3];
+                        const int expert = metadata[block * 3 + 1];
+                        const int length = metadata[block * 3 + 2];
+                        require(first >= 0 && length > 0 && length <= rows && first + length <= count,
+                            "grouped block points outside the sorted routes");
+                        require(expert >= 0 && expert < experts, "grouped block has an invalid expert");
+                        for (int row = first; row < first + length; ++row) {
+                            require(sorted[row] == expert, "grouped block crosses expert boundaries");
+                            ++covered[row];
+                        }
+                    }
+                    require(std::all_of(covered.begin(), covered.end(), [](int visits) { return visits == 1; }),
+                        "grouped block plan drops or duplicates routed rows");
+                }
+            }
+        }
+    }
+}
+
 void test_portable_mmq_row_buckets() {
     constexpr int input_width = 96;
     constexpr int output_width = 68;
@@ -8524,6 +8575,11 @@ int main(int argc, char** argv) {
             std::cout << "MFQ folded top-k decode tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-block-plan") {
+            test_grouped_mmq_sparse_plan_bounds();
+            std::cout << "MFQ grouped block plan bounds passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--test-portable-prefill") {
             test_portable_mmq_row_buckets();
             test_grouped_split_nint_swiglu_prefill();
@@ -8666,6 +8722,7 @@ int main(int argc, char** argv) {
                 "[--benchmark-nepq-a|--benchmark-nint-shared|--test-streamed-mfe|--test-direct-mfe]");
         }
         test_vq_small_m_route_order();
+        test_grouped_mmq_sparse_plan_bounds();
         test_generic_vq_wide_small_m();
         test_all_families_and_projections();
         test_swiglu_ffn();

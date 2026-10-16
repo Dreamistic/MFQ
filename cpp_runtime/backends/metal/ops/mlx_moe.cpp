@@ -2877,7 +2877,7 @@ grouped_mmq_block_builder(bool cohort_ordered) {
         source +=
             R"METAL(
                 const int M = indices_shape[0];
-                const int MAX_BLOCKS = (M + BM - 1) / BM + NUM_EXPERTS;
+                const int MAX_BLOCKS = min(max(M, 1), M / BM + int(M % BM != 0) + NUM_EXPERTS);
                 const uint schedule_index = thread_index_in_threadgroup;
                 const uint expert = uint(
                     MFQ_SCHEDULED_EXPERT(schedule_index));
@@ -3083,10 +3083,11 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
         throw std::invalid_argument(
             "route order must contain one index per routed row");
     }
+    const auto population_bound =
+        (static_cast<std::size_t>(route_count) + block_rows - 1) / block_rows
+        + static_cast<std::size_t>(experts);
     const int max_blocks = checked_int(
-        static_cast<std::size_t>(
-            (route_count + block_rows - 1) / block_rows)
-            + static_cast<std::size_t>(experts),
+        std::min(static_cast<std::size_t>(std::max(route_count, 1)), population_bound),
         "grouped MMQ max blocks");
     auto sorted_ids = mlx::core::contiguous(
         mlx::core::take(
