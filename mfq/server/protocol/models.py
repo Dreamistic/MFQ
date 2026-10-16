@@ -966,6 +966,7 @@ class ModelDirectoryList(ProtocolModel):
     parent_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     model_file_count: int = Field(default=0, ge=0)
     files: list[ModelDirectoryFile] = Field(default_factory=list)
+    can_open_directory: bool = False
     can_open_in_finder: bool = False
     data: list[ModelDirectoryEntry]
 

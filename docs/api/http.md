@@ -234,8 +234,12 @@ before a download. The download-directory routes report where hub downloads
 land and select it by registered directory id; selecting a different directory
 can evict the prefix cache, and an unknown id returns `400
 invalid_download_directory`.
-`POST /api/v1/models/directories/open` probes a registered directory. For a
-registered artifact, `GET /api/v1/models/{model_id}/directory` lists its
+`POST /api/v1/models/directories/open` opens a browsed directory in the server
+host's file manager: Finder on macOS, File Explorer on Windows, or `xdg-open`
+on a Linux desktop. It accepts only an opaque directory id returned by the
+directory browser. `can_open_directory` reports availability; a server without
+a desktop opener returns `501 file_manager_unavailable`.
+For a registered artifact, `GET /api/v1/models/{model_id}/directory` lists its
 files, `/analysis` returns checkpoint composition, and `/cache-profile`
 returns the embedded cache profile or `null`.
 

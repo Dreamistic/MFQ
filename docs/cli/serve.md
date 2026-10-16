@@ -274,7 +274,7 @@ unpinned models; instances may override it through the runtime API.
 | `--max-runtime-memory SIZE` | Aggregate resident-model admission budget, such as `96G`. | None |
 | `--moe-gpu-cache-gb N` | Resident routed-expert cache in GiB; `0` keeps experts resident. | Automatic on native HF Metal |
 | `--no-memory-guard` | Disable the automatic Metal model-residency budget. | Off |
-| `--prefix-cache-dir PATH` | Persistent Session KV cache directory. | Disabled unless set |
+| `--prefix-cache-dir PATH` | Persistent Session KV cache directory. | Managed `prefix-cache` directory beside the server database |
 | `--prefix-cache-disk-size SIZE` | Maximum persistent Session KV cache size, such as `100G`. | None |
 | `--prefix-cache-hot-size SIZE` | Maximum RAM hot-cache size, such as `2G`. | None |
 | `--prefix-cache-block-tokens N` | Tokens per content-addressed Session KV block. | Runtime default |

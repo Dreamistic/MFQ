@@ -33,6 +33,7 @@ from mfq.server.protocol.models import (
 )
 from mfq.server.state.model_weights import estimated_resident_weight_bytes, estimated_weight_roles, weight_role
 from mfq.server.services.model_context import declared_context_size, yarn_context_limits
+from mfq.server.services.desktop import directory_opener
 
 MODEL_FILE_INDEX = ".mfq-files.json"
 _ROUTED_EXPERT_RE = re.compile(
@@ -385,6 +386,7 @@ class ModelCatalog:
             parent_id=self._directory_id(parent) if parent is not None else None,
             model_file_count=self._immediate_model_count(current),
             files=files,
+            can_open_directory=directory_opener() is not None,
             can_open_in_finder=sys.platform == "darwin",
             data=[self._directory_entry(path) for path in children],
         )

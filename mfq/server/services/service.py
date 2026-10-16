@@ -7,7 +7,6 @@ import base64
 import hashlib
 import json
 import subprocess
-import sys
 import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
@@ -33,6 +32,7 @@ from mfq.server.state.catalog import (
 from mfq.server.services.checkpoint_analysis import analyze_checkpoint
 from mfq.server.services.model_memory import checkpoint_cache_profile
 from mfq.server.services.documents import DocumentExtractionError, extract_document
+from mfq.server.services.desktop import FileManagerUnavailableError, open_directory
 from mfq.server.services.evaluation_datasets import official_for_digest
 from mfq.server.services.hub import (
     HubCatalog,
@@ -1090,13 +1090,12 @@ class ServerService:
             directory = await asyncio.to_thread(self.catalog.directory_path, request.directory_id)
         except ModelDirectoryNotFoundError as error:
             raise ServiceError(404, "model_directory_not_found", "model directory is unavailable") from error
-        if sys.platform != "darwin":
-            raise ServiceError(501, "finder_unavailable", "Finder is available only on a macOS server")
         try:
-            await asyncio.to_thread(subprocess.run, ["/usr/bin/open", "-a", "Finder", str(directory)],
-                check=True, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            await asyncio.to_thread(open_directory, directory)
+        except FileManagerUnavailableError as error:
+            raise ServiceError(501, "file_manager_unavailable", str(error)) from error
         except (OSError, subprocess.SubprocessError) as error:
-            raise ServiceError(503, "model_directory_open_failed", "could not open the model directory in Finder") from error
+            raise ServiceError(503, "model_directory_open_failed", "could not open the model directory in the file manager") from error
         return OpenModelDirectoryResult()
 
     async def register_model_directory(

@@ -4703,6 +4703,11 @@
       "ModelDirectoryList": {
         "additionalProperties": false,
         "properties": {
+          "can_open_directory": {
+            "default": false,
+            "title": "Can Open Directory",
+            "type": "boolean"
+          },
           "can_open_in_finder": {
             "default": false,
             "title": "Can Open In Finder",

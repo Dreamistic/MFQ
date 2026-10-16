@@ -6,7 +6,7 @@ import type { useModelCatalog } from './useModelCatalog';
 import { formatBytes } from '../../app/formatters';
 
 /** 渲染服务器文件夹选择器，并在关闭时恢复触发器焦点。 */
-type DirectoryDialogState = Pick<ReturnType<typeof useModelCatalog>, 'modelBrowser' | 'modelBrowserOpen' | 'modelBrowserError' | 'modelBrowserLoading' | 'modelFilesMode' | 'setModelBrowserOpen' | 'modelBrowserTriggerRef' | 'busy' | 'jumpToModelDirectory' | 'openModelDirectory' | 'modelDirectoryPath' | 'setModelDirectoryPath' | 'registerCurrentModelDirectory' | 'openCurrentDirectoryInFinder'>;
+type DirectoryDialogState = Pick<ReturnType<typeof useModelCatalog>, 'modelBrowser' | 'modelBrowserOpen' | 'modelBrowserError' | 'modelBrowserLoading' | 'modelFilesMode' | 'setModelBrowserOpen' | 'modelBrowserTriggerRef' | 'busy' | 'jumpToModelDirectory' | 'openModelDirectory' | 'modelDirectoryPath' | 'setModelDirectoryPath' | 'registerCurrentModelDirectory' | 'openCurrentDirectory'>;
 
 export function ModelDirectoryDialog({ catalog, title }: { catalog: DirectoryDialogState; title?: string }) {
   const { tr } = useSettings();
@@ -24,7 +24,7 @@ export function ModelDirectoryDialog({ catalog, title }: { catalog: DirectoryDia
     modelDirectoryPath,
     setModelDirectoryPath,
     registerCurrentModelDirectory,
-    openCurrentDirectoryInFinder,
+    openCurrentDirectory,
   } = catalog;
   return (
     <Dialog
@@ -84,9 +84,9 @@ export function ModelDirectoryDialog({ catalog, title }: { catalog: DirectoryDia
         )}
       </div>
       <footer>
-        <button className="model-browser-open-finder" disabled={busy || !modelBrowser?.current_id || !modelBrowser.can_open_in_finder || Boolean(modelBrowserError)}
-          onClick={() => void openCurrentDirectoryInFinder()} type="button">
-          <Icon name="folder" size={13} />{tr('在访达中打开', 'Open in Finder')}
+        <button className="model-browser-open-finder" disabled={busy || !modelBrowser?.current_id || !(modelBrowser.can_open_directory ?? modelBrowser.can_open_in_finder) || Boolean(modelBrowserError)}
+          onClick={() => void openCurrentDirectory()} type="button">
+          <Icon name="folder" size={13} />{modelBrowser?.can_open_in_finder ? tr('在访达中打开', 'Open in Finder') : tr('在文件管理器中打开', 'Open in file manager')}
         </button>
         <button onClick={() => setModelBrowserOpen(false)} type="button">
           {tr('取消', 'Cancel')}
