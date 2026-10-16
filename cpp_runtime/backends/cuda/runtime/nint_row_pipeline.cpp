@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
+#include <optional>
 #include <thread>
 namespace tb=mfq_tensor_backend;
 namespace {
@@ -18,9 +19,12 @@ using RowClock=std::chrono::steady_clock;
 uint64_t row_elapsed(RowClock::time_point start) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(RowClock::now()-start).count();
 }
-struct Gathered {
+struct GatherStats {
+    uint64_t queue_ns=0,gather_ns=0,read_ns=0,source_bytes=0,misses=0;
+};
+struct Gathered : GatherStats {
     mfq::NintRowBatch batch;std::vector<int64_t> inverse;
-    uint64_t serial=0,queue_ns=0,gather_ns=0,read_ns=0,source_bytes=0,misses=0;
+    uint64_t serial=0;
 };
 int64_t shape_rows(const std::vector<int64_t>& shape) {
     int64_t n=1;
@@ -112,7 +116,8 @@ struct NintRowPipeline::Impl {
     uint64_t source_id=0;int64_t rows=0;int width=0;
     bool profile=false,serial_small=false;uint64_t serial=0;
     std::vector<int64_t> current_ids,current_shape;
-    std::future<Gathered> pending;std::unique_ptr<Gathered> ready;
+    bool early_prefix=false;unsigned reported_prefix_sizes=0;
+    std::future<Gathered> pending;std::optional<Gathered> ready;
     bool reuse_worker=true,active_read_pool=true,stopping=false;
     mfq::HostParallelPool read_pool{{},false};
     std::mutex work_mutex;
@@ -146,10 +151,10 @@ struct NintRowPipeline::Impl {
         if(worker.joinable())worker.join();
         if(pending.valid())pending.wait();
     }
-    std::future<Gathered> submit(std::vector<int64_t> ids,uint64_t sequence,RowClock::time_point issued) {
+    std::future<Gathered> submit(std::vector<int64_t> ids,uint64_t sequence,RowClock::time_point issued,GatherStats carried) {
         if(!reuse_worker)return std::async(std::launch::async,
-            [this,ids=std::move(ids),sequence,issued]{return gather(ids,sequence,issued);});
-        std::packaged_task<Gathered()> next([this,ids=std::move(ids),sequence,issued]{return gather(ids,sequence,issued);});
+            [this,ids=std::move(ids),sequence,issued,carried]{return gather(ids,sequence,issued,carried);});
+        std::packaged_task<Gathered()> next([this,ids=std::move(ids),sequence,issued,carried]{return gather(ids,sequence,issued,carried);});
         auto result=next.get_future();
         {
             std::lock_guard<std::mutex> lock(work_mutex);
@@ -172,10 +177,10 @@ struct NintRowPipeline::Impl {
         work_ready.notify_one();
         return result;
     }
-    Gathered gather(const std::vector<int64_t>& ids,uint64_t sequence,RowClock::time_point issued) {
-        Gathered out;out.serial=sequence;
+    Gathered gather(const std::vector<int64_t>& ids,uint64_t sequence,RowClock::time_point issued,GatherStats carried) {
+        Gathered out;static_cast<GatherStats&>(out)=carried;out.serial=sequence;
         const auto started=profile?RowClock::now():RowClock::time_point{};
-        if(profile)out.queue_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(started-issued).count();
+        if(profile)out.queue_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(started-issued).count();
         std::map<int64_t,std::shared_ptr<const mfq::NintRowBatch>> selected;
         std::vector<std::vector<int64_t>> misses(tables.size());
         for(const auto id:ids) {
@@ -210,7 +215,7 @@ struct NintRowPipeline::Impl {
             });
         }
         if(profile) {
-            out.read_ns=row_elapsed(read_started);
+            out.read_ns+=row_elapsed(read_started);
             for(const auto& batch:fetched){out.source_bytes+=batch.source_bytes_read();out.misses+=batch.rows();}
         }
         for(std::size_t shard=0;shard<tables.size();++shard)for(std::size_t i=0;i<misses[shard].size();++i) {
@@ -222,23 +227,43 @@ struct NintRowPipeline::Impl {
         std::map<int64_t,int64_t> locations;
         for(const auto& [id,value]:selected){locations.emplace(id,out.batch.rows());out.batch.append_batch(*value);}
         for(auto id:ids)out.inverse.push_back(locations.at(id));
-        if(profile)out.gather_ns=row_elapsed(started);
+        if(profile)out.gather_ns+=row_elapsed(started);
         return out;
     }
 };
 NintRowPipeline::NintRowPipeline(std::vector<std::shared_ptr<mfq::NintRows>> data):impl_(std::make_unique<Impl>(std::move(data))){}
 NintRowPipeline::~NintRowPipeline()=default;
-void NintRowPipeline::issue(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape) {
+void NintRowPipeline::issue(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,bool early_prefix) {
     auto& s=*impl_;if(s.current_ids==ids && s.current_shape==shape && (s.ready || s.pending.valid()))return;
-    if(s.pending.valid())s.ready=std::make_unique<Gathered>(s.pending.get());
+    if(s.pending.valid())s.ready.emplace(s.pending.get());
+    // Attribute the hint's actual I/O to the window that consumes it; otherwise
+    // moving reads earlier would incorrectly appear to reduce source bytes.
+    const GatherStats carried=s.profile && s.early_prefix && s.ready?
+        static_cast<const GatherStats&>(*s.ready):GatherStats{};
+    // Only the immutable rows are prefetched. Recompute the complete window
+    // from its committed ngram context, then reuse matching cache entries.
+    if(s.early_prefix && s.ready && s.current_shape.size()==3 && shape.size()==3 &&
+       s.current_shape[0]==1 && s.current_shape[1]>=1 && shape[0]==1 &&
+       shape[1]>s.current_shape[1] && shape[1]<=8 && shape[2]==s.current_shape[2] &&
+       s.current_ids.size()<=ids.size() &&
+       std::equal(s.current_ids.begin(),s.current_ids.end(),ids.begin())) {
+        const auto bit=1u<<unsigned(shape[1]);
+        if(!(s.reported_prefix_sizes&bit)) {
+            s.reported_prefix_sizes|=bit;
+            std::fprintf(stderr,"ple_prefix_prefetch_reuse enabled=1 tokens=%lld prefix_tokens=%lld rows=%zu\n",
+                static_cast<long long>(shape[1]),static_cast<long long>(s.current_shape[1]),s.current_ids.size());
+        }
+    }
     s.current_ids=ids;s.current_shape=shape;s.ready.reset();
+    s.early_prefix=early_prefix;
     const auto issued=s.profile?RowClock::now():RowClock::time_point{};
     const auto sequence=++s.serial;
-    s.pending=s.submit(ids,sequence,issued);
+    s.pending=s.submit(ids,sequence,issued,carried);
 }
 tb::Tensor NintRowPipeline::collect(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,const tb::Device& device) {
     auto& s=*impl_;issue(ids,shape);
-    if(s.pending.valid())s.ready=std::make_unique<Gathered>(s.pending.get());
+    if(s.pending.valid())s.ready.emplace(s.pending.get());
+    s.early_prefix=false;
     const auto& result=*s.ready;auto out_shape=shape;out_shape.push_back(s.width);
     const auto n=shape_rows(shape);
     if(n!=static_cast<int64_t>(ids.size()) || !device.is_cuda())throw std::invalid_argument("PLE pipeline input shape/device mismatch");
@@ -273,7 +298,8 @@ void NintRowPipeline::upload(NintRowStage& stage,const std::vector<int64_t>& ids
         throw std::invalid_argument("PLE graph upload differs from its prepared stage");
     auto point=target.profile?RowClock::now():RowClock::time_point{};
     issue(ids,shape);
-    if(s.pending.valid())s.ready=std::make_unique<Gathered>(s.pending.get());
+    if(s.pending.valid())s.ready.emplace(s.pending.get());
+    s.early_prefix=false;
     if(target.profile){target.future_ns+=row_elapsed(point);point=RowClock::now();++target.uploads;}
     const auto& result=*s.ready;result.batch.validate();
     if(target.profile && target.last_gather!=result.serial) {

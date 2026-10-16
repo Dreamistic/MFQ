@@ -81,6 +81,8 @@ __device__ __forceinline__ void nvq_compact32_d4_dot(const MfePackedProjection& 
     const auto* anchors=static_cast<const float*>(d.fields[3]);
     const auto* codebook=static_cast<const int8_t*>(d.fields[4]);
     const int row_bits=d.nsign*(2*bits+7)+d.groups*4;
+    const uint32_t bank_map=d.nvq_bank_map;
+    const bool analytic_scale=packed_nvq::jsc_d4_analytic_scales<Format>(codebook);
     const int expert_bytes=d.output_rows*row_bits/8;
     stream+=int64_t(expert)*expert_bytes;
     const int neuron=expert*d.output_rows+first+row;
@@ -95,11 +97,16 @@ __device__ __forceinline__ void nvq_compact32_d4_dot(const MfePackedProjection& 
             const auto words=packed_nvq::load_dense_window32<4+3*(2*bits+7)>(stream,expert_bytes,bit);
             const packed_nvq::DenseD4Group<bits> packed{words.x,words.y,words.z};
             const auto state=packed.state();
-            const auto* bank=packed_nvq::active_codebook<Format>(codebook,state);
+            const int8_t* bank;
+            if constexpr(Format==packed_nvq::kNvq3Jsc || Format==packed_nvq::kNvq3Jsc512 ||
+                         Format==packed_nvq::kNvq3JscL) {
+                bank=bank_map?packed_nvq::packed_jsc_codebook<Format>(codebook,bank_map,state)
+                             :packed_nvq::active_codebook<Format>(codebook,state);
+            }else bank=packed_nvq::active_codebook<Format>(codebook,state);
 #if defined(MFQ_MFE_PARITY_READ) && MFQ_MFE_PARITY_READ
-            const float weight_scale=parity_read_scale<Format>(anchor,state,codebook);
+            const float weight_scale=analytic_scale?anchor*float((state>>1)+1):parity_read_scale<Format>(anchor,state,codebook);
 #else
-            const float weight_scale=packed_nvq::format_scale<Format>(anchor,state,codebook);
+            const float weight_scale=analytic_scale?anchor*float((state>>1)+1):packed_nvq::format_scale<Format>(anchor,state,codebook);
 #endif
             int dot=0;
 #pragma unroll

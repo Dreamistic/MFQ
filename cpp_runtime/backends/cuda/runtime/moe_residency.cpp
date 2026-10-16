@@ -80,8 +80,15 @@ struct MoeResidencyManager::Impl {
         int incoming_bundle=0,incoming_projection=0;
         MoeHostExpertCache::Lease lease;
         mfq::MoeCacheSlotBook::Replacement replacement;
-        std::vector<int64_t> offsets,preserve_offsets;
-        std::vector<const void*> loan_fields;
+        // Canonical expert formats have at most seven physical fields. Keep
+        // transaction metadata with the move instead of allocating three tiny
+        // vectors for every promoted projection on every adaptation round.
+        std::array<int64_t,8> offsets{},preserve_offsets{};
+        std::array<const void*,8> loan_fields{};
+        MoeHostExpertCache::Lease shadow_owner;
+        std::array<const uint8_t*,8> shadow_fields{};
+        bool shadow_indexed=false;
+        std::size_t field_count=0;
         int64_t uncached_bytes=0;
         std::size_t touched_fields=0;
         std::size_t backed_fields=0;
@@ -97,6 +104,7 @@ struct MoeResidencyManager::Impl {
     int64_t rounds=0;
     int pending_tokens=0;
     std::vector<std::vector<float>> heat;
+    std::vector<std::vector<uint8_t>> projection_marks;
     const float heat_retention=mfq::cuda::runtime_options::residency_heat_retention();
     const int interval=mfq::cuda::runtime_options::residency_interval();
     const bool exchange_defaults=[this] {
@@ -126,6 +134,24 @@ struct MoeResidencyManager::Impl {
         return flag?flag[0]=='2':exchange_defaults;
     }();
     std::vector<std::vector<float>> observations;
+    struct SpeculativeRoutes {
+        std::vector<int32_t> ids;
+        std::vector<uint64_t> heat_seen;
+        int rows=0;
+    };
+    std::vector<SpeculativeRoutes> speculative_routes;
+    int speculative_rows=0;
+    // One streamed expert serves every matching row of a verification window.
+    // Rank its avoided transfer once, rather than counting each routed token.
+    const int speculative_heat_mode=[] {
+        const auto* option=std::getenv("MFQ_MOE_MTP_WINDOW_HEAT");
+        return option?std::clamp(std::atoi(option),0,2):2;
+    }();
+    const bool speculative_window_heat=speculative_heat_mode!=0;
+    bool traced_speculative_heat=false;
+    std::atomic<std::uint64_t> speculative_route_windows{0},speculative_routes_committed{0};
+    std::atomic<std::uint64_t> speculative_routes_discarded{0},speculative_route_cancels{0};
+    std::atomic<std::uint64_t> speculative_heat_routes{0};
     std::unique_ptr<mfq::MoeResidencyRanker> ranking;
     struct TransferStage {std::string key;MoeGpuArena* arena=nullptr;int projection=0;};
     std::vector<std::vector<TransferStage>> transfer_stages;
@@ -179,10 +205,54 @@ struct MoeResidencyManager::Impl {
             int(cache->sources_[move.incoming_source]->cohorts_[move.cohort].bytes_per_expert.size()));
     }
     std::atomic<std::uint64_t> native_dma_batches{0},native_dma_copies{0},native_dma_fallbacks{0};
+    std::atomic<std::uint64_t> shadow_backup_bytes{0},shadow_backup_fields{0};
+    std::atomic<std::uint64_t> shadow_index_rebuilds{0},shadow_index_matches{0},shadow_index_backup_bytes{0};
+    struct ShadowIndex {
+        struct Row {mfq::MoeCacheKey key;int64_t row;};
+        std::weak_ptr<const MoeHostExpert> owner;
+        uint64_t generation=0;
+        int64_t slots=0;
+        std::vector<Row> rows;
+        static bool less(const mfq::MoeCacheKey& a,const mfq::MoeCacheKey& b) {
+            if(a.source!=b.source)return a.source<b.source;
+            if(a.cohort!=b.cohort)return a.cohort<b.cohort;
+            return a.expert<b.expert;
+        }
+    };
+    std::map<const MoeGpuArena*,ShadowIndex> shadow_indices;
+    bool shadow_index_reported=false;
+    int64_t find_shadow_row(const MoeGpuArena& arena,const MoeHostExpertCache::Lease& owner,
+                           const mfq::MoeCacheKey& key) {
+        try {
+            auto& index=shadow_indices[&arena];
+            const auto& identities=owner->weights.expert_local;const auto slots=identities.size(0);
+            const auto* data=identities.data_ptr<int32_t>();
+            if(index.owner.lock()!=owner || index.generation!=arena.prefill_backup_generation || index.slots!=slots) {
+                index.rows.clear();index.rows.reserve(std::size_t(slots));
+                for(int64_t row=0;row<slots;++row) {
+                    const mfq::MoeCacheKey candidate{data[row*3],data[row*3+1],data[row*3+2]};
+                    if(candidate.source>=0 && candidate.cohort>=0 && candidate.expert>=0)index.rows.push_back({candidate,row});
+                }
+                std::sort(index.rows.begin(),index.rows.end(),[](const auto& a,const auto& b){return ShadowIndex::less(a.key,b.key);});
+                index.owner=owner;index.generation=arena.prefill_backup_generation;index.slots=slots;
+                ++shadow_index_rebuilds;
+            }
+            const auto found=std::lower_bound(index.rows.begin(),index.rows.end(),key,
+                [](const auto& row,const auto& key){return ShadowIndex::less(row.key,key);});
+            if(found==index.rows.end() || !(found->key==key))return -1;
+            const auto row=found->row;
+            // Validate the live metadata as well as the cached generation.
+            if(data[row*3]!=key.source || data[row*3+1]!=key.cohort || data[row*3+2]!=key.expert)return -1;
+            ++shadow_index_matches;return row;
+        }catch(const std::bad_alloc&) {return -1;}
+    }
     std::atomic<std::uint64_t> observed_routes{0},scheduled_rounds{0},candidate_bundles{0};
     std::atomic<std::uint64_t> planned_bundles{0},committed_bundles{0},memory_rejections{0};
     std::atomic<std::uint64_t> host_pack_bytes{0},direct_upload_bytes{0},backup_peak_bytes{0},shared_backup_bytes{0};
     std::atomic<std::uint64_t> candidate_projections{0},planned_projections{0},committed_projections{0},projection_memory_rejections{0};
+    std::atomic<std::uint64_t> staging_budget_skips{0};
+    std::atomic<std::uint64_t> plan_ns{0},decode_plan_ns{0};
+    std::uint64_t last_plan_ns=0,last_staging_budget_skips=0;
     std::atomic<std::uint64_t> prepare_ns{0},join_ns{0},dma_wait_ns{0},map_ns{0},host_exchange_ns{0},apply_ns{0};
     std::atomic<std::uint64_t> decode_prepare_ns{0},decode_join_ns{0},decode_dma_wait_ns{0},decode_map_ns{0},decode_host_exchange_ns{0},decode_apply_ns{0};
     std::atomic<std::uint64_t> backup_copies{0},upload_copies{0};
@@ -244,6 +314,13 @@ struct MoeResidencyManager::Impl {
     std::condition_variable work_available,work_finished;
     std::atomic_bool work_pending{false};
     bool work_requested=false,work_ready=false,stopping=false,window_inflight=false;
+    const bool predictor_overlap=[] {
+        const auto* option=std::getenv("MFQ_MOE_PREDICTOR_EXCHANGE_OVERLAP");
+        return !option || option[0]!='0';
+    }();
+    bool predictor_overlap_scope=false,predictor_overlap_allowed=false;
+    std::optional<mfq::cuda::KvExpertLoan::ExchangeReadGuard> exchange_reads;
+    std::atomic<std::uint64_t> predictor_overlap_rounds{0},predictor_overlap_serves{0};
     std::exception_ptr error;
     explicit Impl(MoeExpertCache* value,Observer observe,MemoryProbe probe)
         :cache(value),observer(std::move(observe)),memory_probe(probe?std::move(probe):process_memory) {}
@@ -282,10 +359,19 @@ struct MoeResidencyManager::Impl {
         const auto& sources=cache->pipeline_bundles_[bundle];
         return projection==0 && sources[0]==sources[1]?3:1u<<projection;
     }
-    std::size_t complete_pending_bundles() const {
-        std::map<std::pair<int,int>,unsigned> masks;
-        for(const auto& move:pending)masks[{move.incoming_bundle,move.incoming}]|=projection_mask(move.incoming_bundle,move.incoming_projection);
-        return std::count_if(masks.begin(),masks.end(),[](const auto& item){return item.second==7;});
+    void clear_projection_marks() {
+        for(auto& row:projection_marks)std::fill(row.begin(),row.end(),uint8_t(0));
+    }
+    bool mark_projection_complete(int bundle,int expert,int projection) {
+        auto& mask=projection_marks[bundle][expert];const auto before=mask;
+        mask|=projection_mask(bundle,projection);
+        return before!=7 && mask==7;
+    }
+    std::size_t complete_pending_bundles() {
+        clear_projection_marks();std::size_t count=0;
+        for(const auto& move:pending)
+            count+=mark_projection_complete(move.incoming_bundle,move.incoming,move.incoming_projection);
+        return count;
     }
     struct CachedRefill {
         Impl& s;
@@ -321,6 +407,8 @@ struct MoeResidencyManager::Impl {
     };
 };
 
+MoeResidencyManager::MemorySample MoeResidencyManager::sample_host_memory() {return process_memory();}
+
 MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer,MemoryProbe memory_probe)
     :impl_(std::make_unique<Impl>(cache,std::move(observer),std::move(memory_probe))) {
     if(!cache || !cache->complete_residency_ || cache->pipeline_bundles_.empty())
@@ -331,7 +419,11 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
     s.transfer_stages.resize(cache->sources_.size());
     for(const auto& bundle:cache->pipeline_bundles_) {
         const auto& source=cache->sources_.at(bundle[0]);s.heat.emplace_back(std::size_t(source->n_experts()),0.0f);
+        s.projection_marks.emplace_back(std::size_t(source->n_experts()),uint8_t(0));
         s.observations.emplace_back(std::size_t(source->n_experts()),0.0f);
+        s.speculative_routes.emplace_back();
+        if(s.speculative_window_heat)s.speculative_routes.back().heat_seen.resize(
+            (std::size_t(source->n_experts())+63)/64);
         for(int id:bundle)if(cache->sources_.at(id)->layer_id_!=source->layer_id_ ||
                 cache->sources_.at(id)->n_experts()!=source->n_experts())
             throw std::invalid_argument("adaptive expert bundle geometry differs");
@@ -507,6 +599,8 @@ void MoeResidencyManager::release_transfer_stages() {
 }
 void MoeResidencyManager::before_layer(int layer) {
     auto& s=*impl_;if(layer!=s.first && layer>=0)return;
+    if(layer<0 && s.predictor_overlap_scope){prepare_predictor();return;}
+    s.predictor_overlap_scope=false;
     // Eager MTP enters the predictor before the next backbone layer zero.
     // Finish backbone exchanges before predictor DMA reuses shared staging or
     // acquires RAM leases held by the exchange worker.
@@ -515,6 +609,19 @@ void MoeResidencyManager::before_layer(int layer) {
         *static_cast<volatile uint32_t*>(s.expert_done_host->data())=0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
+}
+void MoeResidencyManager::prepare_predictor() {
+    auto& s=*impl_;s.predictor_overlap_scope=true;
+    if(s.predictor_overlap && s.work_pending.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> lock(s.worker_mutex);
+        s.work_finished.wait(lock,[&]{return s.predictor_overlap_allowed || s.work_ready || s.stopping;});
+        if(s.predictor_overlap_allowed && !s.work_ready && !s.stopping) {
+            ++s.predictor_overlap_serves;return;
+        }
+    }
+    apply_pending();
+    // The replay's reset callback enters the same scoped predictor boundary.
+    s.predictor_overlap_scope=true;
 }
 bool MoeResidencyManager::prepare_during_window() const noexcept {
     return impl_->window_prepare;
@@ -547,17 +654,89 @@ void MoeResidencyManager::finish_window(int layer) {
     {std::lock_guard<std::mutex> lock(s.worker_mutex);s.window_inflight=false;}
     s.work_finished.notify_all();
 }
+void MoeResidencyManager::begin_speculative_routes(int rows) {
+    auto& s=*impl_;
+    if(rows<2 || rows>32)throw std::invalid_argument("speculative route row count is out of range");
+    if(s.speculative_rows)throw std::logic_error("speculative routes already pending");
+    for(auto& row:s.speculative_routes){row.ids.clear();row.rows=0;}
+    s.speculative_rows=rows;
+}
+void MoeResidencyManager::commit_speculative_routes(int rows) {
+    auto& s=*impl_;if(!s.speculative_rows)return;
+    if(rows<1 || rows>s.speculative_rows)throw std::invalid_argument("committed route prefix is out of range");
+    // Validate the entire prefix before changing observations. Graph setup may
+    // replay a layer more than once; only its latest route publication counts.
+    for(const auto& record:s.speculative_routes)
+        if(record.rows && (record.rows<rows || record.ids.size()%record.rows))
+            throw std::logic_error("speculative route publication lost row alignment");
+    uint64_t committed=0,heat_routes=0;
+    for(std::size_t b=0;b<s.speculative_routes.size();++b) {
+        auto& record=s.speculative_routes[b];if(!record.rows)continue;
+        const auto count=std::size_t(rows)*(record.ids.size()/record.rows);
+        if(s.speculative_window_heat)std::fill(record.heat_seen.begin(),record.heat_seen.end(),uint64_t(0));
+        std::size_t distinct=0;
+        for(std::size_t i=0;i<count;++i) {
+            const auto expert=unsigned(record.ids[i]);
+            if(s.speculative_window_heat) {
+                auto& word=record.heat_seen[expert/64];const auto bit=uint64_t(1)<<(expert%64);
+                if(word&bit)continue;
+                word|=bit;
+            }
+            ++distinct;
+        }
+        // Keep the old total heat (and its hysteresis scale) while removing
+        // within-window multiplicity from individual expert priorities.
+        // An all-repeated route set is unchanged; mixed route sets give every
+        // unique expert the same avoided-transfer value in this window.
+        const float weight=s.speculative_heat_mode==2 && distinct?float(count)/float(distinct):1.0f;
+        for(std::size_t i=0;i<count;++i) {
+            const auto expert=unsigned(record.ids[i]);
+            if(s.speculative_window_heat) {
+                auto& word=record.heat_seen[expert/64];const auto bit=uint64_t(1)<<(expert%64);
+                if(!(word&bit))continue;
+                word&=~bit;
+            }
+            s.observations[b][expert]+=weight;
+        }
+        heat_routes+=distinct;
+        committed+=count;
+        s.observed_routes+=count;s.speculative_routes_committed+=count;
+        s.speculative_routes_discarded+=record.ids.size()-count;
+    }
+    s.speculative_heat_routes+=heat_routes;
+    if(!s.traced_speculative_heat && committed) {
+        std::fprintf(stderr,"moe_mtp_heat_policy scope=first_committed_window window_union=%d normalized=%d rows=%d routes=%llu heat_routes=%llu\n",
+            int(s.speculative_window_heat),int(s.speculative_heat_mode==2),rows,static_cast<unsigned long long>(committed),
+            static_cast<unsigned long long>(heat_routes));
+        s.traced_speculative_heat=true;
+    }
+    ++s.speculative_route_windows;s.speculative_rows=0;
+}
+void MoeResidencyManager::discard_speculative_routes() noexcept {
+    auto& s=*impl_;if(!s.speculative_rows)return;
+    for(auto& record:s.speculative_routes){s.speculative_routes_discarded+=record.ids.size();record.ids.clear();record.rows=0;}
+    ++s.speculative_route_cancels;s.speculative_rows=0;
+}
 void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight,bool independent_sequences) {
     auto& s=*impl_;
     for(std::size_t b=0;b<s.cache->pipeline_bundles_.size();++b)
-        if(s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_==layer)
-            for(int expert:ids){s.observations[b].at(expert)+=1.0f;++s.observed_routes;}
+        if(s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_==layer) {
+            if(s.speculative_rows && layer>=0) {
+                if(independent_sequences || tokens<1 || tokens>s.speculative_rows || ids.size()%tokens)
+                    throw std::logic_error("speculative routes do not describe one aligned sequence");
+                for(const auto expert:ids)if(unsigned(expert)>=s.observations[b].size())
+                    throw std::out_of_range("speculative expert route is out of range");
+                auto& record=s.speculative_routes[b];record.ids=ids;record.rows=tokens;
+            }else for(int expert:ids){s.observations[b].at(expert)+=1.0f;++s.observed_routes;}
+        }
     if(!s.cache->config_.moe_residency_adapt)return;
     if(layer!=s.last || s.work_pending.load(std::memory_order_acquire))return;
     if(!s.cache->config_.moe_residency_warm && (tokens>8 || (++s.rounds%4)!=0))return;
     // Strata adjusts its cache every few completed windows. Keep collecting
     // all routes between rounds; prompt batches still prepare immediately.
-    // Independent and speculative windows retain every route observation.
+    // Speculative observations become visible when verification commits its
+    // accepted prefix. Prepare from the previous committed observations here,
+    // retaining overlap between expert exchange and the current graph tail.
     // Rank and exchange at the configured window interval for both paths;
     // exchanging after every speculative verification serializes the next
     // draft behind a multi-millisecond backbone cache transaction.
@@ -612,15 +791,29 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
                 try {rollback();}catch(...) {failure=std::current_exception();}
                 state.error=failure;
             }
+            // Keep borrowed cache addresses protected through rollback as well
+            // as successful DMA and publication. Predictor misses may reclaim
+            // them only after no transaction can still read those addresses.
+            state.exchange_reads.reset();
             lock.lock();state.work_ready=true;state.work_finished.notify_one();
         }
     });
     s.work_pending.store(true,std::memory_order_release);
-    {std::lock_guard<std::mutex> lock(s.worker_mutex);s.window_inflight=window_inflight;s.work_requested=true;}
+    {std::lock_guard<std::mutex> lock(s.worker_mutex);s.window_inflight=window_inflight;s.work_requested=true;
+        s.work_ready=false;s.predictor_overlap_allowed=false;}
     s.work_available.notify_one();
 }
 void MoeResidencyManager::prepare() {
     auto& s=*impl_;auto& cache=*s.cache;
+    const auto plan_started=std::chrono::steady_clock::now();
+    const auto prior_skips=s.staging_budget_skips.load();
+    const auto finish_plan=[&] {
+        s.last_plan_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-plan_started).count();
+        s.last_staging_budget_skips=s.staging_budget_skips.load()-prior_skips;
+        s.plan_ns+=s.last_plan_ns;
+        if(s.pending_tokens<=8)s.decode_plan_ns+=s.last_plan_ns;
+    };
     const PhaseClock clock(s.prepare_ns,s.pending_tokens<=8?&s.decode_prepare_ns:nullptr);
     const MfqCudaGuard guard(cache.sources_.front()->cohorts_.front().active.expert_local.device());
     using Expert=mfq::MoeResidencyRanker::Expert;
@@ -661,12 +854,12 @@ void MoeResidencyManager::prepare() {
             }
             return hot?1:cold?0:-1;
         });
-    std::map<std::pair<int,int>,unsigned> candidates;
+    s.clear_projection_marks();
     for(const auto& pair:pairs) {
-        candidates[{pair.incoming.bundle,pair.incoming.expert}]|=s.projection_mask(pair.incoming.bundle,pair.incoming.projection);
+        s.candidate_bundles+=s.mark_projection_complete(
+            pair.incoming.bundle,pair.incoming.expert,pair.incoming.projection);
         s.candidate_projections+=pair.incoming.projection<0?3:1;
     }
-    s.candidate_bundles+=std::count_if(candidates.begin(),candidates.end(),[](const auto& item){return item.second==7;});
     if(!cache.config_.moe_residency_warm && pairs.size()>32)pairs.resize(32);
     s.direct=cache.config_.moe_direct_ram && cache.pipeline_ram_registered_bytes_>0;
     const bool shared_backup=cache.config_.moe_residency_warm && s.direct && cache.pipeline_host_stage_.defined();
@@ -689,10 +882,34 @@ void MoeResidencyManager::prepare() {
         if(shared_backup)stage_limit=std::min(stage_limit,std::uint64_t(s.backup.numel()));
     }
     s.pending.reserve(pairs.size()*3);int64_t bytes=0;
-    std::set<std::pair<int,int>> memory_rejections;
+    std::size_t memory_rejections=0;
     for(const auto& pair:pairs) {
         const int count=pair.incoming.projection<0?3:1;
-        std::vector<Impl::Move> bundle(count);bool valid=true;
+        // Geometry is immutable. Reject candidates that cannot fit before
+        // scanning the RAM image, acquiring leases or allocating replacement
+        // nodes. A full workspace can otherwise pay those costs for every
+        // lower-ranked candidate even though none can be exchanged.
+        int64_t required=bytes;
+        for(int i=0;i<count;++i) {
+            const int projection=count==3?i:pair.incoming.projection;
+            const auto& source=*cache.sources_[cache.pipeline_bundles_[pair.incoming.bundle][projection]];
+            const auto& cohort=source.cohorts_[source.expert_to_cohort_[pair.incoming.expert]];
+            for(const auto field_bytes:cohort.bytes_per_expert) {
+                if(required>INT64_MAX-15)throw std::overflow_error("adaptive staging alignment overflow");
+                required=(required+15)&~int64_t(15);
+                if(field_bytes>INT64_MAX-required)throw std::overflow_error("adaptive staging size overflow");
+                required+=field_bytes;
+            }
+        }
+        if(std::uint64_t(required)>stage_limit) {
+            // Candidate counting has finished. Reuse one spare bit to count
+            // rejected bundles once, without allocating a set node per expert.
+            auto& mark=s.projection_marks[pair.incoming.bundle][pair.incoming.expert];
+            if(!(mark&8)){mark|=8;++memory_rejections;}
+            s.projection_memory_rejections+=count;s.staging_budget_skips+=count;
+            continue;
+        }
+        std::array<Impl::Move,3> bundle;bool valid=true;
         for(int i=0;i<count;++i) {
             const int incoming_projection=count==3?i:pair.incoming.projection;
             const int outgoing_projection=count==3?i:pair.outgoing.projection;
@@ -702,6 +919,9 @@ void MoeResidencyManager::prepare() {
             move.incoming=pair.incoming.expert;move.outgoing=pair.outgoing.expert;
             auto& incoming=*cache.sources_[move.incoming_source];auto& outgoing=*cache.sources_[move.outgoing_source];
             move.cohort=incoming.expert_to_cohort_[move.incoming];auto& cohort=incoming.cohorts_[move.cohort];
+            move.field_count=cohort.bytes_per_expert.size();
+            if(move.field_count>move.offsets.size())
+                throw std::logic_error("adaptive expert field count exceeds transaction capacity");
             if(cache.pipeline_prefill_layer_layout_) {
                 if(move.incoming_source!=move.outgoing_source)
                     throw std::logic_error("prefill residency exchange crosses source geometry");
@@ -718,7 +938,7 @@ void MoeResidencyManager::prepare() {
             if(s.direct && cache.pipeline_ram_registered_bytes_<cache.pipeline_ram_complement_->numel()) {
                 const auto begin=reinterpret_cast<uintptr_t>(cache.pipeline_ram_complement_->data_ptr());
                 const auto end=begin+cache.pipeline_ram_registered_bytes_;
-                for(const auto& field:moe_cache_fields(move.lease->weights)) {
+                for(const auto& field:moe_cache_field_refs(move.lease->weights)) {
                     if(!tensor_nbytes(field))continue;
                     const auto address=reinterpret_cast<uintptr_t>(field.data_ptr());
                     if(address<begin || address>end || uint64_t(tensor_nbytes(field))>end-address){valid=false;break;}
@@ -735,23 +955,27 @@ void MoeResidencyManager::prepare() {
                     });
                 if(slot>=0 && !aliased){move.cached_arena=arena;move.cached_slot=slot;}
             }
-            move.replacement=cohort.arena->book->prepare_replace(move.slot,old_key,incoming.quant_source_->host_key(move.incoming));
         }
         if(!valid)continue;
         int64_t next_bytes=bytes;
-        for(auto& move:bundle) {
+        for(int i=0;i<count;++i) {
+            auto& move=bundle[i];
+            auto& incoming=*cache.sources_[move.incoming_source];
+            auto& outgoing=*cache.sources_[move.outgoing_source];
             auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
-            for(auto count:cohort.bytes_per_expert) {
-                next_bytes=(next_bytes+15)&~int64_t(15);move.offsets.push_back(next_bytes);
-                if(count>INT64_MAX-next_bytes)throw std::overflow_error("adaptive staging size overflow");next_bytes+=count;
+            for(std::size_t f=0;f<move.field_count;++f) {
+                const auto bytes=cohort.bytes_per_expert[f];
+                next_bytes=(next_bytes+15)&~int64_t(15);move.offsets[f]=next_bytes;
+                if(bytes>INT64_MAX-next_bytes)throw std::overflow_error("adaptive staging size overflow");next_bytes+=bytes;
             }
+            move.replacement=cohort.arena->book->prepare_replace(move.slot,
+                outgoing.quant_source_->host_key(move.outgoing),incoming.quant_source_->host_key(move.incoming));
         }
-        if(std::uint64_t(next_bytes)>stage_limit){memory_rejections.emplace(pair.incoming.bundle,pair.incoming.expert);s.projection_memory_rejections+=count;continue;}
-        bytes=next_bytes;for(auto& move:bundle)s.pending.push_back(std::move(move));
+        bytes=next_bytes;for(int i=0;i<count;++i)s.pending.push_back(std::move(bundle[i]));
     }
-    s.memory_rejections+=memory_rejections.size();
+    s.memory_rejections+=memory_rejections;
     for(auto& heat:s.heat)for(float& value:heat)value*=s.heat_retention;
-    if(s.pending.empty())return;
+    if(s.pending.empty()){finish_plan();return;}
     const auto options=tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true);
     if(cache.config_.moe_residency_warm &&
         (!s.backup.defined() || s.backup.numel()<bytes || (!s.direct && (!s.upload.defined() || s.upload.numel()<bytes)))) {
@@ -774,13 +998,14 @@ void MoeResidencyManager::prepare() {
         update_map(move.outgoing_source,outgoing.expert_to_cohort_[move.outgoing],move.outgoing,-1);
         cohort.arena->book->mark_inflight(move.slot);
         if(!s.direct) {
-            const auto fields=moe_cache_fields(move.lease->weights);
+            const auto fields=moe_cache_field_refs(move.lease->weights);
             for(std::size_t f=0;f<fields.size();++f) {
                 std::memcpy(s.upload.data_ptr<uint8_t>()+move.offsets[f],fields[f].data_ptr(),std::size_t(cohort.bytes_per_expert[f]));
                 s.host_pack_bytes+=cohort.bytes_per_expert[f];
             }
         }
     }
+    finish_plan();
     if(s.pending_window) {
         if(s.pending_expert_fence) {
             const PhaseClock wait_clock(s.expert_fence_wait_ns,nullptr);
@@ -816,7 +1041,7 @@ void MoeResidencyManager::prepare() {
     const PhaseClock backup_clock(s.backup_submit_ns,nullptr);
     for(const auto& move:s.pending) {
         auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
-        for(std::size_t f=0;f<move.offsets.size();++f) {
+        for(std::size_t f=0;f<move.field_count;++f) {
             const auto count=cohort.bytes_per_expert[f];if(!count)continue;
             auto* gpu=static_cast<uint8_t*>(cohort.arena->fields[f].data_ptr())+int64_t(move.slot)*count;
             MFQ_CUDA_CHECK(cudaMemcpyAsync(s.backup.data_ptr<uint8_t>()+move.offsets[f],gpu,std::size_t(count),cudaMemcpyDeviceToHost,s.stream));
@@ -829,8 +1054,8 @@ void MoeResidencyManager::prepare() {
     Impl::CachedRefill refill(s);
     for(std::size_t i=0;i<s.pending.size();++i) {
         auto& move=s.pending[i];auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
-        const auto incoming=moe_cache_fields(move.lease->weights);
-        for(std::size_t f=0;f<move.offsets.size();++f) {
+        const auto incoming=moe_cache_field_refs(move.lease->weights);
+        for(std::size_t f=0;f<move.field_count;++f) {
             const auto count=cohort.bytes_per_expert[f];if(!count)continue;
             auto* gpu=static_cast<uint8_t*>(cohort.arena->fields[f].data_ptr())+int64_t(move.slot)*count;
             move.touched_fields=f+1;
@@ -897,32 +1122,85 @@ void MoeResidencyManager::prepare_direct_exchange() {
     constexpr int64_t wire_control_bytes=256;
     const auto* loan_option=std::getenv("MFQ_MOE_RESIDENCY_KV_REFILL");
     const bool reuse_loan=(!loan_option || loan_option[0]!='0') && bool(cache.kv_expert_loan_);
+    const auto* keyed_option=std::getenv("MFQ_MOE_KEYED_EXCHANGE");
+    bool predictor_disjoint=s.predictor_overlap && s.pending_tokens<=8 && reuse_loan && (!keyed_option || keyed_option[0]=='1') &&
+        std::all_of(s.pending.begin(),s.pending.end(),[&](const auto& move) {
+            return !move.cached_arena && cache.sources_[move.incoming_source]->layer_id_>=0 &&
+                cache.sources_[move.outgoing_source]->layer_id_>=0;
+        });
+    if(predictor_disjoint)for(const auto& source:cache.sources_)if(source->layer_id_<0)
+        for(const auto& cohort:source->cohorts_)for(const auto& move:s.pending)
+            if(cohort.arena==cache.sources_[move.incoming_source]->cohorts_[move.cohort].arena)
+                predictor_disjoint=false;
+    if(predictor_disjoint)s.exchange_reads.emplace(cache.kv_expert_loan_->retain_exchange_reads(false,s.pending.size()));
     const auto cached_field=[&](const Impl::Move& move,std::size_t f) -> const uint8_t* {
         const auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
         if(move.cached_arena)return move.cached_arena->field_pointer(move.cached_slot,f,cohort.bytes_per_expert);
-        return f<move.loan_fields.size()?static_cast<const uint8_t*>(move.loan_fields[f]):nullptr;
+        return f<move.field_count?static_cast<const uint8_t*>(move.loan_fields[f]):nullptr;
     };
     int64_t incoming_bytes=0;
     for(auto& move:s.pending)if(!move.cached_arena) {
         const auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
         if(reuse_loan) {
-            move.loan_fields.resize(cohort.bytes_per_expert.size());
-            for(std::size_t f=0;f<move.loan_fields.size();++f)if(cohort.bytes_per_expert[f])
+            for(std::size_t f=0;f<move.field_count;++f)if(cohort.bytes_per_expert[f])
                 move.loan_fields[f]=cache.kv_expert_loan_->find_for_exchange(
-                    {move.incoming_source,move.incoming,int64_t(f)},std::size_t(cohort.bytes_per_expert[f]));
+                    {move.incoming_source,move.incoming,int64_t(f)},std::size_t(cohort.bytes_per_expert[f]),
+                    s.exchange_reads?&*s.exchange_reads:nullptr);
         }
-        move.preserve_offsets.clear();
         for(std::size_t f=0;f<cohort.bytes_per_expert.size();++f) {
             const auto bytes=cohort.bytes_per_expert[f];
-            if(cached_field(move,f)){move.preserve_offsets.push_back(-1);continue;}
+            if(cached_field(move,f)){move.preserve_offsets[f]=-1;continue;}
             incoming_bytes=(incoming_bytes+15)&~int64_t(15);
-            move.preserve_offsets.push_back(incoming_bytes);
+            move.preserve_offsets[f]=incoming_bytes;
             if(bytes>INT64_MAX-incoming_bytes)throw std::overflow_error("incoming expert preservation size overflow");
             incoming_bytes+=bytes;move.uncached_bytes+=bytes;
         }
     }
+    const auto* shadow_option=std::getenv("MFQ_MOE_RESIDENCY_PREFILL_SHADOW");
+    const auto* shadow_index_option=std::getenv("MFQ_MOE_RESIDENCY_PREFILL_SHADOW_INDEX");
+    const bool indexed_shadow=!shadow_index_option || shadow_index_option[0]!='0';
+    if(!shadow_option || shadow_option[0]!='0')for(auto& move:s.pending) {
+        const auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
+        const auto& arena=*cohort.arena;
+        if(!arena.prefill_backup_key)continue;
+        bool reusable=false;
+        for(std::size_t f=0;f<move.field_count;++f)
+            reusable|=cohort.bytes_per_expert[f]>0 && cached_field(move,f)!=nullptr;
+        if(!reusable)continue;
+        auto owner=cache.host_experts_->find(*arena.prefill_backup_key);
+        if(!owner)continue;
+        const auto& keys=owner->weights.expert_local;
+        if(!keys.defined() || keys.is_cuda() || keys.scalar_type()!=tb::kInt32 ||
+                keys.dim()!=2 || keys.size(1)!=3 || !keys.is_contiguous())continue;
+        const auto image_slots=keys.size(0);auto row=int64_t(move.slot)+image_slots-arena.slots;
+        const auto old_key=cache.sources_[move.outgoing_source]->quant_source_->host_key(move.outgoing);
+        const auto matches=[&](int64_t row) {
+            if(row<0 || row>=image_slots)return false;
+            const auto* identity=keys.data_ptr<int32_t>()+row*3;
+            return identity[0]==old_key.source && identity[1]==old_key.cohort && identity[2]==old_key.expert;
+        };
+        if(!matches(row)) {
+            if(!indexed_shadow)continue;
+            row=s.find_shadow_row(arena,owner,old_key);if(row<0)continue;
+            move.shadow_indexed=true;
+        }
+        const auto fields=moe_cache_field_refs(owner->weights);
+        if(fields.size()!=move.field_count)continue;
+        for(std::size_t f=0;f<move.field_count;++f) {
+            const auto bytes=cohort.bytes_per_expert[f];
+            if(bytes>0 && cached_field(move,f) && !fields[f].is_cuda() && fields[f].is_contiguous() &&
+                    tensor_nbytes(fields[f])/bytes==image_slots && tensor_nbytes(fields[f])%bytes==0)
+                move.shadow_fields[f]=static_cast<const uint8_t*>(fields[f].data_ptr())+row*bytes;
+        }
+        move.shadow_owner=std::move(owner);
+    }
     const bool gpu_preserve=incoming_bytes>0 && cache.pipeline_wire_gpu_.defined() &&
         incoming_bytes<=cache.pipeline_wire_gpu_.numel()-wire_control_bytes;
+    // With every incoming field already cached, this transaction neither
+    // borrows the shared wire nor reads shared pinned transfer staging. Its
+    // primary arenas and RAM keys are disjoint from the predictor's. The read
+    // guard prevents a predictor packet from reclaiming cached DMA sources.
+    const bool overlap_candidate=predictor_disjoint && incoming_bytes==0;
     s.last_gpu_preserve=gpu_preserve;s.last_preserve_bytes=incoming_bytes;
     s.last_backup_bytes=0;s.last_small_backup_bytes=0;
     s.last_backup_fields=0;s.last_small_backup_fields=0;
@@ -967,7 +1245,7 @@ void MoeResidencyManager::prepare_direct_exchange() {
         std::vector<mfq::cuda::DmaCopy> preserve_copies;
         const auto flush_preserve=[&]{submit_native(preserve_copies,cudaMemcpyHostToDevice,s.stream);};
         const auto preserve=[&](const Impl::Move& move) {
-            const auto fields=moe_cache_fields(move.lease->weights);
+            const auto fields=moe_cache_field_refs(move.lease->weights);
             const auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
             for(std::size_t f=0;f<fields.size();++f) {
                 const auto bytes=cohort.bytes_per_expert[f];if(!bytes)continue;
@@ -1004,11 +1282,11 @@ void MoeResidencyManager::prepare_direct_exchange() {
                 const auto& item=s.pending[i];auto& old=*cache.sources_[item.outgoing_source];
                 const auto& cohort=old.cohorts_[old.expert_to_cohort_[item.outgoing]];
                 s.observe("host",i);auto result=*cohort.cpu;result.local_experts=1;result.expert_local={};
-                return moe_replace_quant_fields(std::move(result),moe_cache_fields(reused));
+                return moe_replace_quant_fields(std::move(result),moe_cache_field_refs(reused));
             },[&,i](const MixedMoePool& reused) {
                 auto& item=s.pending[i];
                 const auto& cohort=cache.sources_[item.incoming_source]->cohorts_[item.cohort];
-                const auto fields=moe_cache_fields(reused);
+                const auto fields=moe_cache_field_refs(reused);
                 MFQ_CUDA_CHECK(cudaStreamSynchronize(backup_stream));
                 MFQ_CUDA_CHECK(cudaStreamSynchronize(s.stream));
                 // RAM now contains the victim. Restore its GPU bytes before
@@ -1076,6 +1354,14 @@ void MoeResidencyManager::prepare_direct_exchange() {
             cache.sources_[move.incoming_source]->quant_source_->publish_gpu_resident(move.incoming,true);
         }
     },[&] {
+        if(overlap_candidate) {
+            // exchange_batch has reserved just its own incoming/outgoing keys
+            // and released the global host-cache mutex before invoking us.
+            {std::lock_guard<std::mutex> lock(s.worker_mutex);s.predictor_overlap_allowed=true;}
+            if(++s.predictor_overlap_rounds==1)std::fprintf(stderr,
+                "moe_predictor_exchange_overlap_dispatch enabled=1 cached_fields=1 separate_arenas=1 scoped_pins=1 projections=%zu\n",s.pending.size());
+            s.work_finished.notify_all();s.observe("predictor_overlap_ready",0);
+        }
         {
             const PhaseClock backup_clock(s.backup_submit_ns,nullptr);
             std::size_t small_count=0;
@@ -1085,11 +1371,29 @@ void MoeResidencyManager::prepare_direct_exchange() {
             const auto ram_bytes=uint64_t(cache.pipeline_ram_registered_bytes_);
             const auto backup=[&](Impl::Move& move) {
                 const auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
-                const auto fields=moe_cache_fields(move.lease->weights);
+                const auto fields=moe_cache_field_refs(move.lease->weights);
                 for(std::size_t f=0;f<fields.size();++f) {
                     const auto count=cohort.bytes_per_expert[f];if(!count)continue;
                     const auto* gpu=static_cast<const uint8_t*>(cohort.arena->fields[f].data_ptr())+int64_t(move.slot)*count;
                     move.backed_fields=f+1;
+                    // Cached incoming bytes have no preservation read from
+                    // this RAM destination. Reader exclusion is already held,
+                    // so an immutable, identity-checked prefill image can
+                    // replace the victim's D2H without another GPU fence.
+                    // Uncached incoming fields must keep their queued backup.
+                    if(const auto* shadow=move.shadow_fields[f]) {
+                        std::memcpy(fields[f].data_ptr(),shadow,std::size_t(count));
+                        s.shadow_backup_bytes+=count;++s.shadow_backup_fields;
+                        if(move.shadow_indexed) {
+                            s.shadow_index_backup_bytes+=count;
+                            if(!s.shadow_index_reported) {
+                                s.shadow_index_reported=true;
+                                std::cerr<<"runtime_moe_shadow_lookup enabled=1 identity_lookup=1 source="
+                                    <<move.outgoing_source<<" expert="<<move.outgoing<<'\n';
+                            }
+                        }
+                        s.observe("direct_backup",f);continue;
+                    }
                     const auto address=reinterpret_cast<uintptr_t>(fields[f].data_ptr());
                     if(s.backup_descriptors && count<=s.small_backup_limit && small_count<Impl::refill_capacity &&
                             address>=ram_begin && address-ram_begin<=ram_bytes && uint64_t(count)<=ram_bytes-(address-ram_begin)) {
@@ -1165,7 +1469,7 @@ void MoeResidencyManager::prepare_direct_exchange() {
             if(refill.submit())s.observe("direct_refill_batch",0);
         }
         MFQ_CUDA_CHECK(cudaEventRecord(s.done,s.stream));
-    });
+    },overlap_candidate);
     if(!committed){rollback();return;}
     s.retire_promoted_kv();
     for(const auto& move:s.pending)if(move.prefill_ram_slot>=0)
@@ -1196,8 +1500,8 @@ void MoeResidencyManager::prepare_batched(std::int64_t bytes) {
     int64_t largest=0;
     for(const auto& move:s.pending) {
         const auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
-        const auto incoming=moe_cache_fields(move.lease->weights);
-        for(std::size_t f=0;f<move.offsets.size();++f) {
+        const auto incoming=moe_cache_field_refs(move.lease->weights);
+        for(std::size_t f=0;f<move.field_count;++f) {
             const auto count=cohort.bytes_per_expert[f];if(!count)continue;
             auto* gpu=static_cast<uint8_t*>(cohort.arena->fields[f].data_ptr())+int64_t(move.slot)*count;
             const auto* cached=move.cached_arena ? move.cached_arena->field_pointer(move.cached_slot,f,cohort.bytes_per_expert) : nullptr;
@@ -1285,7 +1589,7 @@ void MoeResidencyManager::prepare_batched(std::int64_t bytes) {
         MFQ_CUDA_CHECK(cudaMemcpyAsync(work,s.upload.data_ptr(),std::size_t(bytes),cudaMemcpyHostToDevice,s.stream));
         ++s.upload_copies;
     }
-    for(auto& move:s.pending)move.touched_fields=move.offsets.size();
+    for(auto& move:s.pending)move.touched_fields=move.field_count;
     mfq::moe_cache_mapped_gather_cuda(device+fields.size(),int(fields.size()),blocks,s.stream);
     for(std::size_t i=0;i<s.pending.size();++i)s.observe("upload",i);
 }
@@ -1310,7 +1614,7 @@ void MoeResidencyManager::rollback() {
     s.pending.clear();s.maps.clear();
 }
 void MoeResidencyManager::apply_pending() {
-    auto& s=*impl_;
+    auto& s=*impl_;s.predictor_overlap_scope=false;
     if(!s.work_pending.load(std::memory_order_acquire) && s.pending.empty() && !s.error)return;
     const bool decode=s.pending_tokens<=8;
     const PhaseClock apply_clock(s.apply_ns,decode?&s.decode_apply_ns:nullptr);
@@ -1330,6 +1634,7 @@ void MoeResidencyManager::apply_pending() {
     if(decode && elapsed>=4.0 && s.traced_decode_waits++<32)
         std::cerr<<"runtime_moe_exchange_wait tokens="<<s.pending_tokens<<" ms="<<elapsed
             <<" join_ms="<<(s.join_ns.load()-joined)/1e6
+            <<" plan_ms="<<s.last_plan_ns/1e6<<" staging_budget_skips="<<s.last_staging_budget_skips
             <<" dma_ms="<<(s.dma_wait_ns.load()-dma)/1e6
             <<" map_ms="<<(s.map_ns.load()-maps)/1e6
             <<" gpu_preserve="<<s.last_gpu_preserve<<" preserve_mb="<<s.last_preserve_bytes/1048576.0
@@ -1364,7 +1669,7 @@ void MoeResidencyManager::publish_pending() {
         for(std::size_t i=0;i<s.pending.size();++i) {
             auto& move=s.pending[i];auto& incoming=*cache.sources_[move.incoming_source];auto& outgoing=*cache.sources_[move.outgoing_source];
             {
-                const auto fields=moe_cache_fields(move.lease->weights);
+                const auto fields=moe_cache_field_refs(move.lease->weights);
                 const auto& cohort=incoming.cohorts_[move.cohort];
                 for(std::size_t f=0;f<fields.size();++f) {
                     const auto count=cohort.bytes_per_expert[f];if(!count)continue;
@@ -1376,11 +1681,11 @@ void MoeResidencyManager::publish_pending() {
             changes.push_back({incoming.quant_source_->host_key(move.incoming),outgoing.quant_source_->host_key(move.outgoing),&move.lease,
                 [&,i](const MixedMoePool& reused) {
                     const auto& item=s.pending[i];auto& old=*cache.sources_[item.outgoing_source];
-                    const auto& cohort=old.cohorts_[old.expert_to_cohort_[item.outgoing]];auto fields=moe_cache_fields(reused);
+                    const auto& cohort=old.cohorts_[old.expert_to_cohort_[item.outgoing]];auto fields=moe_cache_field_refs(reused);
                     s.observe("host",i);auto result=*cohort.cpu;result.local_experts=1;result.expert_local={};
                     return moe_replace_quant_fields(std::move(result),fields);
                 },[&,i](const MixedMoePool& reused) {
-                    const auto& item=s.pending[i];const auto& cohort=cache.sources_[item.incoming_source]->cohorts_[item.cohort];auto fields=moe_cache_fields(reused);
+                    const auto& item=s.pending[i];const auto& cohort=cache.sources_[item.incoming_source]->cohorts_[item.cohort];auto fields=moe_cache_field_refs(reused);
                     for(std::size_t f=0;f<fields.size();++f) {
                         const auto count=cohort.bytes_per_expert[f];
                         if(s.direct) {
@@ -1447,7 +1752,11 @@ MoeResidencyManager::Stats MoeResidencyManager::stats() const noexcept {
         s.expert_fence_wait_ns.load(),s.backup_submit_ns.load(),s.refill_submit_ns.load(),
         s.cached_copy_dma_bytes.load(),s.cached_copy_dma_fields.load(),
         s.direct_exchange_rounds.load(),s.direct_exchange_bytes.load(),s.direct_exchange_ns.load(),
-        s.cached_copy_descriptors.load(),s.cached_copy_blocks.load(),s.exchange_defaults,s.kv_refill_bytes.load(),s.native_dma_batches.load(),s.native_dma_copies.load(),s.native_dma_fallbacks.load()};
+        s.cached_copy_descriptors.load(),s.cached_copy_blocks.load(),s.exchange_defaults,s.kv_refill_bytes.load(),s.native_dma_batches.load(),s.native_dma_copies.load(),s.native_dma_fallbacks.load(),s.staging_budget_skips.load(),s.plan_ns.load(),s.decode_plan_ns.load(),
+        s.speculative_route_windows.load(),s.speculative_routes_committed.load(),s.speculative_routes_discarded.load(),s.speculative_route_cancels.load(),
+        s.shadow_backup_bytes.load(),s.shadow_backup_fields.load(),s.shadow_index_rebuilds.load(),
+        s.shadow_index_matches.load(),s.shadow_index_backup_bytes.load(),s.speculative_heat_routes.load(),
+        s.predictor_overlap_rounds.load(),s.predictor_overlap_serves.load()};
 }
 void MoeResidencyManager::trace_rank_summary(std::ostream& out) const {
     const auto* enabled=std::getenv("MFQ_TRACE_MOE_RANK_SUMMARY");

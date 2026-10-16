@@ -1010,6 +1010,81 @@ void complete_two_stage_residual() {
     std::cout<<"complete_two_stage_residual ordinary="<<ordinary<<" changing_graph="<<graphs
         <<" exact; runtime groups5/24/28/32/48/64, rank17/320, variable/aligned/signed q8, unaligned metadata, differing injection group, streams1/3/4, 1025-column tails and pre/after PASS\n";
 }
+
+void prefill_blas_check() {
+    int ordinary=0,graphs=0;
+    const auto verify=[](const tb::Tensor& actual,const tb::Tensor& expected) {
+        auto a=actual.to(tb::kFloat32).cpu().contiguous(),b=expected.to(tb::kFloat32).cpu().contiguous();
+        if(a.sizes()!=b.sizes() || actual.scalar_type()!=expected.scalar_type())throw std::runtime_error("GR BLAS output shape/dtype changed");
+        double squared=0,reference=0,maximum=0,peak=0;
+        for(int64_t i=0;i<a.numel();++i) {
+            const double value=a.data_ptr<float>()[i],ref=b.data_ptr<float>()[i];
+            if(!std::isfinite(value))throw std::runtime_error("GR BLAS result is nonfinite");
+            squared+=(value-ref)*(value-ref);reference+=ref*ref;
+            maximum=std::max(maximum,std::abs(value-ref));peak=std::max(peak,std::abs(ref));
+        }
+        const bool half=actual.scalar_type()==tb::kFloat16;
+        if(std::sqrt(squared/std::max(1e-30,reference))>(half?3e-4:5e-5) || maximum>.005+(half?1e-3:5e-5)*peak)
+            throw std::runtime_error("GR FP32 BLAS error exceeds bound");
+    };
+    for(const auto shape:std::vector<std::pair<int,int>>{{320,10240},{10240,320},{4,10240},{132,263}})
+    for(int packing:{0,1,2}) {
+        const auto [out,width]=shape;
+        auto fixture=make_weight(out,width,width==263?5:48,packing==2,packing==1);
+        for(int rows:{129,1025}) {
+            std::vector<float> values(size_t(rows)*width);
+            for(size_t i=0;i<values.size();++i)values[i]=std::sin(float(i)*.037f)*.4f;
+            auto initial=upload(values,tb::kFloat32,{1,rows,width}),x=initial.clone();
+            const bool mix=out>width || width==263;
+            auto normalized=mix?tb::full({1,rows,out},.37,x.options()):tb::Tensor{};
+            const auto run=[&](int mode) {
+                PrefillProjectionScope projection(mode);
+                return mix?nint_float_projection_mix_cuda(fixture.weight,x,normalized,4):
+                    nint_float_projection_activation_cuda(fixture.weight,x,4,out==4);
+            };
+            verify(run(32),run(31));++ordinary;
+            if(mix) {
+                normalized=normalized.to(tb::kFloat16);verify(run(32),run(31));++ordinary;
+            }
+            if(packing==0 && rows==1025) {
+                tb::Tensor result;mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+                window.capture([&]{result=run(32);},[]{},[&]{result={};});
+                for(float amplitude:{0.f,.3f,1.f}) {
+                    x.copy_(initial*amplitude);window.run();verify(result,run(31));++graphs;
+                }
+            }
+            x=initial.to(tb::kFloat16);
+            verify(run(32),run(31));++ordinary;
+            if(mix) {
+                normalized=normalized.to(tb::kFloat32);verify(run(32),run(31));++ordinary;
+            }
+            if(packing==0 && rows==1025 && out!=4) {
+                tb::Tensor result;mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+                window.capture([&]{result=run(32);},[]{},[&]{result={};});
+                for(float amplitude:{0.f,.3f,1.f}) {
+                    x.copy_(initial.to(tb::kFloat16)*amplitude);window.run();verify(result,run(31));++graphs;
+                }
+            }
+        }
+    }
+    {
+        auto fixture=make_weight(320,10240,48,false,true);
+        auto x=tb::full({1,8193,10240},.037,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+        const auto run=[&](int mode) {
+            PrefillProjectionScope projection(mode);
+            return nint_float_projection_activation_cuda(fixture.weight,x,4,false);
+        };
+        verify(run(32),run(31));++ordinary;
+        tb::Tensor result;mfq::cuda::DecodeWindow window(mfq_current_cuda_stream());
+        window.capture([&]{result=run(32);},[]{},[&]{result={};});
+        for(float amplitude:{.003f,.37f}) {
+            x.fill_(amplitude);window.run();verify(result,run(31));++graphs;
+        }
+    }
+    std::cout<<"gr_prefill_blas ordinary="<<ordinary<<" changing_graph="<<graphs
+        <<" FP32/Half bounds, 1024-row scratch boundary, adaptive/aligned/signed q8, group5 tails, mixed normalized dtypes PASS\n";
+}
+
 }
 
 int main(int argc,char** argv) try {
@@ -1017,6 +1092,11 @@ int main(int argc,char** argv) try {
         auto context=mfq::cuda::default_context(mfq_current_cuda_device());
         const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
         prefill_vector_decode_check();mfq_cuda_synchronize();context->end_graph_pool(stream);return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--prefill-blas-check") {
+        auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+        const auto stream=mfq_current_cuda_stream();context->begin_graph_pool(stream);
+        prefill_blas_check();mfq_cuda_synchronize();context->end_graph_pool(stream);return 0;
     }
     if(argc==2 && std::string(argv[1])=="--prefill-mix-k64-check") {prefill_mix_fusion_check(4,3);return 0;}
     if(argc==2 && std::string(argv[1])=="--prefill-mix-k64-compact-check") {prefill_mix_fusion_check(5,3);return 0;}

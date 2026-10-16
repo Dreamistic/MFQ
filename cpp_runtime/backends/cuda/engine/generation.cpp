@@ -39,6 +39,7 @@ template <typename Model> struct CudaGenerationOps {
     DecodeGraphCache &graph;
     const MfqTokenConstraintPtr &constraint;
     mfq_tensor_backend::Tensor pending, counts;
+    mfq_tensor_backend::Tensor known_token_host;
     mfq::cuda::Sampler sampler;
     bool has_penalties;
     const CudaPreparedPrompt *prepared;
@@ -271,6 +272,16 @@ template <typename Model> struct CudaGenerationOps {
     }
     std::int64_t advance() {
         if (!graph_active) {
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                if(known_token_host.defined()) {
+                    const bool greedy=sampler.greedy() && !has_penalties && !constraint;
+                    if(auto result=qwen4_decode_graph_logits(model,pending.reshape({1,1}),greedy?2:1,known_token_host)) {
+                        pending=greedy?std::move(*result):mfq::cuda::sample_logits(sampler,
+                            result->contiguous().view({1,-1}),counts,constraint);
+                        return pending.template item<int64_t>();
+                    }
+                }
+            }
             pending = sample_token(model, pending.reshape({1, 1}), sampler, counts, constraint);
             return pending.template item<int64_t>();
         }
@@ -295,9 +306,24 @@ template <typename Model> struct CudaGenerationOps {
         ++model.cache_pos;
         return token;
     }
-    void accept(std::int64_t) {
+    void accept(std::int64_t token) {
         if (has_penalties && !graph_active) {
             sample_token_counts_add_cuda(counts, pending.contiguous());
+        }
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            const auto* option=std::getenv("MFQ_DECODE_EARLY_PLE");
+            if((option && option[0]=='0') || !model.reuse_decode_graphs || !model.graph_registry ||
+               (prepared && prepared->transformed()) || (output && output->stopped()))return;
+            if(!known_token_host.defined())known_token_host=mfq_tensor_backend::empty({1,1},
+                mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kInt64));
+            known_token_host.template data_ptr<int64_t>()[0]=token;
+            if(qwen4_prefetch_decode_ple(model,known_token_host)) {
+                static bool reported=false;
+                if(!reported) {
+                    reported=true;
+                    std::cerr<<"runtime_decode_early_ple enabled=1 host_token_reuse=1\n";
+                }
+            }
         }
     }
 };

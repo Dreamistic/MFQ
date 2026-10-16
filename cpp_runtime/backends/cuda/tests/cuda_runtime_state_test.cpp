@@ -1045,6 +1045,13 @@ static void check_kv_expert_loan() {
     check(flexible.copy({11,3,0},source.data_ptr(),destination.data_ptr(),source.nbytes(),copy.get(),hit),
         "flexible expert allocation was not usable");
     check(flexible.external_bytes()==source.nbytes(),"non-KV expert pages were not accounted separately");
+    const auto other_region=flexible.add(tb::zeros({256<<10},options),256<<10,1,true,1,true,true);
+    for(int expert:{4,5})check(flexible.copy({11,expert,0},source.data_ptr(),destination.data_ptr(),
+        source.nbytes(),copy.get(),hit),"second external expert allocation was not usable");
+    check(flexible.region_bytes(region)==2*source.nbytes() &&
+        flexible.region_bytes(other_region)==source.nbytes() && flexible.external_bytes()==3*source.nbytes(),
+        "independent graph and transfer regions were combined in per-region accounting");
+    flexible.remove(other_region);
     flexible.remove(region);
     check(flexible.external_bytes()==0 && flexible.bytes()==2*source.nbytes(),
         "reclaiming graph capacity erased unrelated KV experts");
@@ -1059,6 +1066,58 @@ static void check_kv_expert_loan() {
         "reclaimed graph capacity was not reusable by experts");
     check(flexible.external_bytes()==source.nbytes(),"reused graph capacity has incorrect accounting");
     flexible.remove(reused);
+    {
+        KvExpertLoan protected_cache;
+        protected_cache.add(tb::zeros({256<<10},options),256<<10,1,true,1,true,true);
+        for(int expert:{1,2})check(protected_cache.pin({31,expert,0},source.data_ptr(),source.nbytes(),copy.get(),hit),
+            "exchange-read fixture did not fill its cache");
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));
+        const auto* borrowed=protected_cache.find_for_exchange({31,1,0},source.nbytes());
+        std::optional<KvExpertLoan::ExchangeReadGuard> guard(protected_cache.retain_exchange_reads());
+        protected_cache.next_packet();protected_cache.retire_expert(31,1,1);protected_cache.next_packet();
+        check(protected_cache.find_for_exchange({31,1,0},source.nbytes())==borrowed,
+            "predictor packet reclaimed an exchange's retired source");
+        check(!protected_cache.pin({31,3,0},source.data_ptr(),source.nbytes(),copy.get(),hit),
+            "predictor pressure evicted an exchange's source instead of using its wire fallback");
+        guard.reset();protected_cache.next_packet();
+        check(!protected_cache.find_for_exchange({31,1,0},source.nbytes()) &&
+            protected_cache.pin({31,3,0},source.data_ptr(),source.nbytes(),copy.get(),hit),
+            "finished exchange kept blocking ordinary cache reclamation");
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));
+        std::optional<KvExpertLoan::ExchangeReadGuard> growth(protected_cache.retain_exchange_reads());
+        std::atomic<bool> released=false;
+        std::thread releaser([hold=std::move(growth),&released]() mutable {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            released=true;hold.reset();
+        });
+        protected_cache.protect(0,256<<10);
+        const bool respected=released.load();releaser.join();
+        check(respected && !protected_cache.bytes(),"KV growth reclaimed an exchange source before it finished");
+    }
+    {
+        KvExpertLoan scoped;
+        scoped.add(tb::zeros({256<<10},options),256<<10,1,true,1,true,true);
+        for(int expert:{1,2})check(scoped.pin({41,expert,0},source.data_ptr(),source.nbytes(),copy.get(),hit),
+            "scoped exchange fixture could not fill its cache");
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));scoped.next_packet();
+        std::optional<KvExpertLoan::ExchangeReadGuard> guard(scoped.retain_exchange_reads(false));
+        const auto* borrowed=scoped.find_for_exchange({41,1,0},source.nbytes(),&*guard);
+        check(borrowed && scoped.pin({41,3,0},source.data_ptr(),source.nbytes(),copy.get(),hit) &&
+            !scoped.find_for_exchange({41,2,0},source.nbytes()) &&
+            scoped.find_for_exchange({41,1,0},source.nbytes())==borrowed,
+            "scoped exchange pinned unrelated entries or lost its borrowed source");
+        // Nonadjacent repeated pins must balance, including retired entries.
+        check(scoped.find_for_exchange({41,3,0},source.nbytes(),&*guard),"second scoped pin failed");
+        check(scoped.find_for_exchange({41,1,0},source.nbytes(),&*guard)==borrowed,"repeated scoped pin changed address");
+        scoped.retire_expert(41,1,1);scoped.next_packet();
+        check(scoped.find_for_exchange({41,1,0},source.nbytes())==borrowed,
+            "scoped retirement freed a borrowed source");
+        guard.reset();scoped.next_packet();
+        check(!scoped.find_for_exchange({41,1,0},source.nbytes()) &&
+            scoped.pin({41,4,0},source.data_ptr(),source.nbytes(),copy.get(),hit),
+            "released scoped pins kept their retired payloads alive");
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy.get()));
+    }
 }
 
 static void check_kv_projection_loan() {
@@ -1321,6 +1380,7 @@ void check_dma_copy_buckets() {
 #include "mfe_transfer_bench.h"
 #include "sampling_bench.h"
 #include "transfer_copy_bench.h"
+#include "kv_speculative_lru_test.h"
 int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
@@ -1331,7 +1391,14 @@ int main(int argc, char** argv) try {
     if(argc==2 && std::string(argv[1])=="--kv-expert-loan-check") {
         const auto context=default_context();check_kv_expert_loan();check_kv_projection_loan();return 0;
     }
+    if(argc==2 && std::string(argv[1])=="--kv-speculative-lru-check") {
+        const auto context=default_context();check_kv_speculative_lru();return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--kv-speculative-lru-bench") {
+        const auto context=default_context();benchmark_kv_speculative_lru();return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--sampling-bench") {benchmark_sampling_keys();return 0;}
+    if(argc==2 && std::string(argv[1])=="--conditional-compact-sampling-check") {check_conditional_compact_sampling();return 0;}
     if(argc==2 && std::string(argv[1])=="--sampling-fallback-check") {check_sampling_fallback();return 0;}
     if(argc==2 && std::string(argv[1])=="--sampling-check") {benchmark_sampling_keys(false);return 0;}
     if(argc==2 && std::string(argv[1])=="--transfer-copy-bench") {benchmark_transfer_copy();return 0;}

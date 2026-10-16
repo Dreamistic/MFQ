@@ -200,6 +200,30 @@ class Gdn {
         // Only recurrence is split at the confirmation boundary. Both parts
         // share the input projections and one output projection.
         std::vector<Tensor> projected;if(grouped)projected=w_.input_projection(execution,x);
+        const auto* window_option=std::getenv("MFQ_MTP_GDN_REGISTER_WINDOW");
+        const auto inplace_option=mfq::cuda::runtime_options::gdn_inplace_state();
+        const auto* checkpoint_option=std::getenv("MFQ_MTP_GDN_FUSED_CHECKPOINT");
+        if(grouped && confirmed==1 && x.size(0)==1 && x.size(1)>=2 && x.size(1)<=8 &&
+            (window_option?window_option[0]!='0':nk_==16 && nv_==48) &&
+            (!inplace_option || *inplace_option) && (!checkpoint_option || checkpoint_option[0]!='0') &&
+            d_==128 && kernel_==4 && fused_core_ && fused_decode_ && fused_preparation_ &&
+            fused_output_ && transposed_state_ && conv_.defined() && state_.defined() &&
+            projected.size()==4 && projected[0].scalar_type()==tb::kFloat16 &&
+            projected[1].scalar_type()==projected[2].scalar_type() &&
+            projected[2].scalar_type()==projected[3].scalar_type() &&
+            (projected[1].scalar_type()==tb::kFloat16 || projected[1].scalar_type()==tb::kFloat32) &&
+            (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32)) {
+            auto weight=w_.conv.to(tb::kFloat32).contiguous();
+            const auto channels=(2*nk_+nv_)*d_;
+            if(weight.dim()==2 && weight.size(0)==channels && weight.size(1)==kernel_)
+                weight=weight.reshape({channels,1,kernel_});
+            auto decoded=gdn_decode_window_cuda(projected[0],projected[1],projected[2].reshape({1,x.size(1),nv_}),
+                projected[3].reshape({1,x.size(1),nv_}),conv_,state_,weight,w_.dt_bias.to(tb::kFloat32).contiguous(),
+                w_.a_log.to(tb::kFloat32).contiguous(),w_.norm.to(tb::kFloat32).contiguous(),int(nk_),int(nv_),int(confirmed),
+                1e-6,eps_,silu_gate_,x.scalar_type()==tb::kFloat16,true,checkpoint_conv,checkpoint_state);
+            conv_.copy_(decoded[1]);
+            return w_.output(execution,decoded[0]);
+        }
         const auto slice=[&](int64_t begin,int64_t count) {
             std::vector<Tensor> result;for(const auto& value:projected)result.push_back(value.narrow(1,begin,count));
             return result;
@@ -539,22 +563,27 @@ class NgramEmbedding {
                                   offsets_[h] <= int64_t(shards_.size()) * rows_ - vocab_[h],
                               "Qwen4 ngram vocabulary lies outside embedding shards");
     }
-    void reset() { context_ = {}; }
+    void reset() { context_ = {};hash_ready_=false; }
     bool graph_supported() const { return bool(pipeline_); }
     const Context &context() const { return context_; }
-    void restore(Context context) { context_ = std::move(context); }
+    void restore(Context context) { context_ = std::move(context);hash_ready_=false; }
     Context prefix_context(const Tensor& host_ids,int64_t count) const {
         auto host=host_ids.narrow(1,0,count).to(tb::kInt64).contiguous();
         return mfq::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),host.size(0),count,
             ngram_,heads_,eos_,multipliers_,offsets_,vocab_,context_,true).next;
     }
-    void prefetch(const Tensor& host_ids) {
+    void prefetch(const Tensor& host_ids,bool early_prefix=false) {
         if(!pipeline_)return;
         MFQ_RUNTIME_CHECK(host_ids.is_cpu() && host_ids.dim()==2,"PLE prefetch requires host token IDs");
         auto host=host_ids.to(tb::kInt64).contiguous();const auto b=host.size(0),t=host.size(1);
+        if(cacheable_hashes(b,t)) {
+            const auto& hashes=graph_hashes(host);
+            pipeline_->issue(hashes.ids,{b,t,(ngram_-1)*heads_},early_prefix);
+            return;
+        }
         auto hashes=mfq::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),b,t,ngram_,heads_,eos_,
             multipliers_,offsets_,vocab_,context_,true);
-        pipeline_->issue(hashes.ids,{b,t,(ngram_-1)*heads_});
+        pipeline_->issue(hashes.ids,{b,t,(ngram_-1)*heads_},early_prefix);
     }
     std::shared_ptr<NintRowStage> graph_stage(int64_t b,int64_t t,const tb::Device& device) {
         MFQ_RUNTIME_CHECK(pipeline_,"PLE graph requires canonical range rows");
@@ -563,10 +592,16 @@ class NgramEmbedding {
     void upload_graph(const Tensor& host_ids,NintRowStage& stage) {
         MFQ_RUNTIME_CHECK(pipeline_ && host_ids.is_cpu() && host_ids.dim()==2,"PLE graph requires host token IDs");
         auto host=host_ids.to(tb::kInt64).contiguous();const auto b=host.size(0),t=host.size(1);
+        if(cacheable_hashes(b,t)) {
+            auto& hashes=graph_hashes(host);
+            pipeline_->upload(stage,hashes.ids,{b,t,(ngram_-1)*heads_});
+            restore(std::move(hashes.next));
+            return;
+        }
         auto hashes=mfq::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),b,t,ngram_,heads_,eos_,
             multipliers_,offsets_,vocab_,context_,true);
         pipeline_->upload(stage,hashes.ids,{b,t,(ngram_-1)*heads_});
-        context_=std::move(hashes.next);
+        restore(std::move(hashes.next));
     }
     Tensor forward(const Tensor &ids, bool cache, Tensor *hashed_ids = nullptr,const Tensor& host_ids = {}) {
         MFQ_RUNTIME_CHECK(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0,
@@ -581,7 +616,7 @@ class NgramEmbedding {
         if(pipeline_) {
             auto result=pipeline_->collect(global,{b,t,nh},ids.device());
             if(hashed_ids)*hashed_ids=tb::tensor(global).reshape({b,t,nh}).to(ids.device());
-            if(cache)context_=std::move(hashes.next);
+            if(cache)restore(std::move(hashes.next));
             return result.reshape({b,t,nh*dimension_});
         }
         auto global_tensor =
@@ -605,7 +640,7 @@ class NgramEmbedding {
             result = result.defined() ? result + values : values;
         }
         if (cache)
-            context_ = std::move(hashes.next);
+            restore(std::move(hashes.next));
         return result.reshape({b, t, nh * dimension_});
     }
 
@@ -615,6 +650,28 @@ class NgramEmbedding {
     std::vector<int64_t> multipliers_, offsets_, vocab_;
     Context context_;
     std::shared_ptr<NintRowPipeline> pipeline_;
+    bool reuse_hashes_=[] {
+        const auto* option=std::getenv("MFQ_PLE_HASH_REUSE");return !option || option[0]!='0';
+    }();
+    bool hash_ready_=false,hash_reported_=false;
+    int cached_tokens_=0;
+    std::array<int64_t,8> cached_ids_{};
+    mfq::models::qwen4_exp::NgramHashes cached_hashes_;
+    bool cacheable_hashes(int64_t b,int64_t t) const {return reuse_hashes_ && b==1 && t>0 && t<=8;}
+    mfq::models::qwen4_exp::NgramHashes& graph_hashes(const Tensor& host) {
+        const auto tokens=host.size(1);const auto* ids=host.data_ptr<int64_t>();
+        if(hash_ready_ && cached_tokens_==tokens && std::equal(ids,ids+tokens,cached_ids_.begin())) {
+            if(!hash_reported_) {
+                hash_reported_=true;
+                std::fprintf(stderr,"ple_ngram_hash_reuse enabled=1 tokens=%lld\n",static_cast<long long>(tokens));
+            }
+            return cached_hashes_;
+        }
+        cached_hashes_=mfq::models::qwen4_exp::ngram_hashes(ids,1,tokens,ngram_,heads_,eos_,
+            multipliers_,offsets_,vocab_,context_,true);
+        std::copy_n(ids,tokens,cached_ids_.begin());cached_tokens_=int(tokens);hash_ready_=true;
+        return cached_hashes_;
+    }
 };
 
 struct PleWeights {
@@ -689,7 +746,7 @@ class Ple {
             rows.narrow(1,confirmed,x.size(1)-confirmed),&checkpoint_conv,1);
         return tb::cat({prefix,suffix},1);
     }
-    void prefetch_tokens(const Tensor& ids) { embedding_.prefetch(ids); }
+    void prefetch_tokens(const Tensor& ids,bool early_prefix=false) { embedding_.prefetch(ids,early_prefix); }
     Tensor forward(CudaExecutionContext &execution, const Tensor &x, const Tensor &ids, bool cache,
                    int64_t confirmed = 0,const Tensor& host_ids = {}) {
         MFQ_RUNTIME_CHECK(x.dim() == 3 && ids.dim() == 2 && x.size(0) == ids.size(0) &&

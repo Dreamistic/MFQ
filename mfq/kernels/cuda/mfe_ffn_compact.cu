@@ -6,6 +6,7 @@
 
 namespace mfq::cuda {
 void mfe_ffn_parity_read_gate_up(const MfeFfnBatch&,int,int,cudaStream_t);
+void mfe_ffn_parity_token_single_gate_up(const MfeFfnBatch&,int,int,cudaStream_t);
 void mfe_ffn_parity_transfer_routes(const MfeFfnBatch&,const int32_t*,cudaStream_t);
 namespace {
 bool enabled(const char* name) {
@@ -124,6 +125,11 @@ bool mfe_ffn_compact_down(const MfeFfnBatch& b,int partition,cudaStream_t stream
 }
 bool mfe_ffn_compact_token_single_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
     if(!launch_contract(b,false))return false;
+    if(!b.completion && enabled("MFQ_MFE_TOKEN_SINGLE_PARITY") &&
+            enabled("MFQ_MFE_PARITY_READ") && enabled("MFQ_MFE_GU_PREQUANTIZED")) {
+        mfe_ffn_parity_token_single_gate_up(b,partition,width,stream);
+        return true;
+    }
     if(!(b.nvq_format_mask&~0x3f820u))single_gate_up<0x3f820u>(b,partition,width,stream);
     else single_gate_up<0x3f922u>(b,partition,width,stream);
     return true;

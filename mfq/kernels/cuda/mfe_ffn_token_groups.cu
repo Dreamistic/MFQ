@@ -6,6 +6,8 @@
 #include "mfe_ffn_compact.h"
 #include "nvq_dense_window32.cuh"
 #include "nvq_jsc_bank_map.cuh"
+#include <atomic>
+#include <cstdio>
 
 namespace mfq::cuda {
 namespace {
@@ -72,7 +74,7 @@ __device__ __forceinline__ void nvq1_token_dot(const MfePackedProjection& d,int 
     }
 }
 
-template<int Format,int Lanes,int Capacity>
+template<int Format,int Lanes,int Capacity,bool Compact=false>
 __device__ __forceinline__ void nvq_token_dot(const MfePackedProjection& d,int local,int first,
         const int8_t* const* inputs,const float* const* scales,int count,__half result[Capacity][4],bool narrow) {
     constexpr bool d4=Format==10 || Format==11 || Format==12 || Format==15;
@@ -83,9 +85,10 @@ __device__ __forceinline__ void nvq_token_dot(const MfePackedProjection& d,int l
     const auto* codebook=static_cast<const int8_t*>(d.fields[4]);
     const int neuron=local*d.output_rows+first+row;
     const int row_bits=(d4?d.nsign*(2*bits+7):d.nvec*(bits+7))+d.groups*4;
-    const int expert_bytes=narrow?d.output_rows*row_bits/8:0;
+    const int expert_bytes=(Compact || narrow)?d.output_rows*row_bits/8:0;
     const auto* local_stream=stream+int64_t(local)*expert_bytes;
     const uint32_t bank_map=d.nvq_bank_map;
+    const bool analytic_scale=Capacity<=2 && packed_nvq::jsc_d4_analytic_scales<Format>(codebook);
     const float anchor=first+row<d.output_rows?anchors[neuron]:0.f;
     float partial[Capacity]{};
     for(int group=lane;group<d.groups;group+=Lanes) {
@@ -93,19 +96,24 @@ __device__ __forceinline__ void nvq_token_dot(const MfePackedProjection& d,int l
         if(first+row<d.output_rows) {
             if constexpr(d4) {
                 packed_nvq::DenseD4Group<bits> packed;
-                if(narrow) {
+                if(Compact || narrow) {
                     const auto words=packed_nvq::load_dense_window32<4+3*(2*bits+7)>(local_stream,expert_bytes,
                         (first+row)*row_bits+group*(4+3*(2*bits+7)));
                     packed={words.x,words.y,words.z};
                 }else packed=packed_nvq::load_dense_d4_group<bits>(stream,d.sizes[0],neuron,group,d.nsign,d.groups);
-                const auto state=packed.state();const auto* bank=packed_nvq::active_codebook<Format>(codebook,state);
-                weight_scale=packed_nvq::format_scale<Format>(anchor,state,codebook);
+                const auto state=packed.state();const int8_t* bank;
+                if constexpr(Format==packed_nvq::kNvq3Jsc || Format==packed_nvq::kNvq3Jsc512 ||
+                             Format==packed_nvq::kNvq3JscL) {
+                    bank=bank_map?packed_nvq::packed_jsc_codebook<Format>(codebook,bank_map,state)
+                                 :packed_nvq::active_codebook<Format>(codebook,state);
+                }else bank=packed_nvq::active_codebook<Format>(codebook,state);
+                weight_scale=analytic_scale?anchor*float((state>>1)+1):packed_nvq::format_scale<Format>(anchor,state,codebook);
                 weight[0]=packed_nvq::decode_dense_d4_vector<0>(packed,bank);
                 weight[1]=packed_nvq::decode_dense_d4_vector<1>(packed,bank);
                 weight[2]=packed_nvq::decode_dense_d4_vector<2>(packed,bank);
             }else {
                 packed_nvq::DenseE8Group<bits> packed;
-                if(narrow) {
+                if(Compact || narrow) {
                     const auto words=packed_nvq::load_dense_window32<4+3*(bits+7)>(local_stream,expert_bytes,
                         (first+row)*row_bits+group*(4+3*(bits+7)));
                     packed={uint64_t(words.x)|(uint64_t(words.y)<<32)};
@@ -220,17 +228,17 @@ __device__ __forceinline__ void shared_nint_project(const MfePackedProjection& d
         project_pair<true,0>(&d,0,first,inputs[k],scales[k],result[k],multi_sum);
 }
 
-template<int Capacity,int Rows>
+template<int Capacity,int Rows,bool Compact=false>
 __device__ __forceinline__ void token_project(const MfePackedProjection* d,int local,int first,
         const int8_t* const* inputs,const float* const* scales,int count,
         __half result[Capacity][4],bool multi_sum,bool canonical,bool narrow) {
     if(d && local>=0 && local<d->local_experts) {
         if(d->family==2) {
             constexpr int lanes=Rows==4?8:16;
-            if(!canonical || Rows==2) {
+            if(Compact || !canonical || Rows==2) {
                 if(d->format==1){nvq1_token_dot<1,lanes,Capacity>(*d,local,first,inputs,scales,count,result);return;}
                 if(d->format==8){nvq1_token_dot<8,lanes,Capacity>(*d,local,first,inputs,scales,count,result);return;}
-#define MFQ_TOKEN_NVQ(F,DENSE) case F: if(d->DENSE) {nvq_token_dot<F,lanes,Capacity>(*d,local,first,inputs,scales,count,result,narrow);return;}break
+#define MFQ_TOKEN_NVQ(F,DENSE) case F: if(Compact || d->DENSE) {nvq_token_dot<F,lanes,Capacity,Compact>(*d,local,first,inputs,scales,count,result,narrow);return;}break
                 switch(d->format) {
                     MFQ_TOKEN_NVQ(5,e8_dense_groups);MFQ_TOKEN_NVQ(13,e8_dense_groups);MFQ_TOKEN_NVQ(14,e8_dense_groups);
                     MFQ_TOKEN_NVQ(10,d4_dense_groups);MFQ_TOKEN_NVQ(11,d4_dense_groups);
@@ -238,7 +246,7 @@ __device__ __forceinline__ void token_project(const MfePackedProjection* d,int l
                 }
 #undef MFQ_TOKEN_NVQ
             }
-        }else if(d->family==1 && !d->dense_reduction_warps && !d->nint_late_bits && !multi_sum) {
+        }else if(d->family==1 && (Compact || (!d->dense_reduction_warps && !d->nint_late_bits && !multi_sum))) {
 #pragma unroll
             for(int pair=0;pair<Rows/2;++pair) {
                 if(d->group_size==24)nint_token_pair<24,Capacity>(*d,local,first+pair*2,inputs,scales,count,result,pair*2);
@@ -249,6 +257,7 @@ __device__ __forceinline__ void token_project(const MfePackedProjection* d,int l
             if(d->group_size==24 || d->group_size==28 || d->group_size==32)return;
         }
     }
+    if constexpr(!Compact) {
     // Unusual arithmetic contracts retain their old decoder. Keep its address
     // argument separate from the register-resident multi-token results.
 #pragma unroll
@@ -258,6 +267,7 @@ __device__ __forceinline__ void token_project(const MfePackedProjection* d,int l
         else project_pair<true>(d,local,first,inputs[k],scales[k],fallback,multi_sum);
 #pragma unroll
         for(int r=0;r<Rows;++r)result[k][r]=fallback[r];
+    }
     }
 }
 
@@ -334,7 +344,7 @@ __global__ void __launch_bounds__(32*Warps) hidden_quantize(MfeFfnBatch b,int pa
     quantize_completed_group(b,slot,width,d->group_size,group);
 }
 
-template<int Capacity>
+template<int Capacity,bool Compact=false>
 __global__ void __launch_bounds__(256,Capacity<=2?4:Capacity<=4?3:2) token_gate_up(MfeFfnBatch b,int partition) {
     const int group=token_group_index<Capacity>(b,blockIdx.y);
     if(group<0)return;
@@ -366,7 +376,7 @@ __global__ void __launch_bounds__(256,Capacity<=2?4:Capacity<=4?3:2) token_gate_
         scales[k]=static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups;
     }
     __half values[Capacity][4]{};
-    token_project<Capacity,2>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq);
+    token_project<Capacity,2,Compact>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq);
     __shared__ __half projected[8][Capacity][2];
     if(lane==0) {
 #pragma unroll
@@ -401,8 +411,43 @@ __global__ void __launch_bounds__(256,Capacity<=2?4:Capacity<=4?3:2) token_gate_
 // One CTA owns an entire Down input-quantization group. Gate and Up retain
 // their original pair decoders and rounded SwiGLU, while the CTA barrier
 // replaces cross-CTA completion atomics and per-neuron global fences.
-template<int Capacity>
-__global__ void __launch_bounds__(512,Capacity<=2?2:1) token_gate_up_aligned(MfeFfnBatch b,int partition) {
+template<int Capacity,bool Compact>
+__device__ __forceinline__ void token_aligned_pair(const MfeFfnBatch& b,
+        const MfePackedProjection* descriptors,const int* locals,const int* present,
+        const int* slots,int count,int all_routes,bool shared,int first,int width) {
+    const int lane=threadIdx.x;
+    __half gate[Capacity][2]{};
+    const auto* table=b.sigmoid_table+(!shared && b.tokens*b.routes>1?65536:0);
+    // Reuse one decoder instruction body for Gate and Up. Unrolling the
+    // format switch twice adds instruction-cache pressure without sharing
+    // their different weights, and keeps both result arrays live.
+    #pragma unroll 1
+    for(int p=0;p<2;++p) {
+        const auto* d=present[p]?descriptors+p:nullptr;
+        const int8_t* inputs[Capacity]{};const float* scales[Capacity]{};
+        #pragma unroll
+        for(int k=0;k<Capacity;++k)if(k<count && d) {
+            const int token=slots[k]/all_routes;
+            inputs[k]=static_cast<const int8_t*>(d->fields[7])+int64_t(token)*d->groups*d->group_size;
+            scales[k]=static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups;
+        }
+        __half values[Capacity][4]{};
+        token_project<Capacity,2,Compact>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq);
+        #pragma unroll
+        for(int k=0;k<Capacity;++k)if(k<count) {
+            if(p==0) {
+                gate[k][0]=values[k][0];gate[k][1]=values[k][1];
+            }else if(lane<2 && first+lane<width) {
+                const auto g=gate[k][lane],u=values[k][lane];
+                const auto activated=__float2half_rn(__half2float(g)*__half2float(table[__half_as_ushort(g)]));
+                b.hidden[int64_t(slots[k])*b.hidden_stride+first+lane]=__float2half_rn(__half2float(activated)*__half2float(u));
+            }
+        }
+    }
+}
+
+template<int Capacity,bool Compact=false,int Warps=16>
+__global__ void __launch_bounds__(32*Warps,Warps==12?(Capacity<=2?3:2):(Capacity<=2?2:1)) token_gate_up_aligned(MfeFfnBatch b,int partition) {
     const int group=token_group_index<Capacity>(b,blockIdx.y);
     if(group<0)return;
     const int count=b.token_group_counts[group];
@@ -426,35 +471,15 @@ __global__ void __launch_bounds__(512,Capacity<=2?2:1) token_gate_up_aligned(Mfe
     if(!down || (!early && (locals[2]<0 || locals[2]>=down->local_experts)))return;
     const int gs=down->group_size,base=int(blockIdx.x)*gs,first=base+warp*2;
     if(base>=width)return;
-    if(warp<gs/2) {
-        __half gate[Capacity][2]{};
-        const auto* table=b.sigmoid_table+(!shared && b.tokens*b.routes>1?65536:0);
-        // Reuse one decoder instruction body for Gate and Up. Unrolling the
-        // format switch twice adds instruction-cache pressure without sharing
-        // their different weights, and keeps both result arrays live.
-        #pragma unroll 1
-        for(int p=0;p<2;++p) {
-            const auto* d=present[p]?descriptors+p:nullptr;
-            const int8_t* inputs[Capacity]{};const float* scales[Capacity]{};
-            #pragma unroll
-            for(int k=0;k<Capacity;++k)if(k<count && d) {
-                const int token=slots[k]/all_routes;
-                inputs[k]=static_cast<const int8_t*>(d->fields[7])+int64_t(token)*d->groups*d->group_size;
-                scales[k]=static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups;
-            }
-            __half values[Capacity][4]{};
-            token_project<Capacity,2>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq);
-            #pragma unroll
-            for(int k=0;k<Capacity;++k)if(k<count) {
-                if(p==0) {
-                    gate[k][0]=values[k][0];gate[k][1]=values[k][1];
-                }else if(lane<2 && first+lane<width) {
-                    const auto g=gate[k][lane],u=values[k][lane];
-                    const auto activated=__float2half_rn(__half2float(g)*__half2float(table[__half_as_ushort(g)]));
-                    b.hidden[int64_t(slots[k])*b.hidden_stride+first+lane]=__float2half_rn(__half2float(activated)*__half2float(u));
-                }
-            }
-        }
+    if constexpr(Warps==16) {
+        if(warp<gs/2)token_aligned_pair<Capacity,Compact>(b,descriptors,locals,present,
+            slots,count,all_routes,shared,first,width);
+    }else {
+        // GS28/32 need a second column pair in some warps. All active warps
+        // retain the original reduction order for each output.
+        for(int column=first;column<base+gs;column+=2*Warps)
+            token_aligned_pair<Capacity,Compact>(b,descriptors,locals,present,
+                slots,count,all_routes,shared,column,width);
     }
     __syncthreads();
     if(warp==0) {
@@ -533,7 +558,7 @@ __global__ void __launch_bounds__(128,8) shared_token_down(MfeFfnBatch b,int par
         b.resident_pairs[int64_t(slots[k])*b.output_width+first]=values[k][0];
 }
 
-template<int Capacity,int Rows>
+template<int Capacity,int Rows,bool Compact=false>
 __global__ void __launch_bounds__(128,Capacity<=2?8:Capacity<=4?6:4) token_down(MfeFfnBatch b,int partition) {
     const int group=token_group_index<Capacity>(b,blockIdx.y);
     if(group<0)return;
@@ -555,7 +580,7 @@ __global__ void __launch_bounds__(128,Capacity<=2?8:Capacity<=4?6:4) token_down(
         scales[k]=b.hidden_scales+int64_t(slots[k])*b.scale_stride;
     }
     __half values[Capacity][4]{};
-    token_project<Capacity,Rows>(d,local,first,inputs,scales,count,values,b.warp_multi_sum,b.shared_dense_math,b.compact_nvq);
+    token_project<Capacity,Rows,Compact>(d,local,first,inputs,scales,count,values,b.warp_multi_sum,b.shared_dense_math,b.compact_nvq);
 #pragma unroll
     for(int k=0;k<Capacity;++k)if(k<count) {
 #pragma unroll
@@ -599,7 +624,7 @@ bool enabled(const MfeFfnBatch& b) {
     return (!setting || setting[0]!='0') && (!grouped || grouped[0]!='0') &&
         b.tokens>=2 && b.tokens<=32 && b.token_group_counts && b.token_group_slots && b.resident_pairs;
 }
-template<int Capacity>
+template<int Capacity,bool Compact=false>
 void launch_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
     if(b.plan_ready && b.resident_plan_overlap) {
         const auto* early=std::getenv("MFQ_MFE_EARLY_GU");
@@ -612,11 +637,14 @@ void launch_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t st
             dim3((b.shared_intermediate+3)/4,groups),dim3(32,8),0,stream>>>(b,partition);
         return;
     }
-    if(b.token_group_aligned_gu)
-        token_gate_up_aligned<Capacity><<<dim3(b.scale_stride,groups),dim3(32,16),0,stream>>>(b,partition);
-    else token_gate_up<Capacity><<<dim3((width+7)/8,groups),dim3(32,8),0,stream>>>(b,partition);
+    if(b.token_group_aligned_gu) {
+        const auto* option=std::getenv("MFQ_MFE_ALIGNED_GU_WARPS");
+        if(option && std::atoi(option)==12)
+            token_gate_up_aligned<Capacity,Compact,12><<<dim3(b.scale_stride,groups),dim3(32,12),0,stream>>>(b,partition);
+        else token_gate_up_aligned<Capacity,Compact,16><<<dim3(b.scale_stride,groups),dim3(32,16),0,stream>>>(b,partition);
+    }else token_gate_up<Capacity,Compact><<<dim3((width+7)/8,groups),dim3(32,8),0,stream>>>(b,partition);
 }
-template<int Capacity>
+template<int Capacity,bool Compact=false>
 void launch_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
     const int groups=token_launch_bound<Capacity>(b);
     if(groups<=0)return;
@@ -626,8 +654,8 @@ void launch_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
         return;
     }
     if(b.shared && !b.shared_dense_math)
-        token_down<Capacity,4><<<dim3((b.output_width+15)/16,groups),dim3(32,4),0,stream>>>(b,partition);
-    else token_down<Capacity,2><<<dim3((b.output_width+7)/8,groups),dim3(32,4),0,stream>>>(b,partition);
+        token_down<Capacity,4,Compact><<<dim3((b.output_width+15)/16,groups),dim3(32,4),0,stream>>>(b,partition);
+    else token_down<Capacity,2,Compact><<<dim3((b.output_width+7)/8,groups),dim3(32,4),0,stream>>>(b,partition);
 }
 }
 void mfe_ffn_token_group_shared_plan(const MfeFfnBatch& b,cudaStream_t stream) {
@@ -647,18 +675,80 @@ void mfe_ffn_quantize_hidden(const MfeFfnBatch& b,int partition,cudaStream_t str
 }
 bool mfe_ffn_token_group_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
     if(!enabled(b))return false;
-    if(b.token_group_aligned_gu || !mfe_ffn_compact_token_single_gate_up(b,partition,width,stream))launch_gate_up<1>(b,partition,width,stream);
-    launch_gate_up<2>(b,partition,width,stream);
-    if(b.token_group_capacity>=4)launch_gate_up<4>(b,partition,width,stream);
-    if(b.token_group_capacity>=8)launch_gate_up<8>(b,partition,width,stream);
+    const auto* compact=std::getenv("MFQ_MFE_TOKEN_COMPACT");
+    if(b.token_group_aligned_gu) {
+        const auto* aligned=std::getenv("MFQ_MFE_ALIGNED_COMPACT");
+        if(b.tokens<=8 && b.token_group_compact && (!compact || compact[0]!='0') && (!aligned || aligned[0]!='0')) {
+            launch_gate_up<1,true>(b,partition,width,stream);
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                "mfe_aligned_compact_dispatch scope=eligible_single_group enabled=1 tokens=%d capacity=%d mask=%u\n",
+                b.tokens,b.token_group_capacity,b.nvq_format_mask);
+        }else launch_gate_up<1>(b,partition,width,stream);
+    }else if(!mfe_ffn_compact_token_single_gate_up(b,partition,width,stream))
+        launch_gate_up<1>(b,partition,width,stream);
+    if(b.tokens<=8 && b.token_group_compact && (!compact || compact[0]!='0')) {
+        launch_gate_up<2,true>(b,partition,width,stream);
+        static std::atomic<bool> reported{false};
+        if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+            "mfe_token_compact_dispatch scope=first_pair_gu enabled=1 tokens=%d partition=%d mask=%u\n",
+            b.tokens,partition,b.nvq_format_mask);
+    }else launch_gate_up<2>(b,partition,width,stream);
+    bool wide_compact=false;
+    if(b.token_group_capacity>=4 && b.token_group_capacity<=8 && b.tokens<=8 && b.token_group_compact && (!compact || compact[0]!='0')) {
+        const auto* wide=std::getenv("MFQ_MFE_TOKEN_WIDE_COMPACT");
+        wide_compact=!wide || wide[0]!='0';
+    }
+    if(wide_compact) {
+        static std::atomic<unsigned> reported{0};const unsigned bit=b.token_group_capacity==8?2:1;
+        if(!(reported.fetch_or(bit,std::memory_order_relaxed)&bit))std::fprintf(stderr,
+            "mfe_token_wide_compact_dispatch scope=eligible_routed_gu enabled=1 tokens=%d capacity=%d mask=%u\n",
+            b.tokens,b.token_group_capacity,b.nvq_format_mask);
+    }
+    if(b.token_group_capacity>=4) {
+        if(wide_compact)
+            launch_gate_up<4,true>(b,partition,width,stream);
+        else launch_gate_up<4>(b,partition,width,stream);
+    }
+    if(b.token_group_capacity>=8) {
+        if(wide_compact)
+            launch_gate_up<8,true>(b,partition,width,stream);
+        else launch_gate_up<8>(b,partition,width,stream);
+    }
     return true;
 }
 bool mfe_ffn_token_group_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
     if(!enabled(b))return false;
     if(!mfe_ffn_compact_token_single_down(b,partition,stream))launch_down<1>(b,partition,stream);
-    launch_down<2>(b,partition,stream);
-    if(b.token_group_capacity>=4)launch_down<4>(b,partition,stream);
-    if(b.token_group_capacity>=8)launch_down<8>(b,partition,stream);
+    const auto* compact=std::getenv("MFQ_MFE_TOKEN_COMPACT");
+    if(b.tokens<=8 && b.token_group_compact && (!compact || compact[0]!='0')) {
+        launch_down<2,true>(b,partition,stream);
+        static std::atomic<bool> reported{false};
+        if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+            "mfe_token_compact_dispatch scope=first_pair_down enabled=1 tokens=%d partition=%d mask=%u\n",
+            b.tokens,partition,b.nvq_format_mask);
+    }else launch_down<2>(b,partition,stream);
+    bool wide_compact=false;
+    if(b.token_group_capacity>=4 && b.token_group_capacity<=8 && b.tokens<=8 && b.token_group_compact && (!compact || compact[0]!='0')) {
+        const auto* wide=std::getenv("MFQ_MFE_TOKEN_WIDE_COMPACT");
+        wide_compact=!wide || wide[0]!='0';
+    }
+    if(wide_compact) {
+        static std::atomic<unsigned> reported{0};const unsigned bit=b.token_group_capacity==8?2:1;
+        if(!(reported.fetch_or(bit,std::memory_order_relaxed)&bit))std::fprintf(stderr,
+            "mfe_token_wide_compact_dispatch scope=eligible_routed_down enabled=1 tokens=%d capacity=%d mask=%u\n",
+            b.tokens,b.token_group_capacity,b.nvq_format_mask);
+    }
+    if(b.token_group_capacity>=4) {
+        if(wide_compact)
+            launch_down<4,true>(b,partition,stream);
+        else launch_down<4>(b,partition,stream);
+    }
+    if(b.token_group_capacity>=8) {
+        if(wide_compact)
+            launch_down<8,true>(b,partition,stream);
+        else launch_down<8>(b,partition,stream);
+    }
     if(partition!=1)token_reduce<<<dim3((b.output_width+255)/256,b.tokens),256,0,stream>>>(b);
     return true;
 }

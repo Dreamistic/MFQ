@@ -128,6 +128,7 @@ mfq_tensor_backend::Tensor gr_prefill_matmul(const NintWeight& weight,
         weight.ng==(weight.neuron_len+weight.gs-1)/weight.gs,
         "GR prefill projection geometry mismatch");
     const auto rows=x.numel()/weight.neuron_len;
+    if(gr_prefill_blas_selected(weight,input))return gr_prefill_blas_fp32(weight,x);
     const auto* trace_geometry=std::getenv("MFQ_GR_PREFILL_GEOMETRY_TRACE");
     if(trace_geometry && trace_geometry[0]=='1') {
         thread_local std::map<std::array<int64_t,5>,bool> seen;
@@ -144,6 +145,7 @@ mfq_tensor_backend::Tensor gr_prefill_matmul(const NintWeight& weight,
     const bool requested_tf32=option && std::atoi(option)==2;
     const bool requested_half2=option && std::atoi(option)==3;
     int mode=option?std::atoi(option):31;
+    if(mode==32)mode=31;
     const bool wide_contraction=mode==24 && weight.out<weight.neuron_len && rows>=128;
     const bool transpose_weight=mode==22 || mode==23;
     const bool fewer_registers=mode==23;

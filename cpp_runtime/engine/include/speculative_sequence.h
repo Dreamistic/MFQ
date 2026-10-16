@@ -102,7 +102,11 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         maximum_depth, mtp.dspark_policy(), &mtp.policy_state,[&] {
             if constexpr(requires {ops.gradual_mtp_warmup();})return ops.gradual_mtp_warmup();
             return false;
+        }(),[&] {
+            if constexpr(requires {ops.metal_mtp_policy();})return ops.metal_mtp_policy();
+            return false;
         }());
+    mtp.last_stats.park_count=depth_controller.parks();
 
     {
         Tensor raw, hidden;
@@ -284,6 +288,11 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             if(cursor)cursor->accept(pending);
             initial_hidden=committed_last_hidden;
         };
+        auto prefetch_committed_token=[&](int32_t token) {
+            if(output.stopped())return;
+            if constexpr(requires(Ops& value) {value.prefetch_committed_token(int32_t{});})
+                ops.prefetch_committed_token(token);
+        };
         std::vector<int64_t> first_tokens{pending};
         bool bootstrapped=false;
         if constexpr(requires { ops.bootstrap_before_publication(); }) {
@@ -307,6 +316,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         if(output.result.cancelled)co_return;
         auto first = output.append(first_tokens);
         accept(first);
+        prefetch_committed_token(pending);
         finish();
         co_yield std::move(first);
         if (output.stopped())
@@ -320,6 +330,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             bootstrap(counts,constraint_cursor);
             auto delta = output.append(std::vector<int64_t>{pending});
             accept(delta);
+            prefetch_committed_token(pending);
             finish();
             co_yield std::move(delta);
             if (output.stopped())
@@ -361,6 +372,9 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                     ops.size(hidden_rows, 1) == static_cast<int64_t>(next_ids.size()) &&
                     !next_ids.empty() && requested_depth >= 0 && requested_depth <= maximum_depth,
                 "MTP committed history is incompatible");
+            if constexpr(requires { ops.prefetch_target_first(next_ids.back()); }) {
+                if(requested_depth>0)ops.prefetch_target_first(next_ids.back());
+            }
             mtp.trim_cache_to(predictor_history_position);
             auto prospective_counts = penalties ? ops.clone(counts) : Tensor{};
             DraftChain result;
@@ -451,6 +465,10 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 auto draft_logits = ops.reshape(ops.logits_for(sample_hidden), {1, -1});
                 const int32_t token = select_draft(draft_logits);
                 if (position + 1 < requested_depth) {
+                    if constexpr(requires(Ops& value,const std::vector<int32_t>& ids) {
+                        value.prefetch_target_prefix(int32_t{},ids);
+                    })
+                        ops.prefetch_target_prefix(next_ids.back(),result.tokens);
                     auto next = ops.predictor_step(chain_hidden,
                         ops.ids_for({token}),
                         transformed_prompt
@@ -480,13 +498,15 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 committed_last_hidden = ops.slice(raw_step, 1, ops.size(raw_step, 1)-1, 1);
                 auto delta = output.append(std::vector<int64_t>{next});
                 accept(delta);
+                prefetch_committed_token(next);
                 ++mtp.last_stats.standard_tokens;
                 bool time_sample=!maintenance;
                 if constexpr(requires { ops.take_target_maintenance(); }) {
                     const bool initialized=ops.take_target_maintenance();time_sample=time_sample && !initialized;
                 }
-                depth_controller.observe_plain(std::chrono::duration<double, std::milli>(
-                    Clock::now()-cycle_started).count(), time_sample);
+                depth_controller.observe_plain_window(cycle_started,Clock::now(),time_sample);
+                if(const auto measured=depth_controller.measured_cycle_ms(0))
+                    mtp.last_stats.measured_depth_ms[0]=*measured;
                 mtp.last_stats.selected_depth = depth_controller.depth();
                 mtp.last_stats.reentry_probes = depth_controller.reentries();
                 pending = next;
@@ -523,6 +543,8 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                     verified_raw = std::move(pending_raw);
                 }
             } else {
+                if constexpr(requires { ops.begin_target_routes(int{}); })
+                    if(draft_count>0)ops.begin_target_routes(draft_count+1);
                 verified = ops.target_forward(
                     ops.ids_for(std::move(verify_ids)), &verified_raw, draft_count > 0 ? 1 : 0);
             }
@@ -654,9 +676,14 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             auto delta = output.append(candidates);
             accept(delta);
             const int emitted_accepted = std::min<int>(accepted, delta.token_ids.size());
+            const auto resolve_routes=[&](int rows) {
+                if constexpr(requires { ops.resolve_target_routes(int{},bool{}); })
+                    ops.resolve_target_routes(rows,output.result.cancelled);
+            };
             if (draft_count > 0) {
                 if (emitted_accepted == draft_count) {
                     model.commit_speculative();
+                    resolve_routes(emitted_accepted+1);
                 } else {
                     const bool retained = [&] {
                         if constexpr(requires { ops.retains_partial_target_prefix(emitted_accepted); })
@@ -664,13 +691,16 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                         return mtp.retains_partial_target_prefix();
                     }();
                     model.rollback_speculative(retained ? emitted_accepted : 0);
+                    // A fallback replay observes the accepted rows itself.
+                    // Publish only pending here so those rows count once.
+                    resolve_routes(retained?emitted_accepted+1:1);
                     if (!retained && emitted_accepted > 0) {
                         std::vector<int64_t> replay(
                             draft.tokens.begin(), draft.tokens.begin() + emitted_accepted);
                         (void)ops.target_forward(ops.ids_for(std::move(replay)));
                     }
                 }
-            }
+            }else resolve_routes(1);
             committed_last_hidden = ops.slice(verified_raw, 1, emitted_accepted, 1);
             if (output.stopped()) {
                 if (mtp.teacher_forced_prompt_prime() && !delta.token_ids.empty()) {
@@ -686,8 +716,10 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 co_return;
             }
 
+            prefetch_committed_token(result.next_token);
+            const auto cycle_finished=Clock::now();
             const double cycle_ms =
-                std::chrono::duration<double, std::milli>(Clock::now() - cycle_started).count();
+                std::chrono::duration<double, std::milli>(cycle_finished - cycle_started).count();
             if constexpr(requires { ops.trace_cycle(uint64_t{},int{},int{},double{},double{},double{}); })
                 ops.trace_cycle(mtp.last_stats.cycles,draft_count,accepted,draft_ms,
                     std::chrono::duration<double,std::milli>(verify_finished-verify_started).count(),
@@ -696,7 +728,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             if constexpr(requires { ops.take_target_maintenance(); }) {
                 const bool initialized=ops.take_target_maintenance();time_sample=time_sample && !initialized;
             }
-            depth_controller.observe(draft_count, accepted, cycle_ms, time_sample);
+            depth_controller.observe_window(draft_count,accepted,cycle_started,cycle_finished,time_sample);
             mtp.last_stats.park_count = depth_controller.parks();
             mtp.last_stats.selected_depth = depth_controller.depth();
             for (int depth = 0; depth <= depth_controller.maximum_depth(); ++depth) {

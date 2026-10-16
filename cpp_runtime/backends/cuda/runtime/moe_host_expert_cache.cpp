@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <list>
 #include <mutex>
@@ -49,12 +51,19 @@ struct MoeHostExpertCache::Impl {
     std::list<mfq::MoeCacheKey> lru;
     std::unordered_map<mfq::MoeCacheKey,Entry,mfq::MoeCacheKeyHash> entries;
     std::unordered_map<mfq::MoeCacheKey,std::shared_ptr<Flight>,mfq::MoeCacheKeyHash> flights;
+    std::unordered_set<mfq::MoeCacheKey,mfq::MoeCacheKeyHash> exchanging;
+    std::condition_variable exchange_complete;
+    std::size_t exchange_placeholders=0;
     MoeHostExpertCacheStats counters;
     bool preserve=false;
 
     explicit Impl(std::size_t bytes):budget(bytes) {}
+    void wait_exchange(std::unique_lock<std::mutex>& lock,mfq::MoeCacheKey key) {
+        if(exchanging.contains(key))exchange_complete.wait(lock,[&]{return !exchanging.contains(key);});
+    }
     void remove(decltype(entries)::iterator found) {
         counters.resident_bytes-=found->second.value->bytes;
+        if(found->first.source<0)counters.optional_bytes-=found->second.value->bytes;
         lru.erase(found->second.position);
         entries.erase(found);
     }
@@ -64,6 +73,7 @@ struct MoeHostExpertCache::Impl {
         while (ledger->managed.load()>budget-bytes) {
             if (candidate==lru.begin()) return false;
             --candidate;
+            if(exchanging.contains(*candidate))continue;
             auto found=entries.find(*candidate);
             // Negative source IDs are reusable prefill backup images. Their
             // GPU copy still exists outside the loan; discard them before a
@@ -74,6 +84,7 @@ struct MoeHostExpertCache::Impl {
             if (found->second.value.use_count()!=1) continue;
             candidate=lru.erase(candidate);
             counters.resident_bytes-=found->second.value->bytes;
+            if(found->first.source<0)counters.optional_bytes-=found->second.value->bytes;
             entries.erase(found);
             ++counters.evictions;
         }
@@ -87,11 +98,21 @@ struct MoeHostExpertCache::Impl {
         }
         catch (...) { lru.pop_front(); throw; }
         counters.resident_bytes+=value->bytes;
+        if(key.source<0)counters.optional_bytes+=value->bytes;
     }
 };
 
 MoeHostExpertCache::MoeHostExpertCache(std::size_t bytes):impl_(std::make_unique<Impl>(bytes)) {}
 MoeHostExpertCache::~MoeHostExpertCache()=default;
+
+MoeHostExpertCache::Lease MoeHostExpertCache::find(mfq::MoeCacheKey key) {
+    std::unique_lock lock(impl_->mutex);impl_->wait_exchange(lock,key);
+    const auto found=impl_->entries.find(key);
+    if(found==impl_->entries.end())return {};
+    impl_->lru.splice(impl_->lru.begin(),impl_->lru,found->second.position);
+    ++impl_->counters.hits;
+    return found->second.value;
+}
 
 void MoeHostExpertCache::preserve_resident_experts() {
     std::lock_guard lock(impl_->mutex);
@@ -107,6 +128,7 @@ MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::MoeCacheKey key,std::
     bool managed=false;
     {
         std::unique_lock lock(state.mutex);
+        state.wait_exchange(lock,key);
         if (retain) {
             const auto hit=state.entries.find(key);
             if (hit!=state.entries.end()) {
@@ -164,7 +186,7 @@ bool MoeHostExpertCache::demote(mfq::MoeCacheKey key,std::size_t bytes,const Loa
     std::shared_ptr<MoeHostExpertReservation> reservation;
     std::shared_ptr<Impl::Flight> flight;
     {
-        std::lock_guard lock(state.mutex);
+        std::unique_lock lock(state.mutex);state.wait_exchange(lock,key);
         if (state.entries.contains(key)) return true;
         if (state.flights.contains(key) || !state.make_room(bytes)) return false;
         reservation=std::make_shared<MoeHostExpertReservation>(state.ledger,bytes,true);
@@ -198,7 +220,7 @@ bool MoeHostExpertCache::demote(mfq::MoeCacheKey key,std::size_t bytes,const Loa
 
 void MoeHostExpertCache::promote(mfq::MoeCacheKey key) {
     auto& state=*impl_;
-    std::lock_guard lock(state.mutex);
+    std::unique_lock lock(state.mutex);state.wait_exchange(lock,key);
     const auto found=state.entries.find(key);
     if (found!=state.entries.end()) { state.remove(found); ++state.counters.promotions; }
     const auto flight=state.flights.find(key);
@@ -207,7 +229,7 @@ void MoeHostExpertCache::promote(mfq::MoeCacheKey key) {
 
 void MoeHostExpertCache::erase(mfq::MoeCacheKey key) {
     auto& state=*impl_;
-    std::lock_guard lock(state.mutex);
+    std::unique_lock lock(state.mutex);state.wait_exchange(lock,key);
     const auto found=state.entries.find(key);
     if (found!=state.entries.end()) state.remove(found);
     const auto flight=state.flights.find(key);
@@ -215,13 +237,35 @@ void MoeHostExpertCache::erase(mfq::MoeCacheKey key) {
 }
 
 bool MoeHostExpertCache::contains(mfq::MoeCacheKey key) const {
-    std::lock_guard lock(impl_->mutex);
+    std::unique_lock lock(impl_->mutex);impl_->wait_exchange(lock,key);
     return impl_->entries.contains(key);
+}
+
+std::size_t MoeHostExpertCache::reclaim_optional(std::size_t bytes) {
+    auto& state=*impl_;std::lock_guard lock(state.mutex);
+    std::size_t released=0;
+    auto candidate=state.lru.end();
+    while(candidate!=state.lru.begin() && released<bytes && state.counters.optional_bytes) {
+        --candidate;
+        if(candidate->source>=0)continue;
+        if(state.exchanging.contains(*candidate))continue;
+        const auto found=state.entries.find(*candidate);
+        if(found->second.value.use_count()!=1)continue;
+        released+=found->second.value->bytes;
+        candidate=state.lru.erase(candidate);
+        state.counters.resident_bytes-=found->second.value->bytes;
+        state.counters.optional_bytes-=found->second.value->bytes;
+        state.entries.erase(found);
+        ++state.counters.evictions;
+    }
+    state.counters.optional_reclaimed_bytes+=released;
+    return released;
 }
 bool MoeHostExpertCache::exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey outgoing,
         const Lease& expected,const std::function<MixedMoePool(const MixedMoePool&)>& copy) {
     if(!expected || !copy || incoming==outgoing)return false;
-    auto& state=*impl_;std::lock_guard lock(state.mutex);
+    auto& state=*impl_;std::unique_lock lock(state.mutex);
+    state.wait_exchange(lock,incoming);state.wait_exchange(lock,outgoing);
     auto found=state.entries.find(incoming);
     if(found==state.entries.end() || found->second.value!=expected || expected.use_count()!=2 ||
         state.entries.contains(outgoing) || state.flights.contains(incoming) || state.flights.contains(outgoing))return false;
@@ -233,15 +277,19 @@ bool MoeHostExpertCache::exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey out
     try {value->weights=copy(expected->weights);}
     catch(...) {state.entries.erase(outgoing);throw;}
     state.entries.erase(incoming);*position=outgoing;
+    if(incoming.source<0)state.counters.optional_bytes-=value->bytes;
+    if(outgoing.source<0)state.counters.optional_bytes+=value->bytes;
     state.lru.splice(state.lru.begin(),state.lru,position);
     ++state.counters.promotions;++state.counters.gpu_demotions;
     return true;
 }
 
 bool MoeHostExpertCache::exchange_batch(const std::vector<Exchange>& changes,
-        const std::function<void()>& publish,const std::function<void()>& prepare) {
+        const std::function<void()>& publish,const std::function<void()>& prepare,bool independent_readers) {
     if(changes.empty())return false;
-    auto& state=*impl_;std::lock_guard lock(state.mutex);
+    auto& state=*impl_;std::unique_lock lock(state.mutex);
+    const auto* option=std::getenv("MFQ_MOE_KEYED_EXCHANGE");
+    const bool keyed=option?option[0]=='1':independent_readers;
     std::unordered_set<mfq::MoeCacheKey,mfq::MoeCacheKeyHash> keys;
     struct Prepared {std::shared_ptr<MoeHostExpert> value;std::list<mfq::MoeCacheKey>::iterator position;};
     std::vector<Prepared> prepared;prepared.reserve(changes.size());
@@ -251,17 +299,33 @@ bool MoeHostExpertCache::exchange_batch(const std::vector<Exchange>& changes,
         const auto found=state.entries.find(change.incoming);
         if(found==state.entries.end() || found->second.value!=*change.expected ||
             change.expected->use_count()!=2 || state.entries.contains(change.outgoing) ||
+            state.exchanging.contains(change.incoming) || state.exchanging.contains(change.outgoing) ||
             state.flights.contains(change.incoming) || state.flights.contains(change.outgoing))return false;
         auto value=std::make_shared<MoeHostExpert>();
         value->reservation=(*change.expected)->reservation;value->bytes=(*change.expected)->bytes;
         prepared.push_back({std::move(value),found->second.position});
     }
-    // No new CPU reader can acquire a reused allocation while this lock is held.
+    // The optional keyed path excludes readers of both names while DMA and
+    // publication run, allowing unrelated immutable experts to be acquired.
     std::size_t allocated=0,touched=0;
+    bool reserved=false;
+    const auto unreserve=[&] {
+        if(keyed)for(const auto& key:keys)state.exchanging.erase(key);
+        if(reserved)state.exchange_placeholders-=changes.size();
+    };
     try {
         for(;allocated<changes.size();++allocated)
             state.entries.emplace(changes[allocated].outgoing,
                 Impl::Entry{prepared[allocated].value,prepared[allocated].position});
+        if(keyed) {
+            state.exchanging.reserve(state.exchanging.size()+keys.size());
+            for(const auto& key:keys)state.exchanging.insert(key);
+            reserved=true;state.exchange_placeholders+=changes.size();
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                "moe_host_keyed_exchange scope=first_transaction enabled=1 changes=%zu\n",changes.size());
+            lock.unlock();
+        }
         if(prepare) {
             touched=changes.size();
             prepare();
@@ -272,6 +336,7 @@ bool MoeHostExpertCache::exchange_batch(const std::vector<Exchange>& changes,
         }
         if(publish)publish();
     } catch(...) {
+        if(!lock.owns_lock())lock.lock();
         const auto failure=std::current_exception();std::exception_ptr recovery;
         while(touched) {
             --touched;
@@ -279,14 +344,19 @@ bool MoeHostExpertCache::exchange_batch(const std::vector<Exchange>& changes,
             catch(...) {if(!recovery)recovery=std::current_exception();}
         }
         for(std::size_t i=0;i<allocated;++i)state.entries.erase(changes[i].outgoing);
+        unreserve();lock.unlock();state.exchange_complete.notify_all();
         if(recovery)std::rethrow_exception(recovery);
         std::rethrow_exception(failure);
     }
+    if(!lock.owns_lock())lock.lock();
     for(std::size_t i=0;i<changes.size();++i) {
         state.entries.erase(changes[i].incoming);*prepared[i].position=changes[i].outgoing;
+        if(changes[i].incoming.source<0)state.counters.optional_bytes-=prepared[i].value->bytes;
+        if(changes[i].outgoing.source<0)state.counters.optional_bytes+=prepared[i].value->bytes;
         state.lru.splice(state.lru.begin(),state.lru,prepared[i].position);
     }
     state.counters.promotions+=changes.size();state.counters.gpu_demotions+=changes.size();
+    unreserve();lock.unlock();state.exchange_complete.notify_all();
     return true;
 }
 
@@ -295,7 +365,7 @@ MoeHostExpertCacheStats MoeHostExpertCache::stats() const {
     std::lock_guard lock(state.mutex);
     auto result=state.counters;
     result.budget_bytes=state.budget;
-    result.resident_entries=state.entries.size();
+    result.resident_entries=state.entries.size()-state.exchange_placeholders;
     result.managed_bytes=state.ledger->managed.load();
     result.managed_peak_bytes=state.ledger->managed_peak.load();
     result.transient_bytes=state.ledger->transient.load();

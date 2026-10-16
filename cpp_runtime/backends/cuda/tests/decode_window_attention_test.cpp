@@ -3,6 +3,8 @@
 #include "mfq_cuda_context.h"
 #include "mfq/runtime.h"
 #include "cuda_execution.h"
+#include "../../../tests/nint_row_fixture.h"
+#include "nint.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -15,6 +17,98 @@ using tb::Tensor;
 using namespace mfq::cuda;
 using namespace mfq::cuda::qwen4_exp;
 namespace {
+void ple_prefix_context_case() {
+    auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
+    std::vector<std::shared_ptr<mfq::NintRows>> tables={
+        std::make_shared<mfq::NintRows>(fixture->blob.data(),fixture->blob.size())};
+    const std::vector<int64_t> multipliers={1237,8713,16381},offsets={0,100,200,300},vocab(4,97);
+    const tb::Device device{tb::kCUDA,0};int cases=0;
+    for(int tokens:{2,3,4,6,8})for(bool eos:{false,true}) {
+        auto pipeline=std::make_shared<NintRowPipeline>(tables);
+        NgramEmbedding embedding(std::vector<Embedding>(1),529,160,3,2,999,
+            multipliers,offsets,vocab,pipeline);
+        NgramEmbedding::Context context{1,{17,eos?999:31}};embedding.restore(context);
+        std::vector<int64_t> ids(tokens);for(int i=0;i<tokens;++i)ids[i]=i==1?999:43+i;
+        const auto host=tb::tensor(ids).reshape({1,tokens});
+        embedding.prefetch(host.narrow(1,0,1),true);
+        if(embedding.context().batch!=context.batch || embedding.context().tokens!=context.tokens)
+            throw std::runtime_error("early PLE advanced the committed ngram context");
+        for(int prefix=2;prefix<tokens;++prefix)embedding.prefetch(host.narrow(1,0,prefix),true);
+        if(embedding.context().tokens!=context.tokens)
+            throw std::runtime_error("draft PLE prefix advanced the committed ngram context");
+        const auto hashes=mfq::models::qwen4_exp::ngram_hashes(ids.data(),1,tokens,3,2,999,
+            multipliers,offsets,vocab,context,true);
+        const auto accepted=embedding.prefix_context(host,1);
+        auto stage=embedding.graph_stage(1,tokens,device);
+        embedding.upload_graph(host,*stage);stage->decode();
+        auto actual=stage->output().cpu().contiguous();
+        auto expected=nint_sharded_embedding_lookup(tables,hashes.ids,{1,tokens,4},device).cpu().contiguous();
+        if(embedding.context().tokens!=hashes.next.tokens || actual.sizes()!=expected.sizes() ||
+           std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.numel()*actual.element_size()))
+            throw std::runtime_error("early PLE changed window rows or final ngram context");
+        // A rejected suffix restores the committed context before the next hint.
+        embedding.restore(accepted);embedding.prefetch(host.narrow(1,1,1),true);
+        if(embedding.context().tokens!=accepted.tokens)
+            throw std::runtime_error("PLE hint changed a restored context");
+        ++cases;
+    }
+    std::cout<<"MFQ PLE early-prefix ngram context and EOS exact PASS cases="<<cases<<'\n';
+}
+void ple_hash_lifecycle_case() {
+    auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
+    std::vector<std::shared_ptr<mfq::NintRows>> tables={
+        std::make_shared<mfq::NintRows>(fixture->blob.data(),fixture->blob.size())};
+    const std::vector<int64_t> multipliers={1237,8713,16381},offsets={0,100,200,300},vocab(4,97);
+    const tb::Device device{tb::kCUDA,0};int cases=0;
+    for(int batch:{1,2})for(int tokens:{1,2,4,8,9}) {
+        auto pipeline=std::make_shared<NintRowPipeline>(tables);
+        NgramEmbedding embedding(std::vector<Embedding>(1),529,160,3,2,999,
+            multipliers,offsets,vocab,pipeline);
+        NgramEmbedding::Context expected_context{batch,std::vector<int64_t>(batch*2,17)};
+        embedding.restore(expected_context);
+        std::vector<int64_t> ids(batch*tokens);
+        for(std::size_t i=0;i<ids.size();++i)ids[i]=43+int64_t(i);
+        auto host=tb::tensor(ids).reshape({batch,tokens});
+        auto stage=embedding.graph_stage(batch,tokens,device);
+        const auto hashes=[&](const std::vector<int64_t>& values,bool cache) {
+            return mfq::models::qwen4_exp::ngram_hashes(values.data(),batch,tokens,3,2,999,
+                multipliers,offsets,vocab,expected_context,cache);
+        };
+        for(int step=0;step<7;++step) {
+            embedding.prefetch(host,true);embedding.prefetch(host,true);
+            if(step==2) {
+                expected_context={batch,std::vector<int64_t>(batch*2,999)};
+                embedding.restore(expected_context);
+            }else if(step==3) {
+                ids[0]=999;host.data_ptr<int64_t>()[0]=999;
+            }else if(step==4) {
+                embedding.reset();expected_context={};
+            }else if(step==5 || step==6) {
+                auto alternate=ids;for(auto& id:alternate)id+=13;
+                const bool commit=step==5;const auto expected=hashes(alternate,commit);
+                const auto alternate_host=tb::tensor(alternate).reshape({batch,tokens});
+                auto actual=embedding.forward(alternate_host.to(device),commit,nullptr,alternate_host).cpu().contiguous();
+                auto reference=nint_sharded_embedding_lookup(tables,expected.ids,{batch,tokens,4},device)
+                    .reshape({batch,tokens,640}).cpu().contiguous();
+                if(std::memcmp(actual.data_ptr(),reference.data_ptr(),actual.numel()*actual.element_size()))
+                    throw std::runtime_error("PLE eager/cache hash lifecycle output differs");
+                if(commit)expected_context=expected.next;
+            }
+            if(embedding.context().batch!=expected_context.batch || embedding.context().tokens!=expected_context.tokens)
+                throw std::runtime_error("PLE hash lifecycle mutated committed context before upload");
+            const auto expected=hashes(ids,true);
+            embedding.upload_graph(host,*stage);stage->decode();
+            auto actual=stage->output().cpu().contiguous();
+            auto reference=nint_sharded_embedding_lookup(tables,expected.ids,{batch,tokens,4},device).cpu().contiguous();
+            if(actual.sizes()!=reference.sizes() ||
+               std::memcmp(actual.data_ptr(),reference.data_ptr(),actual.numel()*actual.element_size()) ||
+               embedding.context().batch!=expected.next.batch || embedding.context().tokens!=expected.next.tokens)
+                throw std::runtime_error("PLE hash reuse retained stale token IDs or context");
+            expected_context=expected.next;++cases;
+        }
+    }
+    std::cout<<"MFQ PLE hash lifecycle exact PASS cases="<<cases<<" commit/reset/restore/mutation/eager/stateless/batch/long-window\n";
+}
 class GdnTileScope {
     std::string previous_;
     bool present_;
@@ -1137,10 +1231,15 @@ int main(int argc,char** argv)try {
         for(int tiles:{4,2,1}){GdnTileScope setting(tiles);gdn_independent_state_case();}
     }
     else if(argc==2 && std::string(argv[1])=="--gdn-prefix-checkpoint-check")gdn_prefix_checkpoint_case();
+    else if(argc==2 && std::string(argv[1])=="--ple-prefix-context-check")ple_prefix_context_case();
+    else if(argc==2 && std::string(argv[1])=="--ple-hash-lifecycle-check")ple_hash_lifecycle_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-short-check")gdn_short_preparation_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-short-path-bench")gdn_short_preparation_benchmark();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-check")gdn_prefill_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-columns-check")gdn_prefill_columns_case();
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-staged-check")gdn_prefill_staged_case(false);
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-staged-bench")gdn_prefill_staged_case(true);
+    else if(argc==2 && std::string(argv[1])=="--gdn-prefill-staged-graph-check")gdn_prefill_staged_graph_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-pipeline-default-check")gdn_prefill_pipeline_case(true);
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-pipeline-check")gdn_prefill_pipeline_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-decay-check")gdn_prefill_pipeline_case(false,true);
@@ -1148,6 +1247,7 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--gdn-short-columns-bench")gdn_short_columns_benchmark();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-check")qsa_prefill_fusion_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-history-prime-check")qsa_history_prime_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-scalar-history-chain-check")qsa_scalar_history_chain_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-score-check")qsa_prefill_scores_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-live-score-check")qsa_live_scores_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-pool-write-check")qsa_live_pool_write_case();

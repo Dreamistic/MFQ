@@ -10,6 +10,7 @@
 #include "moe_cache_transfer.h"
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -18,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -108,6 +110,39 @@ static std::vector<mfq_tensor_backend::Tensor> moe_cache_fields(
     return fields;
 }
 
+// Borrow immutable descriptors while the caller holds their pool/lease. A
+// residency transaction revisits these fields several times; copying Tensors
+// into a new vector each time adds allocation and shared-owner traffic.
+struct MoeCacheFieldRefs {
+    using Tensor=mfq_tensor_backend::Tensor;
+    std::array<const Tensor*,7> fields{};
+    std::size_t count=0;
+    MoeCacheFieldRefs(std::initializer_list<const Tensor*> values):count(values.size()) {
+        std::copy(values.begin(),values.end(),fields.begin());
+    }
+    struct Iterator {
+        const Tensor* const* at;
+        const Tensor& operator*() const{return **at;}
+        Iterator& operator++(){++at;return *this;}
+        bool operator!=(const Iterator& other)const{return at!=other.at;}
+    };
+    Iterator begin()const{return {fields.data()};}
+    Iterator end()const{return {fields.data()+count};}
+    const Tensor& operator[](std::size_t index)const{return *fields[index];}
+    std::size_t size()const{return count;}
+};
+static MoeCacheFieldRefs moe_cache_field_refs(const MixedMoePool& pool) {
+    if(pool.family==MixedMoeFamily::Nint)return {&pool.nint.q_packed,&pool.nint.row_q_bits,
+        &pool.nint.row_q_bit_offsets,&pool.nint.sub_scale,&pool.nint.sub_min,&pool.nint.neuron_scale,&pool.nint.neuron_min};
+    if(pool.family==MixedMoeFamily::Nint8Zero)return {&pool.q8_zero.q_packed,&pool.q8_zero.q8_zero_scale};
+    if(pool.family==MixedMoeFamily::Mxfp4)return {&pool.mxfp4.values,&pool.mxfp4.scales};
+    if(pool.family==MixedMoeFamily::Nvq)return {&pool.nvq.indices_packed,&pool.nvq.aux_packed,
+        &pool.nvq.sub_scale_packed,&pool.nvq.neuron_scale};
+    if(pool.nepq.residual)return {&pool.nepq.indices_packed,&pool.nepq.aux_packed,&pool.nepq.state_packed,
+        &pool.nepq.neuron_scale,&pool.nepq.bank_ids,&pool.nepq.residual_first,&pool.nepq.residual_second};
+    return {&pool.nepq.indices_packed,&pool.nepq.aux_packed,&pool.nepq.state_packed,&pool.nepq.neuron_scale,&pool.nepq.bank_ids};
+}
+
 static mfq_tensor_backend::Tensor moe_owned_host_view(
         const std::shared_ptr<mfq_tensor_backend::Tensor>& arena,std::size_t offset,
         const mfq_tensor_backend::Tensor& field) {
@@ -126,7 +161,8 @@ static mfq_tensor_backend::Tensor moe_owned_host_view(
 #endif
 }
 
-static MixedMoePool moe_replace_quant_fields(MixedMoePool pool,const std::vector<mfq_tensor_backend::Tensor>& fields) {
+template<class Fields>
+static MixedMoePool moe_replace_quant_fields(MixedMoePool pool,const Fields& fields) {
     if(pool.family==MixedMoeFamily::Nint) {
         if(fields.size()!=7)throw std::invalid_argument("NINT RAM complement layout mismatch");
         pool.nint.q_packed=fields[0];pool.nint.row_q_bits=fields[1];pool.nint.row_q_bit_offsets=fields[2];
@@ -271,6 +307,8 @@ static std::string moe_cache_signature(
 
 struct MoeGpuArena {
     std::string signature;
+    std::optional<mfq::MoeCacheKey> prefill_backup_key;
+    std::uint64_t prefill_backup_generation=0;
     int64_t slot_bytes = 0;
     int minimum_slots = 0;
     int registered_experts = 0;
@@ -334,6 +372,8 @@ struct MoeCacheStats {
     int64_t pipeline_fetch_ns=0,pipeline_cpu_ns=0;
     int64_t pipeline_window_serves=0,pipeline_window_route_ns=0,pipeline_window_plan_ns=0;
     int64_t pipeline_window_fetch_ns=0,pipeline_window_cpu_ns=0,pipeline_window_gpu_ns=0;
+    // Host dispatch plans for three/four-row windows; routed experts only.
+    int64_t pipeline_small_window_groups[5]{},pipeline_small_window_hot_groups[5]{};
     int64_t pipeline_dma_copies=0,pipeline_window_dma_copies=0,pipeline_window_dma_bytes=0;
     int64_t pipeline_window_pcie_payload_bytes=0;
     int64_t pipeline_fused_transfer_copy_serves=0;
@@ -345,6 +385,7 @@ struct MoeCacheStats {
     int64_t pipeline_mapped_copy_serves=0,pipeline_mapped_copy_bytes=0,pipeline_mapped_copy_descriptors=0;
     int64_t pipeline_mapped_overlap_serves=0;
     int64_t pipeline_phased_transfer_serves=0,pipeline_gate_up_dma_bytes=0,pipeline_down_dma_bytes=0;
+    int64_t pipeline_prefill_cpu_copy_jobs=0,pipeline_prefill_cpu_copy_join_ns=0;
     int64_t pipeline_gate_up_primary_down_missing_experts=0,pipeline_gate_up_primary_down_missing_positions=0;
     int64_t pipeline_early_gate_up_positions=0,pipeline_early_gate_up_enabled=0;
     int64_t pipeline_early_no_cpu_ready_serves=0;
@@ -354,6 +395,7 @@ struct MoeCacheStats {
     int64_t pipeline_transfer_event_polls=0;
     int64_t pipeline_kv_direct_read_bytes=0,pipeline_kv_direct_read_fields=0;
     int64_t pipeline_kv_early_gu_serves=0;
+    int64_t pipeline_gu_build_overlap_serves=0,pipeline_gu_build_overlap_copies=0;
     int64_t pipeline_kv_projection_hits=0,pipeline_kv_projection_misses=0,pipeline_kv_projection_fallbacks=0;
     int64_t pipeline_kv_projection_small_hit_bytes=0;
     int64_t pipeline_kv_projection_early_hits=0;
@@ -361,6 +403,7 @@ struct MoeCacheStats {
     int64_t pipeline_kv_gpu_early_gu_experts=0;
     int64_t pipeline_reader_fence_reuses=0;
     int64_t pipeline_host_packet_serves=0,pipeline_host_packet_descriptor_bytes=0,pipeline_cached_phase_publishes=0;
+    int64_t pipeline_direct_packet_serves=0,pipeline_direct_packet_batch_serves=0;
     int64_t pipeline_native_dma_batches=0,pipeline_native_dma_copies=0,pipeline_native_dma_fallbacks=0;
     int64_t pipeline_window_input_view_serves=0;
     int64_t pipeline_prefetch_experts=0,pipeline_prefetch_bytes=0,pipeline_prefetch_hit_bytes=0,pipeline_prefetch_busy_skips=0;
