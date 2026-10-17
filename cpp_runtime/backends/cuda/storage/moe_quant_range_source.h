@@ -4,6 +4,7 @@
 #include "moe.h"
 #include "runtime/moe_host_expert_cache.h"
 #include <atomic>
+#include <array>
 #include <unordered_map>
 
 // Shared source for GPU cache misses and original-FP32 CPU cold projections.
@@ -45,7 +46,12 @@ public:
     std::uint64_t expert_nint_materialize_ns() const { return nint_materialize_ns_.load(); }
     std::uint64_t expert_nvq_materialize_ns() const { return nvq_materialize_ns_.load(); }
     std::uint64_t direct_field_reads() const { return direct_field_reads_.load(); }
+    // Per-format totals: reads, source bytes, encoded read ns, materialization ns.
+    using FormatIoStats=std::array<std::array<std::uint64_t,4>,18>;
+    FormatIoStats format_io_stats() const;
 private:
+    void record_format_io(int format,std::uint64_t bytes,std::uint64_t encoded_ns,
+                          std::uint64_t materialize_ns) const;
     MixedMoePool read_expert_canonical(int expert) const;
     struct FieldLayout {
         std::vector<std::int64_t> shape;
@@ -75,4 +81,5 @@ private:
     mutable std::atomic<std::uint64_t> encoded_ns_{0},materialize_ns_{0};
     mutable std::atomic<std::uint64_t> nint_materialize_ns_{0},nvq_materialize_ns_{0};
     mutable std::atomic<std::uint64_t> direct_field_reads_{0};
+    mutable std::array<std::array<std::atomic<std::uint64_t>,4>,18> format_io_{};
 };

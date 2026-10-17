@@ -1295,6 +1295,22 @@ std::array<std::uint64_t,4> MoeExpertCache::expert_disk_timings() const {
     return result;
 }
 
+void MoeExpertCache::append_expert_format_metrics(std::vector<std::pair<std::string,double>>& metrics) const {
+    MoeQuantRangeSource::FormatIoStats totals{};
+    for(const auto& source:sources_)if(source->quant_source_) {
+        const auto values=source->quant_source_->format_io_stats();
+        for(std::size_t format=0;format<totals.size();++format)
+            for(std::size_t i=0;i<totals[format].size();++i)totals[format][i]+=values[format][i];
+    }
+    for(std::size_t format=0;format<totals.size();++format)if(totals[format][0]) {
+        const auto prefix="ssd_format_"+std::to_string(format);
+        metrics.emplace_back(prefix+"_reads",double(totals[format][0]));
+        metrics.emplace_back(prefix+"_bytes",double(totals[format][1]));
+        metrics.emplace_back(prefix+"_encoded_ms",double(totals[format][2])/1e6);
+        metrics.emplace_back(prefix+"_materialize_ms",double(totals[format][3])/1e6);
+    }
+}
+
 std::uint64_t MoeExpertCache::expert_disk_bytes_after_preload() const {
     std::uint64_t bytes=0;
     for(const auto& source:sources_)if(source->quant_source_)

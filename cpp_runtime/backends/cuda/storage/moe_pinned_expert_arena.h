@@ -5,18 +5,21 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 
 // One bounded pinned allocation; expert leases own independently reusable
 // intervals. Returning an interval never allocates, including under pressure.
 class MoePinnedExpertArena {
     using Free=std::map<std::size_t,std::size_t>;
+    using Fits=std::set<std::pair<std::size_t,std::size_t>>;
     struct State {
         mfq::cuda::HostBuffer storage;
         std::mutex mutex;
         Free free;
+        Fits fits;
         std::size_t used=0;
         explicit State(std::size_t bytes):storage(bytes,true) {
-            free.emplace(0,bytes);mfq::cuda::charge_tensor_host_bytes(bytes);
+            free.emplace(0,bytes);fits.emplace(bytes,0);mfq::cuda::charge_tensor_host_bytes(bytes);
         }
         ~State(){mfq::cuda::tensor_host_bytes.fetch_sub(storage.size());}
     };
@@ -24,6 +27,7 @@ public:
     struct Block {
         std::shared_ptr<State> state;
         Free::node_type interval;
+        Fits::node_type size_interval;
         ~Block() {
             if(!state)return;
             std::lock_guard lock(state->mutex);
@@ -32,14 +36,17 @@ public:
             if(next!=state->free.begin()) {
                 const auto previous=std::prev(next);
                 if(previous->first+previous->second==interval.key()) {
+                    state->fits.erase({previous->second,previous->first});
                     interval.key()=previous->first;interval.mapped()+=previous->second;
                     state->free.erase(previous);
                 }
             }
             if(next!=state->free.end() && interval.key()+interval.mapped()==next->first) {
+                state->fits.erase({next->second,next->first});
                 interval.mapped()+=next->second;state->free.erase(next);
             }
-            state->free.insert(std::move(interval));
+            size_interval.value()={interval.mapped(),interval.key()};
+            state->free.insert(std::move(interval));state->fits.insert(std::move(size_interval));
         }
         std::uint8_t* data() const {return static_cast<std::uint8_t*>(state->storage.data())+interval.key();}
         std::size_t bytes() const {return interval.mapped();}
@@ -50,13 +57,18 @@ public:
         bytes=(bytes+15)&~std::size_t(15);
         auto block=std::make_shared<Block>();
         Free node;node.emplace(0,bytes);block->interval=node.extract(node.begin());
+        Fits size_node;size_node.emplace(bytes,0);block->size_interval=size_node.extract(size_node.begin());
         std::lock_guard lock(state_->mutex);
-        for(auto it=state_->free.begin();it!=state_->free.end();++it)if(it->second>=bytes) {
+        // The size index avoids scanning fragmented intervals and preserves
+        // larger holes for the next, larger expert format.
+        if(auto fit=state_->fits.lower_bound({bytes,0});fit!=state_->fits.end()) {
+            auto it=state_->free.find(fit->second);
             const auto offset=it->first;
-            if(it->second==bytes)state_->free.erase(it);
+            if(it->second==bytes) {state_->free.erase(it);state_->fits.erase(fit);}
             else {
                 auto rest=state_->free.extract(it);rest.key()+=bytes;rest.mapped()-=bytes;
-                state_->free.insert(std::move(rest));
+                auto size_rest=state_->fits.extract(fit);size_rest.value()={rest.mapped(),rest.key()};
+                state_->free.insert(std::move(rest));state_->fits.insert(std::move(size_rest));
             }
             block->interval.key()=offset;block->state=state_;state_->used+=bytes;return block;
         }

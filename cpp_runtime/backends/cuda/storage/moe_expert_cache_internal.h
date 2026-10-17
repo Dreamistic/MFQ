@@ -786,7 +786,7 @@ public:
             for(const auto& field:arena->fields)transfer_bytes+=std::size_t(tensor_nbytes(field));
         }
         const auto cold=ssd_expert_total_bytes_>gpu_weights?ssd_expert_total_bytes_-gpu_weights:0;
-        return {{"ssd_expert_enabled", ssd_experts_ ? 1.0 : 0.0},
+        std::vector<std::pair<std::string,double>> result{{"ssd_expert_enabled", ssd_experts_ ? 1.0 : 0.0},
             {"ssd_expert_payload_bytes",double(ssd_experts_ && cold>host.resident_bytes?cold-host.resident_bytes:0)},
             {"ssd_expert_bytes_read",double(disk_read_bytes)},
             {"ssd_expert_read_count",double(disk_reads)},
@@ -807,6 +807,10 @@ public:
             {"ram_expert_enabled", resident > 0 ? 1.0 : 0.0},
             {"resident_expert_cache_bytes",double(gpu_weights+(kv_expert_loan_?kv_expert_loan_->bytes():0))},
             {"expert_decode_transfer_bytes",double(transfer_bytes)},
+            {"expert_projection_dma_merges",double(stats_.pipeline_projection_dma_merges)},
+            {"expert_native_dma_batches",double(stats_.pipeline_native_dma_batches)},
+            {"expert_native_dma_copies",double(stats_.pipeline_native_dma_copies)},
+            {"expert_native_dma_fallbacks",double(stats_.pipeline_native_dma_fallbacks)},
             {"expert_direct_cache_capacity_bytes",double(tensor_nbytes(pipeline_direct_cache_storage_))},
             {"expert_wire_fallback_cells",double(pipeline_wire_fallback_cells_)},
             {"expert_wire_fallback_bytes",double(pipeline_wire_fallback_bytes_)},
@@ -847,6 +851,8 @@ public:
             {"host_tensor_allocated_bytes",double(mfq::cuda::tensor_host_bytes.load())},
 #endif
             {"ram_expert_pcie_read_bytes", double(stats_.ram_pcie_bytes)}};
+        append_expert_format_metrics(result);
+        return result;
     }
 
 private:
@@ -961,6 +967,7 @@ private:
     std::uint64_t expert_direct_field_reads() const;
     std::pair<std::size_t,std::size_t> pinned_expert_memory() const;
     std::array<std::uint64_t,4> expert_disk_timings() const;
+    void append_expert_format_metrics(std::vector<std::pair<std::string,double>>& metrics) const;
     bool complete_residency_=false;
     bool ssd_experts_=false;
     std::size_t ssd_expert_total_bytes_=0;

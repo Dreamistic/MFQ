@@ -406,6 +406,7 @@ struct MoeCacheStats {
     int64_t pipeline_host_packet_serves=0,pipeline_host_packet_descriptor_bytes=0,pipeline_cached_phase_publishes=0;
     int64_t pipeline_direct_packet_serves=0,pipeline_direct_packet_batch_serves=0;
     int64_t pipeline_native_dma_batches=0,pipeline_native_dma_copies=0,pipeline_native_dma_fallbacks=0;
+    int64_t pipeline_projection_dma_merges=0;
     int64_t pipeline_window_input_view_serves=0;
     int64_t pipeline_prefetch_experts=0,pipeline_prefetch_bytes=0,pipeline_prefetch_hit_bytes=0,pipeline_prefetch_busy_skips=0;
     int64_t pipeline_gpu_ns=0;

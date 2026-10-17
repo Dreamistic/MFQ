@@ -2626,6 +2626,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     const auto* cached=cache_->kv_expert_loan_->pin_projection(source.id_,initial.expert,
                         cohort.bytes_per_expert,cache_->weight_stream_,hit,
                         [&](void* destination,const std::array<std::size_t,8>& offsets) {
+                            auto& copies=projection_copies[phase];const auto first_copy=copies.size();
                             for(auto i=first;i<last;++i) {
                                 const auto& f=fields[i];const auto address=reinterpret_cast<uintptr_t>(f.source);
                                 const void* origin=f.source;
@@ -2638,7 +2639,28 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                                     origin=packed+host_offset;std::memcpy(packed+host_offset,f.source,std::size_t(f.bytes));
                                     host_offset+=f.bytes;staged_bytes+=f.bytes;
                                 }
-                                projection_copies[phase].push_back({static_cast<uint8_t*>(destination)+offsets[f.field],origin,std::size_t(f.bytes)});
+                                auto* target=static_cast<uint8_t*>(destination)+offsets[f.field];
+                                if(copies.size()>first_copy) {
+                                    auto& previous=copies.back();
+                                    const auto old_source=reinterpret_cast<uintptr_t>(previous.source);
+                                    const auto source=reinterpret_cast<uintptr_t>(origin);
+                                    const auto old_target=reinterpret_cast<uintptr_t>(previous.destination);
+                                    const auto next_target=reinterpret_cast<uintptr_t>(target);
+                                    // All destinations in this callback share one
+                                    // GPU projection allocation. Merge only the
+                                    // matching intervals inside the registered
+                                    // host image; small alignment gaps are owned.
+                                    if(old_source>=begin && old_source-begin<=size &&
+                                            source>=old_source+previous.bytes && source-old_source-previous.bytes<=15 &&
+                                            next_target>=old_target+previous.bytes &&
+                                            next_target-old_target==source-old_source &&
+                                            source-old_source+std::size_t(f.bytes)<=size-(old_source-begin)) {
+                                        previous.bytes=source-old_source+std::size_t(f.bytes);
+                                        ++cache_->stats_.pipeline_projection_dma_merges;
+                                        continue;
+                                    }
+                                }
+                                copies.push_back({target,origin,std::size_t(f.bytes)});
                             }
                         });
                     if(cached) {

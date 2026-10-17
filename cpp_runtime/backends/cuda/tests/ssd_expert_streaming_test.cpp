@@ -5,6 +5,7 @@
 #include "storage/moe_pinned_expert_arena.h"
 #include "storage/weight_loader.h"
 #include "runtime/decode_window.h"
+#include "runtime/native_dma_batch.h"
 #include "mfq_cuda_context.h"
 #include "mfq/runtime.h"
 #include "nint_prefill_cache.h"
@@ -52,6 +53,24 @@ void check_pinned_arena() {
     auto storage=arena->tensor();arena.reset();
     std::memset(joined->data(),0x5a,joined->bytes());joined.reset();
     check(static_cast<const uint8_t*>(storage.data_ptr())[1023]==0x5a,"pinned expert view outlived its storage owner");
+    {
+        auto fragmented=std::make_shared<MoePinnedExpertArena>(1024);
+        auto x=fragmented->allocate(256),guard=fragmented->allocate(128),y=fragmented->allocate(128),tail=fragmented->allocate(512);
+        auto* small=y->data();auto* large=x->data();x.reset();y.reset();
+        auto picked=fragmented->allocate(128),next=fragmented->allocate(256);
+        check(picked && next && picked->data()==small && next->data()==large,
+            "pinned expert allocation fragmented an available larger interval");
+    }
+    if(mfq::cuda::NativeDmaBatch::available()) {
+        auto gpu=tb::empty({1024},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+        void* alias=nullptr;MFQ_CUDA_CHECK(cudaHostGetDevicePointer(&alias,storage.data_ptr(),0));
+        const std::vector<mfq::cuda::DmaCopy> copies{{gpu.data_ptr(),storage.data_ptr(),1024}};
+        check(mfq::cuda::NativeDmaBatch::submit(copies,mfq_current_cuda_stream(),1,
+            [&](const void*,std::size_t){return reinterpret_cast<CUdeviceptr>(alias);}),
+            "single merged projection bypassed the native DMA path");
+        auto result=gpu.cpu().contiguous();
+        check(std::memcmp(result.data_ptr(),storage.data_ptr(),1024)==0,"single native DMA copy changed the payload");
+    }
 }
 std::shared_ptr<MoeQuantRangeSource> source(const std::filesystem::path& path,const std::string& name="linear.weight") {
     auto model=mfq::open_model_source(path.string());auto read=model->tensor_reader(name);

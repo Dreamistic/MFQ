@@ -137,6 +137,7 @@ MixedMoePool MoeQuantRangeSource::read_expert_canonical(int expert) const {
     const auto index=store_->expert_pool(expert);
     auto fields=!dense_groups_ && std::size_t(index)<metadata_->pools.size()?store_->read_nvq_fields(expert):std::nullopt;
     const auto encoded=fields?mfq::MfeQuantExpert{}:store_->read_expert(expert);
+    const auto source_bytes=fields?fields->source_nbytes:encoded.payload.size();
     const auto read_done=profile?Clock::now():Clock::time_point{};
     if (preloaded_.load()) {
         ++disk_reads_after_preload_;
@@ -163,10 +164,13 @@ MixedMoePool MoeQuantRangeSource::read_expert_canonical(int expert) const {
         ++materializations_;
     } else result=decode_expert(expert,encoded);
     if(profile) {
-        encoded_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(read_done-begin).count(),std::memory_order_relaxed);
+        const auto encoded_time=std::chrono::duration_cast<std::chrono::nanoseconds>(read_done-begin).count();
+        encoded_ns_.fetch_add(encoded_time,std::memory_order_relaxed);
         const auto materialize=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_done).count();
         materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
         (result.family==MixedMoeFamily::Nint?nint_materialize_ns_:nvq_materialize_ns_).fetch_add(materialize,std::memory_order_relaxed);
+        record_format_io(result.family==MixedMoeFamily::Nint?0:result.nvq.kernel_format,
+            source_bytes,encoded_time,materialize);
     }
     return result;
 }
@@ -219,15 +223,33 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
                 disk_bytes_after_preload_.fetch_add(bytes-anchors.size()*2,std::memory_order_relaxed);
             }
             if(profile) {
-                encoded_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(read_done-begin).count(),std::memory_order_relaxed);
+                const auto encoded_time=std::chrono::duration_cast<std::chrono::nanoseconds>(read_done-begin).count();
+                encoded_ns_.fetch_add(encoded_time,std::memory_order_relaxed);
                 const auto materialize=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_done).count();
                 materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
                 nvq_materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
+                record_format_io(prototype.nvq.kernel_format,bytes-anchors.size()*2,encoded_time,materialize);
             }
             return;
         }
     }
     copy(read_expert_canonical(expert));
+}
+
+void MoeQuantRangeSource::record_format_io(int format,std::uint64_t bytes,
+        std::uint64_t encoded_ns,std::uint64_t materialize_ns) const {
+    if(format<0 || std::size_t(format)>=format_io_.size())return;
+    const std::array<std::uint64_t,4> values{1,bytes,encoded_ns,materialize_ns};
+    for(std::size_t i=0;i<values.size();++i)
+        format_io_[format][i].fetch_add(values[i],std::memory_order_relaxed);
+}
+
+MoeQuantRangeSource::FormatIoStats MoeQuantRangeSource::format_io_stats() const {
+    FormatIoStats result{};
+    for(std::size_t format=0;format<result.size();++format)
+        for(std::size_t i=0;i<result[format].size();++i)
+            result[format][i]=format_io_[format][i].load(std::memory_order_relaxed);
+    return result;
 }
 
 MixedMoePool MoeQuantRangeSource::decode_expert(int expert,const mfq::MfeQuantExpert& encoded) const {

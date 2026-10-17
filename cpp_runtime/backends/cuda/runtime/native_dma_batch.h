@@ -45,7 +45,7 @@ public:
     // base to the device-visible alias once, before the consumer graph starts.
     template<class Alias>
     static bool submit(const std::vector<DmaCopy>& copies,cudaStream_t stream,int mode,Alias&& alias) {
-        if(!mode || copies.size()<2 || !entry())return false;
+        if(!mode || copies.empty() || !entry())return false;
         constexpr std::size_t capacity=128;
         if(copies.size()>capacity) {
             const auto* multiple=std::getenv("MFQ_MOE_NATIVE_DMA_MULTI_BATCH");
