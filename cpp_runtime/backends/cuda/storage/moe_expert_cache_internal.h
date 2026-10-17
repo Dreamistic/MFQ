@@ -865,6 +865,8 @@ public:
               {"residency_kv_refill_bytes",double(residency.kv_refill_bytes)},
               {"residency_cached_copy_bytes",double(residency.cached_copy_bytes)},
               {"residency_direct_upload_bytes",double(residency.direct_upload_bytes)},
+              {"residency_native_dma_batches",double(residency.native_dma_batches)},
+              {"residency_native_dma_copies",double(residency.native_dma_copies)},
               {"residency_exchange_bytes",double(residency.direct_exchange_bytes)},
               {"residency_decode_plan_ms",double(residency.decode_plan_ns)/1e6},
               {"residency_decode_join_ms",double(residency.decode_join_ns)/1e6},

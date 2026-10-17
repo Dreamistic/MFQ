@@ -1170,21 +1170,54 @@ void MoeResidencyManager::prepare() {
             if(!found)s.exchange_reads.reset();
         }
     }
+    const bool native_ssd_dma=cache.ssd_experts() && s.direct && native_residency_dma_enabled();
+    void* backup_alias=nullptr;
+    if(native_ssd_dma)MFQ_CUDA_CHECK(cudaHostGetDevicePointer(&backup_alias,s.backup.data_ptr(),0));
+    const auto submit_ssd_dma=[&](const std::vector<mfq::cuda::DmaCopy>& copies,cudaMemcpyKind kind) {
+        if(copies.empty())return;
+        auto aliases=copies;
+        const auto ram_begin=reinterpret_cast<uintptr_t>(cache.pipeline_ram_complement_->data_ptr());
+        const auto backup_begin=reinterpret_cast<uintptr_t>(s.backup.data_ptr());
+        bool mapped=true;
+        for(auto& copy:aliases) {
+            const bool upload=kind==cudaMemcpyHostToDevice;
+            const auto address=reinterpret_cast<uintptr_t>(upload?copy.source:copy.destination);
+            const auto begin=upload?ram_begin:backup_begin;
+            const auto bytes=upload?std::size_t(cache.pipeline_ram_registered_bytes_):std::size_t(s.backup.numel());
+            auto* base=static_cast<uint8_t*>(upload?cache.pipeline_ram_alias_:backup_alias);
+            if(!base || address<begin || address-begin>bytes || copy.bytes>bytes-(address-begin)) {
+                mapped=false;break;
+            }
+            if(upload)copy.source=base+(address-begin);else copy.destination=base+(address-begin);
+        }
+        if(mapped && mfq::cuda::NativeDmaBatch::submit(aliases,s.stream,1,
+                [](const void* p,std::size_t){return reinterpret_cast<CUdeviceptr>(p);})) {
+            ++s.native_dma_batches;s.native_dma_copies+=copies.size();
+        } else {
+            ++s.native_dma_fallbacks;
+            for(const auto& copy:copies)MFQ_CUDA_CHECK(cudaMemcpyAsync(copy.destination,copy.source,copy.bytes,kind,s.stream));
+        }
+    };
     {
     const PhaseClock backup_clock(s.backup_submit_ns,nullptr);
+    std::vector<mfq::cuda::DmaCopy> copies;
     for(const auto& move:s.pending) {
         auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
         for(std::size_t f=0;f<move.field_count;++f) {
             const auto count=cohort.bytes_per_expert[f];if(!count)continue;
             auto* gpu=static_cast<uint8_t*>(cohort.arena->fields[f].data_ptr())+int64_t(move.slot)*count;
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(s.backup.data_ptr<uint8_t>()+move.offsets[f],gpu,std::size_t(count),cudaMemcpyDeviceToHost,s.stream));
+            auto* backup=s.backup.data_ptr<uint8_t>()+move.offsets[f];
+            if(native_ssd_dma)copies.push_back({backup,gpu,std::size_t(count)});
+            else MFQ_CUDA_CHECK(cudaMemcpyAsync(backup,gpu,std::size_t(count),cudaMemcpyDeviceToHost,s.stream));
             ++s.backup_copies;
         }
     }
+    submit_ssd_dma(copies,cudaMemcpyDeviceToHost);
     }
     {
     const PhaseClock refill_clock(s.refill_submit_ns,nullptr);
     Impl::CachedRefill refill(s);
+    std::vector<mfq::cuda::DmaCopy> copies;
     for(std::size_t i=0;i<s.pending.size();++i) {
         auto& move=s.pending[i];auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
         const auto incoming=moe_cache_field_refs(move.lease->weights);
@@ -1205,7 +1238,8 @@ void MoeResidencyManager::prepare() {
                 s.cached_copy_dma_bytes+=count;++s.cached_copy_dma_fields;
             } else {
                 const auto* host=s.direct?static_cast<const uint8_t*>(incoming[f].data_ptr()):s.upload.data_ptr<uint8_t>()+move.offsets[f];
-                MFQ_CUDA_CHECK(cudaMemcpyAsync(gpu,host,std::size_t(count),cudaMemcpyHostToDevice,s.stream));
+                if(native_ssd_dma)copies.push_back({gpu,host,std::size_t(count)});
+                else MFQ_CUDA_CHECK(cudaMemcpyAsync(gpu,host,std::size_t(count),cudaMemcpyHostToDevice,s.stream));
                 ++s.upload_copies;
                 if(s.direct)s.direct_upload_bytes+=count;
             }
@@ -1213,6 +1247,7 @@ void MoeResidencyManager::prepare() {
         s.observe("upload",i);
     }
     // All backups precede this kernel; publication still waits for done.
+    submit_ssd_dma(copies,cudaMemcpyHostToDevice);
     refill.submit();
     }
     MFQ_CUDA_CHECK(cudaEventRecord(s.done,s.stream));

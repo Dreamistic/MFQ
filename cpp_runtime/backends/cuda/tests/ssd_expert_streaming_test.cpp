@@ -284,6 +284,9 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
         {std::lock_guard lock(mutex);release=true;}changed.notify_all();
         manager.apply_pending();
         check(manager.stats().kv_refill_bytes>0,"SSD expert promotion reread an existing GPU cache copy");
+        if(const auto* option=std::getenv("MFQ_MOE_RESIDENCY_NATIVE_DMA");option && option[0]=='1' &&
+                mfq::cuda::NativeDmaBatch::available())
+            check(manager.stats().native_dma_batches>0,"SSD expert exchange bypassed native DMA batching");
         check(bool(manager.stats().predictor_overlap_serves)==!shared_arena,
             "SSD predictor overlap ignored shared arena ownership");
         check_output(forward[0](execution,x,ids,weights),target);
