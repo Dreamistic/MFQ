@@ -16,6 +16,40 @@ template<class T> T value(const std::vector<std::uint8_t>& data,std::size_t offs
         throw std::runtime_error("truncated mixed expert metadata");
     T result; std::memcpy(&result,data.data()+offset,sizeof(result)); return result;
 }
+template<int Bits> void copy_nint_metadata(const std::uint8_t* source,std::size_t bytes,
+        std::uint64_t first,std::size_t count,std::uint8_t* target) {
+    constexpr std::uint32_t mask=(1u<<Bits)-1;
+    const auto one=[&] {
+        const auto byte=std::size_t(first/8);std::uint32_t word=source[byte];
+        if(byte+1<bytes)word|=std::uint32_t(source[byte+1])<<8;
+        *target++=std::uint8_t((word>>(first&7))&mask);first+=Bits;--count;
+    };
+    while(count && (first&7))one();
+    if constexpr(Bits==8) {
+        if(count)std::memcpy(target,source+std::size_t(first/8),count);
+        return;
+    }
+    while(count>=8) {
+        std::uint64_t word=0;std::memcpy(&word,source+std::size_t(first/8),Bits);
+        for(int i=0;i<8;++i)target[i]=std::uint8_t((word>>(i*Bits))&mask);
+        target+=8;first+=8*Bits;count-=8;
+    }
+    while(count)one();
+}
+void copy_nint_metadata(const std::uint8_t* source,std::size_t bytes,std::uint64_t first,
+        std::size_t count,int bits,std::uint8_t* target) {
+    switch(bits) {
+        case 1:copy_nint_metadata<1>(source,bytes,first,count,target);break;
+        case 2:copy_nint_metadata<2>(source,bytes,first,count,target);break;
+        case 3:copy_nint_metadata<3>(source,bytes,first,count,target);break;
+        case 4:copy_nint_metadata<4>(source,bytes,first,count,target);break;
+        case 5:copy_nint_metadata<5>(source,bytes,first,count,target);break;
+        case 6:copy_nint_metadata<6>(source,bytes,first,count,target);break;
+        case 7:copy_nint_metadata<7>(source,bytes,first,count,target);break;
+        case 8:copy_nint_metadata<8>(source,bytes,first,count,target);break;
+        default:throw std::runtime_error("invalid NINT metadata field width");
+    }
+}
 }
 
 void copy_nint_runtime_fields(const std::vector<std::uint8_t>& blob,
@@ -93,7 +127,8 @@ void copy_nint_runtime_fields(const std::vector<std::uint8_t>& blob,
         std::uint16_t anchor;std::memcpy(&anchor,anchors+row*2,2);
         if((anchor&0x7c00u)==0x7c00u)throw std::runtime_error("NINT neuron metadata must be finite");
     }
-    std::memset(targets[0].data,0,targets[0].bytes);
+    const auto payload_bytes=bytes_for(qbits,1);
+    std::memset(targets[0].data+payload_bytes,0,targets[0].bytes-payload_bytes);
     std::memcpy(targets[5].data,neuron_scale,sizes[5]);std::memcpy(targets[6].data,neuron_min,sizes[6]);
     std::array<std::uint32_t,4> knext{};
     std::array<std::uint32_t,8> qnext{};
@@ -111,14 +146,14 @@ void copy_nint_runtime_fields(const std::vector<std::uint8_t>& blob,
             const auto source_shift=unsigned(first&7),destination_shift=unsigned(destination&7);
             const auto bits=unsigned(std::min<std::uint64_t>(length,std::min(8-source_shift,8-destination_shift)));
             const auto v=(input[std::size_t(first/8)]>>source_shift)&((1u<<bits)-1);
+            if(!destination_shift)targets[0].data[std::size_t(destination/8)]=0;
             targets[0].data[std::size_t(destination/8)]|=std::uint8_t(v<<destination_shift);
             first+=bits;destination+=bits;length-=bits;
         }
         const auto begin=std::uint64_t(knext[k]++)*groups*kb;
         for(int f=3;f<5;++f) {
             const auto& stream=f==3?scale[k]:minimum[k];
-            for(std::size_t group=0;group<groups;++group)
-                targets[f].data[row*groups+group]=unpack(stream.data,stream.bytes,begin+group*kb,kb);
+            copy_nint_metadata(stream.data,stream.bytes,begin,groups,kb,targets[f].data+row*groups);
         }
     }
 }

@@ -129,8 +129,8 @@ void check_group64_fields(int width) {
     rejected([&]{source.slice_rows_fields(0,1);});
     require(batches==10+int(vectors%3!=0),"group64 field batches were skipped");
 }
-void check_nint_direct_fields(int width,int gs,bool adaptive) {
-    constexpr int rows=34,k=6;
+void check_nint_direct_fields(int width,int gs,bool adaptive,int k=6) {
+    constexpr int rows=34;
     auto fixture=mfq::test::fixture(rows,width,gs,k,adaptive);
     const int groups=(width+gs-1)/gs,padded=groups*gs;
     std::size_t read_bytes=0;
@@ -217,6 +217,8 @@ mfq::MfeQuantExpertStore memory_store(std::vector<std::uint8_t> blob,
     return {source->size(),read,std::move(batch)};
 }
 void self_test() {
+    for(int bits=1;bits<=8;++bits)check_nint_direct_fields(53,5,false,bits);
+    for(int bits:{2,4})check_nint_direct_fields(640,48,true,bits);
     for(int width:{1,7,8,9,23,24,25,53,64,127,128,191,192,193,200,640,2560})check_group64_fields(width);
     for(bool adaptive:{false,true})for(int width:{53,128,640})for(int gs:{5,21,24,28})
         check_nint_direct_fields(width,gs,adaptive);
