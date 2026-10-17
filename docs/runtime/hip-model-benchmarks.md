@@ -80,10 +80,10 @@ gap:
   `mfq_hip_compat.h` guard takes the hardware path in current builds;
   the earlier "no hardware dot" finding predates the newer compiler.
 - **The per-chunk float epilogue is worth 3-4%.** The
-  integer-accumulate path (`nint_group_partial`, gated behind
-  `MFQ_NINT_GROUP_DOT=1` and off by default) measured +3.4% decode on
-  4B S4-M (121.2 to 125.3 tok/s) and +4.4% on 27B (36.4 to 38.0).
-  Enabling it by default is a free, safe win.
+  integer-accumulate path (`nint_group_partial`, previously opt-in via
+  `MFQ_NINT_GROUP_DOT=1`) measured +3.4% decode on 4B S4-M (121.2 to
+  125.3 tok/s) and +4.4% on 27B (36.4 to 38.0) before further kernel
+  work; see the improvement section below.
 - **Prefill above 8 rows dequantizes whole matrices.** `nint_matmul`
   (cpp_runtime/backends/hip/ops/nint.cpp) uses the fused workspace GEMV
   only for M <= 8; larger cohorts dequantize the full weight to BF16
@@ -98,12 +98,31 @@ from the weight stream. llama.cpp's Q4_K_M reaches 1.2 TB/s with an
 inline block layout: scales stored next to the weights they scale and
 32-byte aligned blocks, so one wide load serves both.
 
+## Kernel improvement (2026-10-17)
+
+The integer group-accumulation path (`nint_group_partial`) is now the
+default for single-row decode (`MFQ_NINT_GROUP_DOT=0` still opts out),
+and its weight loads use a sliding dword window: adjacent chunks reuse
+the previously loaded words, so each window advance costs one load
+instead of two per chunk. The unpack arithmetic is unchanged, so the
+grouped path stays within the same tolerance of the plain path as
+before (`mfq-hip-nint-q8-test`, 3 consecutive runs, identical bounds).
+
+| Model | Plain path tok/s | New default tok/s | Gain |
+| --- | ---: | ---: | ---: |
+| Qwen3.5-4B S4-M | 120.3 | 129.5 | +7.6% |
+| Qwen3.5-9B S4-M | 92.9 | 98.3 | +5.8% |
+| Qwen3.5-27B S4-M | 36.2 | 40.4 | +11.6% |
+
+Measurements are medians of 3 runs at the 2048-token cohort; prefill is
+unchanged. The remaining gap to the 1.2 TB/s streaming rate needs the
+larger layout work below.
+
 Fix directions, in expected impact order: widen weight loads to 16
 bytes per iteration and co-locate group scales with the weight stream;
-enable `MFQ_NINT_GROUP_DOT` by default (measured 3-4%); process more
-than one activation row per wave to amortize weight traffic once MTP
-batches arrive; extend the fused path beyond M <= 8 or cache
-dequantized hot tensors for prefill-sized cohorts.
+process more than one activation row per wave to amortize weight
+traffic once MTP batches arrive; extend the fused path beyond M <= 8 or
+cache dequantized hot tensors for prefill-sized cohorts.
 
 ## Speculative MTP decode (2026-10-17, 2048-token cohort)
 

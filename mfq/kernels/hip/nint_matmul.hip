@@ -729,7 +729,7 @@ __device__ __forceinline__ int unpack_nint_codes4_unchecked(
 // metadata values. Routed execution changes only the indexing contract, not
 // the packed-weight compute kernel.
 // Accumulate a complete quantization group in integers before its affine.
-// The caller selects this experimental math only for one activation row.
+// Selected by default for one activation row; MFQ_NINT_GROUP_DOT=0 opts out.
 __device__ __forceinline__ float nint_group_partial(
         const uint8_t* bitstream,int bits,uint64_t row_bit_offset,
         const uint8_t* scale_row,const uint8_t* minimum_row,
@@ -742,19 +742,44 @@ __device__ __forceinline__ float nint_group_partial(
     const bool relative_fits=uint64_t(padded_width)*uint64_t(bits)+row_bit_remainder<=0xffffffffu;
     const auto* row_stream=bitstream+((row_bit_offset>>3)&~uint64_t(3));
     const bool complete_words=relative_fits && end_word<=packed_bytes && packed_bytes-end_word>=8;
+    const auto* row_words=reinterpret_cast<const uint32_t*>(row_stream);
     for(int group=lane;group<groups;group+=32) {
         const int column0=group*group_size;
         int dot=0,activation_sum=0;
         int element=0;
-        for(;element+3<group_size;element+=4) {
-            const int column=column0+element;
-            const uint32_t relative_bit=row_bit_remainder+uint32_t(column)*uint32_t(bits);
-            const int weight_codes=complete_words
-                ? unpack_nint_codes4_unchecked(row_stream,relative_bit,bits,packed_bytes)
-                : unpack_nint_codes4(bitstream,row_bit_offset+uint64_t(column)*uint64_t(bits),bits);
-            const int activation_codes=load_i8x4(activation+column);
-            activation_sum=__dp4a(0x01010101,activation_codes,activation_sum);
-            dot=__dp4a(bits==8 ? (weight_codes^int(0x80808080u)):weight_codes,activation_codes,dot);
+        if(complete_words) {
+            // Sliding dword window: adjacent chunks share the loaded words,
+            // so each advance costs one load instead of two per chunk.
+            const uint32_t group_bit0=row_bit_remainder+uint32_t(column0)*uint32_t(bits);
+            uint32_t window0=0u,window1=0u;
+            uint32_t window_word=0xffffffffu;
+            for(;element+3<group_size;element+=4) {
+                const uint32_t bit=group_bit0+uint32_t(element)*uint32_t(bits);
+                const uint32_t word=bit>>5;
+                if(word!=window_word) {
+                    const bool slide=window_word!=0xffffffffu && word==window_word+1u;
+                    window0=slide?window1:row_words[word];
+                    window1=row_words[word+1];
+                    window_word=word;
+                }
+                const uint32_t packed=__funnelshift_r(window0,window1,int(bit&31u));
+                const uint32_t pairs=__byte_perm(packed,packed>>(2*bits),0x5410);
+                const int weight_codes=static_cast<int>(
+                    __byte_perm(pairs,pairs>>bits,0x6240)
+                    & (((1u<<bits)-1u)*0x01010101u));
+                const int activation_codes=load_i8x4(activation+column0+element);
+                activation_sum=__dp4a(0x01010101,activation_codes,activation_sum);
+                dot=__dp4a(bits==8 ? (weight_codes^int(0x80808080u)):weight_codes,activation_codes,dot);
+            }
+        } else {
+            for(;element+3<group_size;element+=4) {
+                const int column=column0+element;
+                const int weight_codes=unpack_nint_codes4(
+                    bitstream,row_bit_offset+uint64_t(column)*uint64_t(bits),bits);
+                const int activation_codes=load_i8x4(activation+column);
+                activation_sum=__dp4a(0x01010101,activation_codes,activation_sum);
+                dot=__dp4a(bits==8 ? (weight_codes^int(0x80808080u)):weight_codes,activation_codes,dot);
+            }
         }
         if(bits==8)dot+=128*activation_sum;
         for(;element<group_size;++element) {
@@ -2215,10 +2240,10 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
             }
             use_cache = cache_warps > 1 && shared_bytes <= static_cast<size_t>(shared_limit);
         }
-        // At least one warp of groups avoids underfilled lanes.
+        // Integer group accumulation is the measured default; opt out with 0.
         const auto* group_flag=std::getenv("MFQ_NINT_GROUP_DOT");
-        const bool use_group=group_flag && std::strcmp(group_flag,"1")==0 &&
-            groups>=32 && group_size>=1 && group_size<=64;
+        const bool group_disabled=group_flag && std::strcmp(group_flag,"0")==0;
+        const bool use_group=!group_disabled && groups>=32 && group_size>=1 && group_size<=64;
         if (use_cache) {
             const auto launch_cache=[&](auto grouped) {
            hipLaunchKernelGGL(( nint_matmul_activation_cache_kernel<decltype(grouped)::value>), 
