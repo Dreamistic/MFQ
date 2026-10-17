@@ -1,4 +1,6 @@
 #include "mfq_cuda_quant_ops.h"
+#include "hip_execution.h"
+#include "nint.h"
 
 #include <cuda_runtime_api.h>
 #include <cstdint>
@@ -307,6 +309,53 @@ void check_float_input(int gs,int rows,int kind,int mode,int& ordinary,int& chan
         exact_half(actual,expected);bytes(qx[1],qx[0]);bytes(xs[1],xs[0]);++changing;
     }
 }
+void check_fused(int& cases) {
+    const Device gpu{DeviceType::cuda,0};
+    constexpr int n=9,gs=24,ng=5,width=ng*gs;
+    NintCpu c;
+    c.format_version=2; c.bits=5; c.sub_bits=6; c.gs=gs; c.ng=ng;
+    c.axis=0; c.neuron_len=width; c.shape={n,width}; c.out=n;
+    std::uint64_t total=5;  // Misaligned start exercises the bit copy.
+    c.row_q_bits.resize(n); c.row_q_bit_offsets.resize(n);
+    c.row_sub_bits.assign(n,0);
+    for(int row=0;row<n;++row) {
+        const int bits=row<3?4:row<6?5:row<8?6:8;
+        c.row_q_bits[row]=std::uint8_t(bits);
+        c.row_q_bit_offsets[row]=std::int64_t(total);
+        total+=std::uint64_t(width)*std::uint64_t(bits);
+    }
+    c.q_packed.assign(std::size_t((total+7)/8)+8,0);
+    for(std::size_t i=0;i<c.q_packed.size();++i)
+        c.q_packed[i]=std::uint8_t((i*149+37)&0xff);
+    c.sub_scale.resize(std::size_t(n)*ng);
+    c.sub_min.resize(std::size_t(n)*ng);
+    for(std::size_t i=0;i<c.sub_scale.size();++i) {
+        c.sub_scale[i]=std::uint8_t((i*13)%37);
+        c.sub_min[i]=std::uint8_t(i%19);
+    }
+    c.neuron_scale_h.resize(n); c.neuron_min_h.resize(n);
+    for(int row=0;row<n;++row) {
+        const __half scale=__float2half_rn(.000123f*float(row%7-3));
+        const __half minimum=__float2half_rn(.004731f*float(row%5-2));
+        std::memcpy(&c.neuron_scale_h[row],&scale,sizeof(scale));
+        std::memcpy(&c.neuron_min_h[row],&minimum,sizeof(minimum));
+    }
+    NintWeight w=to_device_nint(c,true);
+    require(w.fused_ok,"NINT fused decode layout was not built");
+    std::vector<float> input(width);
+    for(int column=0;column<width;++column)
+        input[column]=std::sin(float(column+7)*.193f)*.31f;
+    auto x=tensor(input).reshape({1,width}).to(gpu,kFloat16);
+    single_path(true);group_path(true);
+    Workspace& ws=w.workspace(1);
+    auto expected=nint_matmul_ws_cuda(w.q_packed,w.row_q_bits,
+        w.row_q_bit_offsets,w.sub_scale,w.sub_min,w.neuron_scale,
+        w.neuron_min,x,gs,ws.qx,ws.xscale);
+    CudaProfiler profiler;
+    auto actual=nint_matmul(profiler,w,x);
+    exact_half(actual,expected);++cases;
+}
+
 }  // namespace
 
 int main() {
@@ -337,6 +386,9 @@ int main() {
             check_single(gs,2560,5,0,8,6144,single_cases);
         }
         std::cout<<"NINT single-row original Half bits ordinary/changing graphs cases="<<single_cases<<" PASS\n";
+        int fused_cases=0;
+        check_fused(fused_cases);
+        std::cout<<"NINT fused decode exact vs grouped cases="<<fused_cases<<" PASS\n";
         for (int gs : {4, 12, 28, 32, 48, 64, 5, 47, 63}) {
             for (int ng : {1, 3, 22}) {
                 for (int m = 1; m <= 8; ++m) {

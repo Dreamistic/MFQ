@@ -98,31 +98,44 @@ from the weight stream. llama.cpp's Q4_K_M reaches 1.2 TB/s with an
 inline block layout: scales stored next to the weights they scale and
 32-byte aligned blocks, so one wide load serves both.
 
-## Kernel improvement (2026-10-17)
+## Kernel improvements (2026-10-17)
 
-The integer group-accumulation path (`nint_group_partial`) is now the
-default for single-row decode (`MFQ_NINT_GROUP_DOT=0` still opts out),
-and its weight loads use a sliding dword window: adjacent chunks reuse
-the previously loaded words, so each window advance costs one load
-instead of two per chunk. The unpack arithmetic is unchanged, so the
-grouped path stays within the same tolerance of the plain path as
-before (`mfq-hip-nint-q8-test`, 3 consecutive runs, identical bounds).
+Two changes landed in the single-row decode path:
 
-| Model | Plain path tok/s | New default tok/s | Gain |
-| --- | ---: | ---: | ---: |
-| Qwen3.5-4B S4-M | 120.3 | 129.5 | +7.6% |
-| Qwen3.5-9B S4-M | 92.9 | 98.3 | +5.8% |
-| Qwen3.5-27B S4-M | 36.2 | 40.4 | +11.6% |
+1. Integer group accumulation (`nint_group_partial`) is now the default
+   (`MFQ_NINT_GROUP_DOT=0` opts out), and its weight loads use a sliding
+   dword window: adjacent chunks reuse the previously loaded words. The
+   unpack arithmetic is unchanged, so the grouped path keeps its
+   tolerance of the plain path (`mfq-hip-nint-q8-test`, identical
+   bounds across repeated runs).
+2. A fused slot layout built once per weight at load time: rows are
+   grouped into uniform-bit segments and each group becomes one
+   4-byte-aligned slot [weight bits | pad | u16 scale/minimum], so the
+   templated-per-bits kernel folds all extraction shifts and byte-perm
+   selectors to constants and reads scales from the same stream
+   (`MFQ_NINT_FUSED_DECODE=0` opts out; aligned-q8 tensors keep their
+   dedicated kernel). The fused path is bit-exact against the grouped
+   path (exact_half in the q8 test) and costs about one second of extra
+   load time plus roughly 30% more VRAM for NINT weights.
+
+| Model | Plain tok/s | Sliding window | + Fused slots | Total gain |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3.5-4B S4-M | 120.3 | 129.5 | 136.2 | +13.2% |
+| Qwen3.5-9B S4-M | 92.9 | 98.3 | 101.7 | +9.5% |
+| Qwen3.5-27B S4-M | 36.2 | 40.4 | 42.5 | +17.4% |
 
 Measurements are medians of 3 runs at the 2048-token cohort; prefill is
-unchanged. The remaining gap to the 1.2 TB/s streaming rate needs the
-larger layout work below.
+unchanged. Effective weight streaming rises from 0.63 to 0.78 TB/s on
+27B — still short of the 1.3-1.5 TB/s needed to match llama.cpp Q4_K_M,
+because one activation row per warp still pays per-chunk activation
+loads and a segment launch per projection.
 
-Fix directions, in expected impact order: widen weight loads to 16
-bytes per iteration and co-locate group scales with the weight stream;
-process more than one activation row per wave to amortize weight
-traffic once MTP batches arrive; extend the fused path beyond M <= 8 or
-cache dequantized hot tensors for prefill-sized cohorts.
+Fix directions, in expected impact order: 16-byte single loads per
+group slot where the slot permits; vectorized activation loads; one
+kernel launch for all segments; more than one activation row per wave
+to amortize weight traffic once MTP batches arrive; extend the fused
+path beyond M <= 8 or cache dequantized hot tensors for prefill-sized
+cohorts.
 
 ## Speculative MTP decode (2026-10-17, 2048-token cohort)
 

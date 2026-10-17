@@ -2025,7 +2025,168 @@ mfq_tensor_backend::Tensor nint_decode_cuda(
 }
 
 
-static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
+static // Fused single-row decode over the load-time slot layout: every group is
+// one 4-byte-aligned slot [weight bits | pad | u16 scale/minimum], rows are
+// grouped into uniform-bit segments, and the kernel is templated on Bits so
+// the per-chunk extraction shifts and byte-perm selectors are constants.
+template <int Bits>
+__global__ void __launch_bounds__(128) nint_fused_decode_kernel(
+        const uint8_t * __restrict__ fused,
+        const int32_t * __restrict__ row_ids,
+        const float * __restrict__ neuron_scale,
+        const float * __restrict__ neuron_minimum,
+        const int8_t * __restrict__ activation,
+        const float * __restrict__ activation_scale,
+        __half * __restrict__ output,
+        int segment_rows,
+        int groups,
+        int padded_width,
+        int group_size,
+        int slot_bytes) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int row = static_cast<int>(blockIdx.x) * 4 +
+        static_cast<int>(threadIdx.y);
+    if (row >= segment_rows) return;
+    const int output_row = row_ids[row];
+    const uint8_t * row_base = fused +
+        static_cast<size_t>(row) * groups * slot_bytes;
+    const float outer_scale = neuron_scale[output_row];
+    const float outer_minimum = neuron_minimum[output_row];
+    const uint32_t mask = ((1u << Bits) - 1u) * 0x01010101u;
+    float partial = 0.0f;
+    for (int group = lane; group < groups; group += 32) {
+        const uint8_t * slot = row_base +
+            static_cast<size_t>(group) * slot_bytes;
+        const auto * words = reinterpret_cast<const uint32_t *>(slot);
+        const uint16_t packed_scales = *reinterpret_cast<const uint16_t*>(
+            slot + slot_bytes - 2);
+        const int8_t * activation_group = activation + group * group_size;
+        int dot = 0;
+        int activation_sum = 0;
+#pragma unroll 8
+        for (int element = 0; element + 3 < group_size; element += 4) {
+            const int bit = element * Bits;
+            const int shift = bit & 31;
+            const int word = bit >> 5;
+            const uint32_t packed = shift == 0
+                ? words[word]
+                : __funnelshift_r(words[word], words[word + 1], shift);
+            const uint32_t pairs =
+                __byte_perm(packed, packed >> (2 * Bits), 0x5410);
+            const int weight_codes = static_cast<int>(
+                __byte_perm(pairs, pairs >> Bits, 0x6240) & mask);
+            const int activation_codes =
+                load_i8x4(activation_group + element);
+            activation_sum =
+                __dp4a(0x01010101, activation_codes, activation_sum);
+            dot = __dp4a(
+                Bits == 8
+                    ? (weight_codes ^ static_cast<int>(0x80808080u))
+                    : weight_codes,
+                activation_codes, dot);
+        }
+        if (Bits == 8) dot += 128 * activation_sum;
+        const float inner_scale =
+            static_cast<float>(packed_scales & 0xffu);
+        const float inner_minimum =
+            static_cast<float>(packed_scales >> 8);
+        partial += activation_scale[group] *
+            (outer_scale * inner_scale * static_cast<float>(dot) -
+             outer_minimum * inner_minimum *
+                 static_cast<float>(activation_sum));
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        partial += __shfl_xor_sync(0xffffffffu, partial, offset);
+    }
+    if (lane == 0) output[output_row] = __float2half(partial);
+}
+
+mfq_tensor_backend::Tensor nint_matmul_fused_decode_cuda(
+        mfq_tensor_backend::Tensor fused_q,
+        mfq_tensor_backend::Tensor row_ids,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_minimum,
+        mfq_tensor_backend::Tensor input,
+        int64_t group_size,
+        const std::vector<int64_t>& segment_bits,
+        const std::vector<int64_t>& segment_row_offsets,
+        const std::vector<int64_t>& segment_byte_offsets,
+        const std::vector<int64_t>& segment_slots,
+        mfq_tensor_backend::Tensor quantized_input,
+        mfq_tensor_backend::Tensor input_scale) {
+    MFQ_RUNTIME_CHECK(
+        input.is_cuda() && input.is_contiguous() && input.dim() == 2 &&
+            input.size(0) == 1 &&
+            (input.scalar_type() == mfq_tensor_backend::kFloat16 ||
+             input.scalar_type() == mfq_tensor_backend::kFloat32),
+        "NINT fused decode requires one contiguous CUDA fp16/fp32 row");
+    MFQ_RUNTIME_CHECK(
+        fused_q.is_cuda() && fused_q.scalar_type() ==
+            mfq_tensor_backend::kUInt8 &&
+            row_ids.is_cuda() && row_ids.scalar_type() ==
+                mfq_tensor_backend::kInt32,
+        "NINT fused layout tensors are invalid");
+    const int groups = static_cast<int>(input_scale.size(1));
+    const int real_width = static_cast<int>(input.size(1));
+    const int padded_width = groups * static_cast<int>(group_size);
+    const int output_rows = static_cast<int>(row_ids.numel());
+    auto output = mfq_tensor_backend::empty(
+        {1, output_rows},
+        input.options().dtype(mfq_tensor_backend::kFloat16));
+    const hipStream_t stream = mfq_current_cuda_stream();
+    const int quantize_threads = group_size <= 32 ? 32 : 64;
+    hipLaunchKernelGGL((nint_quantize_activation_kernel),
+        dim3(dim3(1, groups)), dim3(quantize_threads), 0, stream,
+            input.data_ptr(),
+            nullptr,
+            quantized_input.data_ptr<int8_t>(),
+            input_scale.data_ptr<float>(),
+            1, real_width, padded_width, groups,
+            static_cast<int>(group_size), 0,
+            input.scalar_type() == mfq_tensor_backend::kFloat32, false);
+    for (std::size_t segment = 0; segment < segment_bits.size(); ++segment) {
+        const int bits = static_cast<int>(segment_bits[segment]);
+        const int first =
+            static_cast<int>(segment_row_offsets[segment]);
+        const int rows = static_cast<int>(
+            segment_row_offsets[segment + 1] -
+            segment_row_offsets[segment]);
+        if (rows == 0) continue;
+        const int slot = static_cast<int>(segment_slots[segment]);
+        const uint8_t * base = fused_q.data_ptr<uint8_t>() +
+            static_cast<size_t>(segment_byte_offsets[segment]);
+        const auto launch = [&](auto bits_constant) {
+            hipLaunchKernelGGL(
+                (nint_fused_decode_kernel<decltype(bits_constant)::value>),
+                dim3(dim3((rows + 3) / 4)), dim3(dim3(32, 4)), 0, stream,
+                    base, row_ids.data_ptr<int32_t>() + first,
+                    neuron_scale.data_ptr<float>(),
+                    neuron_minimum.data_ptr<float>(),
+                    quantized_input.data_ptr<int8_t>(),
+                    input_scale.data_ptr<float>(),
+                    reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+                    rows, groups, padded_width,
+                    static_cast<int>(group_size), slot);
+        };
+        switch (bits) {
+            case 2: launch(std::integral_constant<int, 2>{}); break;
+            case 3: launch(std::integral_constant<int, 3>{}); break;
+            case 4: launch(std::integral_constant<int, 4>{}); break;
+            case 5: launch(std::integral_constant<int, 5>{}); break;
+            case 6: launch(std::integral_constant<int, 6>{}); break;
+            case 7: launch(std::integral_constant<int, 7>{}); break;
+            case 8: launch(std::integral_constant<int, 8>{}); break;
+            default:
+                throw std::runtime_error(
+                    "NINT fused decode received an unsupported bit width");
+        }
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         mfq_tensor_backend::Tensor bitstream,
         mfq_tensor_backend::Tensor row_q_bits,
         mfq_tensor_backend::Tensor row_q_bit_offsets,
