@@ -42,6 +42,24 @@ void AsyncRangeReader::read(const std::vector<ReadSpan>& spans) const {
             merged.back().last = std::max(merged.back().last, interval.last);
         else merged.push_back(interval);
     }
+    if(alignment>1 && merged.size()>64) {
+        // Large sparse row gathers otherwise spend an IRP on nearly every
+        // sector. Read nearby sectors together, bounded to 64 KiB and twice
+        // the useful sector bytes. Small expert-field batches keep exact I/O.
+        std::vector<Interval> coalesced;coalesced.reserve(merged.size());
+        std::uint64_t useful=0;
+        for(const auto interval:merged) {
+            const auto size=interval.last-interval.first;
+            if(!coalesced.empty()) {
+                auto& previous=coalesced.back();const auto cover=interval.last-previous.first;
+                if(cover<=65536 && cover<=2*(useful+size)) {
+                    previous.last=interval.last;useful+=size;continue;
+                }
+            }
+            coalesced.push_back(interval);useful=size;
+        }
+        merged=std::move(coalesced);
+    }
     std::uint64_t bytes = 0;
     for (const auto interval : merged) {
         const auto count = interval.last - interval.first;

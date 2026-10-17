@@ -64,6 +64,28 @@ int main() {
         for (std::size_t i=0;i<expected.size();++i) expected[i]=static_cast<std::byte>((i*73+i/131)&255);
         { std::ofstream stream(path,std::ios::binary); stream.write(reinterpret_cast<const char*>(expected.data()),expected.size());
           require(bool(stream),"cannot write fixture"); }
+        {
+            const auto sector=mfq::FileRangeReader(path,mfq::FileReadMode::Direct).alignment();
+            std::vector<std::byte> large(256*sector+13);
+            for(std::size_t i=0;i<large.size();++i)large[i]=std::byte((i*31+i/19)&255);
+            {std::ofstream stream(path,std::ios::binary|std::ios::trunc);
+                stream.write(reinterpret_cast<const char*>(large.data()),large.size());require(bool(stream),"cannot write sparse row fixture");}
+            {
+                mfq::AsyncRangeReader rows(path,mfq::FileReadMode::Direct);
+                std::vector<std::byte> output(96*9,std::byte{0x5a});std::vector<mfq::ReadSpan> spans;
+                for(std::size_t i=0;i<96;++i)spans.push_back({i*2*sector+3,output.data()+i*9+1,7});
+                rows.read(spans);
+                for(std::size_t i=0;i<96;++i) {
+                    require(output[i*9]==std::byte{0x5a} && output[i*9+8]==std::byte{0x5a},"sparse coalescing changed guards");
+                    require(std::equal(output.begin()+i*9+1,output.begin()+i*9+8,large.begin()+i*2*sector+3),"sparse coalescing changed row bytes");
+                }
+                const auto stats=rows.stats();
+                require((sector>65536/3 || stats.calls<96) && stats.physical_bytes<=2*96*sector && !stats.staging_bytes,
+                    "sparse rows did not coalesce or exceeded their physical read bound");
+            }
+            {std::ofstream stream(path,std::ios::binary|std::ios::trunc);
+                stream.write(reinterpret_cast<const char*>(expected.data()),expected.size());require(bool(stream),"cannot restore fixture");}
+        }
         exercise(path,expected,mfq::FileReadMode::Buffered);
         exercise(path,expected,mfq::FileReadMode::Direct);
         for(auto mode:{mfq::FileReadMode::Buffered,mfq::FileReadMode::Direct}) {
