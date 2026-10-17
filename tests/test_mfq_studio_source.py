@@ -76,6 +76,15 @@ def test_studio_starts_the_unified_local_server_and_bundled_runtime():
     assert "MFQ_AVFOUNDATION_VIDEO_LIBRARY" in RUST
 
 
+def test_studio_keeps_web_ui_available_on_the_server_listener():
+    assert '.arg("--no-web-ui")' not in RUST
+    for platform in ("macos", "windows"):
+        config = json.loads(
+            (TAURI / f"tauri.release-{platform}.conf.json").read_text(encoding="utf-8")
+        )
+        assert config["bundle"]["resources"]["../dist"] == "web-ui"
+
+
 def test_studio_supports_local_and_remote_server_connections_with_voice_controls():
     for command in ('studio_configure', 'studio_start_local', 'studio_select_model_directory'):
         assert command in RUST

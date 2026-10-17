@@ -98,12 +98,21 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
             Path(environment_root),
             source="MFQ_SERVER_WEB_ROOT",
         )
+    if getattr(sys, "frozen", False):
+        bundled_root = Path(sys.executable).resolve().parent.parent / "web-ui"
+        if bundled_root.is_dir():
+            return _validate_web_root(bundled_root, source="bundled")
     web_dir = Path(__file__).resolve().parents[2] / "MFQStudio"
     package = web_dir / "package.json"
     output = web_dir / "dist"
     index = output / "index.html"
     if not package.is_file():
-        return None
+        if index.is_file():
+            return output
+        raise FileNotFoundError(
+            "Web UI assets were not found. Pass --web-root with a prebuilt frontend "
+            "or explicitly use --no-web-ui for an API-only server."
+        )
 
     inputs = [
         *(path for path in web_dir.iterdir() if path.is_file()),
@@ -118,11 +127,11 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
 
     npm = shutil.which("npm")
     if npm is None:
-        print(
-            "Web UI source was found but npm is unavailable; serving the API only",
-            file=sys.stderr,
+        raise RuntimeError(
+            "Web UI needs to be built but npm is unavailable. Install Node.js/npm, "
+            "pass --web-root with a prebuilt frontend, or explicitly use --no-web-ui "
+            "for an API-only server."
         )
-        return None
     print("Building MFQ Web UI...", flush=True)
     try:
         subprocess.run([npm, "ci"], cwd=web_dir, check=True)
@@ -361,7 +370,7 @@ def _run(args: argparse.Namespace) -> int:
     )
     api_keys = ApiKeyManager(store, client_api_key) if client_api_key else None
     if web_root is None:
-        print("Web UI assets were not found; serving the API only")
+        print("Web UI disabled by --no-web-ui; serving the API only")
     listener_settings = data_dir / "listener.json"
     app = create_app(service, web_root=web_root, api_keys=api_keys, auth_settings_path=data_dir / "auth.json")
     if error := network_auth_error(args.host, "configured" if app.state.auth_policy.enabled else ""):

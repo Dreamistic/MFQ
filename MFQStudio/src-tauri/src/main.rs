@@ -315,7 +315,6 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
     }
     command
         .arg("serve")
-        .arg("--no-web-ui")
         .arg("--no-access-log")
         .arg("--data-dir")
         .arg(&data_dir)
