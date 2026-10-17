@@ -50,9 +50,9 @@ plt.rcParams.update({
 })
 
 STYLES = {
-    "mfq": {"color": C["accent"], "marker": "o", "linestyle": "-", "width": 2.8},
-    "unsloth-ud": {"color": C["neutral_bar"], "marker": "s", "linestyle": (0, (5, 3)), "width": 1.8},
-    "gsq-rco": {"color": C["muted"], "marker": "D", "linestyle": "-", "width": 1.8},
+    "mfq": {"color": C["accent"], "marker": "o", "linestyle": "-", "width": 5.2, "marker_size": 14, "label_size": 19},
+    "unsloth-ud": {"color": C["neutral_bar"], "marker": "s", "linestyle": (0, (5, 3)), "width": 3, "marker_size": 10.5, "label_size": 17.5},
+    "gsq-rco": {"color": C["muted"], "marker": "D", "linestyle": "-", "width": 3, "marker_size": 10.5, "label_size": 17.5},
 }
 LANGUAGES = {
     "en": {
@@ -110,7 +110,7 @@ def label(fig, x, y, value, size=17, color=None, weight="normal", **kwargs):
 
 def card(fig, x):
     fig.add_artist(FancyBboxPatch(
-        bounds(x, 128, 740, 640)[:2], 740 / WIDTH, 640 / HEIGHT,
+        bounds(x, 128, 740, 652)[:2], 740 / WIDTH, 652 / HEIGHT,
         boxstyle=f"round,pad=0,rounding_size={12 / WIDTH}",
         mutation_aspect=WIDTH / HEIGHT, transform=fig.transFigure,
         facecolor=C["surface"], edgecolor=C["line"], linewidth=0.8, zorder=-1,
@@ -138,9 +138,9 @@ def brand(fig):
 def panel(fig, x, metric, text):
     card(fig, x)
     short = "kld" if metric == "kld" else "top1"
-    label(fig, x + 28, 174, text[short], 23, C["strong"], "bold")
-    label(fig, x + 28, 204, text[f"{short}_hint"], 15, C["muted"])
-    ax = fig.add_axes(bounds(x + 92, 254, 616, 438), facecolor="none")
+    label(fig, x + 28, 174, text[short], 25, C["strong"], "bold")
+    label(fig, x + 28, 204, text[f"{short}_hint"], 17, C["muted"])
+    ax = fig.add_axes(bounds(x + 92, 244, 616, 458), facecolor="none")
     ax.set_xlim(65, 97)
     ax.set_xticks((66, 70, 74, 78, 82, 86, 90, 94))
     if metric == "kld":
@@ -155,23 +155,24 @@ def panel(fig, x, metric, text):
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0f}%"))
     ax.set_axisbelow(True)
     ax.grid(color=C["line_soft"], linewidth=0.7)
-    ax.tick_params(axis="both", length=0, pad=10, labelsize=15)
+    ax.tick_params(axis="both", length=0, pad=10, labelsize=17)
     for spine in ax.spines.values():
         spine.set_visible(False)
-    ax.set_xlabel(text["size"], fontsize=17, color=C["soft"], labelpad=18)
+    ax.set_xlabel(text["size"], fontsize=19, color=C["soft"], labelpad=18)
 
     for series in DATA["series"]:
         style = STYLES[series["id"]]
         rows = series["measurements"]
         line, = ax.plot([r["weight_size_gb"] for r in rows], [r[metric] for r in rows],
                         color=style["color"], linewidth=style["width"],
-                        linestyle=style["linestyle"], zorder=3 if series["id"] == "mfq" else 2)
+                        linestyle=style["linestyle"], solid_capstyle="round",
+                        zorder=3 if series["id"] == "mfq" else 2)
         line.set_gid(f'quality-{short}-{series["id"]}-line')
         for row in rows:
             point, = ax.plot(row["weight_size_gb"], row[metric], linestyle="none",
-                             marker=style["marker"], markersize=9 if series["id"] == "mfq" else 8,
+                             marker=style["marker"], markersize=style["marker_size"],
                              color=style["color"], markeredgecolor=C["surface"],
-                             markeredgewidth=1.2, zorder=5 if series["id"] == "mfq" else 4)
+                             markeredgewidth=1.6, zorder=5 if series["id"] == "mfq" else 4)
             point.set_gid(f'quality-{short}-{series["id"]}-{row["tier"]}')
             offset = OFFSETS[metric][series["id"]].get(row["tier"])
             if offset:
@@ -179,23 +180,23 @@ def panel(fig, x, metric, text):
                 ax.annotate(row["tier"], (row["weight_size_gb"], row[metric]),
                             xytext=(dx, dy), textcoords="offset points", ha=align, va="center",
                             color=C["accent_ink"] if series["id"] == "mfq" else C["muted"],
-                            weight="bold" if series["id"] == "mfq" else "normal", fontsize=15,
-                            arrowprops={"arrowstyle": "-", "linewidth": 0.65,
-                                        "color": style["color"], "shrinkA": 4, "shrinkB": 7})
+                            weight="bold" if series["id"] == "mfq" else "normal", fontsize=style["label_size"],
+                            arrowprops={"arrowstyle": "-", "linewidth": 0.85,
+                                        "color": style["color"], "shrinkA": 4, "shrinkB": 10})
     return ax
 
 
 def generate(locale, text):
     fig = plt.figure(figsize=(WIDTH / 72, HEIGHT / 72), facecolor=C["canvas"])
-    label(fig, 48, 63, text["title"], 30, C["strong"], "bold")
-    label(fig, 48, 96, text["subtitle"], 17, C["muted"])
+    label(fig, 48, 63, text["title"], 32, C["strong"], "bold")
+    label(fig, 48, 96, text["subtitle"], 18, C["muted"])
     brand(fig)
     handles = [Line2D([], [], color=STYLES[s["id"]]["color"], marker=STYLES[s["id"]]["marker"],
                       linestyle=STYLES[s["id"]]["linestyle"], linewidth=STYLES[s["id"]]["width"],
-                      markersize=7) for s in DATA["series"]]
+                      markersize=STYLES[s["id"]]["marker_size"] * 0.8) for s in DATA["series"]]
     fig.legend(handles, [s["label"] for s in DATA["series"]], loc="center right",
                bbox_to_anchor=(1564 / WIDTH, 1 - 91 / HEIGHT), ncol=3,
-               frameon=False, fontsize=16, handlelength=2, columnspacing=1.6)
+               frameon=False, fontsize=18, handlelength=2, columnspacing=1.6)
     panel(fig, 48, "kld", text)
     panel(fig, 812, "top1_agreement_percent", text)
     label(fig, 48, 806, text["exclusions"], 14, C["muted_light"])
