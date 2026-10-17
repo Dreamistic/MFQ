@@ -6,6 +6,7 @@
 #include "mfq/runtime.h"
 #include "mfq/mapped_read_profile.h"
 #include "mfq/mapped_prefetch_scope.h"
+#include "mfq/mapped_tensor_pages.h"
 #include <thread>
 #include <map>
 #include <cmath>
@@ -499,6 +500,8 @@ void MoeExpertCache::initialize_ssd_residency() {
         if(!prepare(*source,{e},true))throw std::runtime_error("SSD expert GPU placement exceeded its arena");
     }
     if(transfer_ready_recorded_)MFQ_CUDA_CHECK(cudaEventSynchronize(transfer_ready_));
+    const auto trimmed=mfq::release_mapped_tensor_pages();
+    std::cerr<<"moe_ssd_source_pages_released views="<<trimmed<<'\n';
     for(auto& stage:stages_) {
         if(stage.pending)MFQ_CUDA_CHECK(cudaEventSynchronize(stage.done));
         stage.device={};stage.host={};stage.pending=false;

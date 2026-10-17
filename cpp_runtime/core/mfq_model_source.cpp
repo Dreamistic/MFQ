@@ -2,6 +2,7 @@
 #include "mfq/async_range_reader.h"
 #include "mfq/mapped_read_profile.h"
 #include "mfq/mapped_prefetch_scope.h"
+#include "mfq/mapped_tensor_pages.h"
 
 #include "mfq_format_compat.h"
 #include "mfq_legacy_tensor_names.h"
@@ -118,6 +119,17 @@ public:
     ~MappedTensorRange(){close();}
     MappedTensorRange(const MappedTensorRange&)=delete;
     MappedTensorRange& operator=(const MappedTensorRange&)=delete;
+    bool release_pages() const noexcept {
+        if(!view_ || !mapped_bytes_)return false;
+#ifdef _WIN32
+        // Unlocked file pages become reclaimable even when the API reports
+        // ERROR_NOT_LOCKED. The read-only view and its file stay open.
+        (void)VirtualUnlock(view_,mapped_bytes_);
+#else
+        (void)::madvise(view_,mapped_bytes_,MADV_DONTNEED);
+#endif
+        return true;
+    }
     void read(std::uint64_t offset,std::byte* destination,std::size_t size)const {
         if(offset>bytes_ || size>bytes_-offset)throw std::out_of_range("mapped tensor row range is out of bounds");
         if(!size)return;
@@ -165,6 +177,14 @@ public:
         for(const auto& span:spans)if(span.size)read(span.offset,span.destination,span.size);
     }
 };
+
+std::mutex mapped_ranges_mutex;
+std::vector<std::weak_ptr<MappedTensorRange>> mapped_ranges;
+std::shared_ptr<MappedTensorRange> map_tensor_range(const MfqStoredRecord& record) {
+    auto range=std::make_shared<MappedTensorRange>(record);
+    std::lock_guard lock(mapped_ranges_mutex);mapped_ranges.push_back(range);
+    return range;
+}
 
 std::filesystem::path stable_path(const std::filesystem::path& path) {
     std::error_code error;
@@ -474,6 +494,16 @@ std::array<std::uint64_t,5> mapped_tensor_read_profile() {
     return result;
 }
 
+std::size_t release_mapped_tensor_pages() {
+    std::lock_guard lock(mapped_ranges_mutex);
+    std::size_t views=0;
+    for(auto item=mapped_ranges.begin();item!=mapped_ranges.end();) {
+        if(const auto range=item->lock()) {views+=range->release_pages();++item;}
+        else item=mapped_ranges.erase(item);
+    }
+    return views;
+}
+
 MappedPrefetchScope::MappedPrefetchScope(bool enabled):previous_(mapped_prefetch_context) {
     mapped_prefetch_context=enabled;
 }
@@ -730,7 +760,7 @@ ModelSource::TensorReader MfqModelSource::mapped_tensor_reader(std::string_view 
     }
     if(found==impl_->records_by_name.end() || impl_->records[found->second].asset)
         throw std::runtime_error("mapped model tensor not found: "+std::string(name));
-    auto range=std::make_shared<MappedTensorRange>(impl_->records[found->second]);
+    auto range=map_tensor_range(impl_->records[found->second]);
     return [range](std::uint64_t offset,std::byte* destination,std::size_t size){range->read(offset,destination,size);};
 }
 
@@ -745,7 +775,7 @@ ModelSource::TensorBatchReader MfqModelSource::mapped_tensor_batch_reader(std::s
     }
     if(found==impl_->records_by_name.end() || impl_->records[found->second].asset)
         throw std::runtime_error("mapped model tensor not found: "+std::string(name));
-    auto range=std::make_shared<MappedTensorRange>(impl_->records[found->second]);
+    auto range=map_tensor_range(impl_->records[found->second]);
     return [range](const std::vector<ReadSpan>& spans){range->read_batch(spans);};
 }
 ModelSource::TensorBatchReader MfqModelSource::tensor_batch_reader(std::string_view name) const {
