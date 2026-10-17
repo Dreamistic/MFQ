@@ -14,6 +14,8 @@ def test_raw_cli_loads_eos_without_changing_tokenized_or_fixed_input_paths(backe
     assert "t0, t1,decode_inputs,stop_ids)" in source
     assert 'option == "--ignore-eos"' in source
     assert "warning: no model EOS token IDs" in source
+    engine = (ROOT / "backends" / backend / "engine/cuda_engine.cpp").read_text()
+    assert "load_model_config_json(*state.language.source, options.config_path)" in engine
 
 
 @pytest.mark.parametrize("backend", ["cuda", "hip"])
