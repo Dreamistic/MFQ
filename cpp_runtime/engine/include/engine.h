@@ -64,6 +64,7 @@ struct EngineInfo {
     std::string model_type;
     MfqModelCapabilities capabilities;
     bool probability = false;
+    std::unordered_set<std::int64_t> stop_token_ids;
 };
 struct EngineStatus {
     std::size_t available = 0;

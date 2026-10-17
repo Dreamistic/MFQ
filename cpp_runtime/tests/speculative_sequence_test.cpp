@@ -546,6 +546,26 @@ void batch_policy() {
 }
 
 int main() try {
+    for (const bool dspark : {false, true}) {
+        Model model;
+        model.speculative_start = -1;
+        Predictor predictor;
+        predictor.legacy = dspark;
+        InferenceRequest request;
+        request.prompt = {1, 1, 1};
+        request.sampling.max_tokens = 64;
+        request.stop_token_ids = {0};
+        InferenceOutput output(request, nullptr, "mtp-raw-eos");
+        auto generation = speculative_sequence(Ops{model, predictor}, request, output, 512, 0, Tensor{}, nullptr);
+        std::vector<int64_t> tokens;
+        while (auto step = generation.next())
+            if (step.value)
+                if (const auto* delta = std::get_if<TokenOutput>(&*step.value))
+                    tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
+        assert((tokens == std::vector<int64_t>{0}));
+        assert(output.result.finish_reason == "stop" && output.result.completion_tokens == 1);
+        assert(model.speculative_start < 0 && model.cache_pos == 3);
+    }
     run(false);
     run(false,true);
     run(false,true,true);

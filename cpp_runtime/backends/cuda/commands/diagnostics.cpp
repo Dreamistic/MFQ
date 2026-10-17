@@ -82,6 +82,7 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     int compare_mma_decode_steps = 1;
     int compare_mma_decode_planned_len = 0;
     bool profile = false;
+    bool ignore_eos = false;
     bool compare_ffn_transfer_phases = false;
     bool compare_router_lookahead = false;
     bool compare_rotary_fusion = false;
@@ -1095,8 +1096,14 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             std::cout << "attention_compare_same_top=" << (same_top.template item<bool>() ? 1 : 0) << "\n";
             return 0;
         }
+        std::unordered_set<int64_t> stop_ids;
+        if (!ignore_eos && tokenizer_model.empty() && decode_inputs.empty()) {
+            stop_ids = mfq::engine::model_stop_token_ids(
+                mfq::cuda::load_model_config_json(*model.source, config_path), model.vocab_size());
+            if (stop_ids.empty()) std::cerr << "warning: no model EOS token IDs; generation is limited only by --gen\n";
+        }
         const auto status=generate_diagnostic_tokens(
-            execution, model, ids, gen, profile, t0, t1,decode_inputs);
+            execution, model, ids, gen, profile, t0, t1,decode_inputs,stop_ids);
         if(!status && !router_lookahead_audit.empty()) {
             if constexpr (std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
                 qwen4_finish_router_lookahead_audit(model,router_lookahead_audit);
@@ -1187,6 +1194,7 @@ void print_diagnostics_help() {
         << "  --compare-router-topk            one load, fixed primary tiers and CPU routes; original/cached/original\n"
         << "  --decode-inputs-file FILE        fixed decode input ids, raw int32, gen-1 entries\n"
         << "  --gen N                         generated tokens\n"
+        << "  --ignore-eos                    fixed-length token diagnostics\n"
         << "  --compare-route-poll            compare route notification polling, 2000/0/2000 us\n"
         << "  --compare-window-flush          compare per-layer / one token / per-layer WDDM submission flush\n"
         << "  --compare-early-no-cpu-ready     compare late / early / late GPU-only CPU completion\n"
@@ -1411,6 +1419,7 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
         else if (option == "--compare-router-topk") result.compare_router_topk = true;
         else if (option == "--decode-inputs-file") result.decode_inputs_file = args.value(option);
         else if (option == "--profile") result.profile = true;
+        else if (option == "--ignore-eos") result.ignore_eos = true;
         else if (option == "--warmup-prefill") {
             result.warmup_prefill = integer<int>(args.value(option), option);
             if (result.warmup_prefill < 0 || result.warmup_prefill > 100)

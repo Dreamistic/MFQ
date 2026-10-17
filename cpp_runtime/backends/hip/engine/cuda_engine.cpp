@@ -157,6 +157,7 @@ struct CudaBackend {
                 caps.full_duplex, caps.mtp, "model-graph+cuda-adapters"};
             auto text = TextProcessor::load(*state.language.source, options.tokenizer_model,
                 info.vocab_size, info.model_type);
+            info.stop_token_ids = model_stop_token_ids(state.language.source->model_config_json(), info.vocab_size);
             return std::pair{std::move(info), std::move(text)};
         });
     }
