@@ -59,12 +59,13 @@ The quality comparison below shows model size against agreement with the
 reference model: lower KL divergence (KLD) and higher Top1 agreement are better.
 
 <p align="center">
-  <img src="./docs/figures/qwen38-flash-next-quality.png" alt="Qwen3.8-Flash-Next: MFQ, Unsloth UD and GSQ-RCO model size versus KLD and Top1 agreement" width="1100">
+  <img src="./docs/figures/qwen38-flash-next-quality.svg" alt="Qwen3.8-Flash-Next: MFQ, Unsloth UD and GSQ-RCO model size versus KLD and Top1 agreement" width="1100">
 </p>
 
 Quality-comparison weight sizes exclude the vision encoder and MTP head;
 GB = 10⁹ bytes. See the [model card](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ)
-for the full comparison and tier selection guide.
+for the full comparison and tier selection guide. The
+[plot data](./docs/figures/data/qwen38-flash-next-quality.json) records all comparison points and their source.
 
 <a id="features"></a>
 

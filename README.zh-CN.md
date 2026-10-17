@@ -56,11 +56,12 @@ OpenAI 和 Anthropic 兼容 API 接入应用与 Agent。
 越高，表示量化后的模型越接近参考模型。
 
 <p align="center">
-  <img src="./docs/figures/qwen38-flash-next-quality.png" alt="Qwen3.8-Flash-Next：MFQ、Unsloth UD 与 GSQ-RCO 的模型大小、KLD 和 Top1 一致率对比" width="1100">
+  <img src="./docs/figures/qwen38-flash-next-quality.zh-CN.svg" alt="Qwen3.8-Flash-Next：MFQ、Unsloth UD 与 GSQ-RCO 的模型大小、KLD 和 Top1 一致率对比" width="1100">
 </p>
 
 质量对比中的权重大小不含视觉编码器与 MTP 层，GB = 10⁹ 字节。
-完整对比与档位选择建议见[模型卡](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ)。
+完整对比与档位选择建议见[模型卡](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ)，
+全部绘图数值与来源见[图表数据](./docs/figures/data/qwen38-flash-next-quality.json)。
 
 <a id="功能特性"></a>
 
