@@ -21,7 +21,7 @@ async function windowsBridge(page: Page) {
             };
             case 'studio_credential_get': return '';
             case 'studio_update_status': return {
-              current_version: '0.3.2', current_release: false, platform_supported: false,
+              current_version: '0.4.0', current_release: false, platform_supported: false,
               automatic_check: false, automatic_download: false, update_available: false,
               releases_page: 'https://github.com/Tylogi/TyloQuant/releases', releases: [], installed_versions: [],
             };
