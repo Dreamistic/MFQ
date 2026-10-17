@@ -83,16 +83,21 @@ int main() {
             {
                 mfq::FileRangeReader batched(path,mode);
                 for(int round=0;round<4;++round) {
-                    std::vector<std::byte> output(96*33,std::byte{0x5a});std::vector<mfq::ReadSpan> spans;
-                    for(std::size_t i=0;i<96;++i)spans.push_back({i*641+std::size_t(round),output.data()+i*33+1,31});
+                    std::vector<std::byte> output(384*33,std::byte{0x5a});std::vector<mfq::ReadSpan> spans;
+                    for(std::size_t i=0;i<384;++i)spans.push_back({i*167+std::size_t(round),output.data()+i*33+1,31});
                     batched.read_batch(spans);
-                    for(std::size_t i=0;i<96;++i) {
+                    for(std::size_t i=0;i<384;++i) {
                         require(output[i*33]==std::byte{0x5a} && output[i*33+32]==std::byte{0x5a},"event reuse changed a destination guard");
-                        require(std::equal(output.begin()+i*33+1,output.begin()+i*33+32,expected.begin()+i*641+round),
+                        require(std::equal(output.begin()+i*33+1,output.begin()+i*33+32,expected.begin()+i*167+round),
                             "event reuse or a batch beyond its event ring changed bytes");
                     }
                 }
                 require(!batched.stats().staging_bytes && !batched.stats().errors,"event reuse leaked request staging");
+#ifdef _WIN32
+                if(mode==mfq::FileReadMode::Direct)
+                    require(batched.stats().staging_peak_bytes<=128*batched.alignment(),
+                        "direct row batches allocated unbounded aligned staging");
+#endif
             }
             auto reader=std::make_shared<mfq::AsyncRangeReader>(path,mode);
             std::vector<std::future<void>> jobs;

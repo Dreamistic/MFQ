@@ -291,14 +291,13 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
         void* storage = nullptr;
         std::byte* destination = nullptr;
         std::size_t prefix = 0, bytes = 0, allocation = 0;
-        bool submitted = false, finished = false, borrowed_event=false;
+        bool submitted = false, finished = false;
         explicit Request(const Impl& value) : owner(value) {}
         ~Request() {
             if (submitted && !finished) {
                 DWORD ignored = 0;
                 GetOverlappedResult(owner.handle, &native, &ignored, TRUE);
             }
-            if (native.hEvent && !borrowed_event) CloseHandle(native.hEvent);
             if (storage) {
                 _aligned_free(storage);
                 owner.staging.fetch_sub(allocation, std::memory_order_relaxed);
@@ -307,56 +306,61 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
     };
     const auto started = std::chrono::steady_clock::now();
     std::vector<std::unique_ptr<Request>> requests;
+    requests.reserve(events.handles.size());
     try {
         const auto alignment = impl_->alignment;
         const auto limit = std::size_t(std::numeric_limits<DWORD>::max()) / alignment * alignment;
-        for (const auto& span : spans) {
-            std::size_t copied = 0;
-            while (copied < span.size) {
-                const auto offset = span.offset + copied;
+        std::size_t span_index = 0, span_offset = 0;
+        while (span_index < spans.size()) {
+            // Large PLE gathers can contain thousands of row ranges. Bound
+            // aligned staging and outstanding IRPs, reusing the same events
+            // after each fully drained batch.
+            while (requests.size() < events.handles.size() && span_index < spans.size()) {
+                const auto& span = spans[span_index];
+                if (span_offset == span.size) { ++span_index; span_offset = 0; continue; }
+                const auto offset = span.offset + span_offset;
                 const auto base = offset / alignment * alignment;
                 auto request = std::make_unique<Request>(*impl_);
                 request->prefix = static_cast<std::size_t>(offset - base);
-                request->bytes = std::min(span.size - copied, limit - request->prefix);
+                request->bytes = std::min(span.size - span_offset, limit - request->prefix);
                 const auto required = request->prefix + request->bytes;
                 request->allocation = required + (alignment - required % alignment) % alignment;
-                request->destination = span.destination + copied;
+                request->destination = span.destination + span_offset;
                 request->storage = _aligned_malloc(request->allocation, std::max(alignment, sizeof(void*)));
                 if (!request->storage) throw std::bad_alloc();
                 impl_->acquire(request->allocation);
                 request->native.Offset = static_cast<DWORD>(base);
                 request->native.OffsetHigh = static_cast<DWORD>(base >> 32);
-                request->borrowed_event=requests.size()<events.handles.size();
-                request->native.hEvent = request->borrowed_event?events.at(requests.size()):CreateEventW(nullptr, TRUE, FALSE, nullptr);
-                if (!request->native.hEvent)
-                    throw std::system_error(GetLastError(), std::system_category(), "create batch-read event");
-                copied += request->bytes;
+                request->native.hEvent = events.at(requests.size());
+                span_offset += request->bytes;
                 requests.push_back(std::move(request));
             }
-        }
-        // Keep every IO request outstanding before waiting for completion.
-        for (auto& request : requests) {
-            impl_->calls.fetch_add(1, std::memory_order_relaxed);
-            const auto ok = ReadFile(impl_->handle, request->storage,
-                static_cast<DWORD>(request->allocation), nullptr, &request->native);
-            const auto error = ok ? ERROR_SUCCESS : GetLastError();
-            if (!ok && error != ERROR_IO_PENDING)
-                throw std::system_error(error, std::system_category(), "submit batch read");
-            request->submitted = true;
-        }
-        for (auto& request : requests) {
-            DWORD actual = 0;
-            const auto ok = GetOverlappedResult(impl_->handle, &request->native, &actual, TRUE);
-            request->finished = true;
-            if (!ok) throw std::system_error(GetLastError(), std::system_category(), "complete batch read");
-            impl_->physical.fetch_add(actual, std::memory_order_relaxed);
-            if (actual < request->prefix + request->bytes)
-                throw std::runtime_error("model file truncated during batch read");
-        }
-        for (auto& request : requests) {
-            std::memcpy(request->destination,
-                static_cast<std::byte*>(request->storage) + request->prefix, request->bytes);
-            impl_->logical.fetch_add(request->bytes, std::memory_order_relaxed);
+            // Keep every IO request in this bounded batch outstanding before
+            // waiting for completion. Ordinary expert field batches fit here.
+            for (auto& request : requests) {
+                impl_->calls.fetch_add(1, std::memory_order_relaxed);
+                const auto ok = ReadFile(impl_->handle, request->storage,
+                    static_cast<DWORD>(request->allocation), nullptr, &request->native);
+                const auto error = ok ? ERROR_SUCCESS : GetLastError();
+                if (!ok && error != ERROR_IO_PENDING)
+                    throw std::system_error(error, std::system_category(), "submit batch read");
+                request->submitted = true;
+            }
+            for (auto& request : requests) {
+                DWORD actual = 0;
+                const auto ok = GetOverlappedResult(impl_->handle, &request->native, &actual, TRUE);
+                request->finished = true;
+                if (!ok) throw std::system_error(GetLastError(), std::system_category(), "complete batch read");
+                impl_->physical.fetch_add(actual, std::memory_order_relaxed);
+                if (actual < request->prefix + request->bytes)
+                    throw std::runtime_error("model file truncated during batch read");
+            }
+            for (auto& request : requests) {
+                std::memcpy(request->destination,
+                    static_cast<std::byte*>(request->storage) + request->prefix, request->bytes);
+                impl_->logical.fetch_add(request->bytes, std::memory_order_relaxed);
+            }
+            requests.clear();
         }
     } catch (...) {
         impl_->errors.fetch_add(1, std::memory_order_relaxed);
