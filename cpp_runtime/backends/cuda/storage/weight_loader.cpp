@@ -67,14 +67,23 @@ MfeWeight load_mfe_gpu(
         try {
             // Streaming workers read independent experts concurrently. A
             // shared buffered FILE serializes their seeks across all fields.
-            if(!execution.config.moe_preload_all) {
+            const bool direct=mfq.file_read_stats().mode==mfq::FileReadMode::Direct;
+            bool mapped=false;
+            if(!execution.config.moe_preload_all && !direct) {
                 reader=mfq.mapped_tensor_reader(name);
                 batch_reader=mfq.mapped_tensor_batch_reader(name);
-                static std::atomic_bool reported{false};
-                if(reader && !reported.exchange(true))
-                    std::fprintf(stderr,"moe_ssd_source_dispatch mapped=1 parallel_reads=1 batch_fields=%d\n",int(bool(batch_reader)));
+                mapped=bool(reader);
+            }else if(!execution.config.moe_preload_all && direct) {
+                batch_reader=mfq.tensor_batch_reader(name);
+                if(batch_reader)reader=[batch=batch_reader](uint64_t offset,std::byte* out,std::size_t count) {
+                    batch({{offset,out,count}});
+                };
             }
             if(!reader)reader=mfq.tensor_reader(name);
+            static std::atomic_bool reported{false};
+            if(!execution.config.moe_preload_all && reader && !reported.exchange(true))
+                std::fprintf(stderr,"moe_ssd_source_dispatch mapped=%d parallel_reads=%d batch_fields=%d direct=%d\n",
+                    int(mapped),int(mapped || mfq.supports_parallel_tensor_reads()),int(bool(batch_reader)),int(direct));
         } catch (const mfq::TensorReaderUnsupported&) {
             // Sources without retained readers keep the existing CPU loader.
         }

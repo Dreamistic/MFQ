@@ -15,8 +15,8 @@ from mfq.quantize.nint_quant import quantize
 from tests.mixed_family_fixtures import make_flat_family
 
 
-@pytest.mark.parametrize("pcie_fraction", [1.0, 0.5])
-def test_ssd_expert_streaming(tmp_path, pcie_fraction):
+@pytest.mark.parametrize("pcie_fraction,read_mode", [(1.0, "buffered"), (0.5, "buffered"), (1.0, "direct")])
+def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode):
     executable = os.environ.get("MFQ_CUDA_SSD_EXPERT_TEST")
     if not executable:
         pytest.skip("MFQ_CUDA_SSD_EXPERT_TEST required")
@@ -40,7 +40,7 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction):
             pools.append(MfePool(ids, values))
         save(tmp_path / f"mixed-{projection}.mfq", FileHeader(version=2, model_arch="qwen4_exp"),
              {"linear.weight": MfeTensor((128, 128, 128), tuple(pools))})
-    env = dict(os.environ, MFQ_MOE_SSD_EXPERTS="1", MFQ_MOE_NVQ_DENSE="0", MFQ_MOE_PRELOAD_ALL="0", MFQ_MOE_ASSERT_RESIDENT="0",
+    env = dict(os.environ, MFQ_MODEL_FILE_IO=read_mode, MFQ_MOE_SSD_EXPERTS="1", MFQ_MOE_NVQ_DENSE="0", MFQ_MOE_PRELOAD_ALL="0", MFQ_MOE_ASSERT_RESIDENT="0",
         MFQ_MOE_TRANSFER_CACHE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_PREFILL_LAYER="0",
         MFQ_MOE_PREFILL_GROUPS="1", MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER="1", MFQ_MOE_RAM_PCIE_FRACTION="1",
         MFQ_MOE_PREFILL_GROUP_SIZE="64" if pcie_fraction < 1 else "16",
@@ -52,7 +52,8 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction):
 
 
 @pytest.mark.parametrize("wide,grouped", [(False, True), (True, True), (True, False)])
-def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped):
+@pytest.mark.parametrize("read_mode", ["buffered", "direct"])
+def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode):
     from mfq.server.runtime.client import StdioRuntimeClient
     from tests.test_cuda_flash_next_runtime import mtp_fixture, write_qwen_fixture
     from tests.test_native_nint_ple import _worker_tokenizer
@@ -87,7 +88,8 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped):
     tokenizer = _worker_tokenizer(tmp_path)
 
     async def run(ssd):
-        env = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_SSD_EXPERTS="1",
+        env = dict(os.environ, MFQ_MODEL_FILE_IO=read_mode, MFQ_PLE_FILE_MAP="0", MFQ_PROFILE_SSD_EXPERTS="1",
+            MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_SSD_EXPERTS="1",
             MFQ_MOE_PRELOAD_ALL=str(int(not ssd)), MFQ_MOE_ASSERT_RESIDENT=str(int(not ssd)), MFQ_MOE_NVQ_DENSE="0",
             MFQ_MOE_HOST_CACHE_BYTES=str((1 << 19 if wide else 4096) if ssd else 1 << 28), MFQ_MOE_RAM_PCIE="1", MFQ_MOE_RAM_PCIE_FRACTION="1",
             MFQ_MOE_RESIDENCY_WARM="1", MFQ_MOE_RESIDENCY_PROJECTION_HEAT="1", MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER="1",
@@ -124,6 +126,7 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped):
                 status = await client.status()
                 if ssd:
                     assert status["ssd_expert_bytes_read"] > 0 and status["ram_expert_cache_evictions"] > 0
+                    assert bool(status.get("ssd_mapped_read_calls", 0)) == (read_mode == "buffered")
                 text = (tmp_path / f"worker-{ssd}.log").read_text(errors="replace")
                 captures = [line for line in text.splitlines() if "runtime_qwen4_graph_capture role=" in line]
                 assert captures
@@ -131,6 +134,8 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped):
                 assert "runtime_mtp_depth_plan" not in text, "requests rebuilt startup graphs"
                 if ssd and grouped:
                     assert "moe_ssd_prefill_dispatch path=grouped" in text
+                if ssd:
+                    assert f"moe_ssd_source_dispatch mapped={int(read_mode == 'buffered')} " in text
                 return outputs
             finally:
                 with suppress(Exception):
