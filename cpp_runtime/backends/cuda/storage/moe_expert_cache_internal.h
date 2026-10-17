@@ -492,6 +492,7 @@ public:
     void print_stats(std::ostream & stream) const {
         const auto host=host_experts_->stats();
         const auto kv_spec=kv_expert_loan_?kv_expert_loan_->speculative_stats():mfq::cuda::KvExpertLoan::SpeculativeStats{};
+        const auto kv_reuse=kv_expert_loan_?kv_expert_loan_->reuse_stats():mfq::cuda::KvExpertLoan::ReuseStats{};
         stream << "moe_cache_stats"
                << " budget_bytes=" << budget_bytes_
                << " allocated_bytes=" << allocated_bytes_
@@ -576,6 +577,11 @@ public:
                << " pipeline_empty_transfer_serves=" << stats_.pipeline_empty_transfer_serves
                << " kv_expert_loan_hit_bytes=" << (kv_expert_loan_?kv_expert_loan_->hits():0)
                << " kv_expert_loan_retired_bytes=" << (kv_expert_loan_?kv_expert_loan_->retired_bytes():0)
+               << " kv_expert_reuse_promotions=" << kv_reuse.promotions
+               << " kv_expert_reuse_enabled=" << kv_reuse.enabled
+               << " kv_expert_reuse_hits=" << kv_reuse.protected_hits
+               << " kv_expert_probation_evictions=" << kv_reuse.probation_evictions
+               << " kv_expert_protected_pages=" << kv_reuse.protected_pages
                << " pipeline_dma_graph_launches=" << stats_.pipeline_dma_graph_launches
                << " pipeline_dma_graph_fallbacks=" << stats_.pipeline_dma_graph_fallbacks
                << " pipeline_ram_registered_bytes=" << pipeline_ram_registered_bytes_
@@ -774,6 +780,7 @@ public:
 
     std::vector<std::pair<std::string, double>> memory_metrics() const {
         const auto host = host_experts_->stats();
+        const auto kv_reuse=kv_expert_loan_?kv_expert_loan_->reuse_stats():mfq::cuda::KvExpertLoan::ReuseStats{};
         const auto residency=moe_residency_?moe_residency_->stats():MoeResidencyManager::Stats{};
         const auto [pinned_bytes,pinned_used]=pinned_expert_memory();
         const auto cached=host.managed_bytes+host.transient_bytes;
@@ -797,6 +804,11 @@ public:
             {"ssd_expert_bytes_read",double(disk_read_bytes)},
             {"ssd_expert_read_count",double(disk_reads)},
             {"ssd_direct_field_reads",double(direct_reads)},
+            {"ssd_reuse_promotions",double(kv_reuse.promotions)},
+            {"ssd_reuse_policy_enabled",kv_reuse.enabled?1.0:0.0},
+            {"ssd_reuse_hits",double(kv_reuse.protected_hits)},
+            {"ssd_probation_evictions",double(kv_reuse.probation_evictions)},
+            {"ssd_protected_cache_bytes",double(kv_reuse.protected_pages*mfq::cuda::KvExpertLoan::page)},
             {"ssd_decode_read_wait_ms",double(stats_.pipeline_window_ssd_read_ns)/1e6},
             {"ssd_expert_read_wait_ms",double(stats_.pipeline_ssd_read_ns)/1e6},
             {"ssd_expert_encoded_ms",double(disk_times[0])/1e6},

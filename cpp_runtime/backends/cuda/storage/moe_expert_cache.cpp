@@ -542,6 +542,7 @@ void MoeExpertCache::initialize_ssd_residency() {
     ssd_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
     ssd_background_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
     ssd_experts_=true;
+    if(kv_expert_loan_)kv_expert_loan_->set_reuse_priority(true);
     const auto host=host_experts_->stats();
     std::cerr<<"moe_ssd_experts_ready gpu_bytes="<<allocated_bytes_<<" ram_budget_bytes="<<host.budget_bytes
         <<" ram_pinned_bytes="<<pipeline_ram_registered_bytes_
@@ -2255,6 +2256,7 @@ void MoeExpertCache::release_direct_transfer_cache() {
 void set_moe_kv_expert_loan(const std::shared_ptr<MoeExpertCache>& cache,std::shared_ptr<mfq::cuda::KvExpertLoan> loan) {
     if(cache) {
         if(cache->kv_expert_loan_!=loan)cache->release_direct_transfer_cache();
+        if(loan && cache->ssd_experts())loan->set_reuse_priority(true);
         cache->kv_expert_loan_=std::move(loan);
     }
 }

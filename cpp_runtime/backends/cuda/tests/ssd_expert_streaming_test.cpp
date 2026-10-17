@@ -75,6 +75,56 @@ void check_pinned_arena() {
         check(std::memcmp(result.data_ptr(),storage.data_ptr(),1024)==0,"single native DMA copy changed the payload");
     }
 }
+void check_reused_expert_pages() {
+    using mfq::cuda::KvExpertLoan;
+    for(bool enabled:{false,true}) {
+        KvExpertLoan loan;loan.set_reuse_priority(enabled);
+        auto memory=tb::empty({int64_t(8*KvExpertLoan::page)},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+        loan.add(memory,8,KvExpertLoan::page,true);
+        const auto advance=[&] {MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));loan.next_packet();};
+        const auto put=[&](int expert,int source=17) {
+            bool hit=false;
+            check(loan.pin_projection(source,expert,{int64_t(KvExpertLoan::page)},mfq_current_cuda_stream(),hit,
+                [&](void* dst,const auto&) {MFQ_CUDA_CHECK(cudaMemsetAsync(dst,expert,KvExpertLoan::page,mfq_current_cuda_stream()));}),
+                "reuse cache could not allocate an unprotected page");
+        };
+        const auto hit=[&](int expert) {
+            std::array<std::size_t,8> offsets{};std::size_t bytes=0;
+            check(loan.pin_existing_projection(17,expert,{int64_t(KvExpertLoan::page)},offsets,bytes),
+                "reuse fixture lost a hot projection");
+        };
+        put(1);put(2);advance();hit(1);hit(2);advance();
+        for(int expert=10;expert<42;++expert){put(expert,99);advance();}
+        check(bool(loan.find_for_exchange({17,1,0},KvExpertLoan::page))==enabled,
+            "a one-use source scan displaced a protected recurring expert");
+        if(!enabled)continue;
+        auto stats=loan.reuse_stats();
+        check(stats.promotions==2 && stats.protected_pages==2 && stats.probation_evictions>0,
+            "reuse cache did not distinguish repeat hits from one-use insertions");
+        // Rejected speculative hits must not promote a cold expert.
+        put(3);put(4);advance();loan.begin_speculative(2);
+        const std::array<int32_t,2> ids{3,4};loan.next_packet({17,18,19},ids.data(),2,1,64);
+        hit(3);hit(4);loan.commit_speculative(1);advance();
+        loan.begin_speculative(2);
+        const std::array<int32_t,2> cancelled{4,3};loan.next_packet({17,18,19},cancelled.data(),2,1,64);
+        hit(4);hit(3);loan.discard_speculative();advance();
+        for(int expert=42;expert<74;++expert){put(expert,99);advance();}
+        check(loan.find_for_exchange({17,3,0},KvExpertLoan::page) && !loan.find_for_exchange({17,4,0},KvExpertLoan::page),
+            "rejected draft routes gained cache protection");
+        for(int expert=5;expert<17;++expert){put(expert);advance();hit(expert);advance();}
+        check(loan.reuse_stats().protected_pages<=6,"reuse protection consumed the probationary space");
+        loan.retire_expert(17,16,1);advance();
+        check(!loan.find_for_exchange({17,16,0},KvExpertLoan::page),"retired reused expert survived its reader fence");
+        loan.ensure(8);
+        check(!loan.bytes() && !loan.reuse_stats().protected_pages,"KV growth retained protected expert pages");
+        const auto region=loan.add(memory,8,KvExpertLoan::page,true,1,true,true);
+        put(1);advance();hit(1);advance();
+        loan.set_reuse_priority(false);loan.set_reuse_priority(true);hit(1);advance();
+        loan.remove(region);
+        check(!loan.bytes() && !loan.reuse_stats().protected_pages,"removed workspace retained reused expert links");
+    }
+    std::cout<<"SSD reused expert pages: scan/eviction/speculation/retirement/KV growth PASS\n";
+}
 std::shared_ptr<MoeQuantRangeSource> source(const std::filesystem::path& path,const std::string& name="linear.weight") {
     auto model=mfq::open_model_source(path.string());auto read=model->tensor_reader(name);
     auto store=std::make_shared<mfq::MfeQuantExpertStore>(require_tensor(*model,name).nbytes,
@@ -217,6 +267,7 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
 int main(int argc,char** argv)try {
     check_packed_metadata();
     check_pinned_arena();
+    check_reused_expert_pages();
     check(argc==2 || argc==3,"expected SSD expert fixture directory or model and expert tensor prefix");
     const auto stream=mfq_current_cuda_stream();
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
