@@ -163,6 +163,24 @@ export interface RuntimeListener {
   anthropic_port?: number | null;
 }
 
+export interface ServingStatistics {
+  scope: 'session' | 'alltime';
+  started_at: number;
+  totals: {
+    completed_requests: number; prompt_tokens: number; prefill_tokens: number;
+    completion_tokens: number; cached_tokens: number;
+    prefill_tps: number | null; decode_tps: number | null;
+    ttft_ms: number | null; cache_hit_rate: number | null;
+  };
+  activity: {
+    instance_id: string; model: string; state: string; active_requests: number;
+    queued_requests: number; sample_age_seconds: number | null;
+    requests: { id: string; phase: string; processed_tokens: number;
+      generated_tokens: number; prefill_tps: number; decode_tps: number;
+      elapsed_seconds: number; updated_at: number }[];
+  }[];
+}
+
 export interface RuntimeResources {
   sampled_at: number;
   interval_seconds: number | null;

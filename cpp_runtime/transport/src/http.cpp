@@ -885,7 +885,14 @@ int run_mfq_http_transport(
             auto completion = std::make_shared<CompletionStream>(scheduler, work, id);
 
             if (!work.stream) {
-                while (completion->next()) {}
+                auto next_progress = std::chrono::steady_clock::time_point{};
+                while (completion->next()) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= next_progress) {
+                        active_request->progress(id, completion->progress());
+                        next_progress = now + std::chrono::milliseconds(250);
+                    }
+                }
                 auto result = std::move(completion->result);
                 auto metrics = completion->metrics;
                 const RequestMetricValues metric_values =
@@ -917,7 +924,13 @@ int run_mfq_http_transport(
                         return false;
                     }
                     try {
+                        auto next_progress = std::chrono::steady_clock::time_point{};
                         while (auto diffs = completion->next()) {
+                            const auto now = std::chrono::steady_clock::now();
+                            if (now >= next_progress) {
+                                active_request->progress(id, completion->progress());
+                                next_progress = now + std::chrono::milliseconds(250);
+                            }
                             for (const auto& diff : *diffs) {
                                 json delta = chat_diff_json(diff);
                                 if (delta.empty()) continue;

@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { modelsApi } from '../../shared/api/resources/models';
+import { ApiError } from '../../shared/api/client';
 import type { ModelArtifact, ModelDirectoryList } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
@@ -146,10 +147,13 @@ export function useModelCatalog() {
         observedActiveLoadJobIds.current.add(job.id);
         continue;
       }
+      if (job.status === 'failed' && !job.error?.message) continue;
       const wasActive = observedActiveLoadJobIds.current.delete(job.id);
-      if (wasActive && job.status === 'failed' && job.error?.message && !reportedFailedJobIds.current.has(job.id)) {
+      if (wasActive && (job.status === 'failed' || job.status === 'interrupted') && !reportedFailedJobIds.current.has(job.id)) {
         reportedFailedJobIds.current.add(job.id);
-        toast.error(`${job.error.code}: ${job.error.message}`);
+        toast.error(job.status === 'interrupted'
+          ? tr('模型加载已中断，请重新加载。', 'Model loading was interrupted. Please load the model again.')
+          : errorMessage(new ApiError(400, { error: job.error! }), tr));
       }
     }
   }, [jobs]);

@@ -69,7 +69,7 @@ it.each(['/', '/runtime', '/chat', '/settings'])('shows sign-in instead of prote
   expect(screen.queryByText(/content$/)).not.toBeInTheDocument();
   expect(screen.queryByText('Service unavailable')).not.toBeInTheDocument();
   expect(screen.queryByText('invalid API credential')).not.toBeInTheDocument();
-  expect(document.title).toBe('Sign in · MFQ Studio');
+  await waitFor(() => expect(document.title).toBe('Sign in · MFQ Studio'));
 });
 
 it('skips sign-in when authentication is disabled', async () => {
