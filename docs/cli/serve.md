@@ -125,14 +125,18 @@ authentication is enabled.
 
 ## Web UI
 
-When Web UI assets are available, open the listener root, such as
-`http://127.0.0.1:8090/`. Asset selection follows this order:
+Web UI is enabled unless you explicitly pass `--no-web-ui`. Open the listener
+root, such as `http://127.0.0.1:8090/`. Asset selection follows this order:
 
 1. `--no-web-ui` disables the Web UI.
 2. `--web-root` uses the specified prebuilt directory.
 3. `MFQ_SERVER_WEB_ROOT` supplies a prebuilt directory when the CLI option is
    absent.
-4. Otherwise, MFQ looks for `MFQStudio` in the source checkout.
+4. Packaged Studio servers use their bundled `web-ui` assets without Node.js/npm.
+5. Otherwise, MFQ looks for `MFQStudio` in the source checkout.
+
+Studio starts both the API and Web UI on the same listener; it does not open a
+browser automatically. The desktop client and browsers share that server.
 
 A prebuilt directory must contain `index.html`. MFQ checks explicit and
 environment-provided directories before starting the backend or loading a
@@ -145,8 +149,9 @@ In automatic source mode, MFQ rebuilds the UI when the sources are newer than
 2. `npm run build`
 
 This needs Node.js/npm, write access to the checkout, and network access when
-npm must download packages. Without npm, the API still starts. A failed build
-or missing `dist/index.html` stops startup before model loading.
+npm must download packages. Missing assets, unavailable npm when a build is
+needed, or a failed build stop startup before model loading, with instructions
+to supply `--web-root` or explicitly select `--no-web-ui` for an API-only server.
 
 Explicit Web UI modes:
 

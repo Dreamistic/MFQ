@@ -7,6 +7,7 @@ import { useSettings } from '../features/settings/SettingsProvider';
 import { ToastContainer } from '../shared/ui/Toast';
 import { FailurePage } from './FailurePage';
 import { LoadingPage } from './LoadingPage';
+import { LoginPage } from './LoginPage';
 import { StudioSidebar } from './StudioSidebar';
 import { RuntimeAlerts } from './RuntimeAlerts';
 import { resolveStudioLocation, isStudioPath } from '../navigation';
@@ -31,7 +32,7 @@ class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: str
 export function StudioShell() {
   const location = useLocation();
   const { tr } = useSettings();
-  const { connectionError, refreshError, jobStreamErrors, ready, reloadService, connectionRevision } = useRuntime();
+  const { connectionError, refreshError, jobStreamErrors, ready, reloadService, connectionRevision, authenticationRequired } = useRuntime();
   const currentLocation = resolveStudioLocation(location.pathname);
   const view = isStudioPath(location.pathname) ? currentLocation.view : 'not-found';
   const pageAvailable = ready || view === 'not-found' ||
@@ -43,8 +44,10 @@ export function StudioShell() {
   useEffect(() => {
     const title = location.pathname === '/'
       ? 'Overview' : location.pathname.slice(1).replaceAll('-', ' ');
-    document.title = `${title} · MFQ Studio`;
-  }, [location.pathname]);
+    document.title = `${authenticationRequired ? tr('登录', 'Sign in') : title} · MFQ Studio`;
+  }, [location.pathname, authenticationRequired, tr]);
+
+  if (authenticationRequired) return <LoginPage />;
 
   return (
     <TooltipPrimitive.Provider delayDuration={300}>

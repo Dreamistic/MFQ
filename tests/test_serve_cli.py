@@ -453,6 +453,77 @@ def test_configured_web_root_must_contain_an_index(tmp_path: Path) -> None:
     assert _prepare_web_root(web_root, disabled=False) == web_root
 
 
+@pytest.mark.parametrize("executable", ["mfq-cli", "mfq-cli.exe"])
+def test_packaged_server_serves_bundled_web_ui_without_node(
+    tmp_path: Path, monkeypatch, executable: str
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from mfq.server.api import create_app
+
+    resources = tmp_path / "Application Resources"
+    web_root = resources / "web-ui"
+    web_root.mkdir(parents=True)
+    index = '<!doctype html><title>MFQ Studio</title><div id="root"></div>'
+    (web_root / "index.html").write_text(index, encoding="utf-8")
+    monkeypatch.delenv("MFQ_SERVER_WEB_ROOT", raising=False)
+    monkeypatch.setattr("mfq.commands.serve.sys.frozen", True, raising=False)
+    monkeypatch.setattr("mfq.commands.serve.sys.executable", str(resources / "mfq-cli" / executable))
+    monkeypatch.setattr("mfq.commands.serve.shutil.which",
+        lambda _: (_ for _ in ()).throw(AssertionError("must not look for npm")))
+
+    assert _prepare_web_root(None, disabled=False) == web_root
+    assert _prepare_web_root(None, disabled=True) is None
+    with TestClient(create_app(web_root=_prepare_web_root(None, disabled=False))) as client:
+        assert client.get("/").text == index
+        assert client.get("/models", headers={"Accept": "text/html"}).text == index
+        assert client.get("/api/v1/auth/policy").json() == {"enabled": False, "has_key": False}
+
+
+def test_bundled_web_root_must_contain_an_index(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "web-ui").mkdir()
+    monkeypatch.delenv("MFQ_SERVER_WEB_ROOT", raising=False)
+    monkeypatch.setattr("mfq.commands.serve.sys.frozen", True, raising=False)
+    monkeypatch.setattr("mfq.commands.serve.sys.executable", str(tmp_path / "mfq-cli" / "mfq-cli"))
+
+    with pytest.raises(FileNotFoundError, match="bundled Web UI entry point"):
+        _prepare_web_root(None, disabled=False)
+
+
+def test_headless_package_requires_explicit_no_web_ui(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("MFQ_SERVER_WEB_ROOT", raising=False)
+    monkeypatch.setattr("mfq.commands.serve.sys.frozen", True, raising=False)
+    monkeypatch.setattr("mfq.commands.serve.sys.executable", str(tmp_path / "mfq-cli" / "mfq-cli"))
+    monkeypatch.setattr("mfq.commands.serve.__file__", str(tmp_path / "mfq" / "commands" / "serve.py"))
+
+    with pytest.raises(FileNotFoundError, match="explicitly use --no-web-ui"):
+        _prepare_web_root(None, disabled=False)
+    assert _prepare_web_root(None, disabled=True) is None
+
+
+def test_missing_npm_does_not_silently_disable_web_ui(tmp_path: Path, monkeypatch) -> None:
+    web = tmp_path / "MFQStudio"
+    web.mkdir()
+    (web / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("MFQ_SERVER_WEB_ROOT", raising=False)
+    monkeypatch.setattr("mfq.commands.serve.__file__", str(tmp_path / "mfq" / "commands" / "serve.py"))
+    monkeypatch.setattr("mfq.commands.serve.shutil.which", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="npm is unavailable"):
+        _prepare_web_root(None, disabled=False)
+    assert _prepare_web_root(None, disabled=True) is None
+
+
+def test_prebuilt_web_ui_does_not_require_package_metadata(tmp_path: Path, monkeypatch) -> None:
+    web = tmp_path / "MFQStudio" / "dist"
+    web.mkdir(parents=True)
+    (web / "index.html").write_text("ready", encoding="utf-8")
+    monkeypatch.delenv("MFQ_SERVER_WEB_ROOT", raising=False)
+    monkeypatch.setattr("mfq.commands.serve.__file__", str(tmp_path / "mfq" / "commands" / "serve.py"))
+
+    assert _prepare_web_root(None, disabled=False) == web
+
+
 def test_environment_web_root_must_exist(tmp_path: Path, monkeypatch) -> None:
     missing = tmp_path / "missing-web"
     monkeypatch.setenv("MFQ_SERVER_WEB_ROOT", str(missing))
