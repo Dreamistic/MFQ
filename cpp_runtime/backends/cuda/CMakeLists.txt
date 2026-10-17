@@ -713,6 +713,9 @@ if(BUILD_TESTING)
     add_executable(mfq-cuda-runtime-state-test
         ${MFQ_CUDA_ROOT}/tests/cuda_runtime_state_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-cuda-runtime-state-test)
+    if(MSVC)
+        target_compile_options(mfq-cuda-runtime-state-test PRIVATE /EHsc)
+    endif()
     target_compile_definitions(mfq-cuda-runtime-state-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-cuda-runtime-state-test PRIVATE mfq-cuda-runtime)
