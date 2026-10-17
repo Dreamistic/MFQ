@@ -15,21 +15,25 @@ from mfq.quantize.nint_quant import quantize
 from tests.mixed_family_fixtures import make_flat_family
 
 
-def test_ssd_expert_streaming(tmp_path):
+@pytest.mark.parametrize("pcie_fraction", [1.0, 0.5])
+def test_ssd_expert_streaming(tmp_path, pcie_fraction):
     executable = os.environ.get("MFQ_CUDA_SSD_EXPERT_TEST")
     if not executable:
         pytest.skip("MFQ_CUDA_SSD_EXPERT_TEST required")
     rng = np.random.default_rng(2038)
     for family in ("nint", "nvq2j", "nvq3j", "nvq2j-l", "nvq2j-xl", "nvq3j-l"):
         for projection in range(4 if family == "nint" else 3):
-            output = 192 if projection == 3 else 96
+            width = 128 if family == "nvq2j-xl" else 96
+            output = 192 if projection == 3 else width
             values = (quantize(rng.normal(0, .03, (64 * output, 96)).astype(np.float32), NintSpec(4, 24, 6))
-                      if family == "nint" else make_flat_family(family.upper(), rows=64 * output, neuron_len=96, seed=2038+projection))
+                      if family == "nint" else make_flat_family(family.upper(), rows=64 * output, neuron_len=width, seed=2038+projection))
             save(tmp_path / f"{family}-{projection}.mfq", FileHeader(version=2, model_arch="qwen4_exp"),
-                 {"linear.weight": MfeTensor((64, output, 96), (MfePool(np.arange(64, dtype=np.int32), values),))})
+                 {"linear.weight": MfeTensor((64, output, width), (MfePool(np.arange(64, dtype=np.int32), values),))})
     env = dict(os.environ, MFQ_MOE_SSD_EXPERTS="1", MFQ_MOE_NVQ_DENSE="0", MFQ_MOE_PRELOAD_ALL="0", MFQ_MOE_ASSERT_RESIDENT="0",
         MFQ_MOE_TRANSFER_CACHE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_PREFILL_LAYER="0",
         MFQ_MOE_PREFILL_GROUPS="1", MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER="1", MFQ_MOE_RAM_PCIE_FRACTION="1",
+        MFQ_MOE_PREFILL_GROUP_SIZE="64" if pcie_fraction < 1 else "16",
+        MFQ_SSD_EXPERT_TEST_PCIE_FRACTION=str(pcie_fraction),
         MFQ_CUDA_WORKSPACE_RESERVE_GIB="0.01", CUDA_MODULE_LOADING="LAZY")
     result = subprocess.run([executable, str(tmp_path)], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr

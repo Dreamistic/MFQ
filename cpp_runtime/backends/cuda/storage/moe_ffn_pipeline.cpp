@@ -330,7 +330,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
 
         // Two compact expert groups keep the copy engine ahead of arithmetic.
     // The group-local route space avoids a full-layer transfer/output workspace.
-    static constexpr int prefill_group_capacity=16;
+    static constexpr int prefill_group_capacity=96;
     struct PrefillBuffer {
         std::array<MixedMoeRuntime,3> projections;
         tb::Tensor maps;
@@ -347,20 +347,20 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     std::unique_ptr<PrefillStream> prefill_stream_;
 
     static int64_t prefill_align(int64_t bytes) {return (bytes+255)&~int64_t(255);}
-    static int64_t prefill_cohort_bytes(const MoeCachedCohort& cohort) {
-        const int slots=2*std::min(prefill_group_capacity,cohort.cpu->local_experts);
+    static int64_t prefill_cohort_bytes(const MoeCachedCohort& cohort,int capacity) {
+        const int slots=2*std::min(capacity,cohort.cpu->local_experts);
         int64_t bytes=0;
         for(const auto size:cohort.bytes_per_expert)bytes+=prefill_align(slots*size);
         return bytes;
     }
-    MoeGpuArena& prefill_stage(int projection,MoeCachedCohort& cohort,int64_t& offset) {
-        const auto key="prefill16:"+std::to_string(sources_[projection]->id_)+":"+std::to_string(offset);
+    MoeGpuArena& prefill_stage(int projection,MoeCachedCohort& cohort,int64_t& offset,int capacity) {
+        const auto key="prefill:"+std::to_string(sources_[projection]->id_)+":"+std::to_string(offset);
         auto& arena=cache_->pipeline_stages_[key];
-        if(arena) {offset+=prefill_cohort_bytes(cohort);return *arena;}
+        if(arena) {offset+=prefill_cohort_bytes(cohort,capacity);return *arena;}
         auto prepared=std::make_unique<MoeGpuArena>();
         prepared->signature=key;prepared->slot_bytes=cohort.arena->slot_bytes;
         prepared->layouts=cohort.arena->layouts;
-        prepared->slots=2*std::min(prefill_group_capacity,cohort.cpu->local_experts);
+        prepared->slots=2*std::min(capacity,cohort.cpu->local_experts);
         for(std::size_t f=0;f<prepared->layouts.size();++f) {
             const auto& layout=prepared->layouts[f];
             auto shape=layout.slot_shape;shape[0]*=prepared->slots;
@@ -377,21 +377,50 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     void initialize_prefill_stream(CudaExecutionContext& execution,const tb::Tensor& ids) {
         if(prefill_stream_)return;
         auto prepared=std::make_unique<PrefillStream>();
-        prepared->group_size=std::clamp(mfq::cuda::runtime_options::moe_prefill_group_size(),1,prefill_group_capacity);
-        prepared->group_size=std::min(prepared->group_size,experts_);
-        const int prefill_group_size=prepared->group_size;
+        int capacity=cache_->pipeline_prefill_group_capacity_;
         if(!cache_->pipeline_prefill_ring_.defined()) {
-            std::unordered_map<int,int64_t> layers;
-            for(const auto& source:cache_->sources_)for(const auto& cohort:source->cohorts_)
-                layers[source->layer_id_]+=prefill_cohort_bytes(cohort);
-            int64_t bytes=0;for(const auto& layer:layers)bytes=std::max(bytes,layer.second);
+            capacity=std::clamp(mfq::cuda::runtime_options::moe_prefill_group_size(),1,prefill_group_capacity);
+            if(cache_->ssd_experts()) {
+                if(!std::getenv("MFQ_MOE_PREFILL_GROUP_SIZE"))capacity=64;
+                std::unordered_map<int,std::size_t> layer_expert_bytes;
+                for(const auto& source:cache_->sources_) {
+                    std::size_t largest=0;
+                    for(const auto& cohort:source->cohorts_) {
+                        std::size_t bytes=0;for(const auto size:cohort.bytes_per_expert)bytes+=size;
+                        largest=std::max(largest,bytes);
+                    }
+                    layer_expert_bytes[source->layer_id_]+=largest;
+                }
+                std::size_t largest=1;for(const auto& layer:layer_expert_bytes)largest=std::max(largest,layer.second);
+                capacity=std::min<std::size_t>(capacity,std::max<std::size_t>(1,
+                    cache_->host_experts_->stats().budget_bytes/2/largest));
+            }
+            const auto ring_bytes=[&](int slots) {
+                std::unordered_map<int,int64_t> layers;
+                for(const auto& source:cache_->sources_)for(const auto& cohort:source->cohorts_)
+                    layers[source->layer_id_]+=prefill_cohort_bytes(cohort,slots);
+                int64_t bytes=0;for(const auto& layer:layers)bytes=std::max(bytes,layer.second);
+                return bytes;
+            };
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+            const auto context=mfq::cuda::default_context(ids.get_device());
+            const auto available=context->available_memory()+context->workspace_available();
+            const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes()/2;
+            const auto limit=available>reserve?available-reserve:0;
+            while(capacity>1 && std::uint64_t(ring_bytes(capacity))>limit)capacity=(capacity+1)/2;
+#endif
+            const auto bytes=ring_bytes(capacity);
             cache_->pipeline_prefill_ring_=tb::empty({bytes},ids.options().dtype(tb::kUInt8));
+            cache_->pipeline_prefill_group_capacity_=capacity;
+            if(cache_->ssd_experts())std::cerr<<"moe_ssd_prefill_ring group_size="<<capacity<<" bytes="<<bytes<<'\n';
         }
+        prepared->group_size=std::min(capacity,experts_);
+        const int prefill_group_size=prepared->group_size;
         std::array<std::vector<MoeGpuArena*>,3> stages;int64_t stage_offset=0;
         for(int p=0;p<3;++p) {
             if(combined_gate_up_ && p==1) { stages[p]=stages[0]; continue; }
             for(auto& cohort:sources_[p]->cohorts_)
-                stages[p].push_back(&prefill_stage(p,cohort,stage_offset));
+                stages[p].push_back(&prefill_stage(p,cohort,stage_offset,capacity));
         }
         if(execution.config.moe_ffn_fused_activation && !cache_->pipeline_sigmoid_table_.defined())
             cache_->pipeline_sigmoid_table_=moe_swiglu_sigmoid_table_cuda();
@@ -470,6 +499,13 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         }
         std::vector<int> order;
         for(int e=0;e<experts_;++e)if(!positions[e].empty())order.push_back(e);
+        if(cache_->ssd_experts())std::sort(order.begin(),order.end(),[&](int a,int b) {
+            for(int p=0;p<3;++p) {
+                const auto x=sources_[p]->expert_to_cohort_[a],y=sources_[p]->expert_to_cohort_[b];
+                if(x!=y)return x<y;
+            }
+            return a<b;
+        });
         const int groups=(int(order.size())+prefill_group_size-1)/prefill_group_size;
         struct Upload {int cohort,slot,expert;std::vector<tb::Tensor> fields;};
         struct Group {
@@ -477,6 +513,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             int route_offset=0,mma_tile_m=8,wide_tile_m=8;
             std::array<std::vector<Upload>,3> uploads;
             std::vector<MoeHostExpertCache::Lease> leases;
+            std::future<std::vector<MoeHostExpertCache::Lease>> pending;
         };
         std::vector<Group> work(groups);stats.pipeline_prefill_groups+=groups;
         struct DrainFailedReads {
@@ -578,21 +615,50 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         auto parts=tb::empty({entries,width_},input.options());
         const auto ram_begin=reinterpret_cast<std::uintptr_t>(cache_->pipeline_ram_complement_->data_ptr());
         const auto ram_end=ram_begin+cache_->pipeline_ram_registered_bytes_;
+        if(cache_->ssd_experts()) {
+            std::size_t required=0;
+            for(const auto& group:work) {
+                std::size_t bytes=0;
+                for(int p=0;p<3;++p)for(std::size_t c=0;c<sources_[p]->cohorts_.size();++c) {
+                    const auto count=std::count_if(group.uploads[p].begin(),group.uploads[p].end(),
+                        [&](const auto& upload){return upload.cohort==int(c);});
+                    if(!count)continue;
+                    for(const auto field:sources_[p]->cohorts_[c].bytes_per_expert)if(field)
+                        bytes=prefill_align(bytes)+std::size_t(count)*field;
+                }
+                required=std::max(required,std::size_t(prefill_align(bytes)));
+            }
+            if(required>cache_->pipeline_prefill_host_stride_) {
+                // The preceding layer's transfer fence was joined above.
+                // Keep two pinned packets across layers and requests; neither
+                // one is replaced while a DMA can still read it.
+                cache_->pipeline_prefill_host_ring_={};
+                cache_->pipeline_prefill_host_stride_=0;
+                cache_->pipeline_prefill_host_ring_=tb::empty({int64_t(required)*2},
+                    tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true));
+                cache_->pipeline_prefill_host_stride_=required;
+            }
+        }
+        const auto queue_group=[&](int g) {
+            std::vector<MoeExpertCache::SsdExpertRequest> requests;
+            for(int p=0;p<3;++p)for(const auto& upload:work[g].uploads[p])
+                requests.emplace_back(sources_[p]->quant_source_.get(),upload.expert);
+            if(requests.empty())return;
+            work[g].pending=std::async(std::launch::async,[cache=cache_,requests=std::move(requests)] {
+                return cache->read_ssd_experts(requests);
+            });
+        };
+        const auto retire_cpu_group=[&](int g) {
+            stream.buffers[g%2].down_ready.synchronize();
+            for(auto& uploads:work[g].uploads)for(auto& upload:uploads)upload.fields.clear();
+            work[g].leases.clear();
+        };
         const auto stage_group=[&](int g) {
             const auto started=Clock::now();auto& buffer=stream.buffers[g%2];
+            std::size_t host_offset=0;
             if(cache_->ssd_experts()) {
-                if(g>=2) {
-                    // Only the two active groups own CPU payloads. The H2D
-                    // fence protects their source storage; used protects the
-                    // GPU destination before this ring slot is overwritten.
-                    buffer.down_ready.synchronize();
-                    for(auto& uploads:work[g-2].uploads)for(auto& upload:uploads)upload.fields.clear();
-                    work[g-2].leases.clear();
-                }
-                std::vector<MoeExpertCache::SsdExpertRequest> requests;
-                for(int p=0;p<3;++p)for(const auto& upload:work[g].uploads[p])
-                    requests.emplace_back(sources_[p]->quant_source_.get(),upload.expert);
-                auto leases=cache_->read_ssd_experts(requests);
+                if(g>=2)buffer.down_ready.synchronize();
+                auto leases=work[g].pending.valid()?work[g].pending.get():std::vector<MoeHostExpertCache::Lease>{};
                 std::size_t at=0;
                 for(auto& uploads:work[g].uploads)for(auto& upload:uploads)
                     upload.fields=moe_cache_fields(leases[at++]->weights);
@@ -609,6 +675,27 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     for(std::size_t f=0;f<cohort.bytes_per_expert.size();++f) {
                         const auto bytes=std::size_t(cohort.bytes_per_expert[f]);if(!bytes)continue;
                         auto* destination_base=static_cast<uint8_t*>(destination_fields[f].data_ptr());
+                        if(cache_->ssd_experts()) {
+                            if(cohort_uploads.empty())continue;
+                            host_offset=prefill_align(host_offset);
+                            const auto count=cohort_uploads.size(),total=count*bytes;
+                            if(host_offset>cache_->pipeline_prefill_host_stride_ ||
+                                    total>cache_->pipeline_prefill_host_stride_-host_offset)
+                                throw std::logic_error("SSD prefill pinned packet exceeded its bound");
+                            auto* packed=cache_->pipeline_prefill_host_ring_.data_ptr<uint8_t>()+
+                                std::size_t(g%2)*cache_->pipeline_prefill_host_stride_+host_offset;
+                            for(std::size_t i=0;i<count;++i) {
+                                if(cohort_uploads[i]->slot!=int(i))
+                                    throw std::logic_error("SSD prefill cohort slots are not contiguous");
+                                std::memcpy(packed+i*bytes,cohort_uploads[i]->fields[f].data_ptr(),bytes);
+                            }
+                            MFQ_CUDA_CHECK(cudaMemcpyAsync(destination_base,packed,total,
+                                cudaMemcpyHostToDevice,cache_->weight_stream_));
+                            host_offset+=total;
+                            stats.ram_pcie_bytes+=total;stats.pipeline_staged_ram_bytes+=total;
+                            if(p<2)stats.pipeline_gate_up_dma_bytes+=total;else stats.pipeline_down_dma_bytes+=total;
+                            ++stats.pipeline_dma_copies;continue;
+                        }
                         for(std::size_t first=0;first<cohort_uploads.size();) {
                             const auto start=reinterpret_cast<std::uintptr_t>(cohort_uploads[first]->fields[f].data_ptr());
                             if(start<ram_begin || start>ram_end || bytes>ram_end-start) {
@@ -657,9 +744,14 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             buffer.down_ready.record(cache_->weight_stream_);
             stats.pipeline_fetch_ns+=elapsed(started);
         };
+        if(cache_->ssd_experts()) {
+            if(groups)queue_group(0);
+            if(groups>1)queue_group(1);
+        }
         if(groups)stage_group(0);
-        if(groups>1)stage_group(1);
+        if(groups>1 && !cache_->ssd_experts())stage_group(1);
         for(int g=0;g<groups;++g) {
+            if(cache_->ssd_experts() && g)stage_group(g);
             auto& buffer=stream.buffers[g%2];const auto& group=work[g];
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(stream_,buffer.gu_ready.get(),0));
             MFQ_CUDA_CHECK(cudaMemcpyAsync(buffer.maps.data_ptr(),maps+g*map_stride,
@@ -703,7 +795,13 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             auto down=projection(2,hidden).reshape({group.rows,width_});
             parts.index_copy_(0,pair_device.narrow(0,group.begin,group.rows),down);
             buffer.used.record(stream_);
-            if(g+2<groups)stage_group(g+2);
+            if(g+2<groups) {
+                if(cache_->ssd_experts()) {
+                    // Retire the H2D source while its GPU copy is in use.
+                    // At most two groups hold or are reading CPU payloads.
+                    retire_cpu_group(g);queue_group(g+2);
+                } else stage_group(g+2);
+            }
         }
         MFQ_CUDA_CHECK(cudaEventRecord(cache_->transfer_ready_,cache_->weight_stream_));
         cache_->transfer_ready_recorded_=true;
@@ -712,7 +810,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         auto output=parts.reshape({tokens,routes,width_});
         if(shared.defined())output=moe_weighted_reduce_cuda(output,weights)+shared;
         cache_->record_compute_use();
-        cache_->moe_residency_->after_layer(sources_[0]->layer_id_,std::vector<int32_t>(host_ids,host_ids+entries),tokens);
+        cache_->moe_residency_->record_prefill_routes(sources_[0]->layer_id_,
+            ids.contiguous().data_ptr<int32_t>(),tokens,routes,stream_);
         MFQ_CUDA_CHECK(cudaGetLastError());return output;
     }
         struct LayerPrefill {
@@ -1915,7 +2014,15 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             for(int p=0;p<3;++p)if(!sources_[p]->quant_source_->gpu_resident(e) && !(cached&(uint64_t(1)<<p)))return false;
             return true;
         };
-        auto eligible=[&](int e) {return std::all_of(sources_.begin(),sources_.end(),[&](const auto& s){return s->quant_source_->host_cache()->contains(s->quant_source_->host_key(e));});};
+        auto eligible=[&](int e) {
+            return std::all_of(sources_.begin(),sources_.end(),[&](const auto& s) {
+                // A completely cold SSD expert can be read for CPU execution.
+                // Keep partial GPU bundles on the GPU so their resident
+                // projections are not redundantly fetched from storage.
+                if(cache_->ssd_experts())return !s->quant_source_->gpu_resident(e);
+                return s->quant_source_->host_cache()->contains(s->quant_source_->host_key(e));
+            });
+        };
         const auto transfer_bytes=[&](int e) {
             uint64_t bytes=0;
             for(int p=0;p<3;++p) {

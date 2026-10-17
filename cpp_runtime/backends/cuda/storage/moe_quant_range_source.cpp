@@ -3,16 +3,37 @@
 #include "cpu_projection_rows.h"
 #include "mfq/cpu_expert_pool.h"
 #include "quant_linear.h"
+#include "format.h"
 
 #include <algorithm>
 #include <cstring>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
 namespace tb=mfq_tensor_backend;
+using mfq::cuda::quant_format::cpu_u8_tensor;
+using mfq::cuda::quant_format::cpu_f16_to_f32_tensor;
 
 namespace {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+struct NvqFieldOwner {
+    mfq::NvqRows::Fields fields;
+    explicit NvqFieldOwner(mfq::NvqRows::Fields value):fields(std::move(value)) {
+        mfq::cuda::charge_tensor_host_bytes(fields.nbytes());
+    }
+    ~NvqFieldOwner(){mfq::cuda::tensor_host_bytes.fetch_sub(fields.nbytes());}
+};
+tb::Tensor nvq_field_view(const std::shared_ptr<NvqFieldOwner>& owner,std::vector<uint8_t>& bytes) {
+    if(bytes.empty())return tb::empty({0},tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8));
+    auto storage=std::make_shared<tb::TensorStorage>();
+    const auto device=tb::Device{tb::kCPU,0};
+    storage->owner=owner;storage->base=bytes.data();storage->bytes=bytes.size();storage->device=device;
+    const std::array<int64_t,1> shape{int64_t(bytes.size())};
+    return tb::Tensor(storage,tb::make_contiguous_view(bytes.data(),shape,tb::kUInt8,device));
+}
+#endif
 std::size_t expert_fields_bytes(const MixedMoePool& pool) {
     std::vector<tb::Tensor> fields;
     if (pool.family==MixedMoeFamily::Nint)
@@ -28,6 +49,8 @@ std::size_t expert_fields_bytes(const MixedMoePool& pool) {
 MoeQuantRangeSource::MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStore> store)
     :store_(std::move(store)),metadata_(std::make_shared<MixedMoeRuntime>()) {
     if (!store_) throw std::invalid_argument("missing quantized expert range source");
+    const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");
+    profile_ssd_=profile && profile[0]=='1';
     const auto dense=mfq::cuda::runtime_options::moe_nvq_dense();
     const auto preload=mfq::cuda::runtime_options::moe_preload_all();
     const auto sealed=mfq::cuda::runtime_options::moe_assert_resident();
@@ -66,12 +89,44 @@ MixedMoePool MoeQuantRangeSource::read_expert(int expert) const {
         ++sealed_disk_attempts_;
         throw std::runtime_error("expert disk read forbidden after complete residency preload");
     }
-    const auto encoded=store_->read_expert(expert);
+    using Clock=std::chrono::steady_clock;
+    const bool profile=profile_ssd_ && preloaded_.load();
+    const auto begin=profile?Clock::now():Clock::time_point{};
+    const auto index=store_->expert_pool(expert);
+    auto fields=!dense_groups_ && std::size_t(index)<metadata_->pools.size()?store_->read_nvq_fields(expert):std::nullopt;
+    const auto encoded=fields?mfq::MfeQuantExpert{}:store_->read_expert(expert);
+    const auto read_done=profile?Clock::now():Clock::time_point{};
     if (preloaded_.load()) {
         ++disk_reads_after_preload_;
-        disk_bytes_after_preload_.fetch_add(encoded.payload.size(),std::memory_order_relaxed);
+        disk_bytes_after_preload_.fetch_add(fields?fields->source_nbytes:encoded.payload.size(),std::memory_order_relaxed);
     }
-    return decode_expert(expert,encoded);
+    MixedMoePool result;
+    if(fields) {
+        result=metadata_->pools[index];result.local_experts=1;result.expert_local={};
+        auto& w=result.nvq;w.workspaces.clear();
+        w.neuron_scale=cpu_f16_to_f32_tensor(fields->neuron_scale,store_->out_per_expert());
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        // Tensor owners retain the actual read buffers through every DMA
+        // consumer. Avoid copying each packed stream into another CPU tensor.
+        fields->neuron_scale=std::vector<uint16_t>{};
+        auto owner=std::make_shared<NvqFieldOwner>(std::move(*fields));
+        w.indices_packed=nvq_field_view(owner,owner->fields.indices);
+        w.aux_packed=nvq_field_view(owner,owner->fields.aux);
+        w.sub_scale_packed=nvq_field_view(owner,owner->fields.states);
+#else
+        w.indices_packed=cpu_u8_tensor(fields->indices,{int64_t(fields->indices.size())});
+        w.aux_packed=cpu_u8_tensor(fields->aux,{int64_t(fields->aux.size())});
+        w.sub_scale_packed=cpu_u8_tensor(fields->states,{int64_t(fields->states.size())});
+#endif
+        ++materializations_;
+    } else result=decode_expert(expert,encoded);
+    if(profile) {
+        encoded_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(read_done-begin).count(),std::memory_order_relaxed);
+        const auto materialize=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_done).count();
+        materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
+        (result.family==MixedMoeFamily::Nint?nint_materialize_ns_:nvq_materialize_ns_).fetch_add(materialize,std::memory_order_relaxed);
+    }
+    return result;
 }
 
 MixedMoePool MoeQuantRangeSource::decode_expert(int expert,const mfq::MfeQuantExpert& encoded) const {

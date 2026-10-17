@@ -22,7 +22,8 @@ std::size_t packed(std::uint64_t items,int bits) {
 }
 }
 
-NvqRows::NvqRows(std::size_t bytes,Read read):read_(std::move(read)),bytes_(bytes) {
+NvqRows::NvqRows(std::size_t bytes,Read read,ReadBatch batch)
+    :read_(std::move(read)),read_batch_(std::move(batch)),bytes_(bytes) {
     if (!read_ || bytes<40) throw std::runtime_error("missing NVQ row header");
     prefix_.resize(40); read_(0,prefix_.data(),prefix_.size());
     const auto magic=[&](const char* value) { return std::memcmp(prefix_.data(),value,4)==0; };
@@ -119,6 +120,94 @@ std::vector<std::uint8_t> NvqRows::slice_rows_blob(std::int64_t begin,std::int64
         field(states_,groups_,state_bits_); field(indices_,vectors_,index_bits_);
         field(aux_,aux_bits_==1 ? groups_ : signs_,aux_bits_);
     }
+    return result;
+}
+
+std::optional<NvqRows::Fields> NvqRows::slice_rows_fields(std::int64_t begin,std::int64_t end) const {
+    if(begin<0 || end<=begin || end>rows_)throw std::out_of_range("NVQ contiguous field range");
+    Fields result;
+    const auto rows=static_cast<std::uint64_t>(end-begin);
+    result.neuron_scale.resize(static_cast<std::size_t>(rows));
+    const ReadSpan anchor_span{anchor_+static_cast<std::size_t>(begin)*2,
+        reinterpret_cast<std::byte*>(result.neuron_scale.data()),result.neuron_scale.size()*2};
+    const auto validate_anchors=[&] {
+        for(const auto anchor:result.neuron_scale)
+            if((anchor&0x7c00u)==0x7c00u || (anchor&0x8000u))
+                throw std::runtime_error("NVQ neuron anchors must be finite and non-negative");
+    };
+    if(group64_) {
+        std::vector<std::uint64_t> records(static_cast<std::size_t>(rows)*groups_);
+        const ReadSpan stream_span{states_+static_cast<std::size_t>(begin)*groups_*8,
+            reinterpret_cast<std::byte*>(records.data()),records.size()*8};
+        if(read_batch_)read_batch_({anchor_span,stream_span});
+        else for(const auto span:{anchor_span,stream_span})
+            read_(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
+        validate_anchors();
+        result.source_nbytes=result.neuron_scale.size()*2+records.size()*8;
+        result.states.resize(packed(rows*groups_,4),0);
+        result.indices.resize(packed(rows*vectors_,12),0);
+        result.aux.resize(packed(rows*vectors_,7),0);
+        std::size_t record_index=0,vector_index=0;
+        for(std::uint64_t row=0;row<rows;++row)for(int group=0;group<groups_;++group,++record_index) {
+            const auto record=records[record_index];
+            result.states[record_index/2]|=std::uint8_t((record>>60)<<((record_index&1)*4));
+            for(int local=0;local<3;++local) {
+                const auto segment=std::uint32_t((record>>(local*20))&0xfffffu);
+                const auto sign=segment>>12;
+                const auto folded=(sign^(sign>>4))&15u;
+                if((0x6996u>>folded)&1u)
+                    throw std::runtime_error("invalid NVQ-JSC group64 parity bit");
+                if(group*3+local>=vectors_) {
+                    if(segment)throw std::runtime_error("NVQ-JSC group64 padding must be zero");
+                    continue;
+                }
+                // Twelve-bit indices alternate between byte and nibble
+                // boundaries. Seven-bit signs span at most two bytes.
+                const auto index_byte=vector_index*12/8;
+                const auto index=(segment&0xfffu)<<((vector_index&1)*4);
+                result.indices[index_byte]|=std::uint8_t(index);
+                result.indices[index_byte+1]|=std::uint8_t(index>>8);
+                const auto sign_bit=vector_index*7;
+                const auto shift=sign_bit&7;
+                const auto value=(sign&127u)<<shift;
+                result.aux[sign_bit/8]|=std::uint8_t(value);
+                if(shift>1)result.aux[sign_bit/8+1]|=std::uint8_t(value>>8);
+                ++vector_index;
+            }
+        }
+        return result;
+    }
+    const int aux_items=aux_bits_==1?groups_:signs_;
+    if(read_batch_ && !(std::uint64_t(begin)*groups_*state_bits_&7) &&
+            !(std::uint64_t(begin)*vectors_*index_bits_&7) &&
+            !(std::uint64_t(begin)*aux_items*aux_bits_&7)) {
+        std::vector<ReadSpan> spans{anchor_span};
+        const auto plan=[&](auto& output,std::size_t offset,int items,int bits) {
+            output.resize(packed(rows*items,bits));
+            if(!output.empty())spans.push_back({offset+std::uint64_t(begin)*items*bits/8,
+                reinterpret_cast<std::byte*>(output.data()),output.size()});
+        };
+        plan(result.states,states_,groups_,state_bits_);
+        plan(result.indices,indices_,vectors_,index_bits_);
+        plan(result.aux,aux_,aux_items,aux_bits_);
+        read_batch_(spans);validate_anchors();
+        const auto trim=[&](auto& output,std::uint64_t bits) {
+            if(bits&7)output.back()&=std::uint8_t((1u<<(bits&7))-1);
+        };
+        trim(result.states,rows*groups_*state_bits_);
+        trim(result.indices,rows*vectors_*index_bits_);
+        trim(result.aux,rows*aux_items*aux_bits_);
+        result.source_nbytes=result.nbytes();return result;
+    }
+    read_(anchor_span.offset,reinterpret_cast<std::uint8_t*>(anchor_span.destination),anchor_span.size);
+    validate_anchors();
+    const auto field=[&](auto& output,std::size_t offset,int items,int bits) {
+        detail::append_packed_range(output,read_,offset,std::uint64_t(begin)*items*bits,rows*items*bits);
+    };
+    field(result.states,states_,groups_,state_bits_);
+    field(result.indices,indices_,vectors_,index_bits_);
+    field(result.aux,aux_,aux_bits_==1?groups_:signs_,aux_bits_);
+    result.source_nbytes=result.nbytes();
     return result;
 }
 

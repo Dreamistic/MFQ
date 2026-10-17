@@ -510,6 +510,7 @@ void MoeExpertCache::initialize_ssd_residency() {
         source->quant_source_->mark_preload_complete(false);
         initialize_mixed_nvq_dispatch(*source->active_,config_);
     }
+    ssd_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
     ssd_experts_=true;
     const auto host=host_experts_->stats();
     std::cerr<<"moe_ssd_experts_ready gpu_bytes="<<allocated_bytes_<<" ram_budget_bytes="<<host.budget_bytes
@@ -522,7 +523,7 @@ std::vector<MoeHostExpertCache::Lease> MoeExpertCache::read_ssd_experts(
         const std::vector<SsdExpertRequest>& requests) {
     std::vector<MoeHostExpertCache::Lease> leases(requests.size());
     if(requests.empty())return leases;
-    if(!ssd_read_pool_)ssd_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
+    if(!ssd_read_pool_)throw std::logic_error("SSD expert read pool is not initialized");
     ssd_read_pool_->run(0,int64_t(requests.size()),1,std::max(1,config_.moe_ssd_io_workers),
         [&](int64_t begin,int64_t end) {
             for(auto i=begin;i<end;++i)leases[i]=requests[i].first->acquire_expert(requests[i].second);
@@ -1234,6 +1235,17 @@ std::uint64_t MoeExpertCache::expert_disk_reads_after_preload() const {
     for (const auto& source:sources_) if (source->quant_source_)
         reads+=source->quant_source_->expert_disk_reads_after_preload();
     return reads;
+}
+
+std::array<std::uint64_t,4> MoeExpertCache::expert_disk_timings() const {
+    std::array<std::uint64_t,4> result{};
+    for(const auto& source:sources_)if(source->quant_source_) {
+        result[0]+=source->quant_source_->expert_encoded_ns();
+        result[1]+=source->quant_source_->expert_materialize_ns();
+        result[2]+=source->quant_source_->expert_nint_materialize_ns();
+        result[3]+=source->quant_source_->expert_nvq_materialize_ns();
+    }
+    return result;
 }
 
 std::uint64_t MoeExpertCache::expert_disk_bytes_after_preload() const {
@@ -2098,9 +2110,10 @@ void release_moe_prefill_buffers(MoeExpertCache* cache) {
     for(auto& release:cache->pipeline_prefill_release_)release();
     cache->pipeline_prefill_release_.clear();
     for(auto i=cache->pipeline_stages_.begin();i!=cache->pipeline_stages_.end();)
-        if(i->first.starts_with("prefill16:"))i=cache->pipeline_stages_.erase(i);else ++i;
+        if(i->first.starts_with("prefill:"))i=cache->pipeline_stages_.erase(i);else ++i;
     cache->pipeline_prefill_activations_.reset();
     cache->pipeline_prefill_ring_={};
+    cache->pipeline_prefill_group_capacity_=0;
     cache->pipeline_prefill_layer_buffer_={};
     cache->pipeline_prefill_layer_second_buffer_={};
     cache->pipeline_prefill_layer_down_buffer_={};cache->pipeline_prefill_layer_split_=0;
@@ -2127,7 +2140,7 @@ void MoeExpertCache::prepare_direct_transfer_cache() {
     auto bytes=pipeline_direct_cache_budget_;
     // An eager/debug graph may have kept its legacy arenas. Their captured
     // addresses remain valid, and both forms share the original reserve.
-    for(const auto& [key,arena]:pipeline_stages_)if(!key.starts_with("prefill16:")) {
+    for(const auto& [key,arena]:pipeline_stages_)if(!key.starts_with("prefill:")) {
         const auto charge=[&](std::size_t used){bytes=used>=bytes?0:bytes-used;};
         charge(std::size_t(tensor_nbytes(arena->packed)));
         for(const auto& field:arena->fields)charge(std::size_t(tensor_nbytes(field)));

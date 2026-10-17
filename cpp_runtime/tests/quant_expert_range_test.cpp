@@ -48,6 +48,66 @@ std::vector<std::uint8_t> nvq(int begin,int end) {
     }
     return blob;
 }
+void check_group64_fields() {
+    constexpr int rows=34,width=53,groups=3,vectors=7;
+    constexpr std::size_t anchor_offset=40+64+4096*8,record_offset=anchor_offset+rows*2;
+    std::vector<std::uint8_t> blob{'N','V','Q','1',37,4,24,0};
+    mfq::test::append<std::int32_t>(blob,0);
+    mfq::test::append<std::int32_t>(blob,width);
+    mfq::test::append<std::uint32_t>(blob,2);
+    mfq::test::append<std::int64_t>(blob,rows);
+    mfq::test::append<std::int64_t>(blob,width);
+    mfq::test::append<std::uint32_t>(blob,rows);
+    blob.resize(anchor_offset,0);blob[40]=2;blob[41]=1;blob[42]=16;blob[92]=1;
+    for(int row=0;row<rows;++row)mfq::test::append<std::uint16_t>(blob,0x3c00+row);
+    for(int row=0;row<rows;++row)for(int group=0;group<groups;++group) {
+        std::uint64_t record=std::uint64_t((row*5+group*3)&15)<<60;
+        for(int local=0;local<3;++local) {
+            const auto vector=group*3+local;
+            if(vector>=vectors)continue;
+            const auto index=(row*53+vector*17+7)&4095,sign=(row*19+vector*11+3)&127;
+            unsigned parity=0;for(int bit=0;bit<7;++bit)parity^=(sign>>bit)&1;
+            const auto segment=std::uint64_t(index)|std::uint64_t(sign|(parity<<7))<<12;
+            record|=segment<<(local*20);
+        }
+        mfq::test::append<std::uint64_t>(blob,record);
+    }
+    const auto read=[&](std::size_t offset,std::uint8_t* output,std::size_t count) {
+        require(offset<=blob.size() && count<=blob.size()-offset,"group64 read exceeded source");
+        std::memcpy(output,blob.data()+offset,count);
+    };
+    int batches=0;
+    const mfq::NvqRows source(blob.size(),read,[&](const std::vector<mfq::ReadSpan>& spans) {
+        require(spans.size()==2,"group64 fields were not read together");++batches;
+        for(const auto& span:spans)read(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
+    });
+    require(source.group64(),"group64 row storage was not detected");
+    for(const auto range:{std::pair<int,int>{0,1},{1,18},{17,34},{0,34}}) {
+        const auto fields=source.slice_rows_fields(range.first,range.second);
+        require(bool(fields),"group64 fields were unavailable");
+        std::vector<unsigned> states,indices,signs;
+        for(int row=range.first;row<range.second;++row) {
+            require(fields->neuron_scale[row-range.first]==0x3c00+row,"group64 anchor changed");
+            for(int group=0;group<groups;++group)states.push_back((row*5+group*3)&15);
+            for(int vector=0;vector<vectors;++vector) {
+                indices.push_back((row*53+vector*17+7)&4095);
+                signs.push_back((row*19+vector*11+3)&127);
+            }
+        }
+        std::vector<std::uint8_t> a,b,c;pack(a,states,4);pack(b,indices,12);pack(c,signs,7);
+        require(fields->states==a && fields->indices==b && fields->aux==c,
+            "group64 fields differ from independent packed oracle");
+        require(fields->source_nbytes==std::size_t(range.second-range.first)*(2+groups*8),
+            "group64 source bytes included the shared codebook or expanded fields");
+    }
+    blob[record_offset+2]^=8; // Sign parity of the first vector.
+    rejected([&]{source.slice_rows_fields(0,1);});blob[record_offset+2]^=8;
+    blob[record_offset+2*8+2]^=16; // Nonzero index in a padded vector.
+    rejected([&]{source.slice_rows_fields(0,1);});blob[record_offset+2*8+2]^=16;
+    blob[anchor_offset+1]=0x7c;
+    rejected([&]{source.slice_rows_fields(0,1);});
+    require(batches==7,"group64 field batches were skipped");
+}
 void append_pool(std::vector<std::uint8_t>& blob,const std::vector<int>& ids,
         const char* dtype,const std::vector<std::uint8_t>& body) {
     mfq::test::append<std::uint32_t>(blob,ids.size());
@@ -66,16 +126,21 @@ std::vector<std::uint8_t> mixed() {
     return blob;
 }
 mfq::MfeQuantExpertStore memory_store(std::vector<std::uint8_t> blob,
-        std::shared_ptr<std::atomic<std::size_t>> bytes=std::make_shared<std::atomic<std::size_t>>(0)) {
+        std::shared_ptr<std::atomic<std::size_t>> bytes=std::make_shared<std::atomic<std::size_t>>(0),bool batched=false) {
     auto source=std::make_shared<const std::vector<std::uint8_t>>(std::move(blob));
-    return {source->size(),
-        [source,bytes](std::size_t offset,std::uint8_t* out,std::size_t size) {
+    const auto read=[source,bytes](std::size_t offset,std::uint8_t* out,std::size_t size) {
             require(offset<=source->size() && size<=source->size()-offset,"read exceeded source");
             bytes->fetch_add(size);
             std::memcpy(out,source->data()+offset,size);
-        }};
+        };
+    mfq::NintRows::ReadBatch batch;
+    if(batched)batch=[read](const std::vector<mfq::ReadSpan>& spans) {
+        for(const auto& span:spans)read(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
+    };
+    return {source->size(),read,std::move(batch)};
 }
 void self_test() {
+    check_group64_fields();
     const auto flat = mfq::test::fixture(52, 53, 5, 6).blob;
     auto packed = std::make_shared<std::vector<std::uint8_t>>(flat.begin(), flat.begin() + 14);
     mfq::test::append<std::uint32_t>(*packed, 3);
@@ -103,6 +168,7 @@ void self_test() {
     const auto original=mixed();
     auto bytes=std::make_shared<std::atomic<std::size_t>>(0);
     const auto store=memory_store(original,bytes);
+    const auto batched=memory_store(original,std::make_shared<std::atomic<std::size_t>>(0),true);
     require(store.num_experts()==4 && store.out_per_expert()==17 && store.neuron_len()==53,
         "mixed expert geometry changed");
     require(bytes->load()<original.size()/4 && store.index_nbytes()<original.size()/4,
@@ -115,7 +181,13 @@ void self_test() {
         const auto result=store.read_expert(expert);
         require(result.payload.size()==budget,"expert payload exceeded its byte budget");
         require(bytes->load()<original.size()/2,"one expert read unrelated payloads");
+        const auto fields=store.read_nvq_fields(expert);
+        const auto bulk=batched.read_nvq_fields(expert);
+        require(bool(fields)==bool(bulk),"batched expert family changed");
+        if(fields)require(fields->neuron_scale==bulk->neuron_scale && fields->states==bulk->states &&
+            fields->indices==bulk->indices && fields->aux==bulk->aux,"batched expert bits changed");
         if (expert==0 || expert==3) {
+            require(!fields,"NINT expert was exposed as NVQ fields");
             require(result.dtype=="NINT","mixed expert dtype changed");
             mfq::NintRows rows(result.payload.data(),result.payload.size());
             mfq::NintRowBatch decoded;
@@ -125,8 +197,18 @@ void self_test() {
                 for (int column=0; column<53; ++column)
                     require(mfq::test::row_value(decoded,row,column)==reference.reference[(row+begin)*53+column],
                         "adaptive NINT expert differs from independent code oracle");
-        } else require(result.dtype=="NVQ" && result.payload==nvq(expert==2 ? 0 : 17,expert==2 ? 17 : 34),
-            "NVQ expert packed fields or padding changed");
+        } else {
+            const auto expected=nvq(expert==2 ? 0 : 17,expert==2 ? 17 : 34);
+            require(result.dtype=="NVQ" && result.payload==expected,"NVQ expert packed fields or padding changed");
+            require(bool(fields),"canonical NVQ fields were unavailable");
+            std::vector<std::uint8_t> direct(expected.begin(),expected.begin()+40);
+            const auto* anchors=reinterpret_cast<const std::uint8_t*>(fields->neuron_scale.data());
+            direct.insert(direct.end(),anchors,anchors+fields->neuron_scale.size()*2);
+            for(const auto* stream:{&fields->states,&fields->indices,&fields->aux})
+                direct.insert(direct.end(),stream->begin(),stream->end());
+            require(direct==expected && fields->nbytes()+40==expected.size(),
+                "direct NVQ fields changed non-byte-aligned expert data");
+        }
     }
     std::vector<std::future<std::vector<std::uint8_t>>> concurrent;
     for (std::size_t pool=0; pool<store.pool_count(); ++pool) {
@@ -169,6 +251,7 @@ void self_test() {
     for (int i=0; i<12; ++i) require(concurrent[i].get()==store.read_expert(i%4).payload,
         "concurrent expert reads changed bytes");
     rejected([&] { store.read_expert(-1); }); rejected([&] { store.read_expert(4); });
+    rejected([&] { store.read_nvq_fields(-1); }); rejected([&] { store.read_nvq_fields(4); });
     rejected([&] { store.expert_dtype(4); });
     for (int kind=0; kind<7; ++kind) {
         auto bad=original;
@@ -187,6 +270,13 @@ void self_test() {
         std::memcpy(out,single.data()+offset,size);
     };
     const mfq::NvqRows rows(single.size(),nvq_reader);
+    for(const std::uint16_t anchor:{0x7c00,0x7e01,0x8000,0xbc00}) {
+        auto bad=single;std::memcpy(bad.data()+40,&anchor,2);
+        mfq::NvqRows invalid(bad.size(),[&](std::size_t offset,std::uint8_t* output,std::size_t count) {
+            std::memcpy(output,bad.data()+offset,count);
+        });
+        rejected([&]{invalid.slice_rows_fields(0,1);});
+    }
     require(rows.slice_rows_blob(0,34)==single,"full NVQ slice changed bytes");
     require(rows.row_range_nbytes(0,34)==single.size(),"NVQ range byte budget mismatch");
     rejected([&] { rows.slice_rows_blob(-1,1); });
@@ -268,6 +358,7 @@ void dump(int argc,char** argv) {
 }
 }
 int main(int argc,char** argv) try {
+
     if (argc==1) self_test();
     else if (argc==3 && std::string(argv[1])=="--index-model") index_model(argv[2]);
     else dump(argc,argv);

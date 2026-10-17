@@ -38,6 +38,7 @@ public:
         std::uint64_t shadow_index_rebuilds=0,shadow_index_matches=0,shadow_index_backup_bytes=0;
         std::uint64_t speculative_heat_routes=0;
         std::uint64_t predictor_overlap_rounds=0,predictor_overlap_serves=0;
+        std::uint64_t ssd_load_requests=0,ssd_load_bytes=0;
     };
     using Observer=std::function<void(const char*,std::size_t)>;
     using MemoryProbe=std::function<MemorySample()>;

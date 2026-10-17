@@ -251,6 +251,7 @@ struct MoeResidencyManager::Impl {
     std::atomic<std::uint64_t> host_pack_bytes{0},direct_upload_bytes{0},backup_peak_bytes{0},shared_backup_bytes{0};
     std::atomic<std::uint64_t> candidate_projections{0},planned_projections{0},committed_projections{0},projection_memory_rejections{0};
     std::atomic<std::uint64_t> staging_budget_skips{0};
+    std::atomic<std::uint64_t> ssd_load_requests{0},ssd_load_bytes{0};
     std::atomic<std::uint64_t> plan_ns{0},decode_plan_ns{0};
     std::uint64_t last_plan_ns=0,last_staging_budget_skips=0;
     std::atomic<std::uint64_t> prepare_ns{0},join_ns{0},dma_wait_ns{0},map_ns{0},host_exchange_ns{0},apply_ns{0};
@@ -836,7 +837,6 @@ void MoeResidencyManager::prepare() {
             if(e.projection>=0) {
                 const auto& source=*cache.sources_[bundle[e.projection]];
                 if(source.quant_source_->gpu_resident(e.expert))return 1;
-                if(cache.ssd_experts() && !source.quant_source_->host_cache()->contains(source.quant_source_->host_key(e.expert)))return -1;
                 // A transfer-cache hit is temporary residency. Let a measured
                 // hot projection compete for permanent space when requested;
                 // the normal lease, inflight and publication guards still
@@ -851,8 +851,6 @@ void MoeResidencyManager::prepare() {
             bool hot=true,cold=true;
             for(int p=0;p<3;++p) {
                 const bool gpu=cache.sources_[bundle[p]]->quant_source_->gpu_resident(e.expert);
-                if(!gpu && cache.ssd_experts() && !cache.sources_[bundle[p]]->quant_source_->host_cache()->contains(
-                        cache.sources_[bundle[p]]->quant_source_->host_key(e.expert)))return -1;
                 hot&=gpu;cold&=!gpu;
             }
             return hot?1:cold?0:-1;
@@ -883,6 +881,53 @@ void MoeResidencyManager::prepare() {
             std::uint64_t(s.upload.defined()?s.upload.numel():0);
         stage_limit=(available+reusable)/(s.direct?1:2);
         if(shared_backup)stage_limit=std::min(stage_limit,std::uint64_t(s.backup.numel()));
+    }
+    std::map<std::pair<int,int>,MoeHostExpertCache::Lease> ssd_images;
+    if(cache.ssd_experts()) {
+        // A small LRU mostly contains the last layers after a decode window.
+        // Rank all cold experts, then read only the selected replacements;
+        // otherwise early-layer hotspots can never become GPU residents.
+        // Leave most of the managed cache available to concurrent demand IO.
+        stage_limit=std::min(stage_limit,std::uint64_t(cache.host_experts_->stats().budget_bytes/4));
+        std::vector<mfq::MoeResidencyRanker::Pair> selected;
+        std::vector<MoeExpertCache::SsdExpertRequest> requests;
+        std::vector<std::pair<int,int>> keys;
+        std::uint64_t selected_bytes=0;
+        for(const auto& pair:pairs) {
+            const int count=pair.incoming.projection<0?3:1;
+            std::uint64_t required=selected_bytes;bool valid=true;
+            for(int i=0;i<count;++i) {
+                const int p=count==3?i:pair.incoming.projection;
+                const int q=count==3?i:pair.outgoing.projection;
+                const auto& source=*cache.sources_[cache.pipeline_bundles_[pair.incoming.bundle][p]];
+                const auto& old=*cache.sources_[cache.pipeline_bundles_[pair.outgoing.bundle][q]];
+                const auto& cohort=source.cohorts_[source.expert_to_cohort_[pair.incoming.expert]];
+                const auto slot=cohort.arena->book->slot_for(old.quant_source_->host_key(pair.outgoing.expert));
+                if(slot<0 || cohort.arena->book->inflight(slot)){valid=false;break;}
+                for(const auto bytes:cohort.bytes_per_expert) {
+                    const auto padding=(16-(required&15))&15;
+                    if(required>stage_limit || padding>stage_limit-required ||
+                            std::uint64_t(bytes)>stage_limit-required-padding){valid=false;break;}
+                    required+=padding+bytes;
+                }
+                if(!valid)break;
+            }
+            if(!valid)continue;
+            selected_bytes=required;selected.push_back(pair);
+            for(int i=0;i<count;++i) {
+                const int p=count==3?i:pair.incoming.projection;
+                const int id=cache.pipeline_bundles_[pair.incoming.bundle][p];
+                const auto key=std::make_pair(id,pair.incoming.expert);
+                if(ssd_images.try_emplace(key).second) {
+                    requests.emplace_back(cache.sources_[id]->quant_source_.get(),pair.incoming.expert);
+                    keys.push_back(key);
+                }
+            }
+        }
+        pairs.swap(selected);
+        s.ssd_load_requests+=requests.size();s.ssd_load_bytes+=selected_bytes;
+        auto images=cache.read_ssd_experts(requests);
+        for(std::size_t i=0;i<images.size();++i)ssd_images.at(keys[i])=std::move(images[i]);
     }
     s.pending.reserve(pairs.size()*3);int64_t bytes=0;
     std::size_t memory_rejections=0;
@@ -936,7 +981,8 @@ void MoeResidencyManager::prepare() {
             const auto old_key=outgoing.quant_source_->host_key(move.outgoing);move.slot=cohort.arena->book->slot_for(old_key);
             if(move.slot<0 || cohort.arena->book->inflight(move.slot) ||
                     !cache.host_experts_->contains(incoming.quant_source_->host_key(move.incoming))){valid=false;break;}
-            move.lease=incoming.quant_source_->acquire_expert(move.incoming);
+            if(cache.ssd_experts())move.lease=std::move(ssd_images.at({move.incoming_source,move.incoming}));
+            else move.lease=incoming.quant_source_->acquire_expert(move.incoming);
             if(move.lease.use_count()!=2){valid=false;break;}
             if(s.direct && cache.pipeline_ram_registered_bytes_<cache.pipeline_ram_complement_->numel()) {
                 const auto begin=reinterpret_cast<uintptr_t>(cache.pipeline_ram_complement_->data_ptr());
@@ -1759,14 +1805,16 @@ MoeResidencyManager::Stats MoeResidencyManager::stats() const noexcept {
         s.speculative_route_windows.load(),s.speculative_routes_committed.load(),s.speculative_routes_discarded.load(),s.speculative_route_cancels.load(),
         s.shadow_backup_bytes.load(),s.shadow_backup_fields.load(),s.shadow_index_rebuilds.load(),
         s.shadow_index_matches.load(),s.shadow_index_backup_bytes.load(),s.speculative_heat_routes.load(),
-        s.predictor_overlap_rounds.load(),s.predictor_overlap_serves.load()};
+        s.predictor_overlap_rounds.load(),s.predictor_overlap_serves.load(),
+        s.ssd_load_requests.load(),s.ssd_load_bytes.load()};
 }
 void MoeResidencyManager::trace_rank_summary(std::ostream& out) const {
+    const auto& s=*impl_;
     const auto* enabled=std::getenv("MFQ_TRACE_MOE_RANK_SUMMARY");
-    if(!enabled || enabled[0]!='1')return;
+    const auto* ssd_profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");
+    if(enabled?enabled[0]!='1':!(s.cache->ssd_experts() && ssd_profile && ssd_profile[0]=='1'))return;
     // Called only after exchanges finish. Estimate the placement restriction
     // from existing decayed observations, without instrumenting GPU work.
-    const auto& s=*impl_;
     struct Group {std::vector<double> heat;std::size_t slots=0;double bytes=0;};
     std::map<std::pair<MoeGpuArena*,int>,Group> local;
     std::map<MoeGpuArena*,Group> global;

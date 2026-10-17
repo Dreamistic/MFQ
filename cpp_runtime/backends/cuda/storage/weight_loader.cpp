@@ -16,6 +16,7 @@
 #include "mfq/packed_nint_expert_store.h"
 #include <cstdlib>
 #include <cstdio>
+#include <atomic>
 
 std::shared_ptr<mfq::NintRows> load_nint_row_table(
         const mfq::ModelSource& source, const std::string& name) {
@@ -62,8 +63,18 @@ MfeWeight load_mfe_gpu(
             execution.config.moe_ssd_ranges) {
         const auto & record = require_tensor(mfq, name);
         mfq::ModelSource::TensorReader reader;
+        mfq::ModelSource::TensorBatchReader batch_reader;
         try {
-            reader=mfq.tensor_reader(name);
+            // Streaming workers read independent experts concurrently. A
+            // shared buffered FILE serializes their seeks across all fields.
+            if(!execution.config.moe_preload_all) {
+                reader=mfq.mapped_tensor_reader(name);
+                batch_reader=mfq.mapped_tensor_batch_reader(name);
+                static std::atomic_bool reported{false};
+                if(reader && !reported.exchange(true))
+                    std::fprintf(stderr,"moe_ssd_source_dispatch mapped=1 parallel_reads=1 batch_fields=%d\n",int(bool(batch_reader)));
+            }
+            if(!reader)reader=mfq.tensor_reader(name);
         } catch (const mfq::TensorReaderUnsupported&) {
             // Sources without retained readers keep the existing CPU loader.
         }
@@ -109,7 +120,7 @@ MfeWeight load_mfe_gpu(
                     auto store=std::make_shared<mfq::MfeQuantExpertStore>(record.nbytes,
                         [reader](std::size_t offset,std::uint8_t* output,std::size_t bytes) {
                             reader(offset,reinterpret_cast<std::byte*>(output),bytes);
-                        });
+                        },batch_reader);
                     const int minimum=std::min(execution.moe_cache_registration_min_slots,store->num_experts());
                     return cache_quant_moe_weight(cache,name,std::make_shared<MoeQuantRangeSource>(std::move(store)),
                         minimum,layer_id,projection_role);

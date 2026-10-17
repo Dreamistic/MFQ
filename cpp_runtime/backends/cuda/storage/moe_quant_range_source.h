@@ -37,12 +37,17 @@ public:
     std::uint64_t dense_materializations() const { return dense_materializations_.load(); }
     std::uint64_t expert_disk_reads_after_preload() const { return disk_reads_after_preload_.load(); }
     std::uint64_t expert_disk_bytes_after_preload() const { return disk_bytes_after_preload_.load(); }
+    std::uint64_t expert_encoded_ns() const { return encoded_ns_.load(); }
+    std::uint64_t expert_materialize_ns() const { return materialize_ns_.load(); }
+    std::uint64_t expert_nint_materialize_ns() const { return nint_materialize_ns_.load(); }
+    std::uint64_t expert_nvq_materialize_ns() const { return nvq_materialize_ns_.load(); }
 private:
     std::shared_ptr<mfq::MfeQuantExpertStore> store_;
     std::shared_ptr<MixedMoeRuntime> metadata_;
     std::vector<std::int64_t> q_strides_;
     std::vector<std::size_t> field_bytes_;
     bool dense_groups_=false;
+    bool profile_ssd_=false;
     std::shared_ptr<MoeHostExpertCache> host_cache_;
     int source_id_=-1;
     std::unique_ptr<std::atomic_bool[]> gpu_resident_;
@@ -54,4 +59,6 @@ private:
     std::atomic_bool preloaded_{false};
     mutable std::atomic<std::uint64_t> disk_reads_after_preload_{0};
     mutable std::atomic<std::uint64_t> disk_bytes_after_preload_{0};
+    mutable std::atomic<std::uint64_t> encoded_ns_{0},materialize_ns_{0};
+    mutable std::atomic<std::uint64_t> nint_materialize_ns_{0},nvq_materialize_ns_{0};
 };

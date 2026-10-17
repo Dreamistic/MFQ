@@ -24,7 +24,7 @@ struct MfeQuantExpert {
 class MfeQuantExpertStore {
 public:
     using Read=NintRows::Read;
-    MfeQuantExpertStore(std::size_t bytes,Read read);
+    MfeQuantExpertStore(std::size_t bytes,Read read,NintRows::ReadBatch batch={});
     int num_experts() const noexcept { return experts_; }
     int out_per_expert() const noexcept { return output_; }
     int neuron_len() const noexcept { return width_; }
@@ -36,6 +36,7 @@ public:
     const std::string& expert_dtype(int expert) const;
     std::size_t expert_payload_nbytes(int expert) const;
     MfeQuantExpert read_expert(int expert) const;
+    std::optional<NvqRows::Fields> read_nvq_fields(int expert) const;
     // Startup-only sequential pool read; the temporary canonical pool is
     // released before advancing to the next pool. Visitors own each leaf.
     // An optional executor slices immutable pool bytes concurrently; callers
@@ -54,6 +55,7 @@ private:
     };
     struct Expert { int pool=-1,local=-1; };
     Read read_;
+    NintRows::ReadBatch read_batch_;
     std::size_t bytes_=0;
     int experts_=0,output_=0,width_=0;
     std::vector<Pool> pools_;

@@ -70,7 +70,8 @@ std::shared_ptr<MfeQuantExpertStore> make_packed_nint_expert_store(
         });
 }
 
-MfeQuantExpertStore::MfeQuantExpertStore(std::size_t bytes,Read reader):read_(std::move(reader)),bytes_(bytes) {
+MfeQuantExpertStore::MfeQuantExpertStore(std::size_t bytes,Read reader,NintRows::ReadBatch batch)
+    :read_(std::move(reader)),read_batch_(std::move(batch)),bytes_(bytes) {
     if (!read_ || bytes_<20)
         throw std::runtime_error("missing mixed expert range source");
     const auto read=[&](std::uint64_t offset,std::size_t bytes) {
@@ -122,12 +123,22 @@ MfeQuantExpertStore::MfeQuantExpertStore(std::size_t bytes,Read reader):read_(st
             if (position>bytes || size>bytes-position) throw std::runtime_error("mixed expert row read exceeds pool");
             reader(offset+position,output,size);
         };
+        NintRows::ReadBatch body_batch;
+        if(read_batch_)body_batch=[reader=read_batch_,offset=cursor,bytes](const std::vector<ReadSpan>& spans) {
+            auto absolute=spans;
+            for(auto& span:absolute) {
+                if(span.offset>bytes || span.size>bytes-span.offset)
+                    throw std::runtime_error("mixed expert batch read exceeds pool");
+                span.offset+=offset;
+            }
+            reader(absolute);
+        };
         int rows=0,columns=0;
         if (pool.dtype=="NINT") {
-            pool.nint=std::make_shared<mfq::NintRows>(static_cast<std::size_t>(bytes),body);
+            pool.nint=std::make_shared<mfq::NintRows>(static_cast<std::size_t>(bytes),body,false,body_batch);
             rows=pool.nint->rows(); columns=pool.nint->width();
         } else if (pool.dtype=="NVQ" || pool.dtype=="NPQ") {
-            pool.nvq=std::make_shared<mfq::NvqRows>(static_cast<std::size_t>(bytes),body);
+            pool.nvq=std::make_shared<mfq::NvqRows>(static_cast<std::size_t>(bytes),body,body_batch);
             rows=pool.nvq->rows(); columns=pool.nvq->width();
         } else throw MfeQuantRangeUnsupported("unsupported mixed expert range dtype: "+pool.dtype);
         if (rows!=static_cast<int>(count*output) || columns!=width_)
@@ -157,6 +168,14 @@ MfeQuantExpert MfeQuantExpertStore::read_expert(int expert) const {
     const auto& owner=owners_[expert]; const auto& pool=pools_[owner.pool];
     const auto begin=std::int64_t(owner.local)*output_,end=begin+output_;
     return {pool.dtype,pool.nint ? pool.nint->slice_rows_blob(begin,end) : pool.nvq->slice_rows_blob(begin,end)};
+}
+
+std::optional<NvqRows::Fields> MfeQuantExpertStore::read_nvq_fields(int expert) const {
+    if(expert<0 || expert>=experts_)throw std::out_of_range("mixed expert field ID");
+    const auto& owner=owners_[expert];const auto& pool=pools_[owner.pool];
+    if(!pool.nvq)return std::nullopt;
+    const auto begin=std::int64_t(owner.local)*output_;
+    return pool.nvq->slice_rows_fields(begin,begin+output_);
 }
 
 void MfeQuantExpertStore::visit_pool_experts(std::size_t index,

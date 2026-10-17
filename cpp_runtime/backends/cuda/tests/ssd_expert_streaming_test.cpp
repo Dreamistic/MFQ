@@ -7,6 +7,7 @@
 #include "mfq_cuda_context.h"
 #include "mfq/runtime.h"
 #include "nint_prefill_cache.h"
+#include "format.h"
 #include <array>
 #include <cmath>
 #include <filesystem>
@@ -16,6 +17,27 @@
 namespace tb=mfq_tensor_backend;
 namespace {
 void check(bool value,const char* message){if(!value)throw std::runtime_error(message);}
+void check_packed_metadata() {
+    for(int bits=1;bits<=8;++bits)for(std::size_t count=0;count<=257;++count) {
+        const auto bytes=(count*bits+7)/8;
+        std::vector<uint8_t> encoded(bytes+12,0),expected(count);
+        for(std::size_t i=0;i<count;++i) {
+            expected[i]=uint8_t((i*13+count*7)&((1u<<bits)-1));
+            for(int bit=0;bit<bits;++bit)
+                encoded[3+(i*bits+bit)/8]|=((expected[i]>>bit)&1u)<<((i*bits+bit)&7);
+        }
+        std::fill(encoded.begin()+3+bytes,encoded.end(),0xa5);
+        std::size_t offset=3;
+        check(mfq::cuda::quant_format::unpack_bits(encoded,offset,count,bits)==expected && offset==3+bytes,
+            "packed metadata unpack changed values or consumed its neighbor");
+        if(bytes) {
+            encoded.resize(3+bytes-1);offset=3;bool rejected=false;
+            try{(void)mfq::cuda::quant_format::unpack_bits(encoded,offset,count,bits);}
+            catch(const std::runtime_error&){rejected=true;}
+            check(rejected && offset==3,"truncated packed metadata was accepted");
+        }
+    }
+}
 std::shared_ptr<MoeQuantRangeSource> source(const std::filesystem::path& path,const std::string& name="linear.weight") {
     auto model=mfq::open_model_source(path.string());auto read=model->tensor_reader(name);
     auto store=std::make_shared<mfq::MfeQuantExpertStore>(require_tensor(*model,name).nbytes,
@@ -27,12 +49,18 @@ struct Run {
     std::shared_ptr<MoeExpertCache> cache;
     std::vector<std::shared_ptr<MoeQuantRangeSource>> sources;
     MoeFfnForward forward;
+    bool hybrid=false;
     Run(const std::filesystem::path& path,bool streaming,bool automatic=false,bool combined=false,const std::string& prefix="") {
         auto& c=execution.config;
         c.moe_pipeline=true;c.moe_two_stage_ffn=true;c.moe_ram_pcie=true;c.moe_direct_ram=true;
         c.moe_ram_pcie_fraction=1.;c.moe_preload_all=!streaming || automatic;c.moe_assert_resident=!streaming || automatic;
+        if(const auto* fraction=std::getenv("MFQ_SSD_EXPERT_TEST_PCIE_FRACTION")) {
+            c.moe_ram_pcie_fraction=std::stod(fraction);hybrid=*c.moe_ram_pcie_fraction<1;
+        }
         c.moe_host_cache_bytes=prefix.empty()?(streaming?32768:8*1024*1024):(streaming?32*1024*1024:4LL*1024*1024*1024);
-        c.moe_residency_adapt=streaming;c.moe_residency_warm=streaming;c.moe_residency_projection_heat=true;
+        // CPU/GPU arithmetic parity needs the same placement in both runs.
+        // The GPU-only variant separately exercises adaptive exchanges.
+        c.moe_residency_adapt=streaming && !hybrid;c.moe_residency_warm=streaming && !hybrid;c.moe_residency_projection_heat=true;
         cache=make_moe_expert_cache(prefix.empty()?32768:64*1024*1024,c);
         const auto separator=prefix.find(';');
         std::vector<std::string> prefixes=separator==std::string::npos?std::vector<std::string>{prefix}:
@@ -100,6 +128,7 @@ void check_output(const tb::Tensor& actual,const tb::Tensor& expected) {
 }
 }
 int main(int argc,char** argv)try {
+    check_packed_metadata();
     check(argc==2 || argc==3,"expected SSD expert fixture directory or model and expert tensor prefix");
     const auto stream=mfq_current_cuda_stream();
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
@@ -113,6 +142,23 @@ int main(int argc,char** argv)try {
         Run candidate(path,true,std::string(format)!="nvq2j",combined,prefix);
         const int width=reference.sources[0]->metadata()->neuron_len;
         const int experts=reference.sources[0]->metadata()->n_experts;
+        if(candidate.hybrid)for(std::size_t p=0;p<candidate.sources.size();++p)for(const int e:{31%experts,32%experts}) {
+            const auto& source=candidate.sources[p];
+            const auto direct=source->read_expert(e);
+            const auto decoded=source->decode_expert(e,source->store().read_expert(e));
+            const auto resident=reference.sources[p]->acquire_expert(e);
+            const auto a=moe_cache_fields(direct),b=moe_cache_fields(decoded);
+            const auto c=moe_cache_fields(resident->weights);
+            check(a.size()==b.size(),"direct CPU expert field count differs");
+            for(std::size_t f=0;f<a.size();++f) {
+                check(a[f].numel()==b[f].numel() && a[f].scalar_type()==b[f].scalar_type(),"direct CPU expert field shape differs");
+                check(!a[f].numel() || !std::memcmp(a[f].data_ptr(),b[f].data_ptr(),a[f].numel()*a[f].element_size()),
+                    "direct CPU expert fields differ from full codec");
+                check(a[f].numel()==c[f].numel() && (!a[f].numel() ||
+                    !std::memcmp(a[f].data_ptr(),c[f].data_ptr(),a[f].numel()*a[f].element_size())),
+                    "SSD CPU fields differ from resident RAM fields");
+            }
+        }
         for(const int rows:{1,2,3,4,5,6,8,32,1024,143,1,1024})for(const bool graph:{false,true}) {
             if(graph && rows>32)continue;
             std::cerr<<"ssd_case format="<<format<<" rows="<<rows<<" graph="<<graph<<'\n';
@@ -143,12 +189,13 @@ int main(int argc,char** argv)try {
             }
             for(int step=0;step<3;++step) {
                 set_input(step);
-                const auto before=candidate.metrics().at("ssd_expert_read_count");
+                const auto before=candidate.metrics();
                 if(graph)window->run();else result=candidate.forward(candidate.execution,x,ids,weights);
                 check_output(result,expected[step]);
                 finish_moe_expert_exchanges(candidate.cache);
                 const auto after=candidate.metrics();
-                if(rows<=32)check(after.at("ssd_expert_read_count")-before<=2*candidate.sources.size(),
+                const auto promotion_reads=after.at("residency_ssd_load_requests")-before.at("residency_ssd_load_requests");
+                if(rows<=32)check(after.at("ssd_expert_read_count")-before.at("ssd_expert_read_count")<=2*candidate.sources.size()+promotion_reads,
                     "one window reread an expert for repeated token routes");
                 check(after.at("ssd_expert_enabled")==1 && after.at("ssd_expert_payload_bytes")>0,
                     "SSD expert residency was not reported");
@@ -192,10 +239,39 @@ int main(int argc,char** argv)try {
             }
         }
         release_moe_decode_buffers(candidate.cache);
+        if(prefix.empty() && !combined && !candidate.hybrid) {
+            int cold=-1;
+            for(int e=0;e<experts && cold<0;++e)for(const auto& source:candidate.sources)
+                if(!source->gpu_resident(e)){cold=e;break;}
+            check(cold>=0,"SSD promotion fixture has no cold expert");
+            const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16);
+            auto input=tb::full({143,width},.015,options);
+            auto ids=tb::full({143,2},cold,options.dtype(tb::kInt32));
+            auto weights=tb::full({143,2},.5,options.dtype(tb::kFloat32));
+            check_output(candidate.forward(candidate.execution,input,ids,weights),
+                reference.forward(reference.execution,input,ids,weights));
+            release_moe_prefill_buffers(candidate.cache);
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));
+            for(const auto& source:candidate.sources)for(int e=0;e<experts;++e)
+                source->host_cache()->erase(source->host_key(e));
+            const auto before=candidate.metrics().at("residency_committed_projections");
+            prepare_moe_decode_residency(candidate.cache);
+            check(candidate.metrics().at("residency_committed_projections")>before,
+                "hot experts evicted from RAM could not be promoted from SSD");
+            check(candidate.sources[0]->host_cache()->stats().managed_peak_bytes<=candidate.execution.config.moe_host_cache_bytes,
+                "SSD promotion exceeded the managed RAM budget");
+            check_output(candidate.forward(candidate.execution,input,ids,weights),
+                reference.forward(reference.execution,input,ids,weights));
+            release_moe_prefill_buffers(candidate.cache);
+        }
         const auto metrics=candidate.metrics();
         check(metrics.at("ssd_expert_bytes_read")>0,"SSD expert path did not read checkpoint payloads");
         check(metrics.at("ram_expert_cache_evictions")>0,"tiny RAM cache did not exercise eviction");
-        check(metrics.at("residency_committed_projections")>0,"SSD cache never adapted GPU expert residency");
+        if(!candidate.hybrid)check(metrics.at("residency_committed_projections")>0,"SSD cache never adapted GPU expert residency");
+        if(candidate.hybrid) {
+            std::uint64_t cpu=0;for(const auto& source:candidate.sources)cpu+=source->cpu_projections();
+            check(cpu>0,"SSD hybrid test did not execute CPU expert projections");
+        }
         std::cout<<"ssd_experts format="<<format<<" reads="<<metrics.at("ssd_expert_read_count")
             <<" bytes="<<metrics.at("ssd_expert_bytes_read")<<" bounded_RAM=1 graph=1 PASS\n";
         release_moe_decode_buffers(candidate.cache);

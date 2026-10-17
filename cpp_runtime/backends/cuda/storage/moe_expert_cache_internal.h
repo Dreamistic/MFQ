@@ -767,11 +767,12 @@ public:
         const auto resident = std::size_t(std::max<int64_t>(0, host_bytes_)) + host.managed_bytes + host.transient_bytes;
         const auto disk_reads=expert_disk_reads_after_preload();
         const auto disk_read_bytes=expert_disk_bytes_after_preload();
+        const auto disk_times=expert_disk_timings();
         std::size_t gpu_weights=0;
         for(const auto& [signature,arena]:arenas_)
             for(const auto& field:arena->fields)gpu_weights+=std::size_t(tensor_nbytes(field));
         std::size_t transfer_bytes=0;
-        for(const auto& [signature,arena]:pipeline_stages_)if(!signature.starts_with("prefill16:")) {
+        for(const auto& [signature,arena]:pipeline_stages_)if(!signature.starts_with("prefill:")) {
             if(arena->packed.defined())transfer_bytes+=std::size_t(tensor_nbytes(arena->packed));
             for(const auto& field:arena->fields)transfer_bytes+=std::size_t(tensor_nbytes(field));
         }
@@ -780,6 +781,11 @@ public:
             {"ssd_expert_payload_bytes",double(ssd_experts_ && cold>host.resident_bytes?cold-host.resident_bytes:0)},
             {"ssd_expert_bytes_read",double(disk_read_bytes)},
             {"ssd_expert_read_count",double(disk_reads)},
+            {"ssd_expert_encoded_ms",double(disk_times[0])/1e6},
+            {"ssd_expert_materialize_ms",double(disk_times[1])/1e6},
+            {"ssd_expert_nint_materialize_ms",double(disk_times[2])/1e6},
+            {"ssd_expert_nvq_materialize_ms",double(disk_times[3])/1e6},
+            {"ssd_prefill_host_stage_bytes",double(tensor_nbytes(pipeline_prefill_host_ring_))},
             {"ram_expert_limit_bytes",double(host.budget_bytes)},
             {"ram_expert_cache_hits",double(host.hits)},
             {"ram_expert_cache_misses",double(host.misses)},
@@ -803,6 +809,8 @@ public:
               {"residency_predictor_overlap_rounds",double(residency.predictor_overlap_rounds)},
               {"residency_predictor_overlap_serves",double(residency.predictor_overlap_serves)},
               {"residency_committed_projections",double(residency.committed_projections)},
+              {"residency_ssd_load_requests",double(residency.ssd_load_requests)},
+              {"residency_ssd_load_bytes",double(residency.ssd_load_bytes)},
               {"residency_exchange_bytes",double(residency.direct_exchange_bytes)},
               {"residency_decode_plan_ms",double(residency.decode_plan_ns)/1e6},
               {"residency_decode_join_ms",double(residency.decode_join_ns)/1e6},
@@ -936,6 +944,7 @@ private:
     }
     std::uint64_t expert_disk_reads_after_preload() const;
     std::uint64_t expert_disk_bytes_after_preload() const;
+    std::array<std::uint64_t,4> expert_disk_timings() const;
     bool complete_residency_=false;
     bool ssd_experts_=false;
     std::size_t ssd_expert_total_bytes_=0;
@@ -978,6 +987,9 @@ private:
     std::shared_ptr<MixedMoeRuntime> pipeline_prefill_activations_;
     std::shared_ptr<void> pipeline_prefill_dma_metadata_;
     mfq_tensor_backend::Tensor pipeline_prefill_ring_;
+    int pipeline_prefill_group_capacity_=0;
+    mfq_tensor_backend::Tensor pipeline_prefill_host_ring_;
+    std::size_t pipeline_prefill_host_stride_=0;
     bool pipeline_prefill_layer_layout_=false;
     std::map<int,std::pair<int64_t,int64_t>> pipeline_prefill_layers_;
     std::map<int,int64_t> pipeline_prefill_layer_gate_up_bytes_;

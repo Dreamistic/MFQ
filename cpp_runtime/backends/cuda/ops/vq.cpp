@@ -1647,14 +1647,14 @@ NvqWeight to_device_nvq(
         const CudaExecutionConfig& config) {
     NvqWeight w;
     std::array<uint8_t, 16> e8_state_remap = {};
-    auto e8_index_remap =
-        std::make_unique<std::array<std::array<uint16_t, 4096>, 4>>();
+    std::unique_ptr<std::array<std::array<uint16_t,4096>,4>> e8_index_remap;
     std::vector<int8_t> e8_runtime_codebook;
     std::vector<uint8_t> e8_runtime_sub_scale;
     const bool use_extended_e8 =
         cuda && c.format == 14 &&
         extended_jsc_group_layout_enabled(config);
     if (use_extended_e8) {
+        e8_index_remap=std::make_unique<std::array<std::array<uint16_t,4096>,4>>();
         e8_runtime_codebook = reorder_extended_e8_codebook_for_stage3(
             c, e8_state_remap, *e8_index_remap);
         e8_runtime_sub_scale = remap_extended_e8_sub_scale_states(
