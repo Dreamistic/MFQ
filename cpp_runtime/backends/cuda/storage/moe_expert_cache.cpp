@@ -542,6 +542,7 @@ void MoeExpertCache::initialize_ssd_residency() {
     ssd_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
     ssd_background_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
     ssd_experts_=true;
+    host_experts_->enable_reuse_priority();
     if(kv_expert_loan_)kv_expert_loan_->set_reuse_priority(true);
     const auto host=host_experts_->stats();
     std::cerr<<"moe_ssd_experts_ready gpu_bytes="<<allocated_bytes_<<" ram_budget_bytes="<<host.budget_bytes
@@ -573,7 +574,9 @@ void MoeExpertCache::copy_ssd_experts(const std::vector<SsdExpertCopy>& requests
     ssd_read_pool_->run(0,int64_t(requests.size()),1,std::max(1,config_.moe_ssd_io_workers),
         [&](int64_t begin,int64_t end) {
             const mfq::MappedPrefetchScope prefetch(true);
-            for(auto i=begin;i<end;++i)requests[i].source->copy_expert_fields(requests[i].expert,requests[i].fields);
+            // A prompt scans most experts once. Reuse decoded images without
+            // promoting that scan above the preceding decode's working set.
+            for(auto i=begin;i<end;++i)requests[i].source->copy_expert_fields(requests[i].expert,requests[i].fields,false);
         });
 }
 

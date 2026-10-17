@@ -187,7 +187,7 @@ MixedMoePool MoeQuantRangeSource::read_expert_canonical(int expert) const {
     return result;
 }
 
-void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Tensor>& targets) const {
+void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Tensor>& targets,bool touch_cache) const {
     const auto index=store_->expert_pool(expert);
     std::size_t bytes=0;
     for(const auto& target:targets) {
@@ -205,7 +205,7 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
             if(size)std::memcpy(targets[f].data_ptr(),fields[f].data_ptr(),size);
         }
     };
-    if(host_cache_)if(auto cached=host_cache_->find(host_key(expert))) {copy(cached->weights);return;}
+    if(host_cache_)if(auto cached=host_cache_->find(host_key(expert),touch_cache)) {copy(cached->weights);return;}
     if(disk_sealed_.load()) {
         ++sealed_disk_attempts_;
         throw std::runtime_error("expert disk copy forbidden after complete residency preload");

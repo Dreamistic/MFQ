@@ -37,7 +37,7 @@ struct MoeHostExpertReservation {
 };
 
 struct MoeHostExpertCache::Impl {
-    struct Entry { Lease value; std::list<mfq::MoeCacheKey>::iterator position; };
+    struct Entry { Lease value; std::list<mfq::MoeCacheKey>::iterator position; bool reused=false; };
     struct Flight {
         bool ready=false;
         bool retain=true;
@@ -49,6 +49,7 @@ struct MoeHostExpertCache::Impl {
     std::shared_ptr<Ledger> ledger=std::make_shared<Ledger>();
     mutable std::mutex mutex;
     std::list<mfq::MoeCacheKey> lru;
+    std::list<mfq::MoeCacheKey> reused;
     std::unordered_map<mfq::MoeCacheKey,Entry,mfq::MoeCacheKeyHash> entries;
     std::unordered_map<mfq::MoeCacheKey,std::shared_ptr<Flight>,mfq::MoeCacheKeyHash> flights;
     // Bypassed payloads still have an active consumer. Reuse that immutable
@@ -67,14 +68,33 @@ struct MoeHostExpertCache::Impl {
     void remove(decltype(entries)::iterator found) {
         counters.resident_bytes-=found->second.value->bytes;
         if(found->first.source<0)counters.optional_bytes-=found->second.value->bytes;
-        lru.erase(found->second.position);
+        if(found->second.reused)counters.reuse_protected_bytes-=found->second.value->bytes;
+        (found->second.reused?reused:lru).erase(found->second.position);
         entries.erase(found);
+    }
+    void touch(mfq::MoeCacheKey key,Entry& entry) {
+        if(!counters.reuse_priority || key.source<0) {
+            lru.splice(lru.begin(),lru,entry.position);return;
+        }
+        reused.splice(reused.begin(),entry.reused?reused:lru,entry.position);
+        if(!entry.reused) {
+            entry.reused=true;counters.reuse_protected_bytes+=entry.value->bytes;++counters.reuse_promotions;
+        }
+        const auto limit=budget-budget/4;
+        while(counters.reuse_protected_bytes>limit && !reused.empty()) {
+            auto candidate=reused.end();
+            do {--candidate;}while(candidate!=reused.begin() && exchanging.contains(*candidate));
+            if(exchanging.contains(*candidate))break;
+            auto& old=entries.at(*candidate);
+            counters.reuse_protected_bytes-=old.value->bytes;old.reused=false;
+            lru.splice(lru.begin(),reused,old.position);
+        }
     }
     bool make_room(std::size_t bytes) {
         if (!bytes || bytes>budget) return false;
-        auto candidate=lru.end();
-        while (ledger->managed.load()>budget-bytes) {
-            if (candidate==lru.begin()) return false;
+        for(auto* queue:{&lru,&reused}) {
+          auto candidate=queue->end();
+          while (ledger->managed.load()>budget-bytes && candidate!=queue->begin()) {
             --candidate;
             if(exchanging.contains(*candidate))continue;
             auto found=entries.find(*candidate);
@@ -85,13 +105,16 @@ struct MoeHostExpertCache::Impl {
             // Externally held payloads stay charged even after removal. Keep
             // their lookup entry rather than evicting useful pinned data.
             if (found->second.value.use_count()!=1) continue;
-            candidate=lru.erase(candidate);
+            candidate=queue->erase(candidate);
             counters.resident_bytes-=found->second.value->bytes;
             if(found->first.source<0)counters.optional_bytes-=found->second.value->bytes;
+            if(found->second.reused)counters.reuse_protected_bytes-=found->second.value->bytes;
             entries.erase(found);
             ++counters.evictions;
+          }
+          if(ledger->managed.load()<=budget-bytes)return true;
         }
-        return true;
+        return false;
     }
     void publish(mfq::MoeCacheKey key,Lease value) {
         lru.push_front(key);
@@ -107,12 +130,15 @@ struct MoeHostExpertCache::Impl {
 
 MoeHostExpertCache::MoeHostExpertCache(std::size_t bytes):impl_(std::make_unique<Impl>(bytes)) {}
 MoeHostExpertCache::~MoeHostExpertCache()=default;
+void MoeHostExpertCache::enable_reuse_priority() {
+    std::lock_guard lock(impl_->mutex);impl_->counters.reuse_priority=true;
+}
 
-MoeHostExpertCache::Lease MoeHostExpertCache::find(mfq::MoeCacheKey key) {
+MoeHostExpertCache::Lease MoeHostExpertCache::find(mfq::MoeCacheKey key,bool touch) {
     std::unique_lock lock(impl_->mutex);impl_->wait_exchange(lock,key);
     const auto found=impl_->entries.find(key);
     if(found==impl_->entries.end())return {};
-    impl_->lru.splice(impl_->lru.begin(),impl_->lru,found->second.position);
+    if(touch)impl_->touch(key,found->second);
     ++impl_->counters.hits;
     return found->second.value;
 }
@@ -135,7 +161,7 @@ MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::MoeCacheKey key,std::
         if (retain) {
             const auto hit=state.entries.find(key);
             if (hit!=state.entries.end()) {
-                state.lru.splice(state.lru.begin(),state.lru,hit->second.position);
+                state.touch(key,hit->second);
                 ++state.counters.hits;
                 return hit->second.value;
             }
@@ -280,6 +306,7 @@ bool MoeHostExpertCache::exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey out
     auto value=std::make_shared<MoeHostExpert>();
     value->reservation=expected->reservation;value->bytes=expected->bytes;
     const auto position=found->second.position;
+    const bool was_reused=found->second.reused;
     // Allocate the new lookup entry before copying into the reused fields.
     state.entries.emplace(outgoing,Impl::Entry{value,position});
     try {value->weights=copy(expected->weights);}
@@ -287,7 +314,8 @@ bool MoeHostExpertCache::exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey out
     state.entries.erase(incoming);*position=outgoing;
     if(incoming.source<0)state.counters.optional_bytes-=value->bytes;
     if(outgoing.source<0)state.counters.optional_bytes+=value->bytes;
-    state.lru.splice(state.lru.begin(),state.lru,position);
+    if(was_reused)state.counters.reuse_protected_bytes-=value->bytes;
+    state.lru.splice(state.lru.begin(),was_reused?state.reused:state.lru,position);
     ++state.counters.promotions;++state.counters.gpu_demotions;
     return true;
 }
@@ -299,7 +327,7 @@ bool MoeHostExpertCache::exchange_batch(const std::vector<Exchange>& changes,
     const auto* option=std::getenv("MFQ_MOE_KEYED_EXCHANGE");
     const bool keyed=option?option[0]=='1':independent_readers;
     std::unordered_set<mfq::MoeCacheKey,mfq::MoeCacheKeyHash> keys;
-    struct Prepared {std::shared_ptr<MoeHostExpert> value;std::list<mfq::MoeCacheKey>::iterator position;};
+    struct Prepared {std::shared_ptr<MoeHostExpert> value;std::list<mfq::MoeCacheKey>::iterator position;bool reused;};
     std::vector<Prepared> prepared;prepared.reserve(changes.size());
     for(const auto& change:changes) {
         if(!change.expected || !*change.expected || !change.copy || !change.restore ||
@@ -311,7 +339,7 @@ bool MoeHostExpertCache::exchange_batch(const std::vector<Exchange>& changes,
             state.flights.contains(change.incoming) || state.flights.contains(change.outgoing))return false;
         auto value=std::make_shared<MoeHostExpert>();
         value->reservation=(*change.expected)->reservation;value->bytes=(*change.expected)->bytes;
-        prepared.push_back({std::move(value),found->second.position});
+        prepared.push_back({std::move(value),found->second.position,found->second.reused});
     }
     // The optional keyed path excludes readers of both names while DMA and
     // publication run, allowing unrelated immutable experts to be acquired.
@@ -361,7 +389,8 @@ bool MoeHostExpertCache::exchange_batch(const std::vector<Exchange>& changes,
         state.entries.erase(changes[i].incoming);*prepared[i].position=changes[i].outgoing;
         if(changes[i].incoming.source<0)state.counters.optional_bytes-=prepared[i].value->bytes;
         if(changes[i].outgoing.source<0)state.counters.optional_bytes+=prepared[i].value->bytes;
-        state.lru.splice(state.lru.begin(),state.lru,prepared[i].position);
+        if(prepared[i].reused)state.counters.reuse_protected_bytes-=prepared[i].value->bytes;
+        state.lru.splice(state.lru.begin(),prepared[i].reused?state.reused:state.lru,prepared[i].position);
     }
     state.counters.promotions+=changes.size();state.counters.gpu_demotions+=changes.size();
     unreserve();lock.unlock();state.exchange_complete.notify_all();

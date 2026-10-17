@@ -26,6 +26,9 @@ struct MoeHostExpertCacheStats {
     std::size_t transient_bytes=0, transient_peak_bytes=0;
     std::uint64_t hits=0, misses=0, coalesced=0, evictions=0;
     std::uint64_t promotions=0, gpu_demotions=0, bypasses=0;
+    bool reuse_priority=false;
+    std::size_t reuse_protected_bytes=0;
+    std::uint64_t reuse_promotions=0;
 };
 
 // Engine-wide, byte-bounded LRU for immutable CPU expert fields. CPU leases
@@ -51,8 +54,10 @@ public:
     std::size_t reclaim_optional(std::size_t bytes);
     bool contains(mfq::MoeCacheKey key) const;
     // Read an already cached immutable image without invoking a loader.
-    Lease find(mfq::MoeCacheKey key);
+    Lease find(mfq::MoeCacheKey key,bool touch=true);
     MoeHostExpertCacheStats stats() const;
+    // A streaming scan must not evict repeatedly consumed decoded images.
+    void enable_reuse_priority();
     // Complete-residency mode cannot evict the last copy of an expert.
     void preserve_resident_experts();
     bool exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey outgoing,

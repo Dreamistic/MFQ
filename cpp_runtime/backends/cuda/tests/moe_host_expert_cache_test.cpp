@@ -34,6 +34,33 @@ void wait_coalesced(const MoeHostExpertCache& cache,std::promise<void>& release)
 }
 
 int main() try {
+    for(bool reuse:{false,true}) {
+        MoeHostExpertCache cache(512);if(reuse)cache.enable_reuse_priority();
+        for(int expert:{0,1})cache.acquire(key(expert),64,[expert]{return weight(64,expert+1);});
+        for(int expert:{0,1})bytes_equal(cache.find(key(expert)),expert+1);
+        cache.acquire(key(99),64,[]{return weight(64,3);});
+        for(int scan=0;scan<3;++scan)bytes_equal(cache.find(key(99),false),3);
+        for(int expert=2;expert<34;++expert)cache.acquire(key(expert),64,[expert]{return weight(64,expert+1);});
+        check(cache.contains(key(0))==reuse && cache.contains(key(1))==reuse,
+            "a one-use RAM scan displaced repeated decoded expert images");
+        if(!reuse)continue;
+        check(cache.stats().reuse_promotions==2,"prefill image lookups promoted one-use RAM experts");
+        for(int expert=34;expert<50;++expert) {
+            cache.acquire(key(expert),64,[expert]{return weight(64,expert+1);});
+            bytes_equal(cache.find(key(expert)),expert+1);
+            check(cache.stats().reuse_protected_bytes<=384,"RAM reuse protection exceeded its byte quota");
+        }
+        cache.acquire(key(0,-2),64,[]{return weight(64,9);});
+        bytes_equal(cache.find(key(0,-2)),9);
+        check(cache.reclaim_optional(64)==64,"repeated optional backup was protected from reclamation");
+        auto held=cache.find(key(49));check(bool(held),"RAM reuse fixture lost its latest expert");
+        const auto protected_before=cache.stats().reuse_protected_bytes;
+        check(cache.exchange(key(49),key(50),held,[](const MixedMoePool&){return weight(64,51);}),
+            "RAM reuse prevented a valid GPU exchange");
+        check(cache.stats().reuse_protected_bytes+64==protected_before,"GPU victim inherited the incoming expert's protection");
+        held.reset();bytes_equal(cache.find(key(50)),51);
+        check(cache.stats().managed_peak_bytes<=512,"RAM reuse exceeded its physical payload budget");
+    }
     {
         MoeHostExpertCache cache(0);
         int reads=0;
@@ -239,11 +266,13 @@ int main() try {
             "pressure reclaim could not reuse the completed backup allocation");
     }
     int batch_cases=0;
-    for(bool bulk:{false,true})for(int fail_at:{-2,0,1,2,3,-1}) {
+    for(bool reuse:{false,true})for(bool bulk:{false,true})for(int fail_at:{-2,0,1,2,3,-1}) {
         if(!bulk && fail_at==-2)continue;
         MoeHostExpertCache cache(192);cache.preserve_resident_experts();
+        if(reuse)cache.enable_reuse_priority();
         std::array<MoeHostExpertCache::Lease,3> held;
         for(int i=0;i<3;++i)held[i]=cache.acquire(key(i),64,[i]{return weight(64,i+1);});
+        if(reuse)for(int i=0;i<3;++i)bytes_equal(cache.find(key(i)),i+1);
         std::vector<MoeHostExpertCache::Exchange> changes;
         for(int i=0;i<3;++i)changes.push_back({key(i),key(i+3),&held[i],
             [i,fail_at,bulk](const MixedMoePool& original) {
@@ -278,10 +307,12 @@ int main() try {
     }
     int keyed_cases=0;
     if(const auto* option=std::getenv("MFQ_MOE_KEYED_EXCHANGE");option && option[0]=='1')
-      for(bool fail:{false,true}) {
+      for(bool reuse:{false,true})for(bool fail:{false,true}) {
         MoeHostExpertCache cache(192);cache.preserve_resident_experts();
+        if(reuse)cache.enable_reuse_priority();
         auto held=cache.acquire(key(0),64,[]{return weight(64,1);});
         cache.acquire(key(7),64,[]{return weight(64,7);});
+        if(reuse)bytes_equal(cache.find(key(0)),1);
         std::promise<void> entered,release;
         auto released=release.get_future().share();
         std::vector<MoeHostExpertCache::Exchange> changes={{key(0),key(1),&held,
@@ -302,6 +333,7 @@ int main() try {
         auto unrelated=std::async(std::launch::async,[&] {
             bytes_equal(cache.acquire(key(7),64,[]{throw std::runtime_error("unrelated reread");return weight(64,0);}),7);
             bytes_equal(cache.acquire(key(8),64,[]{return weight(64,8);}),8);
+            if(reuse)bytes_equal(cache.find(key(8)),8);
             const auto stats=cache.stats();
             return stats.resident_entries==3 && stats.managed_bytes==192 && stats.managed_peak_bytes==192;
         });
