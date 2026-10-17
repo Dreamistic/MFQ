@@ -107,13 +107,6 @@ Gate、Up、Down 精度，四张热力图使用同一色阶。
 
 </details>
 
-MFQ Studio 原生集成量化可视化功能，可直观、详细地查看任意 MoE 检查点的
-精度分配，从各层、各专家一直细化到 Gate、Up、Down 投影。
-
-<p align="center">
-  <img src="./docs/figures/mfq-studio-analysis-zh.png" alt="MFQ Studio 分析：检查点架构、模型结构与投影级精度分配明细" width="1100">
-</p>
-
 我们的校准方法已开源，详见论文
 [Beyond Expert Rankings: Contrast Calibration for Mixed-Precision MoE Quantization](https://arxiv.org/abs/2610.20353)。
 BibTeX 格式见[引用](#引用)。
@@ -175,8 +168,19 @@ ROCm/HIP 支持仍在开发中，优化的 CPU 后端正在规划中。
    `.mfq` 检查点。
 3. 在本地使用已加载的模型，或通过兼容 API 接入应用，全程无需从源码构建。
 
+**服务概览**
+
 <p align="center">
   <img src="./docs/figures/mfq-studio-overview-zh.png" alt="MFQ Studio：本地模型服务、实时性能与资源概览" width="1100">
+</p>
+
+**量化分析**
+
+MFQ Studio 原生集成量化可视化功能，可直观、详细地查看任意 MoE 检查点的
+精度分配，从各层、各专家一直细化到 Gate、Up、Down 投影。
+
+<p align="center">
+  <img src="./docs/figures/mfq-studio-analysis-zh.png" alt="MFQ Studio 分析：检查点架构、模型结构与投影级精度分配明细" width="1100">
 </p>
 
 ### 从源码构建
