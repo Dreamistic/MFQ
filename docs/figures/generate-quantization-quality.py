@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 DATA = json.loads((ROOT / "data/qwen38-flash-next-quality.json").read_text())
 C = json.loads((ROOT / "studio-figure-theme.json").read_text())["colors"]
 REPOSITORY_URL = "https://github.com/Tylogi/MFQ"
-WIDTH, HEIGHT = 1600, 900
+WIDTH, HEIGHT = 1600, 1020
 
 families = ["DejaVu Sans"]
 for font_path in (
@@ -79,22 +79,28 @@ LANGUAGES = {
     },
 }
 
-# Label the MFQ tiers and selected reference points; every point retains its
-# exact tier and measurements in SVG metadata and in the checked-in data file.
+# Every point shows its metric; MFQ labels also retain the tier name. Offsets
+# keep labels outside the neighboring curves without moving any data points.
 OFFSETS = {
     "kld": {
-        "mfq": {"V1-S": (-10, -24, "right"), "V1-M": (-6, -28, "right"),
-                "S2-L": (0, -28, "center"), "V3-XXS": (-8, -26, "right"),
-                "S3-L": (-6, -28, "right"), "V4-XS": (-4, -28, "right")},
-        "unsloth-ud": {"IQ1_M": (6, 20, "left"), "IQ4_XS": (10, 6, "left")},
-        "gsq-rco": {"Q2_0": (12, 14, "left"), "IQ3_S": (10, 32, "left")},
+        "mfq": {"V1-S": (-20, -18, "right", "top"), "V1-M": (-6, -34, "right", "top"),
+                "S2-L": (-6, -18, "right", "top"), "V3-XXS": (-8, -18, "right", "top"),
+                "S3-L": (-14, -18, "right", "top"), "V4-XS": (-4, -18, "right", "top")},
+        "unsloth-ud": {"IQ1_S": (4, 24, "left", "bottom"), "IQ1_M": (10, 22, "left", "bottom"),
+                       "Q2_K_XL": (10, 42, "left", "bottom"), "IQ3_XXS": (10, 20, "left", "bottom"),
+                       "Q3_K_XL": (4, 20, "left", "bottom"), "IQ4_XS": (10, 8, "left", "bottom")},
+        "gsq-rco": {"Q2_0": (10, 18, "left", "bottom"), "IQ2_XS": (12, 22, "left", "bottom"),
+                    "IQ3_XXS": (10, 70, "left", "bottom"), "IQ3_S": (10, 38, "left", "bottom")},
     },
     "top1_agreement_percent": {
-        "mfq": {"V1-S": (-14, 12, "right"), "V1-M": (-6, 24, "right"),
-                "S2-L": (-4, 20, "right"), "V3-XXS": (-4, 23, "right"),
-                "S3-L": (-8, 20, "right"), "V4-XS": (-4, 23, "right")},
-        "unsloth-ud": {"IQ1_M": (10, -25, "left"), "IQ4_XS": (8, -24, "left")},
-        "gsq-rco": {"Q2_0": (12, -16, "left"), "IQ3_S": (10, 14, "left")},
+        "mfq": {"V1-S": (-12, 16, "right", "bottom"), "V1-M": (-8, 30, "right", "bottom"),
+                "S2-L": (-8, 16, "right", "bottom"), "V3-XXS": (-8, 24, "right", "bottom"),
+                "S3-L": (-10, 18, "right", "bottom"), "V4-XS": (-4, 36, "right", "bottom")},
+        "unsloth-ud": {"IQ1_S": (8, -24, "left", "top"), "IQ1_M": (10, -20, "left", "top"),
+                       "Q2_K_XL": (12, -35, "left", "top"), "IQ3_XXS": (10, -22, "left", "top"),
+                       "Q3_K_XL": (8, -22, "left", "top"), "IQ4_XS": (8, -24, "left", "top")},
+        "gsq-rco": {"Q2_0": (10, -16, "left", "top"), "IQ2_XS": (10, -18, "left", "top"),
+                    "IQ3_XXS": (8, -20, "left", "top"), "IQ3_S": (10, -16, "left", "top")},
     },
 }
 
@@ -110,7 +116,7 @@ def label(fig, x, y, value, size=17, color=None, weight="normal", **kwargs):
 
 def card(fig, x):
     fig.add_artist(FancyBboxPatch(
-        bounds(x, 128, 740, 652)[:2], 740 / WIDTH, 652 / HEIGHT,
+        bounds(x, 128, 740, 772)[:2], 740 / WIDTH, 772 / HEIGHT,
         boxstyle=f"round,pad=0,rounding_size={12 / WIDTH}",
         mutation_aspect=WIDTH / HEIGHT, transform=fig.transFigure,
         facecolor=C["surface"], edgecolor=C["line"], linewidth=0.8, zorder=-1,
@@ -140,7 +146,7 @@ def panel(fig, x, metric, text):
     short = "kld" if metric == "kld" else "top1"
     label(fig, x + 28, 174, text[short], 25, C["strong"], "bold")
     label(fig, x + 28, 204, text[f"{short}_hint"], 17, C["muted"])
-    ax = fig.add_axes(bounds(x + 92, 244, 616, 458), facecolor="none")
+    ax = fig.add_axes(bounds(x + 92, 244, 616, 578), facecolor="none")
     ax.set_xlim(65, 97)
     ax.set_xticks((66, 70, 74, 78, 82, 86, 90, 94))
     if metric == "kld":
@@ -174,15 +180,17 @@ def panel(fig, x, metric, text):
                              color=style["color"], markeredgecolor=C["surface"],
                              markeredgewidth=1.6, zorder=5 if series["id"] == "mfq" else 4)
             point.set_gid(f'quality-{short}-{series["id"]}-{row["tier"]}')
-            offset = OFFSETS[metric][series["id"]].get(row["tier"])
-            if offset:
-                dx, dy, align = offset
-                ax.annotate(row["tier"], (row["weight_size_gb"], row[metric]),
-                            xytext=(dx, dy), textcoords="offset points", ha=align, va="center",
-                            color=C["accent_ink"] if series["id"] == "mfq" else C["muted"],
-                            weight="bold" if series["id"] == "mfq" else "normal", fontsize=style["label_size"],
-                            arrowprops={"arrowstyle": "-", "linewidth": 0.85,
-                                        "color": style["color"], "shrinkA": 4, "shrinkB": 10})
+            dx, dy, align, vertical = OFFSETS[metric][series["id"]][row["tier"]]
+            value = f'{row[metric]:.5f}' if metric == "kld" else f'{row[metric]:.2f}%'
+            caption = f'{row["tier"]}\n{value}' if series["id"] == "mfq" else value
+            ink = C["accent_ink"] if series["id"] == "mfq" else C["muted_light"] if series["id"] == "unsloth-ud" else C["muted"]
+            annotation = ax.annotate(caption, (row["weight_size_gb"], row[metric]),
+                                    xytext=(dx, dy), textcoords="offset points", ha=align, va=vertical,
+                                    color=ink, linespacing=1.15,
+                                    weight="bold" if series["id"] == "mfq" else "normal", fontsize=style["label_size"],
+                                    arrowprops={"arrowstyle": "-", "linewidth": 0.85,
+                                                "color": style["color"], "shrinkA": 4, "shrinkB": 10})
+            annotation.set_gid(f'quality-{short}-label-{series["id"]}-{row["tier"]}')
     return ax
 
 
@@ -199,9 +207,9 @@ def generate(locale, text):
                frameon=False, fontsize=18, handlelength=2, columnspacing=1.6)
     panel(fig, 48, "kld", text)
     panel(fig, 812, "top1_agreement_percent", text)
-    label(fig, 48, 806, text["exclusions"], 14, C["muted_light"])
-    label(fig, 48, 832, text["protocol"], 14, C["muted_light"])
-    footer = label(fig, 1552, 876, REPOSITORY_URL, 14, C["muted_light"], ha="right")
+    label(fig, 48, 926, text["exclusions"], 14, C["muted_light"])
+    label(fig, 48, 952, text["protocol"], 14, C["muted_light"])
+    footer = label(fig, 1552, 996, REPOSITORY_URL, 14, C["muted_light"], ha="right")
     footer.set_gid("repository-url")
     footer.set_url(REPOSITORY_URL)
 
