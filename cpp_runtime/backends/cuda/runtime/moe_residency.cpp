@@ -984,7 +984,7 @@ void MoeResidencyManager::prepare() {
             if(cache.ssd_experts())move.lease=std::move(ssd_images.at({move.incoming_source,move.incoming}));
             else move.lease=incoming.quant_source_->acquire_expert(move.incoming);
             if(move.lease.use_count()!=2){valid=false;break;}
-            if(s.direct && cache.pipeline_ram_registered_bytes_<cache.pipeline_ram_complement_->numel()) {
+            if(s.direct && (cache.ssd_experts() || cache.pipeline_ram_registered_bytes_<cache.pipeline_ram_complement_->numel())) {
                 const auto begin=reinterpret_cast<uintptr_t>(cache.pipeline_ram_complement_->data_ptr());
                 const auto end=begin+cache.pipeline_ram_registered_bytes_;
                 for(const auto& field:moe_cache_field_refs(move.lease->weights)) {
@@ -1066,7 +1066,7 @@ void MoeResidencyManager::prepare() {
     // Only fixed GPU routing without background CPU calibration uses this
     // path. The host-cache lock spans the exchange, so window completion must
     // never require a new host-cache lookup. Existing readers reject it.
-    if(s.direct_exchange && s.direct && s.reuse_transfer &&
+    if(s.direct_exchange && s.direct && s.reuse_transfer && !cache.ssd_experts() &&
             (!s.pending_window || s.pending_expert_fence) &&
             cache.config_.moe_ram_pcie_fraction && cache.ram_pcie_fraction_==1.0 &&
             !cache.pipeline_shared_cpu_cost_ &&

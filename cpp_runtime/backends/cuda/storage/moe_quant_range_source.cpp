@@ -1,5 +1,6 @@
 #include "../runtime/execution_options.h"
 #include "moe_quant_range_source.h"
+#include "moe_pinned_expert_arena.h"
 #include "cpu_projection_rows.h"
 #include "mfq/cpu_expert_pool.h"
 #include "quant_linear.h"
@@ -66,6 +67,7 @@ MoeQuantRangeSource::MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStor
     metadata_->neuron_len=store_->neuron_len();
     q_strides_.assign(store_->pool_count(),0);
     field_bytes_.assign(store_->pool_count(),0);
+    field_layouts_.resize(store_->pool_count());arena_bytes_.resize(store_->pool_count());
     gpu_resident_=std::make_unique<std::atomic_bool[]>(store_->num_experts());
     for (int expert=0; expert<store_->num_experts(); ++expert) gpu_resident_[expert].store(false);
     for (std::size_t index=0; index<store_->pool_count(); ++index) {
@@ -79,6 +81,14 @@ MoeQuantRangeSource::MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStor
         }
         auto pool=read_expert(ids.front());
         field_bytes_[index]=expert_fields_bytes(pool);
+        std::size_t packed=0;
+        for(const auto& field:expert_field_tensors(pool)) {
+            packed=(packed+15)&~std::size_t(15);
+            const auto bytes=std::size_t(field.numel()*field.element_size());
+            field_layouts_[index].push_back({field.sizes().vec(),field.scalar_type(),packed,bytes});
+            packed+=bytes;
+        }
+        arena_bytes_[index]=(packed+15)&~std::size_t(15);
         pool.local_experts=static_cast<int>(ids.size());
         std::vector<std::int32_t> local(store_->num_experts(),-1);
         for (std::size_t j=0; j<ids.size(); ++j) local[ids[j]]=static_cast<std::int32_t>(j);
@@ -88,6 +98,35 @@ MoeQuantRangeSource::MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStor
 }
 
 MixedMoePool MoeQuantRangeSource::read_expert(int expert) const {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    const auto index=store_->expert_pool(expert);
+    if(pinned_arena_)if(auto block=pinned_arena_->allocate(arena_bytes_.at(index))) {
+        std::vector<tb::Tensor> fields;
+        for(const auto& layout:field_layouts_.at(index)) {
+            auto storage=std::make_shared<tb::TensorStorage>();
+            const auto device=tb::Device{tb::kCPU,0};
+            auto* address=block->data()+layout.offset;
+            storage->owner=block;storage->base=address;storage->bytes=layout.bytes;
+            storage->device=device;storage->pinned=true;
+            fields.emplace_back(storage,tb::make_contiguous_view(address,layout.shape,layout.dtype,device));
+        }
+        copy_expert_fields(expert,fields);
+        auto pool=metadata_->pools.at(index);pool.local_experts=1;pool.expert_local={};
+        if(pool.family==MixedMoeFamily::Nvq) {
+            auto& w=pool.nvq;w.workspaces.clear();
+            w.indices_packed=fields[0];w.aux_packed=fields[1];w.sub_scale_packed=fields[2];w.neuron_scale=fields[3];
+        } else {
+            auto& w=pool.nint;w.workspaces.clear();
+            w.q_packed=fields[0];w.row_q_bits=fields[1];w.row_q_bit_offsets=fields[2];
+            w.sub_scale=fields[3];w.sub_min=fields[4];w.neuron_scale=fields[5];w.neuron_min=fields[6];
+        }
+        return pool;
+    }
+#endif
+    return read_expert_canonical(expert);
+}
+
+MixedMoePool MoeQuantRangeSource::read_expert_canonical(int expert) const {
     if (disk_sealed_.load()) {
         ++sealed_disk_attempts_;
         throw std::runtime_error("expert disk read forbidden after complete residency preload");
@@ -174,7 +213,7 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
                 throw std::invalid_argument("SSD neuron scale target differs");
             const auto scale=cpu_f16_to_f32_tensor(anchors,store_->out_per_expert());
             std::memcpy(targets[3].data_ptr(),scale.data_ptr(),anchors.size()*4);
-            ++prefill_direct_reads_;++materializations_;
+            ++direct_field_reads_;++materializations_;
             if(preloaded_.load()) {
                 ++disk_reads_after_preload_;
                 disk_bytes_after_preload_.fetch_add(bytes-anchors.size()*2,std::memory_order_relaxed);
@@ -188,7 +227,7 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
             return;
         }
     }
-    const auto lease=acquire_expert(expert);copy(lease->weights);
+    copy(read_expert_canonical(expert));
 }
 
 MixedMoePool MoeQuantRangeSource::decode_expert(int expert,const mfq::MfeQuantExpert& encoded) const {

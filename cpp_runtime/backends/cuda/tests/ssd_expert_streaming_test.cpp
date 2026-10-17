@@ -2,6 +2,7 @@
 #include "storage/moe_expert_cache_internal.h"
 #include "storage/moe_ffn_pipeline.h"
 #include "storage/moe_quant_range_source.h"
+#include "storage/moe_pinned_expert_arena.h"
 #include "storage/weight_loader.h"
 #include "runtime/decode_window.h"
 #include "mfq_cuda_context.h"
@@ -37,6 +38,20 @@ void check_packed_metadata() {
             check(rejected && offset==3,"truncated packed metadata was accepted");
         }
     }
+}
+void check_pinned_arena() {
+    auto arena=std::make_shared<MoePinnedExpertArena>(1024);
+    auto a=arena->allocate(255),b=arena->allocate(256),c=arena->allocate(512);
+    check(a && b && c && arena->used_bytes()==1024,"pinned expert allocations were not bounded and aligned");
+    check(!arena->allocate(16),"pinned expert arena exceeded its capacity");
+    a.reset();c.reset();
+    check(!arena->allocate(768),"pinned arena reused an interval protected by a live lease");
+    b.reset();
+    auto joined=arena->allocate(1024);
+    check(joined && joined->data()==arena->data(),"pinned expert intervals did not coalesce");
+    auto storage=arena->tensor();arena.reset();
+    std::memset(joined->data(),0x5a,joined->bytes());joined.reset();
+    check(static_cast<const uint8_t*>(storage.data_ptr())[1023]==0x5a,"pinned expert view outlived its storage owner");
 }
 std::shared_ptr<MoeQuantRangeSource> source(const std::filesystem::path& path,const std::string& name="linear.weight") {
     auto model=mfq::open_model_source(path.string());auto read=model->tensor_reader(name);
@@ -129,6 +144,7 @@ void check_output(const tb::Tensor& actual,const tb::Tensor& expected) {
 }
 int main(int argc,char** argv)try {
     check_packed_metadata();
+    check_pinned_arena();
     check(argc==2 || argc==3,"expected SSD expert fixture directory or model and expert tensor prefix");
     const auto stream=mfq_current_cuda_stream();
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
@@ -265,6 +281,7 @@ int main(int argc,char** argv)try {
             release_moe_prefill_buffers(candidate.cache);
         }
         const auto metrics=candidate.metrics();
+        check(metrics.at("ram_expert_pinned_bytes")>0,"SSD RAM cache did not allocate reusable pinned storage");
         check(metrics.at("ssd_expert_bytes_read")>0,"SSD expert path did not read checkpoint payloads");
         check(metrics.at("ram_expert_cache_evictions")>0,"tiny RAM cache did not exercise eviction");
         if(!candidate.hybrid)check(metrics.at("residency_committed_projections")>0,"SSD cache never adapted GPU expert residency");
@@ -273,7 +290,7 @@ int main(int argc,char** argv)try {
             check(cpu>0,"SSD hybrid test did not execute CPU expert projections");
         }
         if(prefix.empty() && std::string(format).starts_with("nvq") && std::string(format)!="nvq2j-xl")
-            check(metrics.at("ssd_prefill_direct_reads")>0,"prefill did not read NVQ fields directly into pinned targets");
+            check(metrics.at("ssd_direct_field_reads")>0,"NVQ fields were not read directly into pinned targets");
         std::cout<<"ssd_experts format="<<format<<" reads="<<metrics.at("ssd_expert_read_count")
             <<" bytes="<<metrics.at("ssd_expert_bytes_read")<<" bounded_RAM=1 graph=1 PASS\n";
         release_moe_decode_buffers(candidate.cache);

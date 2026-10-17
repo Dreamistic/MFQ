@@ -16,6 +16,7 @@
 
 struct MoeFfnPrefillHostWorkspace;
 struct CudaProfiler;
+class MoePinnedExpertArena;
 class MoeExpertCache {
 public:
     struct PrefillCopySubmission {
@@ -127,7 +128,7 @@ public:
         for(auto& batch:pipeline_dma_batches_)batch.reset();
         if(pipeline_pool_context_)
             pipeline_pool_context_->end_graph_pool(pipeline_pool_stream_);
-        if (!registered_host_fields_.empty() &&
+        if ((!registered_host_fields_.empty() || pinned_expert_arena_) &&
                 weight_stream_ != nullptr) {
             (void)cudaStreamSynchronize(weight_stream_);
         }
@@ -768,11 +769,14 @@ public:
     std::vector<std::pair<std::string, double>> memory_metrics() const {
         const auto host = host_experts_->stats();
         const auto residency=moe_residency_?moe_residency_->stats():MoeResidencyManager::Stats{};
-        const auto resident = std::size_t(std::max<int64_t>(0, host_bytes_)) + host.managed_bytes + host.transient_bytes;
+        const auto [pinned_bytes,pinned_used]=pinned_expert_memory();
+        const auto cached=host.managed_bytes+host.transient_bytes;
+        const auto resident = std::size_t(std::max<int64_t>(0, host_bytes_)) + pinned_bytes+
+            (cached>pinned_used?cached-pinned_used:0);
         const auto disk_reads=expert_disk_reads_after_preload();
         const auto disk_read_bytes=expert_disk_bytes_after_preload();
         const auto disk_times=expert_disk_timings();
-        const auto direct_reads=expert_prefill_direct_reads();
+        const auto direct_reads=expert_direct_field_reads();
         std::size_t gpu_weights=0;
         for(const auto& [signature,arena]:arenas_)
             for(const auto& field:arena->fields)gpu_weights+=std::size_t(tensor_nbytes(field));
@@ -786,7 +790,7 @@ public:
             {"ssd_expert_payload_bytes",double(ssd_experts_ && cold>host.resident_bytes?cold-host.resident_bytes:0)},
             {"ssd_expert_bytes_read",double(disk_read_bytes)},
             {"ssd_expert_read_count",double(disk_reads)},
-            {"ssd_prefill_direct_reads",double(direct_reads)},
+            {"ssd_direct_field_reads",double(direct_reads)},
             {"ssd_decode_read_wait_ms",double(stats_.pipeline_window_ssd_read_ns)/1e6},
             {"ssd_expert_read_wait_ms",double(stats_.pipeline_ssd_read_ns)/1e6},
             {"ssd_expert_encoded_ms",double(disk_times[0])/1e6},
@@ -795,6 +799,8 @@ public:
             {"ssd_expert_nvq_materialize_ms",double(disk_times[3])/1e6},
             {"ssd_prefill_host_stage_bytes",double(tensor_nbytes(pipeline_prefill_host_ring_))},
             {"ram_expert_limit_bytes",double(host.budget_bytes)},
+            {"ram_expert_pinned_bytes",double(pinned_bytes)},
+            {"ram_expert_pinned_used_bytes",double(pinned_used)},
             {"ram_expert_cache_hits",double(host.hits)},
             {"ram_expert_cache_misses",double(host.misses)},
             {"ram_expert_cache_evictions",double(host.evictions)},
@@ -952,7 +958,8 @@ private:
     }
     std::uint64_t expert_disk_reads_after_preload() const;
     std::uint64_t expert_disk_bytes_after_preload() const;
-    std::uint64_t expert_prefill_direct_reads() const;
+    std::uint64_t expert_direct_field_reads() const;
+    std::pair<std::size_t,std::size_t> pinned_expert_memory() const;
     std::array<std::uint64_t,4> expert_disk_timings() const;
     bool complete_residency_=false;
     bool ssd_experts_=false;
@@ -1036,6 +1043,7 @@ private:
     std::array<std::pair<int64_t,int64_t>,2> pipeline_wire_geometry_{};
     std::unordered_map<int,std::vector<int64_t>> pipeline_host_staged_expert_bytes_;
     std::shared_ptr<mfq_tensor_backend::Tensor> pipeline_ram_complement_;
+    std::shared_ptr<MoePinnedExpertArena> pinned_expert_arena_;
     int64_t pipeline_ram_registered_bytes_=0;
     void* pipeline_ram_alias_=nullptr;
     void* pipeline_host_stage_alias_=nullptr;

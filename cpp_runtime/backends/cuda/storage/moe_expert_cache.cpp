@@ -1,7 +1,9 @@
 #include "../runtime/execution_options.h"
 #include "moe_cached_source_internal.h"
+#include "moe_pinned_expert_arena.h"
 #include "mfq_cuda_resident_allocations.h"
 #include "mfq/host_parallel.h"
+#include "mfq/runtime.h"
 #include <thread>
 #include <map>
 #include <cmath>
@@ -500,11 +502,33 @@ void MoeExpertCache::initialize_ssd_residency() {
         stage.device={};stage.host={};stage.pending=false;
     }
     next_stage_=0;
-    // There is no immutable all-expert RAM arena in streaming mode. Pageable
-    // LRU entries use the graph transfer path's bounded pinned staging ring.
+    // The file tier supplies a bounded LRU, rather than an all-expert image.
+    // Give its entries stable pinned intervals so demand reads go straight to
+    // DMA-ready storage and reuse the existing direct-RAM decode machinery.
     pipeline_ram_complement_=std::make_shared<mfq_tensor_backend::Tensor>(mfq_tensor_backend::empty(
         {0},mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kUInt8)));
     pipeline_ram_registered_bytes_=0;
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    if(config_.moe_direct_ram) {
+        std::size_t pinned=host_experts_->stats().budget_bytes;
+        if(const auto available=mfq::cuda::shared_memory_available(mfq_current_cuda_device())) {
+            const auto reserve=std::size_t(mfq::cuda::runtime_options::moe_ram_pin_reserve_bytes().value_or(1LL<<30));
+            pinned=std::min(pinned,*available>reserve?*available-reserve:0);
+        }
+        if(const auto limit=mfq::cuda::runtime_options::moe_ram_pin_bytes();limit && *limit>0)
+            pinned=std::min(pinned,std::size_t(*limit));
+        pinned=pinned/4096*4096;
+        while(pinned) {
+            try {pinned_expert_arena_=std::make_shared<MoePinnedExpertArena>(pinned);break;}
+            catch(const MfqResourceExhausted&) {pinned=pinned/2/4096*4096;}
+        }
+        if(pinned_expert_arena_) {
+            pipeline_ram_complement_=std::make_shared<mfq_tensor_backend::Tensor>(pinned_expert_arena_->tensor());
+            pipeline_ram_registered_bytes_=pinned_expert_arena_->bytes();
+            for(const auto& source:sources_)source->quant_source_->bind_pinned_arena(pinned_expert_arena_);
+        }
+    }
+#endif
     pipeline_prefill_layer_layout_=false;
     for(const auto& source:sources_) {
         source->quant_source_->mark_preload_complete(false);
@@ -514,6 +538,7 @@ void MoeExpertCache::initialize_ssd_residency() {
     ssd_experts_=true;
     const auto host=host_experts_->stats();
     std::cerr<<"moe_ssd_experts_ready gpu_bytes="<<allocated_bytes_<<" ram_budget_bytes="<<host.budget_bytes
+        <<" ram_pinned_bytes="<<pipeline_ram_registered_bytes_
         <<" ram_bytes="<<host.resident_bytes<<" expert_bytes="<<ssd_expert_total_bytes_
         <<" disk_reads_sealed=0\n";
     stats_={};
@@ -1246,9 +1271,16 @@ std::uint64_t MoeExpertCache::expert_disk_reads_after_preload() const {
     return reads;
 }
 
-std::uint64_t MoeExpertCache::expert_prefill_direct_reads() const {
+std::pair<std::size_t,std::size_t> MoeExpertCache::pinned_expert_memory() const {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    if(pinned_expert_arena_)return {pinned_expert_arena_->bytes(),pinned_expert_arena_->used_bytes()};
+#endif
+    return {};
+}
+
+std::uint64_t MoeExpertCache::expert_direct_field_reads() const {
     std::uint64_t reads=0;
-    for(const auto& source:sources_)if(source->quant_source_)reads+=source->quant_source_->prefill_direct_reads();
+    for(const auto& source:sources_)if(source->quant_source_)reads+=source->quant_source_->direct_field_reads();
     return reads;
 }
 

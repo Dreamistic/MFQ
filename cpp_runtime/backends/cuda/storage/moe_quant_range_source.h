@@ -9,6 +9,7 @@
 // Shared source for GPU cache misses and original-FP32 CPU cold projections.
 // Only one prototype per format cohort is read at registration. Its codebook
 // is shared by all experts; fields are released after arena registration.
+class MoePinnedExpertArena;
 class MoeQuantRangeSource {
 public:
     explicit MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStore> store);
@@ -20,6 +21,7 @@ public:
     void mark_preload_complete(bool assert_resident) { disk_sealed_.store(assert_resident); preloaded_.store(true); }
     bool expert_disk_sealed() const { return disk_sealed_.load(); }
     void bind_host_cache(std::shared_ptr<MoeHostExpertCache> cache,int source_id);
+    void bind_pinned_arena(std::shared_ptr<MoePinnedExpertArena> arena) {pinned_arena_=std::move(arena);}
     MoeHostExpertCache::Lease acquire_expert(int expert) const;
     bool demote_expert(int expert,const MoeHostExpertCache::Load& copy);
     void mark_gpu_resident(int expert,bool resident);
@@ -42,12 +44,21 @@ public:
     std::uint64_t expert_materialize_ns() const { return materialize_ns_.load(); }
     std::uint64_t expert_nint_materialize_ns() const { return nint_materialize_ns_.load(); }
     std::uint64_t expert_nvq_materialize_ns() const { return nvq_materialize_ns_.load(); }
-    std::uint64_t prefill_direct_reads() const { return prefill_direct_reads_.load(); }
+    std::uint64_t direct_field_reads() const { return direct_field_reads_.load(); }
 private:
+    MixedMoePool read_expert_canonical(int expert) const;
+    struct FieldLayout {
+        std::vector<std::int64_t> shape;
+        mfq_tensor_backend::ScalarType dtype;
+        std::size_t offset=0,bytes=0;
+    };
     std::shared_ptr<mfq::MfeQuantExpertStore> store_;
     std::shared_ptr<MixedMoeRuntime> metadata_;
     std::vector<std::int64_t> q_strides_;
     std::vector<std::size_t> field_bytes_;
+    std::vector<std::vector<FieldLayout>> field_layouts_;
+    std::vector<std::size_t> arena_bytes_;
+    std::shared_ptr<MoePinnedExpertArena> pinned_arena_;
     bool dense_groups_=false;
     bool profile_ssd_=false;
     std::shared_ptr<MoeHostExpertCache> host_cache_;
@@ -63,5 +74,5 @@ private:
     mutable std::atomic<std::uint64_t> disk_bytes_after_preload_{0};
     mutable std::atomic<std::uint64_t> encoded_ns_{0},materialize_ns_{0};
     mutable std::atomic<std::uint64_t> nint_materialize_ns_{0},nvq_materialize_ns_{0};
-    mutable std::atomic<std::uint64_t> prefill_direct_reads_{0};
+    mutable std::atomic<std::uint64_t> direct_field_reads_{0};
 };
