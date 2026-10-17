@@ -28,6 +28,7 @@ struct MfeCachedDispatch {
     uint64_t* snapshot_tags=nullptr;
     uint32_t* snapshot_ready=nullptr;
     int primary_counts[3]{};
+    bool primary_incomplete=false;
     MfePrepareSharedGate gate{};
 };
 void mfe_ffn_prepare_warp(const MfeFfnBatch&,const MfeInputQuantization*,int count,int groups,cudaStream_t);
@@ -36,6 +37,8 @@ void mfe_ffn_prepare_publish(const MfeFfnBatch&,const MfeInputQuantization*,int 
 void mfe_ffn_prepare_publish_cached(const MfeFfnBatch&,const MfeInputQuantization*,int count,int groups,
     int32_t* mapped_ids,uint32_t* ready,const MfeCachedDispatch&,cudaStream_t);
 void mfe_ffn_wait_transfer_packet(const MfeFfnBatch&,const int32_t* mapped_plan,cudaStream_t);
+// Optional M1 route output needs routes+2 integers: count, original slots,
+// then the proven all-resident reduction flag.
 void mfe_ffn_wait_transfer_packet_snapshot(const MfeFfnBatch&,const int32_t* mapped_plan,
     const void* mapped_table,void* snapshot,uint64_t capacity,cudaStream_t,
     const void* mapped_descriptors=nullptr,void* device_descriptors=nullptr,uint64_t descriptor_capacity_words=0,

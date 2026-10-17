@@ -6,8 +6,12 @@
 
 namespace mfq::cuda {
 void mfe_ffn_parity_read_gate_up(const MfeFfnBatch&,int,int,cudaStream_t);
+void mfe_ffn_parity_group_gate_up(const MfeFfnBatch&,int,cudaStream_t,const int32_t*);
 void mfe_ffn_parity_token_single_gate_up(const MfeFfnBatch&,int,int,cudaStream_t);
 void mfe_ffn_parity_transfer_routes(const MfeFfnBatch&,const int32_t*,cudaStream_t);
+void mfe_ffn_parity_read_down(const MfeFfnBatch&,int,cudaStream_t);
+void mfe_ffn_parity_token_single_down(const MfeFfnBatch&,int,cudaStream_t);
+void mfe_ffn_cached_down(const MfeFfnBatch&,const uint32_t*,cudaStream_t);
 namespace {
 bool enabled(const char* name) {
     const auto* setting=std::getenv(name);
@@ -32,17 +36,23 @@ void gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
     mfe_ffn_parallel_gate_up_kernel<2,true,Formats,true,false>
         <<<dim3((width+7)/8,b.tokens*(b.routes+int(b.shared!=nullptr))),dim3(32,8),0,stream>>>(b,partition);
 }
+bool group_gate_up(const MfeFfnBatch& b,int partition,cudaStream_t stream,const int32_t* routes) {
+    if(b.tokens!=1 || b.token_group_counts || b.token_group_aligned_gu ||
+            !enabled("MFQ_MFE_GU_GROUP_QUANT") || !enabled("MFQ_MFE_PARITY_READ") ||
+            !launch_contract(b,false))return false;
+    mfe_ffn_parity_group_gate_up(b,partition,stream,routes);return true;
+}
 template<uint32_t Formats>
 void down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
     partition|=16;
     if(b.shared) {
         const auto kernel=mfe_ffn_down_reduce_kernel_quad<true,true,Formats,true,false>;
         const int warps=mfe_ffn_down_launch_warps(reinterpret_cast<const void*>(kernel),b.routes+1,b.tokens);
-        kernel<<<dim3((b.output_width+3)/4,b.tokens),dim3(32,warps),0,stream>>>(b,partition);
+        kernel<<<dim3((b.output_width+3)/4,b.tokens),dim3(32,warps),0,stream>>>(b,partition,nullptr);
     }else {
         const auto kernel=mfe_ffn_down_reduce_kernel<true,true,Formats,true,false>;
         const int warps=mfe_ffn_down_launch_warps(reinterpret_cast<const void*>(kernel),b.routes,b.tokens);
-        kernel<<<dim3((b.output_width+1)/2,b.tokens),dim3(32,warps),0,stream>>>(b,partition);
+        kernel<<<dim3((b.output_width+1)/2,b.tokens),dim3(32,warps),0,stream>>>(b,partition,nullptr);
     }
 }
 
@@ -55,6 +65,7 @@ __global__ void __launch_bounds__(128,8) token_single_down(MfeFfnBatch b,int par
     const int slot=b.token_group_slots[group*8];
     const int all_routes=b.routes+int(b.shared!=nullptr),route=slot%all_routes;
     const bool shared=route==b.routes;
+    if(shared && b.shared_intermediate==0)return;
     const int expert=shared?0:b.ids[(slot/all_routes)*b.routes+route];
     const int kind=shared?1:route_kind(b,expert);
     if(kind<=0 || (partition && kind!=partition))return;
@@ -103,9 +114,13 @@ bool mfe_ffn_compact_gate_up(const MfeFfnBatch& b,int partition,int width,cudaSt
 // Transfer-only work is usually a small fraction of the routed experts. Its
 // existing completion path avoids a second mostly empty quantization node.
 // Resident GU continues to use the independent quantization schedule.
+bool mfe_ffn_compact_group_gate_up(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
+    return group_gate_up(b,partition,stream,nullptr);
+}
 bool mfe_ffn_compact_transferred_fused(const MfeFfnBatch& b,cudaStream_t stream,const int32_t* routes) {
     if(!enabled("MFQ_MFE_TRANSFER_HIDDEN_FUSED") || b.tokens!=1 || !b.plan_ready || !b.completion ||
             b.token_group_counts || b.token_group_aligned_gu || !launch_contract(b,false))return false;
+    if(group_gate_up(b,2,stream,routes))return true;
     const int width=std::max(b.intermediate,b.shared?b.shared_intermediate:0);
     const auto* parity_read=std::getenv("MFQ_MFE_PARITY_READ");
     if(routes && (!parity_read || parity_read[0]!='0'))mfe_ffn_parity_transfer_routes(b,routes,stream);
@@ -119,9 +134,19 @@ bool mfe_ffn_compact_transferred_fused(const MfeFfnBatch& b,cudaStream_t stream,
 }
 bool mfe_ffn_compact_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
     if(!launch_contract(b,true))return false;
+    if(enabled("MFQ_MFE_PARITY_DOWN") && enabled("MFQ_MFE_PARITY_READ")) {
+        mfe_ffn_parity_read_down(b,partition,stream);
+        return true;
+    }
     if(!(b.nvq_format_mask&~0x3f820u))down<0x3f820u>(b,partition,stream);
     else down<0x3f922u>(b,partition,stream);
     return true;
+}
+bool mfe_ffn_compact_cached_down(const MfeFfnBatch& b,const uint32_t* cached,cudaStream_t stream) {
+    if(!cached || b.tokens!=1 || !b.plan_ready || !b.resident_pairs || b.output_pairs ||
+            !enabled("MFQ_MFE_CACHED_REDUCE") || !enabled("MFQ_MFE_PARITY_DOWN") ||
+            !enabled("MFQ_MFE_PARITY_READ") || !launch_contract(b,true))return false;
+    mfe_ffn_cached_down(b,cached,stream);return true;
 }
 bool mfe_ffn_compact_token_single_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
     if(!launch_contract(b,false))return false;
@@ -136,6 +161,10 @@ bool mfe_ffn_compact_token_single_gate_up(const MfeFfnBatch& b,int partition,int
 }
 bool mfe_ffn_compact_token_single_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
     if(!launch_contract(b,true))return false;
+    if(enabled("MFQ_MFE_PARITY_DOWN") && enabled("MFQ_MFE_PARITY_READ")) {
+        mfe_ffn_parity_token_single_down(b,partition,stream);
+        return true;
+    }
     if(!(b.nvq_format_mask&~0x3f820u))single_down<0x3f820u>(b,partition,stream);
     else single_down<0x3f922u>(b,partition,stream);
     return true;

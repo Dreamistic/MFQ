@@ -856,6 +856,7 @@ class RuntimePool:
             await context.progress(0.02, message="Starting runtime process")
             process = await asyncio.create_subprocess_exec(
                 *command,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 stdin=(
                     asyncio.subprocess.PIPE
                     if self.transport == "stdio"

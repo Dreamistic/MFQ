@@ -12,7 +12,7 @@ bool mfe_ffn_compact_requested(const MfeFfnBatch& b,bool down) {
     if(!b.compact_nvq || !b.default_math || b.shared_dense_math ||
             (b.nvq_format_mask&~0x3f922u) || b.tokens<1 || b.routes<1 ||
             b.routes+int(b.shared!=nullptr)>32 || b.input_width<1 || b.output_width<1 ||
-            b.intermediate<1 || (b.shared && b.shared_intermediate<1))return false;
+            b.intermediate<1 || (b.shared && b.shared_intermediate<0))return false;
     // This module independently proves default arithmetic. The legacy
     // DEFAULT_MATH flag selects the fallback kernel's code specialization;
     // COMPACT=0 retains that choice exactly.

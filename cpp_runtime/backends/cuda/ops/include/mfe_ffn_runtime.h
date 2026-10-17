@@ -2,6 +2,7 @@
 #include "moe.h"
 #include "mfe_ffn.h"
 #include "mfe_ffn_prepare.h"
+#include "mfq_cuda_context.h"
 #include <array>
 #include <map>
 
@@ -20,6 +21,24 @@ class MfeFfnRuntime {
     bool dispatch_trace_reported_=false;
     bool combined_gate_up_=false;
     bool split_shared_groups_=false;
+    mfq_tensor_backend::Tensor early_shared_descriptors_,early_shared_quantizers_;
+    std::vector<mfq_tensor_backend::Tensor> early_shared_inputs_;
+    mfq::cuda::MfePrepareSharedGate early_shared_gate_{};
+    int early_shared_quantizer_count_=0,early_shared_groups_=0;
+    std::unique_ptr<mfq::cuda::Stream> shared_stream_;
+    std::unique_ptr<mfq::cuda::Event> shared_fork_,shared_done_;
+    bool shared_in_flight_=false,shared_stream_reported_=false;
+    bool shared_short_encoding_=false,shared_short_reported_=false;
+    bool shared_early_reported_=false;
+    mfq::cuda::MfeFfnBatch arithmetic_batch()const {
+        auto b=batch_;
+        // Keep the shared slot and reduction geometry intact. Only its
+        // arithmetic is delegated to shared_stream_.
+        if(shared_in_flight_)b.shared_intermediate=0;
+        return b;
+    }
+    void join_shared();
+    void start_shared(bool early);
     const int32_t* transfer_route_plan_=nullptr;
     mfq_tensor_backend::Tensor primary_cohorts_,cached_snapshot_tags_;
     mfq_tensor_backend::Tensor cached_transfer_routes_;

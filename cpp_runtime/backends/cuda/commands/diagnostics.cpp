@@ -1254,30 +1254,104 @@ bool has_diagnostic_action(const DiagnosticsCommandOptions& value) {
         value.prefill_repeat > 0 || value.profile || value.minicpmo_eval_batch;
 }
 
+// Keep flag dispatch flat: MSVC limits nesting in long else-if chains.
+bool parse_diagnostic_switch(std::string_view option, DiagnosticsCommandOptions& result) {
+    static constexpr std::pair<std::string_view, bool DiagnosticsCommandOptions::*> switches[] = {
+        {"--check-qwen4-decode-hidden", &DiagnosticsCommandOptions::check_qwen4_decode_hidden},
+        {"--compare-ram-field-packing", &DiagnosticsCommandOptions::compare_ram_field_packing},
+        {"--compare-qsa-fusion", &DiagnosticsCommandOptions::compare_qsa_fusion},
+        {"--compare-moe-plan-reuse", &DiagnosticsCommandOptions::compare_moe_plan_reuse},
+        {"--compare-mfe-default-math", &DiagnosticsCommandOptions::compare_mfe_default_math},
+        {"--compare-mfe-e8-narrow", &DiagnosticsCommandOptions::compare_mfe_e8_narrow},
+        {"--minicpmo-eval-batch", &DiagnosticsCommandOptions::minicpmo_eval_batch},
+        {"--check-mfe-routed-input", &DiagnosticsCommandOptions::check_mfe_routed_input},
+        {"--check-mfe-benchmark-only", &DiagnosticsCommandOptions::check_mfe_benchmark_only},
+        {"--check-attention-swa-decode", &DiagnosticsCommandOptions::check_attention_swa_decode},
+        {"--check-gemma4-swa", &DiagnosticsCommandOptions::check_gemma4_swa},
+        {"--check-glm-dsa", &DiagnosticsCommandOptions::check_glm_dsa},
+        {"--check-dsv4-attention", &DiagnosticsCommandOptions::check_dsv4_attention},
+        {"--check-dsv4-hc", &DiagnosticsCommandOptions::check_dsv4_hc},
+        {"--check-deepseek-v41", &DiagnosticsCommandOptions::check_deepseek_v41},
+        {"--check-text-session-state", &DiagnosticsCommandOptions::check_text_session_state},
+        {"--check-qwen35-mtp", &DiagnosticsCommandOptions::check_qwen35_mtp},
+        {"--check-flash-next", &DiagnosticsCommandOptions::check_flash_next},
+        {"--check-flash-next-mtp", &DiagnosticsCommandOptions::check_flash_next_mtp},
+        {"--compare-dsv4-hc-ops", &DiagnosticsCommandOptions::compare_dsv4_hc_ops},
+        {"--compare-dsv4-hc-model", &DiagnosticsCommandOptions::compare_dsv4_hc_model},
+        {"--check-continuous-batching", &DiagnosticsCommandOptions::check_continuous_batching},
+        {"--check-engine-isolation", &DiagnosticsCommandOptions::check_engine_isolation},
+        {"--check-runtime-assets", &DiagnosticsCommandOptions::check_runtime_assets},
+        {"--check-mfq-container", &DiagnosticsCommandOptions::check_mfq_container},
+        {"--compare-ffn-transfer-phases", &DiagnosticsCommandOptions::compare_ffn_transfer_phases},
+        {"--compare-route-poll", &DiagnosticsCommandOptions::compare_route_poll},
+        {"--compare-window-flush", &DiagnosticsCommandOptions::compare_window_flush},
+        {"--compare-early-no-cpu-ready", &DiagnosticsCommandOptions::compare_early_no_cpu_ready},
+        {"--compare-gpu-only-cpu-wait", &DiagnosticsCommandOptions::compare_gpu_only_cpu_wait},
+        {"--compare-fixed-gpu-timing", &DiagnosticsCommandOptions::compare_fixed_gpu_timing},
+        {"--compare-window-input-views", &DiagnosticsCommandOptions::compare_window_input_views},
+        {"--compare-route-spin", &DiagnosticsCommandOptions::compare_route_spin},
+        {"--compare-shared-gate-fusion", &DiagnosticsCommandOptions::compare_shared_gate_fusion},
+        {"--compare-graph-optimizations", &DiagnosticsCommandOptions::compare_graph_optimizations},
+        {"--comparison-phase-timings", &DiagnosticsCommandOptions::comparison_phase_timings},
+        {"--compare-host-pin", &DiagnosticsCommandOptions::compare_host_pin},
+        {"--compare-resident-overlap", &DiagnosticsCommandOptions::compare_resident_overlap},
+        {"--compare-dma-graph-batch", &DiagnosticsCommandOptions::compare_dma_graph_batch},
+        {"--compare-warp-multi-sum", &DiagnosticsCommandOptions::compare_warp_multi_sum},
+        {"--compare-router-lookahead", &DiagnosticsCommandOptions::compare_router_lookahead},
+        {"--compare-rotary-fusion", &DiagnosticsCommandOptions::compare_rotary_fusion},
+        {"--compare-attention-grouping", &DiagnosticsCommandOptions::compare_attention_grouping},
+        {"--compare-mhc-fusion", &DiagnosticsCommandOptions::compare_mhc_fusion},
+        {"--compare-mhc-shared-norm", &DiagnosticsCommandOptions::compare_mhc_shared_norm},
+        {"--compare-mhc-dense-fusion", &DiagnosticsCommandOptions::compare_mhc_dense_fusion},
+        {"--compare-mhc-packed-groups", &DiagnosticsCommandOptions::compare_mhc_packed_groups},
+        {"--compare-mhc-fixed-formats", &DiagnosticsCommandOptions::compare_mhc_fixed_formats},
+        {"--compare-mhc-async-normalized", &DiagnosticsCommandOptions::compare_mhc_async_normalized},
+        {"--compare-gdn-fixed-geometry", &DiagnosticsCommandOptions::compare_gdn_fixed_geometry},
+        {"--compare-gdn-inplace-state", &DiagnosticsCommandOptions::compare_gdn_inplace_state},
+        {"--compare-mfe-parallel-gu", &DiagnosticsCommandOptions::compare_mfe_parallel_gu},
+        {"--compare-mfe-gpu-bundle", &DiagnosticsCommandOptions::compare_mfe_gpu_bundle},
+        {"--compare-mfe-shared-first", &DiagnosticsCommandOptions::compare_mfe_shared_first},
+        {"--compare-mfe-early-gate-up", &DiagnosticsCommandOptions::compare_mfe_early_gu},
+        {"--compare-cpu-background-calibration", &DiagnosticsCommandOptions::compare_cpu_background_calibration},
+        {"--compare-cpu-transfer-budget", &DiagnosticsCommandOptions::compare_cpu_transfer_budget},
+        {"--compare-router-topk", &DiagnosticsCommandOptions::compare_router_topk},
+        {"--profile", &DiagnosticsCommandOptions::profile},
+        {"--ignore-eos", &DiagnosticsCommandOptions::ignore_eos},
+        {"--check-backend-bf16-add", &DiagnosticsCommandOptions::check_backend_bf16_add},
+        {"--check-backend-argmax", &DiagnosticsCommandOptions::check_backend_argmax},
+        {"--compare-mma-attention", &DiagnosticsCommandOptions::compare_mma_attention},
+        {"--compare-decode-splitk", &DiagnosticsCommandOptions::compare_decode_splitk},
+        {"--compare-mma-decode", &DiagnosticsCommandOptions::compare_mma_decode},
+        {"--compare-nvq-vec4", &DiagnosticsCommandOptions::compare_nvq_vec4},
+        {"--compare-niq-vec4", &DiagnosticsCommandOptions::compare_nvq_vec4},
+    };
+    for (const auto& [name, field] : switches) {
+        if (option == name) {
+            result.*field = true;
+            return true;
+        }
+    }
+    return false;
+}
+
 DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
     DiagnosticsCommandOptions result;
     while (!args.empty()) {
         const std::string_view option = args.next();
-        if(option == "--check-qwen4-decode-hidden") {result.check_qwen4_decode_hidden=true;continue;}
-        if(option == "--compare-ram-field-packing") {result.compare_ram_field_packing=true;continue;}
-        if(option == "--compare-qsa-fusion") {result.compare_qsa_fusion=true;continue;}
-        if(option == "--compare-moe-plan-reuse") {result.compare_moe_plan_reuse=true;continue;}
-        if(option == "--compare-mfe-default-math") {result.compare_mfe_default_math=true;continue;}
-        if(option == "--compare-mfe-e8-narrow") {result.compare_mfe_e8_narrow=true;continue;}
         if (option == "--help" || option == "-h") {
             print_diagnostics_help();
             throw HelpRequested{};
         }
         if (parse_cuda_load_option(option, args, result) ||
-                parse_token_input_option(option, args, result)) {
+                parse_token_input_option(option, args, result) ||
+                parse_diagnostic_switch(option, result)) {
             continue;
         }
         if (option == "--continuous-batching-check-requests") {
             result.check_continuous_batching_requests = integer<int>(args.value(option),option);
             continue;
         }
-        if (option == "--minicpmo-eval-batch") result.minicpmo_eval_batch = true;
-        else if (option == "--minicpmo-eval-vision-batch-size") {
+        if (option == "--minicpmo-eval-vision-batch-size") {
             result.minicpmo_eval_vision_batch_size =
                 integer<int64_t>(args.value(option), option);
             if (result.minicpmo_eval_vision_batch_size <= 0) {
@@ -1333,8 +1407,6 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
         else if (option == "--check-mfe-routes") result.check_mfe_routes = integer<int>(args.value(option), option);
         else if (option == "--check-mfe-reps") result.check_mfe_reps = integer<int>(args.value(option), option);
         else if (option == "--check-mfe-split-width") result.check_mfe_split_width = integer<int>(args.value(option), option);
-        else if (option == "--check-mfe-routed-input") result.check_mfe_routed_input = true;
-        else if (option == "--check-mfe-benchmark-only") result.check_mfe_benchmark_only = true;
         else if (option == "--check-dsv4-output-a") result.check_dsv4_output_a = args.value(option);
         else if (option == "--check-dsv4-output-a-batch") result.check_dsv4_output_a_batch = integer<int>(args.value(option), option);
         else if (option == "--check-dsv4-output-a-reps") result.check_dsv4_output_a_reps = integer<int>(args.value(option), option);
@@ -1342,20 +1414,8 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
         else if (option == "--check-attention-reps") result.check_attention_reps = integer<int>(args.value(option), option);
         else if (option == "--check-attention-head-dim") result.check_attention_head_dim = integer<int>(args.value(option), option);
         else if (option == "--check-attention-window") result.check_attention_window = integer<int>(args.value(option), option);
-        else if (option == "--check-attention-swa-decode") result.check_attention_swa_decode = true;
-        else if (option == "--check-gemma4-swa") result.check_gemma4_swa = true;
-        else if (option == "--check-glm-dsa") result.check_glm_dsa = true;
-        else if (option == "--check-dsv4-attention") result.check_dsv4_attention = true;
-        else if (option == "--check-dsv4-hc") result.check_dsv4_hc = true;
-        else if (option == "--check-deepseek-v41") result.check_deepseek_v41 = true;
-        else if (option == "--check-text-session-state") result.check_text_session_state = true;
-        else if (option == "--check-qwen35-mtp") result.check_qwen35_mtp = true;
-        else if (option == "--check-flash-next") result.check_flash_next = true;
-        else if (option == "--check-flash-next-mtp") result.check_flash_next_mtp = true;
         else if (option == "--bench-qwen35-mtp") result.bench_qwen35_mtp = args.value(option);
         else if (option == "--bench-qwen35-mtp-reps") result.bench_qwen35_mtp_reps = integer<int>(args.value(option), option);
-        else if (option == "--compare-dsv4-hc-ops") result.compare_dsv4_hc_ops = true;
-        else if (option == "--compare-dsv4-hc-model") result.compare_dsv4_hc_model = true;
         else if (option == "--kl-mmq") {
             result.kl_mmq_arg = args.value(option);
             try { (void)parse_kl_mmq_mode(result.kl_mmq_arg); }
@@ -1373,66 +1433,21 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
             validate_integer_list(result.prefill_sweep_arg, option);
         }
         else if (option == "--prefill-sweep-reps") result.prefill_sweep_reps = integer<int>(args.value(option), option);
-        else if (option == "--check-continuous-batching") result.check_continuous_batching = true;
-        else if (option == "--check-engine-isolation") result.check_engine_isolation = true;
-        else if (option == "--check-runtime-assets") result.check_runtime_assets = true;
-        else if (option == "--check-mfq-container") result.check_mfq_container = true;
         else if (option == "--check-tokenizer-text") result.check_tokenizer_text = args.value(option);
         else if (option == "--router-lookahead-audit") result.router_lookahead_audit = args.value(option);
-        else if (option == "--compare-ffn-transfer-phases") result.compare_ffn_transfer_phases = true;
-        else if (option == "--compare-route-poll") result.compare_route_poll = true;
-        else if (option == "--compare-window-flush") result.compare_window_flush = true;
-        else if (option == "--compare-early-no-cpu-ready") result.compare_early_no_cpu_ready = true;
-        else if (option == "--compare-gpu-only-cpu-wait") result.compare_gpu_only_cpu_wait = true;
-        else if (option == "--compare-fixed-gpu-timing") result.compare_fixed_gpu_timing = true;
-        else if (option == "--compare-window-input-views") result.compare_window_input_views = true;
-        else if (option == "--compare-route-spin") result.compare_route_spin = true;
-        else if (option == "--compare-shared-gate-fusion") result.compare_shared_gate_fusion = true;
-        else if (option == "--compare-graph-optimizations") result.compare_graph_optimizations = true;
-        else if (option == "--comparison-phase-timings") result.comparison_phase_timings = true;
         else if (option == "--comparison-rounds") {
             result.comparison_rounds=integer<int>(args.value(option),option);
             if(result.comparison_rounds<1 || result.comparison_rounds>8)
                 throw std::invalid_argument("comparison rounds must be between one and eight");
         }
-        else if (option == "--compare-host-pin") result.compare_host_pin = true;
-        else if (option == "--compare-resident-overlap") result.compare_resident_overlap = true;
-        else if (option == "--compare-dma-graph-batch") result.compare_dma_graph_batch = true;
-        else if (option == "--compare-warp-multi-sum") result.compare_warp_multi_sum = true;
-        else if (option == "--compare-router-lookahead") result.compare_router_lookahead = true;
-        else if (option == "--compare-rotary-fusion") result.compare_rotary_fusion = true;
-        else if (option == "--compare-attention-grouping") result.compare_attention_grouping = true;
-        else if (option == "--compare-mhc-fusion") result.compare_mhc_fusion = true;
-        else if (option == "--compare-mhc-shared-norm") result.compare_mhc_shared_norm = true;
-        else if (option == "--compare-mhc-dense-fusion") result.compare_mhc_dense_fusion = true;
-        else if (option == "--compare-mhc-packed-groups") result.compare_mhc_packed_groups = true;
-        else if (option == "--compare-mhc-fixed-formats") result.compare_mhc_fixed_formats = true;
-        else if (option == "--compare-mhc-async-normalized") result.compare_mhc_async_normalized = true;
-        else if (option == "--compare-gdn-fixed-geometry") result.compare_gdn_fixed_geometry = true;
-        else if (option == "--compare-gdn-inplace-state") result.compare_gdn_inplace_state = true;
-        else if (option == "--compare-mfe-parallel-gu") result.compare_mfe_parallel_gu = true;
-        else if (option == "--compare-mfe-gpu-bundle") result.compare_mfe_gpu_bundle = true;
-        else if (option == "--compare-mfe-shared-first") result.compare_mfe_shared_first = true;
-        else if (option == "--compare-mfe-early-gate-up") result.compare_mfe_early_gu = true;
-        else if (option == "--compare-cpu-background-calibration") result.compare_cpu_background_calibration = true;
-        else if (option == "--compare-cpu-transfer-budget") result.compare_cpu_transfer_budget = true;
-        else if (option == "--compare-router-topk") result.compare_router_topk = true;
         else if (option == "--decode-inputs-file") result.decode_inputs_file = args.value(option);
-        else if (option == "--profile") result.profile = true;
-        else if (option == "--ignore-eos") result.ignore_eos = true;
         else if (option == "--warmup-prefill") {
             result.warmup_prefill = integer<int>(args.value(option), option);
             if (result.warmup_prefill < 0 || result.warmup_prefill > 100)
                 usage_error("--warmup-prefill requires a count from 0 to 100");
         }
-        else if (option == "--check-backend-bf16-add") result.check_backend_bf16_add = true;
-        else if (option == "--check-backend-argmax") result.check_backend_argmax = true;
-        else if (option == "--compare-mma-attention") result.compare_mma_attention = true;
-        else if (option == "--compare-decode-splitk") result.compare_decode_splitk = true;
-        else if (option == "--compare-mma-decode") result.compare_mma_decode = true;
         else if (option == "--compare-mma-decode-steps") result.compare_mma_decode_steps = integer<int>(args.value(option), option);
         else if (option == "--compare-mma-decode-planned-len") result.compare_mma_decode_planned_len = integer<int>(args.value(option), option);
-        else if (option == "--compare-nvq-vec4" || option == "--compare-niq-vec4") result.compare_nvq_vec4 = true;
         else usage_error("unknown option: " + std::string(option));
     }
     if (!result.decode_inputs_file.empty()) {

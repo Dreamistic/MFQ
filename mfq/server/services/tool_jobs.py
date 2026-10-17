@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -1161,6 +1162,7 @@ class ToolJobHandlers:
         inherited = (int(env['MFQ_DOWNLOAD_RESERVATION_FD']),) if env and os.name != 'nt' and 'MFQ_DOWNLOAD_RESERVATION_FD' in env else ()
         process = await asyncio.create_subprocess_exec(
             *argv,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             cwd=self.root,
             env=env,
             stdin=asyncio.subprocess.DEVNULL,

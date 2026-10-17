@@ -104,6 +104,7 @@ void launch_mfe_down(const MfeFfnBatch& b,int partition,cudaStream_t stream) {
     else launch_mfe_down_math<false>(b,partition,stream);
 }
 void launch_mfe_gate_up(const MfeFfnBatch& b,int partition,int width,cudaStream_t stream) {
+    if(mfe_ffn_compact_group_gate_up(b,partition,stream))return;
     const auto* option=std::getenv("MFQ_MFE_SEPARATE_HIDDEN_QUANT");
     const bool separate=(!option || option[0]!='0') && !b.token_group_aligned_gu && b.tokens<=8;
     auto producer=b;
