@@ -49,12 +49,13 @@ void AsyncRangeReader::read(const std::vector<ReadSpan>& spans) const {
             throw std::overflow_error("batched range storage exceeds address space");
         bytes += count;
     }
-    // Disjoint buffered ranges already accept the caller's exact destinations.
-    // Typical PLE misses are five disjoint streams: no aligned bounce storage
-    // or copy-back is needed. Retain coalescing for overlapping/adjacent ranges.
-    if(alignment==1 && merged.size()==intervals.size()) {
+    // The file reader already supplies direct I/O's aligned storage. Disjoint
+    // ranges need no second buffer and copy-back in this batching wrapper.
+    // Keep sector coalescing when requests overlap or touch.
+    if(merged.size()==intervals.size()) {
         state.file.read_batch(spans);
-        state.logical.fetch_add(bytes,std::memory_order_relaxed);
+        std::uint64_t logical=0;for(const auto& span:spans)logical+=span.size;
+        state.logical.fetch_add(logical,std::memory_order_relaxed);
         return;
     }
     std::vector<std::byte> storage(static_cast<std::size_t>(bytes));

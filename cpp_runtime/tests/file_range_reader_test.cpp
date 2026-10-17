@@ -67,6 +67,33 @@ int main() {
         exercise(path,expected,mfq::FileReadMode::Buffered);
         exercise(path,expected,mfq::FileReadMode::Direct);
         for(auto mode:{mfq::FileReadMode::Buffered,mfq::FileReadMode::Direct}) {
+            {
+                mfq::AsyncRangeReader disjoint(path,mode);
+                std::vector<std::byte> output(8*9,std::byte{0x5a});std::vector<mfq::ReadSpan> spans;
+                for(std::size_t i=0;i<8;++i)spans.push_back({i*8192+3,output.data()+i*9+1,7});
+                disjoint.read(spans);
+                for(std::size_t i=0;i<8;++i) {
+                    require(output[i*9]==std::byte{0x5a} && output[i*9+8]==std::byte{0x5a},"disjoint read changed guards");
+                    require(std::equal(output.begin()+i*9+1,output.begin()+i*9+8,expected.begin()+i*8192+3),"disjoint read changed bytes");
+                }
+                const auto stats=disjoint.stats();
+                require(stats.logical_bytes==56 && !stats.staging_bytes && stats.staging_peak_bytes<=stats.physical_bytes,
+                    "disjoint direct ranges allocated a redundant staging copy");
+            }
+            {
+                mfq::FileRangeReader batched(path,mode);
+                for(int round=0;round<4;++round) {
+                    std::vector<std::byte> output(96*33,std::byte{0x5a});std::vector<mfq::ReadSpan> spans;
+                    for(std::size_t i=0;i<96;++i)spans.push_back({i*641+std::size_t(round),output.data()+i*33+1,31});
+                    batched.read_batch(spans);
+                    for(std::size_t i=0;i<96;++i) {
+                        require(output[i*33]==std::byte{0x5a} && output[i*33+32]==std::byte{0x5a},"event reuse changed a destination guard");
+                        require(std::equal(output.begin()+i*33+1,output.begin()+i*33+32,expected.begin()+i*641+round),
+                            "event reuse or a batch beyond its event ring changed bytes");
+                    }
+                }
+                require(!batched.stats().staging_bytes && !batched.stats().errors,"event reuse leaked request staging");
+            }
             auto reader=std::make_shared<mfq::AsyncRangeReader>(path,mode);
             std::vector<std::future<void>> jobs;
             for(int client=0;client<4;++client)jobs.push_back(std::async(std::launch::async,[&,reader,client] {

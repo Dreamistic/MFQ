@@ -275,20 +275,30 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
             std::chrono::steady_clock::now()-started).count(),std::memory_order_relaxed);
         return;
     }
+    struct DirectEvents {
+        std::array<HANDLE,64> handles{};
+        ~DirectEvents(){for(auto handle:handles)if(handle)CloseHandle(handle);}
+        HANDLE at(std::size_t i) {
+            if(!handles[i])handles[i]=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+            if(!handles[i])throw std::system_error(GetLastError(),std::system_category(),"create direct batch event");
+            return handles[i];
+        }
+    };
+    static thread_local DirectEvents events;
     struct Request {
         const Impl& owner;
         OVERLAPPED native{};
         void* storage = nullptr;
         std::byte* destination = nullptr;
         std::size_t prefix = 0, bytes = 0, allocation = 0;
-        bool submitted = false, finished = false;
+        bool submitted = false, finished = false, borrowed_event=false;
         explicit Request(const Impl& value) : owner(value) {}
         ~Request() {
             if (submitted && !finished) {
                 DWORD ignored = 0;
                 GetOverlappedResult(owner.handle, &native, &ignored, TRUE);
             }
-            if (native.hEvent) CloseHandle(native.hEvent);
+            if (native.hEvent && !borrowed_event) CloseHandle(native.hEvent);
             if (storage) {
                 _aligned_free(storage);
                 owner.staging.fetch_sub(allocation, std::memory_order_relaxed);
@@ -316,7 +326,8 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
                 impl_->acquire(request->allocation);
                 request->native.Offset = static_cast<DWORD>(base);
                 request->native.OffsetHigh = static_cast<DWORD>(base >> 32);
-                request->native.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                request->borrowed_event=requests.size()<events.handles.size();
+                request->native.hEvent = request->borrowed_event?events.at(requests.size()):CreateEventW(nullptr, TRUE, FALSE, nullptr);
                 if (!request->native.hEvent)
                     throw std::system_error(GetLastError(), std::system_category(), "create batch-read event");
                 copied += request->bytes;
