@@ -223,12 +223,14 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
         config.moe_residency_adapt=true;config.moe_residency_warm=true;config.moe_residency_projection_heat=true;
         config.moe_host_cache_bytes=128*1024;
         auto cache=make_moe_expert_cache(64*1024,config);
+        std::vector<std::shared_ptr<MoeQuantRangeSource>> quant_sources;
         std::array<MoeFfnForward,2> forward;
         for(int layer=0;layer<2;++layer) {
             std::vector<std::shared_ptr<MfeWeight>> gu,down;
             for(int p=0;p<3;++p) {
                 const auto family=layer && !shared_arena?"nint":"nvq3j";
                 auto quant=source(root/(std::string(family)+"-"+std::to_string(p)+".mfq"));
+                quant_sources.push_back(quant);
                 auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(cache,
                     "ssd-overlap/"+std::to_string(layer)+"/"+std::to_string(p),quant,1,layer?-1:0,std::to_string(p)));
                 (p==2?down:gu).push_back(std::move(weight));
@@ -236,6 +238,30 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
             forward[layer]=make_moe_ffn_pipeline(gu,down);
         }
         finalize_moe_expert_cache(cache);
+        auto loan=std::make_shared<mfq::cuda::KvExpertLoan>();
+        auto loan_storage=tb::empty({2<<20},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+        loan->add(loan_storage,loan_storage.numel(),1,true,1,true,true);
+        set_moe_kv_expert_loan(cache,loan);
+        for(const auto& quant:quant_sources) {
+            const auto lease=quant->acquire_expert(33);
+            const auto fields=moe_cache_field_refs(lease->weights);
+            std::vector<int64_t> sizes;for(const auto& field:fields)sizes.push_back(field.nbytes());
+            // The tiny fixture is below the cache's 64 KiB admission floor.
+            // Add a private tail while retaining the real fields' geometry.
+            std::size_t packed=0;for(const auto size:sizes)packed=((packed+15)&~std::size_t(15))+size;
+            sizes.push_back((64<<10)-((packed+15)&~std::size_t(15)));
+            bool hit=false;
+            const auto* cached=loan->pin_projection(quant->host_key(33).source,33,sizes,mfq_current_cuda_stream(),hit,
+                [&](void* target,const std::array<std::size_t,8>& offsets) {
+                    for(std::size_t f=0;f<fields.size();++f)if(sizes[f])
+                        MFQ_CUDA_CHECK(cudaMemcpyAsync(static_cast<uint8_t*>(target)+offsets[f],fields[f].data_ptr(),
+                            std::size_t(sizes[f]),cudaMemcpyHostToDevice,mfq_current_cuda_stream()));
+                    MFQ_CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(target)+offsets[fields.size()],0,
+                        std::size_t(sizes.back()),mfq_current_cuda_stream()));
+                });
+            check(cached!=nullptr,"SSD GPU refill fixture did not enter the cache");
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
+        }
         auto x=tb::full({1,96},.017,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
         auto ids=tb::tensor(std::vector<int32_t>{31,32}).reshape({1,2}).to(tb::kCUDA);
         auto weights=tb::full({1,2},.5,x.options().dtype(tb::kFloat32));
@@ -248,7 +274,7 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
             if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return release;}))
                 throw std::runtime_error("SSD predictor waited for a held background read");
         });
-        for(int i=0;i<8;++i)manager.after_layer(0,std::vector<int32_t>(10,31),1);
+        for(int i=0;i<8;++i)manager.after_layer(0,std::vector<int32_t>(10,33),1);
         manager.prepare_predictor();
         if(!shared_arena) {
             {std::unique_lock lock(mutex);
@@ -257,6 +283,7 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
         }
         {std::lock_guard lock(mutex);release=true;}changed.notify_all();
         manager.apply_pending();
+        check(manager.stats().kv_refill_bytes>0,"SSD expert promotion reread an existing GPU cache copy");
         check(bool(manager.stats().predictor_overlap_serves)==!shared_arena,
             "SSD predictor overlap ignored shared arena ownership");
         check_output(forward[0](execution,x,ids,weights),target);

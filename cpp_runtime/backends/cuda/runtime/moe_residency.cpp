@@ -1151,6 +1151,25 @@ void MoeResidencyManager::prepare() {
         if(s.observer) {MFQ_CUDA_CHECK(cudaEventSynchronize(s.done));s.observe("copies_complete",0);}
         return;
     }
+    if(cache.ssd_experts() && cache.kv_expert_loan_) {
+        const auto* option=std::getenv("MFQ_MOE_RESIDENCY_KV_REFILL");
+        if(!option || option[0]!='0') {
+            // CPU images still participate in the bounded RAM exchange, but
+            // an immutable extra GPU copy need not cross PCIe a second time.
+            // Copies are already permitted here, after predictor overlap.
+            s.exchange_reads.emplace(cache.kv_expert_loan_->retain_exchange_reads(false,s.pending.size()));
+            bool found=false;
+            for(auto& move:s.pending)if(!move.cached_arena) {
+                const auto& cohort=cache.sources_[move.incoming_source]->cohorts_[move.cohort];
+                for(std::size_t f=0;f<move.field_count;++f)if(cohort.bytes_per_expert[f]) {
+                    move.loan_fields[f]=cache.kv_expert_loan_->find_for_exchange(
+                        {move.incoming_source,move.incoming,int64_t(f)},std::size_t(cohort.bytes_per_expert[f]),&*s.exchange_reads);
+                    found|=move.loan_fields[f]!=nullptr;
+                }
+            }
+            if(!found)s.exchange_reads.reset();
+        }
+    }
     {
     const PhaseClock backup_clock(s.backup_submit_ns,nullptr);
     for(const auto& move:s.pending) {
@@ -1178,6 +1197,12 @@ void MoeResidencyManager::prepare() {
                 // The window event fences the final transfer scatter. The
                 // next window joins this transaction before reusing its slots.
                 refill.copy(gpu,cached,std::uint64_t(count));
+            } else if(move.loan_fields[f]) {
+                // Keep this path on the copy engine; a side-stream gather
+                // kernel cannot pass a graph waiting for expert publication.
+                MFQ_CUDA_CHECK(cudaMemcpyAsync(gpu,move.loan_fields[f],std::size_t(count),cudaMemcpyDeviceToDevice,s.stream));
+                s.kv_refill_bytes+=count;s.cached_copy_bytes+=count;++s.cached_copy_fields;
+                s.cached_copy_dma_bytes+=count;++s.cached_copy_dma_fields;
             } else {
                 const auto* host=s.direct?static_cast<const uint8_t*>(incoming[f].data_ptr()):s.upload.data_ptr<uint8_t>()+move.offsets[f];
                 MFQ_CUDA_CHECK(cudaMemcpyAsync(gpu,host,std::size_t(count),cudaMemcpyHostToDevice,s.stream));
@@ -1191,6 +1216,9 @@ void MoeResidencyManager::prepare() {
     refill.submit();
     }
     MFQ_CUDA_CHECK(cudaEventRecord(s.done,s.stream));
+    // The worker releases its read guard after prepare(). Isolated SSD
+    // transactions publish on the caller, so retire GPU reads before returning.
+    if(cache.ssd_experts() && s.exchange_reads)MFQ_CUDA_CHECK(cudaEventSynchronize(s.done));
     if(s.observer) {MFQ_CUDA_CHECK(cudaEventSynchronize(s.done));s.observe("copies_complete",0);}
 }
 void MoeResidencyManager::prepare_direct_exchange() {
