@@ -50,9 +50,9 @@ plt.rcParams.update({
 })
 
 STYLES = {
-    "mfq": {"color": C["accent"], "marker": "o", "linestyle": "-", "width": 5.2, "marker_size": 14, "label_size": 19},
-    "unsloth-ud": {"color": C["neutral_bar"], "marker": "s", "linestyle": (0, (5, 3)), "width": 3, "marker_size": 10.5, "label_size": 17.5},
-    "gsq-rco": {"color": C["muted"], "marker": "D", "linestyle": "-", "width": 3, "marker_size": 10.5, "label_size": 17.5},
+    "mfq": {"color": C["accent"], "label_color": C["accent_ink"], "marker": "o", "linestyle": "-", "width": 5.2, "marker_size": 14, "label_size": 19},
+    "unsloth-ud": {"color": "#6da993", "label_color": "#3f806c", "marker": "s", "linestyle": (0, (5, 3)), "width": 3, "marker_size": 10.5, "label_size": 17.5},
+    "gsq-rco": {"color": "#8b9fd0", "label_color": "#5c74ad", "marker": "D", "linestyle": "-", "width": 3, "marker_size": 10.5, "label_size": 17.5},
 }
 LANGUAGES = {
     "en": {
@@ -79,28 +79,28 @@ LANGUAGES = {
     },
 }
 
-# Every point shows its metric; MFQ labels also retain the tier name. Offsets
+# Every point shows its tier and metric in its series color. Offsets
 # keep labels outside the neighboring curves without moving any data points.
 OFFSETS = {
     "kld": {
-        "mfq": {"V1-S": (-20, -18, "right", "top"), "V1-M": (-6, -34, "right", "top"),
-                "S2-L": (-6, -18, "right", "top"), "V3-XXS": (-8, -18, "right", "top"),
-                "S3-L": (-14, -18, "right", "top"), "V4-XS": (-4, -18, "right", "top")},
-        "unsloth-ud": {"IQ1_S": (4, 24, "left", "bottom"), "IQ1_M": (10, 22, "left", "bottom"),
-                       "Q2_K_XL": (10, 42, "left", "bottom"), "IQ3_XXS": (10, 20, "left", "bottom"),
-                       "Q3_K_XL": (4, 20, "left", "bottom"), "IQ4_XS": (10, 8, "left", "bottom")},
-        "gsq-rco": {"Q2_0": (10, 18, "left", "bottom"), "IQ2_XS": (12, 22, "left", "bottom"),
-                    "IQ3_XXS": (10, 70, "left", "bottom"), "IQ3_S": (10, 38, "left", "bottom")},
+        "mfq": {"V1-S": (-32, -20, "center", "top"), "V1-M": (0, -48, "center", "top"),
+                "S2-L": (-32, -20, "center", "top"), "V3-XXS": (0, -32, "center", "top"),
+                "S3-L": (-16, -20, "center", "top"), "V4-XS": (8, -12, "center", "top")},
+        "unsloth-ud": {"IQ1_S": (0, 12, "center", "bottom"), "IQ1_M": (32, 20, "center", "bottom"),
+                       "Q2_K_XL": (32, 0, "left", "center"), "IQ3_XXS": (8, 12, "left", "bottom"),
+                       "Q3_K_XL": (32, 20, "center", "bottom"), "IQ4_XS": (8, 32, "center", "bottom")},
+        "gsq-rco": {"Q2_0": (16, 12, "center", "bottom"), "IQ2_XS": (-8, -32, "center", "top"),
+                    "IQ3_XXS": (32, 48, "left", "bottom"), "IQ3_S": (32, 12, "left", "bottom")},
     },
     "top1_agreement_percent": {
-        "mfq": {"V1-S": (-12, 16, "right", "bottom"), "V1-M": (-8, 30, "right", "bottom"),
-                "S2-L": (-8, 16, "right", "bottom"), "V3-XXS": (-8, 24, "right", "bottom"),
-                "S3-L": (-10, 18, "right", "bottom"), "V4-XS": (-4, 36, "right", "bottom")},
-        "unsloth-ud": {"IQ1_S": (8, -24, "left", "top"), "IQ1_M": (10, -20, "left", "top"),
-                       "Q2_K_XL": (12, -35, "left", "top"), "IQ3_XXS": (10, -22, "left", "top"),
-                       "Q3_K_XL": (8, -22, "left", "top"), "IQ4_XS": (8, -24, "left", "top")},
-        "gsq-rco": {"Q2_0": (10, -16, "left", "top"), "IQ2_XS": (10, -18, "left", "top"),
-                    "IQ3_XXS": (8, -20, "left", "top"), "IQ3_S": (10, -16, "left", "top")},
+        "mfq": {"V1-S": (-32, 12, "center", "bottom"), "V1-M": (-8, 48, "center", "bottom"),
+                "S2-L": (0, 32, "center", "bottom"), "V3-XXS": (32, 48, "center", "bottom"),
+                "S3-L": (-8, 20, "center", "bottom"), "V4-XS": (8, 12, "center", "bottom")},
+        "unsloth-ud": {"IQ1_S": (0, -12, "center", "top"), "IQ1_M": (32, -12, "center", "top"),
+                       "Q2_K_XL": (32, 0, "left", "center"), "IQ3_XXS": (8, -12, "left", "top"),
+                       "Q3_K_XL": (0, -32, "center", "top"), "IQ4_XS": (8, -20, "center", "top")},
+        "gsq-rco": {"Q2_0": (16, -12, "center", "top"), "IQ2_XS": (32, -12, "center", "top"),
+                    "IQ3_XXS": (32, -48, "left", "top"), "IQ3_S": (64, -48, "left", "top")},
     },
 }
 
@@ -182,11 +182,10 @@ def panel(fig, x, metric, text):
             point.set_gid(f'quality-{short}-{series["id"]}-{row["tier"]}')
             dx, dy, align, vertical = OFFSETS[metric][series["id"]][row["tier"]]
             value = f'{row[metric]:.5f}' if metric == "kld" else f'{row[metric]:.2f}%'
-            caption = f'{row["tier"]}\n{value}' if series["id"] == "mfq" else value
-            ink = C["accent_ink"] if series["id"] == "mfq" else C["muted_light"] if series["id"] == "unsloth-ud" else C["muted"]
+            caption = f'{row["tier"]}\n{value}'
             annotation = ax.annotate(caption, (row["weight_size_gb"], row[metric]),
                                     xytext=(dx, dy), textcoords="offset points", ha=align, va=vertical,
-                                    color=ink, linespacing=1.15,
+                                    color=style["label_color"], linespacing=1.15,
                                     weight="bold" if series["id"] == "mfq" else "normal", fontsize=style["label_size"],
                                     arrowprops={"arrowstyle": "-", "linewidth": 0.85,
                                                 "color": style["color"], "shrinkA": 4, "shrinkB": 10})
