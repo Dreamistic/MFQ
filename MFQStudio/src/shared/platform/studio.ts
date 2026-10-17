@@ -92,6 +92,12 @@ export function isStudio(): boolean {
   return internals() !== null;
 }
 
+/** 原生壳决定是否使用自绘标题栏；浏览器和其他桌面平台保留原有布局。 */
+export async function studioCustomTitlebar(): Promise<boolean> {
+  const tauri = internals();
+  return tauri ? tauri.invoke<boolean>('studio_custom_titlebar') : false;
+}
+
 /** 查询桌面服务状态；浏览器环境没有本地管理服务，返回 null。 */
 export async function studioStatus(): Promise<StudioStatus | null> {
   const tauri = internals();

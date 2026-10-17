@@ -13,7 +13,8 @@ param(
     [string] $ReleaseVenv = $env:MFQ_RELEASE_VENV,
     [string] $OutputDirectory = $env:MFQ_RELEASE_OUTPUT_DIR,
     [string] $CudaArchitectures = $env:MFQ_RELEASE_CUDA_ARCHITECTURES,
-    [int] $Jobs = 0
+    [int] $Jobs = 0,
+    [switch] $Clean
 )
 
 Set-StrictMode -Version Latest
@@ -277,7 +278,7 @@ function Initialize-BuildEnvironment {
     $Context.Tools.Npm = Require-Command "npm.cmd"
     $null = Require-Command "cl"
     $null = Require-Command "nvcc"
-    $null = Require-Command "makensis"
+    # Tauri downloads its pinned NSIS toolset when no local installation exists.
 }
 
 function Initialize-ReleaseDirectories {
@@ -292,6 +293,11 @@ function Initialize-ReleaseDirectories {
         $Context.OutputDirectory
     )
     New-Item -ItemType Directory -Force -Path $directories | Out-Null
+    $temporaryDirectory = Join-Path $Context.ScriptDirectory "build\tmp"
+    New-Item -ItemType Directory -Force -Path $temporaryDirectory | Out-Null
+    $env:TEMP = $temporaryDirectory
+    $env:TMP = $temporaryDirectory
+    $env:PYINSTALLER_CONFIG_DIR = Join-Path $Context.ScriptDirectory "build\pyinstaller-cache"
 }
 
 function Stage-LicenseNotices {
@@ -478,8 +484,13 @@ function Build-NsisInstaller {
         Pop-Location
     }
 
-    $nsisDirectory = Join-Path $Context.StudioDirectory `
-        "src-tauri\target\$($Context.TargetTriple)\release\bundle\nsis"
+    $cargoTargetDirectory = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        Join-Path $Context.StudioDirectory "src-tauri\target"
+    } else {
+        Resolve-BuildPath $env:CARGO_TARGET_DIR $Context.StudioDirectory
+    }
+    $nsisDirectory = Join-Path $cargoTargetDirectory `
+        "$($Context.TargetTriple)\release\bundle\nsis"
     $installer = Get-ChildItem -LiteralPath $nsisDirectory -File -Filter "*.exe" `
         -ErrorAction SilentlyContinue |
         Sort-Object -Property LastWriteTimeUtc -Descending |
@@ -497,15 +508,17 @@ if (-not [System.OperatingSystem]::IsWindows() -or -not [Environment]::Is64BitOp
     Fail "this release target must be built on 64-bit Windows"
 }
 
-foreach ($name in @("build", "sidecars", "Frameworks", "Resources", "windows-runtime", "dist")) {
-    $path = Join-Path $PSScriptRoot $name
-    if (Test-Path -LiteralPath $path) {
-        Remove-Item -LiteralPath $path -Recurse -Force
+if ($Clean) {
+    foreach ($name in @("build", "sidecars", "Frameworks", "Resources", "windows-runtime", "dist")) {
+        $path = Join-Path $PSScriptRoot $name
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Recurse -Force
+        }
     }
 }
 
 $PythonVersion = if ([string]::IsNullOrWhiteSpace($PythonVersion)) { "3.12" } else { $PythonVersion }
-$CudaArchitectures = if ([string]::IsNullOrWhiteSpace($CudaArchitectures)) { "86" } else { $CudaArchitectures }
+$CudaArchitectures = if ([string]::IsNullOrWhiteSpace($CudaArchitectures)) { "80-real;86-real;89" } else { $CudaArchitectures }
 $Jobs = Get-ReleaseJobs $Jobs
 
 $venvDirectory = if ([string]::IsNullOrWhiteSpace($ReleaseVenv)) {

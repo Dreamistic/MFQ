@@ -1,6 +1,7 @@
 {
   "bundle": {
     "targets": ["nsis"],
+    "useLocalToolsDir": true,
     "externalBin": [
       "../../packaging/sidecars/mfq-runtime",
       "../../packaging/sidecars/mfq-diagnostics"

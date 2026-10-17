@@ -135,7 +135,13 @@ __global__ void transfer_packet(MfeFfnBatch b,const int32_t* packet,
         const unsigned active=__ballot_sync(0xffffffffu,cold_route);
         const int rank=__popc(active&((1u<<threadIdx.x)-1));
         if(cold_route)transfer_routes[1+rank]=int(threadIdx.x);
-        if(!threadIdx.x)transfer_routes[0]=__popc(active);
+        if(!threadIdx.x) {
+            transfer_routes[0]=__popc(active);
+            // This existing ballot proves every original route was already
+            // resident before the transfer wait. Partial GU/Down and CPU
+            // routes never qualify, and cancellation retains the old path.
+            transfer_routes[b.routes+1]=!cancelled && resident;
+        }
     }
     if constexpr(Snapshot)if(!cancelled)
         for(uint64_t word=threadIdx.x;word<fields*4;word+=blockDim.x)snapshot[4+word]=table[4+word];
@@ -148,7 +154,7 @@ __global__ void transfer_packet(MfeFfnBatch b,const int32_t* packet,
         if(!threadIdx.x && (descriptor_words&1))device_descriptors[descriptor_words-1]=host_descriptors[descriptor_words-1];
     }
 }
-template<bool Publish,bool Cached=false,bool Gate=false,bool StableSnapshot=false>
+template<bool Publish,bool Cached=false,bool Gate=false,bool StableSnapshot=false,bool EarlyTags=false>
 __global__ void __launch_bounds__(64) prepare_warp(MfeFfnBatch b,
         const MfeInputQuantization* inputs,int count,int32_t* mapped_ids,uint32_t* ready,bool local_control,
         MfeCachedDispatch cache={}) {
@@ -208,24 +214,44 @@ __global__ void __launch_bounds__(64) prepare_warp(MfeFfnBatch b,
             const int entries=b.tokens*b.routes;
             auto* mapping=const_cast<int32_t*>(b.cohort_by_expert);
             bool needs_refresh=false;
-            for(int pair=thread;pair<entries;pair+=64) {
-                selected[pair]=0;refresh[pair]=0;tags[pair]=0;cached_kinds[pair]=-2;
+            for(int pair=thread/4;pair<entries;pair+=16) {
+                const int projection=thread&3;
+                const unsigned mask=0xfu<<((thread&31)&~3);
+                if(!projection){selected[pair]=0;refresh[pair]=0;tags[pair]=0;cached_kinds[pair]=-2;}
                 const int expert=b.ids[pair];if(unsigned(expert)>=unsigned(b.experts))continue;
                 bool duplicate=false;
-                for(int prior=0;prior<pair;++prior)duplicate|=b.ids[prior]==expert;
+                // The route's four lanes inspect disjoint prior positions.
+                // Their vote preserves one writer per expert, including routes
+                // repeated in another warp or an earlier loop iteration.
+                for(int prior=projection;prior<pair;prior+=4)duplicate|=b.ids[prior]==expert;
+                duplicate=__any_sync(mask,duplicate);
                 if(duplicate)continue;
+                // The snapshot publication below still protects this read.
+                // Issue its PCIe request before the independent GPU mapping
+                // reads, then consume the value only if a primary is missing.
+                uint64_t early_tag=0;
+                if constexpr(EarlyTags)if(projection==3)
+                    early_tag=reinterpret_cast<const volatile MfeCachedExpert*>(cache.mapped)[expert].ready_mask;
                 unsigned missing=0;
-                for(int p=0;p<3;++p) {
+                if(projection<3) {
+                    const int p=projection;
                     const int pool=cache.primary_cohorts[p*b.experts+expert];
                     mapping[p*b.experts+expert]=pool;
-                    if(unsigned(pool)>=unsigned(cache.primary_counts[p])){missing|=1u<<p;continue;}
-                    const auto& d=b.projections[b.projection_offsets[p]+pool];
-                    const int local=d.expert_local?d.expert_local[expert]:0;
-                    if(local<0 || local>=d.local_experts)missing|=1u<<p;
+                    if(unsigned(pool)>=unsigned(cache.primary_counts[p]))missing=1u<<p;
+                    else {
+                        const auto& d=b.projections[b.projection_offsets[p]+pool];
+                        const int local=d.expert_local?d.expert_local[expert]:0;
+                        if(local<0 || local>=d.local_experts)missing=1u<<p;
+                    }
                 }
+                missing|=__shfl_xor_sync(mask,missing,1,4);
+                missing|=__shfl_xor_sync(mask,missing,2,4);
+                if constexpr(EarlyTags)early_tag=__shfl_sync(mask,early_tag,((thread&31)|3));
+                if(projection)continue;
                 unsigned remaining=missing;
                 if(missing) {
-                    const auto tag=reinterpret_cast<const volatile MfeCachedExpert*>(cache.mapped)[expert].ready_mask;
+                    const auto tag=EarlyTags?early_tag:
+                        reinterpret_cast<const volatile MfeCachedExpert*>(cache.mapped)[expert].ready_mask;
                     const unsigned available=unsigned(tag&7)&missing;
                     remaining=missing&~available;
                     // Cached GU can run before the Down DMA, just like GU in
@@ -255,6 +281,13 @@ __global__ void __launch_bounds__(64) prepare_warp(MfeFfnBatch b,
                 if(f+1<fields)d.fields[f+1]=reinterpret_cast<const void*>(uint64_t(values.z)|(uint64_t(values.w)<<32));
               }
               __syncthreads();
+            }
+            // No mapped validity or field reader remains after the refresh
+            // barrier (or the needs_refresh reduction). CPU fetch may proceed
+            // while the CTA finishes its independent GPU mappings and kinds.
+            if constexpr(Publish)if(!thread) {
+                ::cuda::atomic_ref<uint32_t,::cuda::thread_scope_system> publication(*cache.snapshot_ready);
+                publication.store(1u,::cuda::std::memory_order_release);
             }
             for(int pair=thread;pair<entries;pair+=64)if(selected[pair]) {
                 const int expert=b.ids[pair];
@@ -293,16 +326,6 @@ __global__ void __launch_bounds__(64) prepare_warp(MfeFfnBatch b,
         }else for(int expert=thread;expert<b.experts;expert+=64) {
             b.kinds[expert]=cancelled?-1:reinterpret_cast<const volatile int32_t*>(b.host_kinds)[expert];
             b.transfer_index[expert]=cancelled?-1:reinterpret_cast<const volatile int32_t*>(b.host_transfer_index)[expert];
-        }
-    }
-    if constexpr(Cached)if(Publish && blockIdx.x==0) {
-        // Route IDs already let the CPU plan concurrently. Only its mutating
-        // fetch waits for this snapshot; the validity table stays unchanged
-        // throughout classification and both dispatches see the same image.
-        __syncthreads();
-        if(!thread) {
-            ::cuda::atomic_ref<uint32_t,::cuda::thread_scope_system> publication(*cache.snapshot_ready);
-            publication.store(1u,::cuda::std::memory_order_release);
         }
     }
     // A warp owns one group, including GS33..64 via two values per lane.
@@ -359,9 +382,26 @@ void mfe_ffn_prepare_warp(const MfeFfnBatch& b,const MfeInputQuantization* input
 }
 void mfe_ffn_prepare_publish_cached(const MfeFfnBatch& b,const MfeInputQuantization* inputs,int count,int groups,
         int32_t* mapped_ids,uint32_t* ready,const MfeCachedDispatch& cache,cudaStream_t stream) {
+    static std::atomic<bool> cooperative_reported{false};
+    if(!cooperative_reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+        "mfe_prepare_cooperative_dispatch scope=first_cached_prepare enabled=1 route_lanes=4 snapshot_publish=after_mapped_reads duplicate_check=quad tokens=%d\n",b.tokens);
     int blocks=std::max((b.tokens*groups+1)/2,
         (b.tokens*(b.routes+(b.shared?1:0))*b.scale_stride+63)/64);
     const auto* stable=std::getenv("MFQ_MFE_CACHE_PREPARE_SYNC");
+    const auto* tag_overlap=std::getenv("MFQ_MFE_TAG_OVERLAP");
+    if(cache.primary_incomplete && (!tag_overlap || tag_overlap[0]!='0') && (!stable || stable[0]!='0')) {
+        if(cache.gate.activation)
+            prepare_warp<true,true,true,true,true><<<blocks,64,0,stream>>>(b,inputs,count,mapped_ids,ready,true,cache);
+        else prepare_warp<true,true,false,true,true><<<blocks,64,0,stream>>>(b,inputs,count,mapped_ids,ready,true,cache);
+        static std::atomic<bool> reported{false};
+        if(!reported.exchange(true,std::memory_order_relaxed)) {
+            std::fprintf(stderr,"mfe_prepare_tag_overlap_dispatch scope=first_cached_prepare enabled=1 tokens=%d gate=%d\n",
+                b.tokens,int(cache.gate.activation!=nullptr));
+            std::fprintf(stderr,"mfe_cache_prepare_sync_dispatch scope=first_cached_prepare enabled=1 tokens=%d gate=%d tag_overlap=1\n",
+                b.tokens,int(cache.gate.activation!=nullptr));
+        }
+        return;
+    }
     if(!stable || stable[0]!='0') {
         if(cache.gate.activation)
             prepare_warp<true,true,true,true><<<blocks,64,0,stream>>>(b,inputs,count,mapped_ids,ready,true,cache);

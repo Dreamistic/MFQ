@@ -64,6 +64,7 @@ export const officialCatalog: OfficialModelList = {
 
 interface MockOptions {
   language?: 'zh-CN' | 'en';
+  theme?: 'light' | 'dark';
   /** 首次生成后的历史查询返回失败，供验证手动恢复且不重复提交。 */
   failFirstSync?: boolean;
   /** 挂起生成请求直到用户调用取消接口。 */
@@ -81,12 +82,12 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
   let responses: ResponseResource[] = [];
   let failedSync = false;
   let releasePending: (() => void) | undefined;
-  await page.addInitScript((language) => {
+  await page.addInitScript(({ language, theme }) => {
     localStorage.setItem(
       'mfq.studio.generation.v1',
-      JSON.stringify({ language, theme: 'light' }),
+      JSON.stringify({ language, theme }),
     );
-  }, options.language ?? 'en');
+  }, { language: options.language ?? 'en', theme: options.theme ?? 'light' });
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     const method = route.request().method();
