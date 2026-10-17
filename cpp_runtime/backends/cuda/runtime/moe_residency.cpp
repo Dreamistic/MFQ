@@ -381,13 +381,21 @@ struct MoeResidencyManager::Impl {
     }
     struct CachedRefill {
         Impl& s;
+        const bool native_ssd_dma;
+        std::vector<mfq::cuda::DmaCopy> native_copies;
         std::size_t count=0;
         std::uint64_t largest=0;
-        explicit CachedRefill(Impl& owner):s(owner) {}
+        explicit CachedRefill(Impl& owner):s(owner),
+            native_ssd_dma(s.cache->ssd_experts() && native_residency_dma_enabled()) {}
         void copy(uint8_t* destination,const uint8_t* source,std::uint64_t bytes) {
             const auto chunk=s.refill_chunk_bytes?s.refill_chunk_bytes:bytes;
             const auto pieces=1+(bytes-1)/chunk;
-            if(s.cached_refill && (!s.refill_dma_min || bytes<s.refill_dma_min) && pieces<=refill_capacity-count) {
+            if(s.cache->ssd_experts()) {
+                // Copy-engine work can pass a graph's expert publication wait.
+                if(native_ssd_dma)native_copies.push_back({destination,source,std::size_t(bytes)});
+                else MFQ_CUDA_CHECK(cudaMemcpyAsync(destination,source,std::size_t(bytes),cudaMemcpyDeviceToDevice,s.stream));
+                s.cached_copy_dma_bytes+=bytes;++s.cached_copy_dma_fields;
+            } else if(s.cached_refill && (!s.refill_dma_min || bytes<s.refill_dma_min) && pieces<=refill_capacity-count) {
                 auto* descriptors=static_cast<mfq::MoeCacheMappedCopyDescriptor*>(s.refill_descriptors->data());
                 for(std::uint64_t begin=0;begin<bytes;begin+=chunk) {
                     const auto size=std::min(chunk,bytes-begin);
@@ -401,7 +409,17 @@ struct MoeResidencyManager::Impl {
             s.cached_copy_bytes+=bytes;++s.cached_copy_fields;
         }
         bool submit() {
-            if(!count)return false;
+            if(!native_copies.empty()) {
+                if(mfq::cuda::NativeDmaBatch::submit(native_copies,s.stream,1,
+                        [](const void* pointer,std::size_t){return reinterpret_cast<CUdeviceptr>(pointer);})) {
+                    ++s.native_dma_batches;s.native_dma_copies+=native_copies.size();
+                } else {
+                    ++s.native_dma_fallbacks;
+                    for(const auto& copy:native_copies)MFQ_CUDA_CHECK(cudaMemcpyAsync(
+                        copy.destination,copy.source,copy.bytes,cudaMemcpyDeviceToDevice,s.stream));
+                }
+            }
+            if(!count)return !native_copies.empty();
             // Chunked descriptors receive one block each. Work grows with
             // actual bytes, avoiding maximum-size grids for tiny fields.
             const int blocks=s.refill_chunk_bytes?1:static_cast<int>(std::min<std::uint64_t>(128,(largest+4095)/4096));
@@ -820,7 +838,7 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
             // Keep borrowed cache addresses protected through rollback as well
             // as successful DMA and publication. Predictor misses may reclaim
             // them only after no transaction can still read those addresses.
-            state.exchange_reads.reset();
+            if(!state.cache->ssd_experts() || state.pending.empty())state.exchange_reads.reset();
             lock.lock();state.work_ready=true;state.work_finished.notify_one();
         }
     });
@@ -1040,7 +1058,10 @@ void MoeResidencyManager::prepare() {
             if(cache.ssd_experts())move.lease=std::move(ssd_images.at({move.incoming_source,move.incoming}));
             else move.lease=incoming.quant_source_->acquire_expert(move.incoming);
             if(move.lease.use_count()!=2){valid=false;break;}
-            if(s.direct && (cache.ssd_experts() || cache.pipeline_ram_registered_bytes_<cache.pipeline_ram_complement_->numel())) {
+            // Streamed RAM images may outgrow the pinned arena. The ordinary
+            // SSD transaction accepts pageable images through staged CUDA DMA;
+            // only the full-RAM in-place exchange requires registered fields.
+            if(s.direct && !cache.ssd_experts() && cache.pipeline_ram_registered_bytes_<cache.pipeline_ram_complement_->numel()) {
                 const auto begin=reinterpret_cast<uintptr_t>(cache.pipeline_ram_complement_->data_ptr());
                 const auto end=begin+cache.pipeline_ram_registered_bytes_;
                 for(const auto& field:moe_cache_field_refs(move.lease->weights)) {
@@ -1231,11 +1252,8 @@ void MoeResidencyManager::prepare() {
                 // next window joins this transaction before reusing its slots.
                 refill.copy(gpu,cached,std::uint64_t(count));
             } else if(move.loan_fields[f]) {
-                // Keep this path on the copy engine; a side-stream gather
-                // kernel cannot pass a graph waiting for expert publication.
-                MFQ_CUDA_CHECK(cudaMemcpyAsync(gpu,move.loan_fields[f],std::size_t(count),cudaMemcpyDeviceToDevice,s.stream));
-                s.kv_refill_bytes+=count;s.cached_copy_bytes+=count;++s.cached_copy_fields;
-                s.cached_copy_dma_bytes+=count;++s.cached_copy_dma_fields;
+                refill.copy(gpu,static_cast<const uint8_t*>(move.loan_fields[f]),std::uint64_t(count));
+                s.kv_refill_bytes+=count;
             } else {
                 const auto* host=s.direct?static_cast<const uint8_t*>(incoming[f].data_ptr()):s.upload.data_ptr<uint8_t>()+move.offsets[f];
                 if(native_ssd_dma)copies.push_back({gpu,host,std::size_t(count)});
@@ -1251,9 +1269,6 @@ void MoeResidencyManager::prepare() {
     refill.submit();
     }
     MFQ_CUDA_CHECK(cudaEventRecord(s.done,s.stream));
-    // The worker releases its read guard after prepare(). Isolated SSD
-    // transactions publish on the caller, so retire GPU reads before returning.
-    if(cache.ssd_experts() && s.exchange_reads)MFQ_CUDA_CHECK(cudaEventSynchronize(s.done));
     if(s.observer) {MFQ_CUDA_CHECK(cudaEventSynchronize(s.done));s.observe("copies_complete",0);}
 }
 void MoeResidencyManager::prepare_direct_exchange() {
@@ -1807,6 +1822,12 @@ void MoeResidencyManager::apply_pending() {
             s.work_pending.store(false,std::memory_order_release);
         }
     }
+    // SSD prepares may return with device copies still queued. Keep borrowed
+    // addresses pinned until publication (or rollback) retires their reads.
+    struct ReleaseReads {
+        decltype(s.exchange_reads)& guard;
+        ~ReleaseReads(){guard.reset();}
+    } release_reads{s.exchange_reads};
     if(s.error){auto failure=s.error;s.error=nullptr;std::rethrow_exception(failure);}
     publish_pending();
     const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();

@@ -242,9 +242,13 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
         auto loan_storage=tb::empty({2<<20},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
         loan->add(loan_storage,loan_storage.numel(),1,true,1,true,true);
         set_moe_kv_expert_loan(cache,loan);
-        for(const auto& quant:quant_sources) {
+        bool pageable_target=false;
+        for(auto it=quant_sources.rbegin();it!=quant_sources.rend();++it) {
+            const auto& quant=*it;
             const auto lease=quant->acquire_expert(33);
             const auto fields=moe_cache_field_refs(lease->weights);
+            if(quant->host_key(33).source<3)for(const auto& field:fields)
+                pageable_target|=field.nbytes()>0 && !field.options().pinned();
             std::vector<int64_t> sizes;for(const auto& field:fields)sizes.push_back(field.nbytes());
             // The tiny fixture is below the cache's 64 KiB admission floor.
             // Add a private tail while retaining the real fields' geometry.
@@ -262,6 +266,8 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
             check(cached!=nullptr,"SSD GPU refill fixture did not enter the cache");
             MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
         }
+        if(const auto* cap=std::getenv("MFQ_MOE_RAM_PIN_GIB");cap && std::atof(cap)*(1LL<<30)==16384)
+            check(pageable_target,"SSD partial pin fixture did not include pageable experts");
         auto x=tb::full({1,96},.017,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
         auto ids=tb::tensor(std::vector<int32_t>{31,32}).reshape({1,2}).to(tb::kCUDA);
         auto weights=tb::full({1,2},.5,x.options().dtype(tb::kFloat32));

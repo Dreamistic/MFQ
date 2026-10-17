@@ -15,9 +15,10 @@ from mfq.quantize.nint_quant import quantize
 from tests.mixed_family_fixtures import make_flat_family
 
 
-@pytest.mark.parametrize("pcie_fraction,read_mode,native_dma", [
-    (1.0,"buffered","1"),(0.5,"buffered","1"),(1.0,"direct","1"),(1.0,"buffered","0")])
-def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma):
+@pytest.mark.parametrize("pcie_fraction,read_mode,native_dma,ram_pin_bytes", [
+    (1.0,"buffered","1","0"),(0.5,"buffered","1","0"),(1.0,"direct","1","0"),
+    (1.0,"buffered","0","0"),(1.0,"buffered","1","16384")])
+def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma,ram_pin_bytes):
     executable = os.environ.get("MFQ_CUDA_SSD_EXPERT_TEST")
     if not executable:
         pytest.skip("MFQ_CUDA_SSD_EXPERT_TEST required")
@@ -46,6 +47,7 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma):
         MFQ_MOE_PREFILL_GROUPS="1", MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER="1", MFQ_MOE_RAM_PCIE_FRACTION="1",
         MFQ_MOE_PREFILL_GROUP_SIZE="64" if pcie_fraction < 1 else "16",
         MFQ_MOE_RESIDENCY_NATIVE_DMA=native_dma,
+        MFQ_MOE_RAM_PIN_GIB=str(int(ram_pin_bytes)/(1<<30)),
         MFQ_SSD_EXPERT_TEST_PCIE_FRACTION=str(pcie_fraction),
         MFQ_CUDA_WORKSPACE_RESERVE_GIB="0.01", CUDA_MODULE_LOADING="LAZY")
     result = subprocess.run([executable, str(tmp_path)], env=env, capture_output=True, text=True, timeout=120)
