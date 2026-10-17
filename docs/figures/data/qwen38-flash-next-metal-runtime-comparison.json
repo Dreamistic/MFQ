@@ -13,11 +13,11 @@
     "sampling": "greedy",
     "corpus_sha256": "f0b97fa3cc6b13fda04d41998d14cf358c38e3edd9e744257d37d1e5a065a248",
     "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/README.md",
-    "note": "The Strata and llama.cpp protocols identify the 4K code continuation as the same workload used for MFQ. Their context limit is 16384; the MFQ table does not report its context limit."
+    "note": "The Strata, llama.cpp and oMLX protocols identify the 4K code continuation as the same workload used for MFQ. Their context limit is 16384; the MFQ table does not report its context limit."
   },
   "source": {
     "repository": "ssh://git@fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity.git",
-    "revision": "a4b2f83959b50611043e1f86cdb80bb81f1cb3c9",
+    "revision": "9b7c1f7900f1fa877eecf4b25076e3a048748f4b",
     "files": [
       {
         "path": "Qwen3.8-Flash-Next-EW-MFQ/README.md",
@@ -33,7 +33,11 @@
       },
       {
         "path": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/README.md",
-        "sha256": "c2ccc02b3b037f53f0682ba9c00416ffdaebf18720445693671355ec7eab6390"
+        "sha256": "a32c35c958e4990dff7c0e1e5f1d3e227427eef1ae515b4854803bf020cce354"
+      },
+      {
+        "path": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md",
+        "sha256": "e5ed7a6aace4f1fb00235fc68ed1b24d07072268a53227c0a6d0e896e2a9a47b"
       }
     ],
     "description": "Published benchmark tables from MFQ-Publicity; no new measurements. The full prompt is not copied into this snapshot."
@@ -73,15 +77,37 @@
       "prefix_reuse_tokens": 0,
       "warmup_excluded": true,
       "idle_seconds_before_run": 60
+    },
+    {
+      "id": "omlx",
+      "label": "oMLX",
+      "version": "0.7.1.dev2",
+      "libraries": {
+        "mlx": "0.32.4",
+        "mlx_lm": "0.31.4.dev132+g94cdcae13"
+      },
+      "date_range": [
+        "2026-10-16",
+        "2026-10-17"
+      ],
+      "measured_runs_per_mode": 1,
+      "mtp_draft_setup": "Each checkpoint's included draft head; default adaptive policy with maximum draft depth 3; controller can reduce or pause drafting; not fixed-single-draft results",
+      "prefill_timing": "4096 / wall-clock time to first producer-generated token, including first-token overhead",
+      "generation_timing": "127 intervals between the first and last producer-generated token timestamps",
+      "prefix_reuse_tokens": 0,
+      "warmup_excluded": true,
+      "idle_seconds_before_run": 60,
+      "power_mode": "High Power Mode enabled for battery and AC; oQ2.5e ordinary run used AC; oQ3.5e measured on battery; short power diagnostics are not throughput measurements"
     }
   ],
   "interpretation": [
     "Rows are runtime/checkpoint configurations, with different quantization tiers; they are not matched-precision or matched-quality comparisons.",
-    "The chart uses the one published MFQ prefill value and MTP-off prefill values for the two GGUF runtimes. Missing MFQ prefill mode values remain null.",
-    "MTP draft weights and head configurations differ between Strata and llama.cpp; MFQ draft settings are not specified in this source.",
-    "Strata combines two measured runs per mode; llama.cpp reports one. The source does not give uncertainty estimates or MFQ repeat counts.",
+    "The chart uses the one published MFQ prefill value and MTP-off prefill values for Strata, llama.cpp and oMLX. Missing MFQ prefill mode values remain null. oMLX prefill includes first-token overhead, while the GGUF runtimes report engine prompt time.",
+    "MTP draft weights, head configurations and policies differ. oMLX uses default adaptive MTP with maximum draft depth 3; Strata and llama.cpp use one draft token per verification round; MFQ draft settings are not specified in this source.",
+    "Strata combines two measured runs per mode; llama.cpp and oMLX each report one. The source does not give uncertainty estimates or MFQ repeat counts.",
     "Strata ordinary and MTP outputs match for all four configurations; llama.cpp UD-Q4_K_XL diverges from output token 80, while its three GSQ-RCO outputs match.",
-    "GSQ-RCO IQ2_XS is unsupported by this Strata Metal release and is not plotted as a zero-speed result."
+    "GSQ-RCO IQ2_XS is unsupported by this Strata Metal release and is not plotted as a zero-speed result.",
+    "oMLX ordinary and adaptive-MTP output text matches within each tier; its throughput uses producer-generated token timestamps through the native streaming API, without HTTP transport or profiling."
   ],
   "measurements": [
     {
@@ -257,6 +283,56 @@
       "generation_mtp": 57.7,
       "draft_acceptance_percent": 88.1,
       "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md"
+    },
+    {
+      "runtime": "omlx",
+      "method": "jundot-oq",
+      "tier": "oQ2.5e",
+      "checkpoint": {
+        "repository": "Jundot/Qwen3.8-Flash-Next-oQ2.5e-mtp",
+        "revision": "ebfb10474baa3c1c78d38453ce0d5228febd32e9"
+      },
+      "prefill_reported": null,
+      "prefill_no_mtp": 2010.4,
+      "generation_no_mtp": 51.5,
+      "prefill_mtp": 2064.8,
+      "generation_mtp": 84.9,
+      "draft_acceptance_percent": 87.8,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md"
+    },
+    {
+      "runtime": "omlx",
+      "method": "jundot-oq",
+      "tier": "oQ3.5e",
+      "checkpoint": {
+        "repository": "Jundot/Qwen3.8-Flash-Next-oQ3.5e-mtp",
+        "revision": "e8216051d1a75ec4a523ed8c6b0ed4a01667bcda"
+      },
+      "prefill_reported": null,
+      "prefill_no_mtp": 1448.9,
+      "generation_no_mtp": 60.2,
+      "prefill_mtp": 1443.8,
+      "generation_mtp": 108.4,
+      "draft_acceptance_percent": 90.6,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md"
+    },
+    {
+      "runtime": "omlx",
+      "method": "jundot-oq",
+      "tier": "oQ4e",
+      "checkpoint": {
+        "repository": "Jundot/Qwen3.8-Flash-Next-oQ4e-mtp",
+        "revision": null,
+        "weight_shards_bytes": 106294664646,
+        "note": "Previously downloaded checkpoint; source does not identify a repository revision."
+      },
+      "prefill_reported": null,
+      "prefill_no_mtp": 1497.0,
+      "generation_no_mtp": 64.2,
+      "prefill_mtp": 1484.3,
+      "generation_mtp": 75.3,
+      "draft_acceptance_percent": 91.0,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md"
     }
   ]
 }

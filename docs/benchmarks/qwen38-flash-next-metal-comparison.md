@@ -1,13 +1,13 @@
 # Qwen3.8-Flash-Next: Metal runtime comparison
 
-This comparison collects 14 runtime/checkpoint configurations from
-MFQ-Publicity revision `a4b2f83959b50611043e1f86cdb80bb81f1cb3c9`.
+This comparison collects 17 runtime/checkpoint configurations from
+MFQ-Publicity revision `9b7c1f7900f1fa877eecf4b25076e3a048748f4b`.
 All reported results use an Apple M5 Max with a 40-core GPU and 128 GB memory.
-The Strata and llama.cpp protocols identify the 4K Python-code input as the
+The Strata, llama.cpp and oMLX protocols identify the 4K Python-code input as the
 same input used for the MFQ measurements.
 
 <p align="center">
-  <img src="../figures/qwen38-flash-next-metal-runtime-comparison.svg" alt="Qwen3.8-Flash-Next Metal comparison: prompt processing and generation with MTP off and on, grouped by MFQ, Strata and llama.cpp" width="1100">
+  <img src="../figures/qwen38-flash-next-metal-runtime-comparison.svg" alt="Qwen3.8-Flash-Next Metal comparison: prompt processing and generation with MTP off and on, grouped by MFQ, Strata, llama.cpp and oMLX" width="1100">
 </p>
 
 The rows retain each runtime's tested quantization tiers. Their weight sizes,
@@ -16,7 +16,7 @@ configurations rather than isolating runtime overhead at matched precision.
 Each bar starts at zero, and both generation columns use the same scale.
 The [data snapshot](../figures/data/qwen38-flash-next-metal-runtime-comparison.json)
 preserves every published value, including the MTP-on prefill measurements
-that are available for the two GGUF runtimes.
+that are available for Strata, llama.cpp and oMLX.
 
 ## Comparable weight sizes
 
@@ -36,24 +36,32 @@ as described below.
 
 The baseline workload uses 4,096 input tokens, 128 generated tokens, greedy
 sampling, batch size 1 and a 16,384-token context limit, without an added chat
-template. llama.cpp's raw input token IDs match the Strata fixture, with no
-extra BOS token. Both GGUF runtimes keep model weights resident and read PLE
-data from SSD.
+template. llama.cpp's and oMLX's raw input token IDs match the Strata fixture,
+with no extra BOS token. All three baseline runtimes keep model weights
+resident and read PLE data from SSD.
 
 For Strata and llama.cpp, warmup, loading and compilation are excluded, prefix
 reuse is zero, and each measured run follows 60 seconds idle. Prompt processing
 uses the engine's prompt time. Generation measures the 127 token intervals
 between the first and last emitted tokens.
 
+oMLX also excludes warmup, loading and compilation, with zero prefix reuse
+and 60 seconds idle before each measured run. Its prefill timing includes
+first-token overhead: 4,096 divided by the wall-clock time to the first
+producer-generated token. Generation uses 127 intervals between the first
+and last producer-generated token timestamps. These timings come from the
+native streaming API, without HTTP transport or profiling.
+
 | Runtime | Version | Measured runs per mode | MTP setup |
 | --- | --- | --- | --- |
 | MFQ | Not specified in the source table | Not specified | Not specified in the source table |
 | Strata | `v0.1.44.1` / `296b59d2` | Two; total tokens divided by total measured time | Q2_0 draft experts, default CJK vocabulary shortlist, `spec=2`: one draft token per round |
 | llama.cpp | `f74e2fa6a31cc33ab4ee4ae516641cfe62df3924` | One | Self-contained Unsloth Q8_0 MTP head, one draft token per round |
+| oMLX | `0.7.1.dev2`; MLX `0.32.4`; mlx-lm `0.31.4.dev132+g94cdcae13` | One | Each checkpoint's included draft head; default adaptive MTP, maximum draft depth 3; controller can reduce or pause drafting |
 
 The MFQ table reports a single prompt-processing rate per tier without
 identifying its MTP mode. The figure uses that published value for MFQ and
-MTP-off prefill for Strata and llama.cpp; it does not fill in missing MFQ
+MTP-off prefill for Strata, llama.cpp and oMLX; it does not fill in missing MFQ
 prefill measurements. The source does not specify MFQ's repeat count, context
 limit or detailed timing protocol, and gives no uncertainty estimates for
 the comparison.
@@ -113,13 +121,43 @@ configurations. UD-Q4_K_XL differs starting at output token 80. Strata and
 llama.cpp use different draft weights and head configurations, so their
 MTP results include those differences.
 
+## oMLX
+
+| Checkpoint | Prefill: MTP off | Generation: MTP off | Prefill: adaptive MTP | Generation: adaptive MTP | Draft acceptance |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Jundot oQ2.5e | 2,010.4 | 51.5 | 2,064.8 | 84.9 | 87.8% |
+| Jundot oQ3.5e | 1,448.9 | 60.2 | 1,443.8 | 108.4 | 90.6% |
+| Jundot oQ4e | 1,497.0 | 64.2 | 1,484.3 | 75.3 | 91.0% |
+
+oMLX uses the official `VLMBatchedEngine` streaming API with a 4,096-token
+prefill step. Experts remain resident and PLE uses SSD-backed mmap. KV
+quantization, TurboQuant and ANE prefill are disabled. Normal warmup generates
+16 tokens; adaptive-MTP warmup generates 128 tokens to exercise verification
+depths. Ordinary and adaptive-MTP output text matches within each tier.
+
+MTP uses `mtp_enabled=True`, `mtp_fixed_depth=None` and
+`mtp_adaptive_max_depth=None`, retaining the model's default maximum draft
+depth of 3. These adaptive results include a different drafting policy from
+the fixed-single-draft Strata and llama.cpp runs. They do not establish a
+comparison at matched model size or quality with MFQ V3-XXS or GSQ-RCO IQ3_S.
+
+The source pins oQ2.5e to revision
+`ebfb10474baa3c1c78d38453ce0d5228febd32e9` and oQ3.5e to
+`e8216051d1a75ec4a523ed8c6b0ed4a01667bcda`. oQ4e uses a previously downloaded
+checkpoint with 106,294,664,646 bytes of weight shards; its repository revision
+is not reported. All oMLX runs enable High Power Mode. The oQ2.5e ordinary
+run uses AC power, while oQ3.5e is measured on battery. Separate short power
+diagnostics are excluded from the throughput table and do not establish a
+battery-versus-AC speed difference.
+
 ## Sources and regeneration
 
 The source tables are pinned to the same MFQ-Publicity commit:
 
-- [MFQ Apple table](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/a4b2f83959b50611043e1f86cdb80bb81f1cb3c9/Qwen3.8-Flash-Next-EW-MFQ/README.md#local-inference-speed).
-- [Strata configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/a4b2f83959b50611043e1f86cdb80bb81f1cb3c9/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md).
-- [llama.cpp configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/a4b2f83959b50611043e1f86cdb80bb81f1cb3c9/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md).
+- [MFQ Apple table](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/README.md#local-inference-speed).
+- [Strata configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md).
+- [llama.cpp configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md).
+- [oMLX configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md).
 
 The snapshot records source-file SHA-256 values and the input checksum.
 The original input excerpt is credited to the Apache-2.0

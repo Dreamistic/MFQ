@@ -1,4 +1,4 @@
-"""Plot the revision-pinned MFQ, Strata and llama.cpp Metal measurements.
+"""Plot the revision-pinned MFQ, Strata, llama.cpp and oMLX Metal measurements.
 
 uv run --no-project --no-config --with matplotlib python docs/figures/generate-metal-runtime-comparison.py
 """
@@ -25,11 +25,12 @@ ROOT = Path(__file__).resolve().parent
 DATA = json.loads((ROOT / "data/qwen38-flash-next-metal-runtime-comparison.json").read_text())
 C = json.loads((ROOT / "studio-figure-theme.json").read_text())["colors"]
 REPOSITORY_URL = "https://github.com/Tylogi/MFQ"
-WIDTH, HEIGHT = 1600, 1060
+WIDTH, HEIGHT = 1600, 1224
 COLORS = {
     "mfq": (C["accent"], C["accent_ink"]),
     "gsq-rco": ("#8b9fd0", "#5c74ad"),
     "unsloth-ud": ("#6da993", "#3f806c"),
+    "jundot-oq": ("#a69bbf", "#76678f"),
 }
 FAMILIES = ["DejaVu Sans"]
 for font_path in (
@@ -60,8 +61,8 @@ LANGUAGES = {
         "prefill": "Prompt processing¹",
         "generation_no_mtp": "Generation · MTP off",
         "generation_mtp": "Generation · MTP on",
-        "prefill_note": "¹ MFQ: published prefill value; Strata / llama.cpp: MTP off.",
-        "comparison_note": "Shaded rows: similar weight size. MTP draft setups differ; see the benchmark notes.",
+        "prefill_note": "¹ MFQ: published prefill value; others: MTP off. oMLX includes first-token overhead.",
+        "comparison_note": "Shaded rows: similar weight size. Draft setups differ; oMLX uses adaptive MTP. See notes.",
     },
     "zh-CN": {
         "title": "Metal 运行时速度对比",
@@ -71,21 +72,22 @@ LANGUAGES = {
         "prefill": "提示词处理¹",
         "generation_no_mtp": "生成速度 · 关闭 MTP",
         "generation_mtp": "生成速度 · 开启 MTP",
-        "prefill_note": "¹ MFQ 为已发布的提示词处理值；Strata / llama.cpp 使用 MTP 关闭值。",
-        "comparison_note": "浅色底纹标出相近体积的档位；MTP 草稿配置不同，详细条件见基准说明。",
+        "prefill_note": "¹ MFQ 为已发布的提示词处理值；其余使用 MTP 关闭值。oMLX 计时包含首 token 开销。",
+        "comparison_note": "浅色底纹标出相近体积的档位；草稿配置不同，oMLX 使用自适应 MTP。详见基准说明。",
     },
 }
 GROUPS = (
     ("mfq", "MFQ", 268, 306),
     ("strata", "Strata · v0.1.44.1", 540, 578),
     ("llamacpp", "llama.cpp · f74e2fa6", 740, 778),
+    ("omlx", "oMLX · 0.7.1.dev2", 940, 978),
 )
 ROWS = [
     (row, first_y + index * 36)
     for runtime, _, _, first_y in GROUPS
     for index, row in enumerate(r for r in DATA["measurements"] if r["runtime"] == runtime)
 ]
-assert len(ROWS) == 14
+assert len(ROWS) == len(DATA["measurements"]) == 17
 
 
 def bounds(x, y, width, height):
@@ -140,9 +142,9 @@ def panel(fig, left, width, metric, text):
     ticks = (0, 1000, 2000, 3000) if metric == "prefill" else (0, 40, 80, 120, 140)
     label(fig, left, 199, text[metric], 19, C["strong"], "bold")
     label(fig, left, 223, "tok/s", 14, C["muted_light"])
-    ax = fig.add_axes(bounds(left, 284, width, 626), facecolor="none")
+    ax = fig.add_axes(bounds(left, 284, width, 790), facecolor="none")
     ax.set_xlim(0, limit)
-    ax.set_ylim(910, 284)
+    ax.set_ylim(1074, 284)
     ax.set_xticks(ticks)
     ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
     ax.set_yticks([])
@@ -172,12 +174,12 @@ def generate(locale, text):
     label(fig, 48, 96, text["hardware"], 17, C["muted"])
     label(fig, 48, 125, text["workload"], 16, C["muted"])
     brand(fig)
-    fig.legend([Patch(color=COLORS[k][0]) for k in COLORS], ["MFQ", "GSQ-RCO", "Unsloth UD"],
-               loc="center right", bbox_to_anchor=(1564 / WIDTH, 1 - 123 / HEIGHT), ncol=3,
+    fig.legend([Patch(color=COLORS[k][0]) for k in COLORS], ["MFQ", "GSQ-RCO", "Unsloth UD", "Jundot oQ"],
+               loc="center right", bbox_to_anchor=(1564 / WIDTH, 1 - 123 / HEIGHT), ncol=4,
                frameon=False, fontsize=16, handlelength=1.2, columnspacing=1.7)
-    surface(fig, 48, 156, 1504, 796, C["surface"], C["line"])
+    surface(fig, 48, 156, 1504, 960, C["surface"], C["line"])
     label(fig, 76, 199, text["configuration"], 17, C["muted"])
-    for y in (238, 514, 714):
+    for y in (238, 514, 714, 914):
         rule(fig, y)
     for _, title, heading_y, _ in GROUPS:
         label(fig, 76, heading_y, title, 20, C["strong"], "bold")
@@ -186,15 +188,16 @@ def generate(locale, text):
         if highlight:
             tint = C["accent_soft"] if row["method"] == "mfq" else "#eef1f8"
             surface(fig, 64, y - 17, 1472, 34, tint, radius=6, zorder=0)
-        method = {"mfq": "", "gsq-rco": "GSQ-RCO · ", "unsloth-ud": "Unsloth · "}[row["method"]]
+        method = {"mfq": "", "gsq-rco": "GSQ-RCO · ", "unsloth-ud": "Unsloth · ",
+                  "jundot-oq": "Jundot · "}[row["method"]]
         label(fig, 76, y + 6, method + row["tier"], 17,
               COLORS[row["method"]][1] if highlight else C["soft"], "bold" if highlight else "normal")
     panel(fig, 360, 330, "prefill", text)
     panel(fig, 820, 300, "generation_no_mtp", text)
     panel(fig, 1210, 300, "generation_mtp", text)
-    label(fig, 48, 978, text["prefill_note"], 14, C["muted_light"])
-    label(fig, 48, 1003, text["comparison_note"], 14, C["muted_light"])
-    footer = label(fig, 1552, 1036, REPOSITORY_URL, 14, C["muted_light"], ha="right")
+    label(fig, 48, 1142, text["prefill_note"], 14, C["muted_light"])
+    label(fig, 48, 1167, text["comparison_note"], 14, C["muted_light"])
+    footer = label(fig, 1552, 1200, REPOSITORY_URL, 14, C["muted_light"], ha="right")
     footer.set_gid("repository-url")
     footer.set_url(REPOSITORY_URL)
     suffix = "" if locale == "en" else ".zh-CN"
