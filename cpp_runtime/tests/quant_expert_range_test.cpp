@@ -48,8 +48,9 @@ std::vector<std::uint8_t> nvq(int begin,int end) {
     }
     return blob;
 }
-void check_group64_fields() {
-    constexpr int rows=34,width=53,groups=3,vectors=7;
+void check_group64_fields(int width) {
+    constexpr int rows=34;
+    const int groups=(width+23)/24,vectors=(width+7)/8;
     constexpr std::size_t anchor_offset=40+64+4096*8,record_offset=anchor_offset+rows*2;
     std::vector<std::uint8_t> blob{'N','V','Q','1',37,4,24,0};
     mfq::test::append<std::int32_t>(blob,0);
@@ -82,7 +83,7 @@ void check_group64_fields() {
         for(const auto& span:spans)read(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
     });
     require(source.group64(),"group64 row storage was not detected");
-    require(!source.copy_rows_fields(0,1,{}),"group64 direct targets changed the physical layout");
+    rejected([&]{source.copy_rows_fields(0,1,{});});
     for(const auto range:{std::pair<int,int>{0,1},{1,18},{17,34},{0,34}}) {
         const auto fields=source.slice_rows_fields(range.first,range.second);
         require(bool(fields),"group64 fields were unavailable");
@@ -98,16 +99,35 @@ void check_group64_fields() {
         std::vector<std::uint8_t> a,b,c;pack(a,states,4);pack(b,indices,12);pack(c,signs,7);
         require(fields->states==a && fields->indices==b && fields->aux==c,
             "group64 fields differ from independent packed oracle");
+        const std::array<std::size_t,4> sizes{std::size_t(range.second-range.first)*2,a.size(),b.size(),c.size()};
+        std::array<std::vector<std::uint8_t>,4> direct;
+        std::array<mfq::NvqRows::FieldTarget,4> targets;
+        for(std::size_t f=0;f<4;++f) {
+            direct[f].assign(sizes[f]+2,0xa5);targets[f]={direct[f].data()+1,sizes[f]};
+        }
+        std::size_t source_bytes=0;
+        require(source.copy_rows_fields(range.first,range.second,targets,&source_bytes),
+            "group64 could not fill direct fields");
+        const std::array<const std::uint8_t*,4> expected{
+            reinterpret_cast<const std::uint8_t*>(fields->neuron_scale.data()),a.data(),b.data(),c.data()};
+        for(std::size_t f=0;f<4;++f)
+            require(direct[f].front()==0xa5 && direct[f].back()==0xa5 &&
+                std::memcmp(targets[f].data,expected[f],sizes[f])==0,
+                "group64 direct fields changed packed bytes or overwrote a neighbour");
+        require(source_bytes==fields->source_nbytes,"group64 direct source byte count changed");
         require(fields->source_nbytes==std::size_t(range.second-range.first)*(2+groups*8),
             "group64 source bytes included the shared codebook or expanded fields");
     }
     blob[record_offset+2]^=8; // Sign parity of the first vector.
     rejected([&]{source.slice_rows_fields(0,1);});blob[record_offset+2]^=8;
-    blob[record_offset+2*8+2]^=16; // Nonzero index in a padded vector.
-    rejected([&]{source.slice_rows_fields(0,1);});blob[record_offset+2*8+2]^=16;
+    if(vectors%3) {
+        const auto byte=record_offset+std::size_t(groups-1)*8+(vectors%3)*20/8;
+        const auto mask=std::uint8_t(1u<<((vectors%3)*20%8));
+        blob[byte]^=mask;rejected([&]{source.slice_rows_fields(0,1);});blob[byte]^=mask;
+    }
     blob[anchor_offset+1]=0x7c;
     rejected([&]{source.slice_rows_fields(0,1);});
-    require(batches==7,"group64 field batches were skipped");
+    require(batches==10+int(vectors%3!=0),"group64 field batches were skipped");
 }
 void append_pool(std::vector<std::uint8_t>& blob,const std::vector<int>& ids,
         const char* dtype,const std::vector<std::uint8_t>& body) {
@@ -141,7 +161,7 @@ mfq::MfeQuantExpertStore memory_store(std::vector<std::uint8_t> blob,
     return {source->size(),read,std::move(batch)};
 }
 void self_test() {
-    check_group64_fields();
+    for(int width:{1,7,8,9,23,24,25,53,64,127,128,191,192,193,200,640,2560})check_group64_fields(width);
     const auto flat = mfq::test::fixture(52, 53, 5, 6).blob;
     auto packed = std::make_shared<std::vector<std::uint8_t>>(flat.begin(), flat.begin() + 14);
     mfq::test::append<std::uint32_t>(*packed, 3);

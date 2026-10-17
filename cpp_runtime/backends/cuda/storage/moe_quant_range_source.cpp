@@ -211,7 +211,8 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
         const std::array<mfq::NvqRows::FieldTarget,4> fields={
             mfq::NvqRows::FieldTarget{reinterpret_cast<std::uint8_t*>(anchors.data()),anchors.size()*2},
             target(2),target(0),target(1)};
-        if(store_->copy_nvq_fields(expert,fields)) {
+        std::size_t source_bytes=0;
+        if(store_->copy_nvq_fields(expert,fields,&source_bytes)) {
             const auto read_done=profile?Clock::now():Clock::time_point{};
             if(targets[3].numel()*targets[3].element_size()!=anchors.size()*4)
                 throw std::invalid_argument("SSD neuron scale target differs");
@@ -220,7 +221,7 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
             ++direct_field_reads_;++materializations_;
             if(preloaded_.load()) {
                 ++disk_reads_after_preload_;
-                disk_bytes_after_preload_.fetch_add(bytes-anchors.size()*2,std::memory_order_relaxed);
+                disk_bytes_after_preload_.fetch_add(source_bytes,std::memory_order_relaxed);
             }
             if(profile) {
                 const auto encoded_time=std::chrono::duration_cast<std::chrono::nanoseconds>(read_done-begin).count();
@@ -228,7 +229,7 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
                 const auto materialize=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_done).count();
                 materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
                 nvq_materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
-                record_format_io(prototype.nvq.kernel_format,bytes-anchors.size()*2,encoded_time,materialize);
+                record_format_io(prototype.nvq.kernel_format,source_bytes,encoded_time,materialize);
             }
             return;
         }

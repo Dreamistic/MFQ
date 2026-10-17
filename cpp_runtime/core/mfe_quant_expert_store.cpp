@@ -178,12 +178,13 @@ std::optional<NvqRows::Fields> MfeQuantExpertStore::read_nvq_fields(int expert) 
     return pool.nvq->slice_rows_fields(begin,begin+output_);
 }
 
-bool MfeQuantExpertStore::copy_nvq_fields(int expert,const std::array<NvqRows::FieldTarget,4>& targets) const {
+bool MfeQuantExpertStore::copy_nvq_fields(int expert,const std::array<NvqRows::FieldTarget,4>& targets,
+        std::size_t* source_bytes) const {
     if(expert<0 || expert>=experts_)throw std::out_of_range("mixed expert direct field ID");
     const auto& owner=owners_[expert];const auto& pool=pools_[owner.pool];
     if(!pool.nvq)return false;
     const auto begin=std::int64_t(owner.local)*output_;
-    return pool.nvq->copy_rows_fields(begin,begin+output_,targets);
+    return pool.nvq->copy_rows_fields(begin,begin+output_,targets,source_bytes);
 }
 
 void MfeQuantExpertStore::visit_pool_experts(std::size_t index,

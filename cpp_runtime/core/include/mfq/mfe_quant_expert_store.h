@@ -37,7 +37,8 @@ public:
     std::size_t expert_payload_nbytes(int expert) const;
     MfeQuantExpert read_expert(int expert) const;
     std::optional<NvqRows::Fields> read_nvq_fields(int expert) const;
-    bool copy_nvq_fields(int expert,const std::array<NvqRows::FieldTarget,4>& targets) const;
+    bool copy_nvq_fields(int expert,const std::array<NvqRows::FieldTarget,4>& targets,
+                         std::size_t* source_bytes=nullptr) const;
     // Startup-only sequential pool read; the temporary canonical pool is
     // released before advancing to the next pool. Visitors own each leaf.
     // An optional executor slices immutable pool bytes concurrently; callers

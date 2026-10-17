@@ -36,7 +36,8 @@ public:
     struct FieldTarget {std::uint8_t* data=nullptr;std::size_t bytes=0;};
     // Anchor (FP16), states, indices and auxiliary bits. Unsupported physical
     // layouts return false before reading or touching any target.
-    bool copy_rows_fields(std::int64_t begin,std::int64_t end,const std::array<FieldTarget,4>& targets) const;
+    bool copy_rows_fields(std::int64_t begin,std::int64_t end,const std::array<FieldTarget,4>& targets,
+                          std::size_t* source_bytes=nullptr) const;
     std::size_t row_range_nbytes(std::int64_t begin,std::int64_t end) const;
 private:
     Read read_;

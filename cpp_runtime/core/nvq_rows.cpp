@@ -20,6 +20,69 @@ std::size_t packed(std::uint64_t items,int bits) {
         throw std::overflow_error("NVQ row stream is too large");
     return static_cast<std::size_t>((items*bits+7)/8);
 }
+
+void unpack_group64(const std::vector<std::uint64_t>& records,std::size_t rows,int groups,int vectors,
+        const std::array<NvqRows::FieldTarget,4>& fields) {
+    for(int f=1;f<4;++f)if(fields[f].bytes)std::memset(fields[f].data,0,fields[f].bytes);
+    std::uint64_t invalid=0;
+    constexpr std::uint64_t parity_mask=(1ull<<12)|(1ull<<32)|(1ull<<52);
+    for(std::size_t i=0;i<records.size();++i) {
+        auto parity=records[i]^(records[i]>>4);parity^=parity>>2;parity^=parity>>1;
+        invalid|=parity&parity_mask;
+        fields[1].data[i/2]|=std::uint8_t((records[i]>>60)<<((i&1)*4));
+    }
+    if(invalid)throw std::runtime_error("invalid NVQ-JSC group64 parity bit");
+    if(const int tail=vectors%3) {
+        const auto padding=((1ull<<60)-1)^((1ull<<(tail*20))-1);
+        for(std::size_t row=0;row<rows;++row)
+            if(records[(row+1)*groups-1]&padding)
+                throw std::runtime_error("NVQ-JSC group64 padding must be zero");
+    }
+    std::size_t vector_index=0;
+    for(std::size_t row=0;row<rows;++row) {
+        int group=0;
+        while(group<groups) {
+            // Eight complete records hold 24 vectors. Their index and sign
+            // fields occupy whole bytes, allowing word stores with no OR
+            // dependencies between individual signs or neighbouring indices.
+            if(!(vector_index&7) && group*3+24<=vectors) {
+                std::uint64_t signs[4];
+                auto* indices=fields[2].data+vector_index*12/8;
+                for(int pair=0;pair<4;++pair) {
+                    const auto a=records[row*groups+group+pair*2];
+                    const auto b=records[row*groups+group+pair*2+1];
+                    const std::uint32_t index0=std::uint32_t(a&4095)|std::uint32_t((a>>20)&4095)<<12;
+                    const std::uint32_t index1=std::uint32_t((a>>40)&4095)|std::uint32_t(b&4095)<<12;
+                    const std::uint32_t index2=std::uint32_t((b>>20)&4095)|std::uint32_t((b>>40)&4095)<<12;
+                    std::memcpy(indices+pair*9,&index0,3);
+                    std::memcpy(indices+pair*9+3,&index1,3);
+                    std::memcpy(indices+pair*9+6,&index2,3);
+                    signs[pair]=((a>>12)&127)|((a>>32)&127)<<7|((a>>52)&127)<<14|
+                        ((b>>12)&127)<<21|((b>>32)&127)<<28|((b>>52)&127)<<35;
+                }
+                const std::uint64_t low=signs[0]|signs[1]<<42;
+                const std::uint64_t middle=signs[1]>>22|signs[2]<<20|signs[3]<<62;
+                const std::uint64_t high=signs[3]>>2;
+                auto* aux=fields[3].data+vector_index*7/8;
+                std::memcpy(aux,&low,8);std::memcpy(aux+8,&middle,8);std::memcpy(aux+16,&high,5);
+                vector_index+=24;group+=8;continue;
+            }
+            const auto record=records[row*groups+group];
+            for(int local=0;local<3 && group*3+local<vectors;++local,++vector_index) {
+                const auto segment=std::uint32_t((record>>(local*20))&0xfffffu);
+                const auto index_byte=vector_index*12/8;
+                const auto index=(segment&0xfffu)<<((vector_index&1)*4);
+                fields[2].data[index_byte]|=std::uint8_t(index);
+                fields[2].data[index_byte+1]|=std::uint8_t(index>>8);
+                const auto sign_bit=vector_index*7,shift=sign_bit&7;
+                const auto value=((segment>>12)&127u)<<shift;
+                fields[3].data[sign_bit/8]|=std::uint8_t(value);
+                if(shift>1)fields[3].data[sign_bit/8+1]|=std::uint8_t(value>>8);
+            }
+            ++group;
+        }
+    }
+}
 }
 
 NvqRows::NvqRows(std::size_t bytes,Read read,ReadBatch batch)
@@ -136,45 +199,14 @@ std::optional<NvqRows::Fields> NvqRows::slice_rows_fields(std::int64_t begin,std
                 throw std::runtime_error("NVQ neuron anchors must be finite and non-negative");
     };
     if(group64_) {
-        std::vector<std::uint64_t> records(static_cast<std::size_t>(rows)*groups_);
-        const ReadSpan stream_span{states_+static_cast<std::size_t>(begin)*groups_*8,
-            reinterpret_cast<std::byte*>(records.data()),records.size()*8};
-        if(read_batch_)read_batch_({anchor_span,stream_span});
-        else for(const auto span:{anchor_span,stream_span})
-            read_(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
-        validate_anchors();
-        result.source_nbytes=result.neuron_scale.size()*2+records.size()*8;
-        result.states.resize(packed(rows*groups_,4),0);
-        result.indices.resize(packed(rows*vectors_,12),0);
-        result.aux.resize(packed(rows*vectors_,7),0);
-        std::size_t record_index=0,vector_index=0;
-        for(std::uint64_t row=0;row<rows;++row)for(int group=0;group<groups_;++group,++record_index) {
-            const auto record=records[record_index];
-            result.states[record_index/2]|=std::uint8_t((record>>60)<<((record_index&1)*4));
-            for(int local=0;local<3;++local) {
-                const auto segment=std::uint32_t((record>>(local*20))&0xfffffu);
-                const auto sign=segment>>12;
-                const auto folded=(sign^(sign>>4))&15u;
-                if((0x6996u>>folded)&1u)
-                    throw std::runtime_error("invalid NVQ-JSC group64 parity bit");
-                if(group*3+local>=vectors_) {
-                    if(segment)throw std::runtime_error("NVQ-JSC group64 padding must be zero");
-                    continue;
-                }
-                // Twelve-bit indices alternate between byte and nibble
-                // boundaries. Seven-bit signs span at most two bytes.
-                const auto index_byte=vector_index*12/8;
-                const auto index=(segment&0xfffu)<<((vector_index&1)*4);
-                result.indices[index_byte]|=std::uint8_t(index);
-                result.indices[index_byte+1]|=std::uint8_t(index>>8);
-                const auto sign_bit=vector_index*7;
-                const auto shift=sign_bit&7;
-                const auto value=(sign&127u)<<shift;
-                result.aux[sign_bit/8]|=std::uint8_t(value);
-                if(shift>1)result.aux[sign_bit/8+1]|=std::uint8_t(value>>8);
-                ++vector_index;
-            }
-        }
+        result.states.resize(packed(rows*groups_,4));
+        result.indices.resize(packed(rows*vectors_,12));
+        result.aux.resize(packed(rows*vectors_,7));
+        const std::array<FieldTarget,4> targets{{
+            {reinterpret_cast<std::uint8_t*>(result.neuron_scale.data()),result.neuron_scale.size()*2},
+            {result.states.data(),result.states.size()},{result.indices.data(),result.indices.size()},
+            {result.aux.data(),result.aux.size()}}};
+        copy_rows_fields(begin,end,targets,&result.source_nbytes);
         return result;
     }
     const int aux_items=aux_bits_==1?groups_:signs_;
@@ -212,10 +244,29 @@ std::optional<NvqRows::Fields> NvqRows::slice_rows_fields(std::int64_t begin,std
 }
 
 bool NvqRows::copy_rows_fields(std::int64_t begin,std::int64_t end,
-        const std::array<FieldTarget,4>& targets) const {
+        const std::array<FieldTarget,4>& targets,std::size_t* source_bytes) const {
     if(begin<0 || end<=begin || end>rows_)throw std::out_of_range("NVQ direct field range");
-    if(group64_)return false;
     const auto rows=std::uint64_t(end-begin);
+    if(group64_) {
+        const std::array<std::size_t,4> sizes={std::size_t(rows)*2,packed(rows*groups_,4),
+            packed(rows*vectors_,12),packed(rows*vectors_,7)};
+        for(int f=0;f<4;++f)if(targets[f].bytes!=sizes[f] || (sizes[f] && !targets[f].data))
+            throw std::invalid_argument("NVQ group64 target size differs");
+        std::vector<std::uint64_t> records(std::size_t(rows)*groups_);
+        const std::vector<ReadSpan> spans{
+            {anchor_+std::size_t(begin)*2,reinterpret_cast<std::byte*>(targets[0].data),sizes[0]},
+            {states_+std::size_t(begin)*groups_*8,reinterpret_cast<std::byte*>(records.data()),records.size()*8}};
+        if(read_batch_)read_batch_(spans);
+        else for(const auto& span:spans)read_(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
+        for(std::size_t row=0;row<std::size_t(rows);++row) {
+            std::uint16_t anchor;std::memcpy(&anchor,targets[0].data+row*2,2);
+            if((anchor&0x7c00u)==0x7c00u || (anchor&0x8000u))
+                throw std::runtime_error("NVQ neuron anchors must be finite and non-negative");
+        }
+        unpack_group64(records,std::size_t(rows),groups_,vectors_,targets);
+        if(source_bytes)*source_bytes=sizes[0]+records.size()*8;
+        return true;
+    }
     const int aux_items=aux_bits_==1?groups_:signs_;
     const std::array<std::uint64_t,4> first={std::uint64_t(begin)*16,
         std::uint64_t(begin)*groups_*state_bits_,std::uint64_t(begin)*vectors_*index_bits_,
@@ -238,6 +289,7 @@ bool NvqRows::copy_rows_fields(std::int64_t begin,std::int64_t end,
         if((anchor&0x7c00u)==0x7c00u || (anchor&0x8000u))
             throw std::runtime_error("NVQ neuron anchors must be finite and non-negative");
     }
+    if(source_bytes)*source_bytes=targets[0].bytes+targets[1].bytes+targets[2].bytes+targets[3].bytes;
     return true;
 }
 
