@@ -206,6 +206,10 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
         }
     };
     if(host_cache_)if(auto cached=host_cache_->find(host_key(expert),touch_cache)) {copy(cached->weights);return;}
+    if(host_cache_ && !touch_cache && !gpu_resident(expert) && !disk_sealed_.load())
+        if(auto cached=host_cache_->acquire_scan(host_key(expert),bytes,[&]{return read_expert(expert);})) {
+            copy(cached->weights);return;
+        }
     if(disk_sealed_.load()) {
         ++sealed_disk_attempts_;
         throw std::runtime_error("expert disk copy forbidden after complete residency preload");

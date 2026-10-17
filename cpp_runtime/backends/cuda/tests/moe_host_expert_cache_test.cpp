@@ -34,6 +34,33 @@ void wait_coalesced(const MoeHostExpertCache& cache,std::promise<void>& release)
 }
 
 int main() try {
+    {
+        MoeHostExpertCache cache(192);cache.enable_reuse_priority();
+        bytes_equal(cache.acquire(key(0),64,[]{return weight(64,1);}),1);
+        bytes_equal(cache.find(key(0)),1);
+        bytes_equal(cache.acquire_scan(key(1),64,[]{return weight(64,2);}),2);
+        bytes_equal(cache.acquire_scan(key(1),64,[]{throw std::runtime_error("scan hit reread");return weight(64,0);}),2);
+        check(cache.stats().reuse_promotions==1,"scan acquisition promoted one-use data");
+        std::promise<void> entered,release;auto released=release.get_future().share();
+        auto loading=std::async(std::launch::async,[&] {
+            return cache.acquire_scan(key(2),64,[&]{entered.set_value();released.wait();return weight(64,3);});
+        });
+        entered.get_future().wait();
+        int unexpected=0;
+        const auto rejected=cache.acquire_scan(key(3),64,[&]{++unexpected;return weight(64,4);});
+        release.set_value();bytes_equal(loading.get(),3);
+        check(!rejected && !unexpected,"a scan evicted entries or ignored an in-flight reservation");
+        check(cache.contains(key(0)) && cache.contains(key(1)) && cache.contains(key(2)),"scan displaced cached experts");
+        check(cache.stats().managed_peak_bytes==192 && !cache.stats().evictions &&
+            cache.stats().scan_admissions==2 && cache.stats().scan_admitted_bytes==128,
+            "scan admission accounting exceeded the RAM budget");
+        cache.erase(key(2));
+        bool failed=false;
+        try{cache.acquire_scan(key(3),64,[]{throw std::runtime_error("expected scan read failure");return weight(64,0);});}
+        catch(const std::runtime_error&){failed=true;}
+        check(failed && cache.stats().managed_bytes==128,"failed scan retained a reservation");
+        bytes_equal(cache.acquire_scan(key(3),64,[]{return weight(64,4);}),4);
+    }
     for(bool reuse:{false,true}) {
         MoeHostExpertCache cache(512);if(reuse)cache.enable_reuse_priority();
         for(int expert:{0,1})cache.acquire(key(expert),64,[expert]{return weight(64,expert+1);});

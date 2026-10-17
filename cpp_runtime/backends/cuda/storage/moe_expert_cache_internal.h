@@ -810,6 +810,8 @@ public:
             {"ssd_reuse_policy_enabled",kv_reuse.enabled?1.0:0.0},
             {"ssd_ram_reuse_policy_enabled",host.reuse_priority?1.0:0.0},
             {"ssd_ram_reuse_promotions",double(host.reuse_promotions)},
+            {"ssd_ram_scan_admissions",double(host.scan_admissions)},
+            {"ssd_ram_scan_admitted_bytes",double(host.scan_admitted_bytes)},
             {"ssd_ram_protected_bytes",double(host.reuse_protected_bytes)},
             {"ssd_reuse_hits",double(kv_reuse.protected_hits)},
             {"ssd_probation_evictions",double(kv_reuse.probation_evictions)},

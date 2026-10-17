@@ -29,6 +29,7 @@ struct MoeHostExpertCacheStats {
     bool reuse_priority=false;
     std::size_t reuse_protected_bytes=0;
     std::uint64_t reuse_promotions=0;
+    std::uint64_t scan_admissions=0,scan_admitted_bytes=0;
 };
 
 // Engine-wide, byte-bounded LRU for immutable CPU expert fields. CPU leases
@@ -45,6 +46,9 @@ public:
     MoeHostExpertCache(const MoeHostExpertCache&)=delete;
     MoeHostExpertCache& operator=(const MoeHostExpertCache&)=delete;
     Lease acquire(mfq::MoeCacheKey key,std::size_t bytes,const Load& load,bool retain=true);
+    // A prefill scan may fill unused capacity, without evicting existing
+    // experts or promoting scan hits. Returns empty without loading if full.
+    Lease acquire_scan(mfq::MoeCacheKey key,std::size_t bytes,const Load& load);
     // Returns false without invoking copy when the managed budget cannot fit.
     bool demote(mfq::MoeCacheKey key,std::size_t bytes,const Load& copy);
     void promote(mfq::MoeCacheKey key);
@@ -78,6 +82,7 @@ public:
                         const std::function<void()>& publish = {},
                         const std::function<void()>& prepare = {},bool independent_readers=false);
 private:
+    Lease load(mfq::MoeCacheKey key,std::size_t bytes,const Load& loader,bool retain,bool scan);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

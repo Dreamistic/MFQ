@@ -150,6 +150,16 @@ void MoeHostExpertCache::preserve_resident_experts() {
 
 MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::MoeCacheKey key,std::size_t bytes,
         const Load& load,bool retain) {
+    return this->load(key,bytes,load,retain,false);
+}
+
+MoeHostExpertCache::Lease MoeHostExpertCache::acquire_scan(mfq::MoeCacheKey key,std::size_t bytes,
+        const Load& load) {
+    return this->load(key,bytes,load,true,true);
+}
+
+MoeHostExpertCache::Lease MoeHostExpertCache::load(mfq::MoeCacheKey key,std::size_t bytes,
+        const Load& load,bool retain,bool scan) {
     if (!load || !bytes) throw std::invalid_argument("host expert needs a loader and exact byte size");
     auto& state=*impl_;
     std::shared_ptr<Impl::Flight> flight;
@@ -161,7 +171,7 @@ MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::MoeCacheKey key,std::
         if (retain) {
             const auto hit=state.entries.find(key);
             if (hit!=state.entries.end()) {
-                state.touch(key,hit->second);
+                if(!scan)state.touch(key,hit->second);
                 ++state.counters.hits;
                 return hit->second.value;
             }
@@ -178,8 +188,9 @@ MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::MoeCacheKey key,std::
                 return flight->value;
             }
         }
+        if(scan && (bytes>state.budget || state.ledger->managed.load()>state.budget-bytes))return {};
         ++state.counters.misses;
-        managed=retain && state.make_room(bytes);
+        managed=retain && (scan || state.make_room(bytes));
         if (!managed) ++state.counters.bypasses;
         reservation=std::make_shared<MoeHostExpertReservation>(state.ledger,bytes,managed);
         if (retain) {
@@ -193,7 +204,10 @@ MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::MoeCacheKey key,std::
         value->bytes=bytes;
         value->weights=load();
         std::lock_guard lock(state.mutex);
-        if (managed && (!flight || flight->retain)) state.publish(key,value);
+        if (managed && (!flight || flight->retain)) {
+            state.publish(key,value);
+            if(scan){++state.counters.scan_admissions;state.counters.scan_admitted_bytes+=bytes;}
+        }
         else if(retain) state.transient.insert_or_assign(key,value);
         if (flight) {
             flight->value=value;
