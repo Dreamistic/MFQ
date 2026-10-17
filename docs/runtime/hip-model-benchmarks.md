@@ -63,36 +63,47 @@ fallback cannot amortize (see diagnosis).
 ## Diagnosis: where quantized speed is lost
 
 An op-level profile (`mfq-diagnostics --profile --gen 65`, GPU event
-timings, 4B models) locates the remaining gap:
+timings, 4B models) plus kernel-source analysis and A/B runs locate the
+gap:
 
-- **Decode is not bandwidth-bound on the quantized path.** Effective
-  weight traffic at the 2048 cohort is 1.0-1.3 TB/s for BF16 versus
-  0.4-0.65 TB/s for S4-M (MI300X peak is 5.3 TB/s). The S4-M kernels
-  convert only 35-55% of the theoretical 2.6-3.0x weight reduction into
-  speed; the BF16 GEMV path reaches roughly twice the bandwidth
-  efficiency of the NINT GEMV kernels.
-- **Mixed-precision width costs real time.** S4-M stores the GDN qkv
-  projection wider than the uniform default (16.5 vs 11.3 MiB per
-  layer on 4B). The resulting GEMV variant costs 2.86 ms per token
-  inside `linear.in_proj` versus 0.85 ms for the uniform-width file,
-  about 2 ms per token of the 8.3 ms budget.
+- **The packed NINT GEMV kernel is the bottleneck, and its cost scales
+  with weight bytes at a fixed rate.** Normalizing end-to-end decode by
+  stored bytes, the uniform-NINT and S4-M files both stream at about
+  0.41 TB/s on 4B and 0.63 TB/s on 27B, independent of bit width. On
+  the same GPU the MFQ BF16 path sustains 1.14 TB/s and llama.cpp
+  sustains 1.2-1.25 TB/s at 27B. Every other part of the stack is
+  competitive; the fused decode kernel converts weight bytes to
+  answers at roughly half the demonstrated streaming rate.
+- **The scalar `__dp4a` fallback is no longer active.** A probe kernel
+  compiled with the current toolchain shows `__gfx942__` defined and
+  `__has_builtin(__builtin_amdgcn_sdot4)` true, emitting `v_dot4`. The
+  `mfq_hip_compat.h` guard takes the hardware path in current builds;
+  the earlier "no hardware dot" finding predates the newer compiler.
+- **The per-chunk float epilogue is worth 3-4%.** The
+  integer-accumulate path (`nint_group_partial`, gated behind
+  `MFQ_NINT_GROUP_DOT=1` and off by default) measured +3.4% decode on
+  4B S4-M (121.2 to 125.3 tok/s) and +4.4% on 27B (36.4 to 38.0).
+  Enabling it by default is a free, safe win.
 - **Prefill above 8 rows dequantizes whole matrices.** `nint_matmul`
   (cpp_runtime/backends/hip/ops/nint.cpp) uses the fused workspace GEMV
   only for M <= 8; larger cohorts dequantize the full weight to BF16
   and call a dense GEMM. In the profiled window the dequant kernel
-  alone cost 11.3 ms against 6.5 ms for the GEMM it feeds, and
-  `linear.in_proj` ran 6x slower than the BF16 equivalent (0.274 vs
-  0.045 ms per call).
-- **Eager totals confirm the ordering.** Without decode graphs, per
-  token costs were 16.4 ms (uniform NINT), 19.8 ms (S4-M), and 23.2 ms
-  (BF16); the graph path compresses all three but keeps the order.
+  alone cost 11.3 ms against 6.5 ms for the GEMM it feeds.
 
-Fix directions, in expected impact order: vectorized bit-unpacking with
-wave-resident scales in the fused GEMV; a hardware `v_dot4`/MFMA integer
-dot (the known `__dp4a` scalar fallback); routing the S4-M wide tensors
-through the aligned-q8 fast kernel where quality allows; extending the
-fused path beyond M <= 8 or caching dequantized hot tensors for
-prefill-sized cohorts.
+What remains is the kernel's per-byte instruction and access pattern:
+one output row per 32-lane subwarp, 4-8 byte weight loads per chunk
+followed by shift/mask unpacking, and three scattered per-group scale
+loads (subgroup scale, minimum, activation scale) that are separate
+from the weight stream. llama.cpp's Q4_K_M reaches 1.2 TB/s with an
+inline block layout: scales stored next to the weights they scale and
+32-byte aligned blocks, so one wide load serves both.
+
+Fix directions, in expected impact order: widen weight loads to 16
+bytes per iteration and co-locate group scales with the weight stream;
+enable `MFQ_NINT_GROUP_DOT` by default (measured 3-4%); process more
+than one activation row per wave to amortize weight traffic once MTP
+batches arrive; extend the fused path beyond M <= 8 or cache
+dequantized hot tensors for prefill-sized cohorts.
 
 ## Speculative MTP decode (2026-10-17, 2048-token cohort)
 
