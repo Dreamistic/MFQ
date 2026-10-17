@@ -113,7 +113,7 @@
     "Strata ordinary and MTP outputs match for all four configurations; llama.cpp UD-Q4_K_XL diverges from output token 80, while its three GSQ-RCO outputs match.",
     "GSQ-RCO IQ2_XS is unsupported by this Strata Metal release and is not plotted as a zero-speed result.",
     "oMLX ordinary and adaptive-MTP output text matches within each tier; its throughput uses producer-generated token timestamps through the native streaming API, without HTTP transport or profiling.",
-    "Shaded comparable-size pairs: MFQ V3-XXS (81.952 GB) / GSQ-RCO IQ3_S (83.618 GB); MFQ V4-XS (93.672 GB) / Jundot oQ3.5e (approximately 93.856 GB from rounded model-card components). All sizes exclude the vision encoder and MTP head; matching size does not imply matching quality or MTP setup."
+    "Shaded comparable-size pair: MFQ V3-XXS (81.952 GB) / GSQ-RCO IQ3_S (83.618 GB). These sizes exclude the vision encoder and MTP head; matching size does not imply matching quality or MTP setup."
   ],
   "measurements": [
     {

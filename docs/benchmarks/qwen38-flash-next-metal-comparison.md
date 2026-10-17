@@ -32,8 +32,8 @@ Strata is slightly faster: 72.8 tok/s versus MFQ's 70.8 tok/s; llama.cpp
 reports 45.4 tok/s. The MTP comparison includes each runtime's draft setup,
 as described below.
 
-The second highlighted pair is MFQ V4-XS (93.672 GB) and Jundot oQ3.5e
-(approximately 93.856 GB). The oQ3.5e size adds the rounded storage figures
+MFQ V4-XS (93.672 GB) and Jundot oQ3.5e (approximately 93.856 GB) also have
+similar weight sizes. The oQ3.5e size adds the rounded storage figures
 for the language backbone (61.856 GB) and N-gram embedding (32.000 GB) in its
 [revision-pinned model card](https://huggingface.co/Jundot/Qwen3.8-Flash-Next-oQ3.5e-mtp/blob/e8216051d1a75ec4a523ed8c6b0ed4a01667bcda/README.md),
 excluding the vision encoder and MTP head to match the MFQ size convention.

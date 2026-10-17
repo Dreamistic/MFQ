@@ -126,12 +126,10 @@ BibTeX 格式见[引用](#引用)。
   <img src="./docs/figures/qwen38-flash-next-metal-runtime-comparison.zh-CN.svg" alt="M5 Max 上的 Qwen3.8-Flash-Next：MFQ、Strata、llama.cpp 与 oMLX 共 17 个运行时和检查点配置的提示词处理速度及 MTP 开关生成速度" width="1100">
 </p>
 
-浅色底纹和加粗标注对应两组相近体积的档位：**MFQ V3-XXS（82.0 GB）** 与
-**GSQ-RCO IQ3_S（83.6 GB）**，以及 **MFQ V4-XS（93.7 GB）** 与
-**Jundot oQ3.5e（约 93.9 GB）**。大小均不含视觉编码器与 MTP 层。
+浅色底纹和加粗标注对应相近体积的 **MFQ V3-XXS（82.0 GB）** 与
+**GSQ-RCO IQ3_S（83.6 GB）**，大小均不含视觉编码器与 MTP 层。
 开启 MTP 时，V3-XXS 的生成速度为 **105.4 tok/s**，IQ3_S 在 Strata 和
-llama.cpp 中分别为 **99.6 tok/s** 和 **59.3 tok/s**；V4-XS 为 **96.7 tok/s**，
-oQ3.5e 在 oMLX 中为 **111.0 tok/s**。
+llama.cpp 中分别为 **99.6 tok/s** 和 **59.3 tok/s**。
 
 MFQ 来源表每档只给出一组提示词处理值，其余运行时的提示词处理柱均使用 MTP 关闭值。
 oMLX 使用官方 macOS 26/27 DMG 内的原生 NAX 内核与自适应 MTP，

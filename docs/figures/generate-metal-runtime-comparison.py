@@ -136,7 +136,6 @@ def selected_metric(row, metric):
 def comparable_size(row):
     return (row["method"], row["tier"]) in (
         ("mfq", "V3-XXS"), ("gsq-rco", "IQ3_S"),
-        ("mfq", "V4-XS"), ("jundot-oq", "oQ3.5e"),
     )
 
 
@@ -189,8 +188,7 @@ def generate(locale, text):
     for row, y in ROWS:
         highlight = comparable_size(row)
         if highlight:
-            tint = {"mfq": C["accent_soft"], "gsq-rco": "#eef1f8",
-                    "jundot-oq": "#f1eef6"}[row["method"]]
+            tint = {"mfq": C["accent_soft"], "gsq-rco": "#eef1f8"}[row["method"]]
             surface(fig, 64, y - 17, 1472, 34, tint, radius=6, zorder=0)
         method = {"mfq": "", "gsq-rco": "GSQ-RCO · ", "unsloth-ud": "Unsloth · ",
                   "jundot-oq": "Jundot · "}[row["method"]]
