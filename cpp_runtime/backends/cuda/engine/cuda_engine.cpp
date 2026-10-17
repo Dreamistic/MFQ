@@ -441,8 +441,7 @@ struct CudaEngineState {
                 {"resident_memory_budget_bytes",double(resident_budget)}, {"resident_weight_budget_bytes",double(weight_budget)},
                 {"resident_memory_used_bytes",double(std::max(allocated,reserved))},
                 {"resident_reclaimable_weight_bytes",double(expert_bytes>minimum?expert_bytes-minimum:0)}});
-            metrics.insert(metrics.end(), {{"ssd_expert_enabled", 0.0}, {"ssd_expert_payload_bytes", 0.0},
-                {"qsa_kv_offload_supported", std::is_same_v<Model, Qwen4CausalLm> ? 1.0 : 0.0}});
+            metrics.emplace_back("qsa_kv_offload_supported",std::is_same_v<Model, Qwen4CausalLm> ? 1.0 : 0.0);
             if (execution->qsa_kv_store) {
                 auto kv = execution->qsa_kv_store->metrics();
                 metrics.insert(metrics.end(), kv.begin(), kv.end());

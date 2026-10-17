@@ -98,8 +98,20 @@ void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budg
     // those weights, retaining room for prefill, graph warmup and growing KV.
     size_t device_free=0,device_total=0;
     MFQ_CUDA_CHECK(cudaMemGetInfo(&device_free,&device_total));
+    const auto* ssd_option=std::getenv("MFQ_MOE_SSD_EXPERTS");
+    if(config_.moe_pipeline && config_.moe_preload_all && ssd_option && ssd_option[0]=='1' &&
+            std::all_of(sources_.begin(),sources_.end(),[](const auto& s){return bool(s->quant_source_);})) {
+        std::size_t fields=0;
+        for(const auto& source:sources_)for(int e=0;e<source->n_experts();++e)
+            fields+=source->quant_source_->expert_field_bytes(e);
+        const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes()+kv_growth_reserve;
+        const auto gpu=std::min(std::size_t(budget_bytes_),device_free>reserve?device_free-reserve:0);
+        if(fields>gpu && fields-gpu>config_.moe_host_cache_bytes) {
+            config_.moe_preload_all=false;config_.moe_assert_resident=false;
+        }
+    }
     std::size_t transfer_reserve=0,legacy_transfer_reserve=0;
-    if(config_.moe_pipeline && config_.moe_preload_all) {
+    if(config_.moe_pipeline) {
         // One decode transfer arena per projection and compressed layout,
         // shared across layers and M=1..8. Price the pipeline's bounded arenas
         // instead of withholding the prefill peak throughout decoding.
@@ -452,6 +464,70 @@ void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budg
     calibrate_pipeline_pcie();
     if (profile_.has_value()) prewarm();
     if (config_.moe_preload_all) preload_complete_residency();
+    else if(config_.moe_pipeline) initialize_ssd_residency();
+}
+
+void MoeExpertCache::initialize_ssd_residency() {
+    if(!finalized_)throw std::logic_error("SSD expert cache requires finalized GPU arenas");
+    if(const auto* option=std::getenv("MFQ_MOE_SSD_EXPERTS");option && option[0]=='0')
+        throw std::runtime_error("RAM expert preloading is required when SSD expert streaming is disabled");
+    // The checkpoint remains the immutable third tier. Only the current GPU
+    // demand and the byte-bounded RAM LRU are materialized; never scan an entire
+    // pool into a temporary RAM copy merely to fill the GPU cache.
+    for(const auto& source:sources_) {
+        if(!source->quant_source_)throw std::runtime_error("SSD expert streaming requires canonical expert sources");
+        for(int e=0;e<source->n_experts();++e)
+            ssd_expert_total_bytes_+=source->quant_source_->expert_field_bytes(e);
+    }
+    std::unordered_map<MoeGpuArena*,int> available;
+    for(const auto& [signature,arena]:arenas_)available[arena.get()]=arena->slots-arena->book->size();
+    int maximum=0;
+    for(const auto& source:sources_)maximum=std::max(maximum,source->n_experts());
+    // Profile-hot experts were populated by prewarm(). Distribute remaining
+    // slots across layers so SSD mode does not fill only the first layers.
+    std::vector<std::vector<int32_t>> selected(sources_.size());
+    for(int e=0;e<maximum;++e)for(const auto& source:sources_) {
+        if(e>=source->n_experts() || source->quant_source_->gpu_resident(e))continue;
+        auto* arena=source->cohorts_[source->expert_to_cohort_[e]].arena;
+        if(available[arena]>0){--available[arena];selected[source->id_].push_back(e);}
+    }
+    for(const auto& source:sources_)for(const auto e:selected[source->id_]) {
+        if(!prepare(*source,{e},true))throw std::runtime_error("SSD expert GPU placement exceeded its arena");
+    }
+    if(transfer_ready_recorded_)MFQ_CUDA_CHECK(cudaEventSynchronize(transfer_ready_));
+    for(auto& stage:stages_) {
+        if(stage.pending)MFQ_CUDA_CHECK(cudaEventSynchronize(stage.done));
+        stage.device={};stage.host={};stage.pending=false;
+    }
+    next_stage_=0;
+    // There is no immutable all-expert RAM arena in streaming mode. Pageable
+    // LRU entries use the graph transfer path's bounded pinned staging ring.
+    pipeline_ram_complement_=std::make_shared<mfq_tensor_backend::Tensor>(mfq_tensor_backend::empty(
+        {0},mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kUInt8)));
+    pipeline_ram_registered_bytes_=0;
+    pipeline_prefill_layer_layout_=false;
+    for(const auto& source:sources_) {
+        source->quant_source_->mark_preload_complete(false);
+        initialize_mixed_nvq_dispatch(*source->active_,config_);
+    }
+    ssd_experts_=true;
+    const auto host=host_experts_->stats();
+    std::cerr<<"moe_ssd_experts_ready gpu_bytes="<<allocated_bytes_<<" ram_budget_bytes="<<host.budget_bytes
+        <<" ram_bytes="<<host.resident_bytes<<" expert_bytes="<<ssd_expert_total_bytes_
+        <<" disk_reads_sealed=0\n";
+    stats_={};
+}
+
+std::vector<MoeHostExpertCache::Lease> MoeExpertCache::read_ssd_experts(
+        const std::vector<SsdExpertRequest>& requests) {
+    std::vector<MoeHostExpertCache::Lease> leases(requests.size());
+    if(requests.empty())return leases;
+    if(!ssd_read_pool_)ssd_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
+    ssd_read_pool_->run(0,int64_t(requests.size()),1,std::max(1,config_.moe_ssd_io_workers),
+        [&](int64_t begin,int64_t end) {
+            for(auto i=begin;i<end;++i)leases[i]=requests[i].first->acquire_expert(requests[i].second);
+        });
+    return leases;
 }
 
 std::size_t MoeExpertCache::prefill_transfer_bytes(bool predictor) const {
@@ -887,7 +963,14 @@ void MoeExpertCache::preload_complete_residency() {
     std::cerr << "moe_residency_plan experts=" << total_experts << " runtime_bytes=" << total_bytes
         << " gpu_bytes=" << allocated_bytes_ << " cold_bytes=" << cold_bytes
         << " host_field_budget_bytes=" << host_budget << std::endl;
-    if (cold_bytes>host_budget) throw std::runtime_error("complete expert residency exceeds RAM field budget");
+    if(cold_bytes>host_budget) {
+        const auto* option=std::getenv("MFQ_MOE_SSD_EXPERTS");
+        if(config_.moe_pipeline && option && option[0]=='1') {
+            config_.moe_preload_all=false;config_.moe_assert_resident=false;
+            initialize_ssd_residency();return;
+        }
+        throw std::runtime_error("complete expert residency exceeds RAM field budget");
+    }
     // Fill shared GPU arenas fairly across sources, preserving profile-hot
     // slots. No initial placement may replace an already valid GPU expert.
     std::unordered_map<MoeGpuArena*,int> remaining;
@@ -1151,6 +1234,13 @@ std::uint64_t MoeExpertCache::expert_disk_reads_after_preload() const {
     for (const auto& source:sources_) if (source->quant_source_)
         reads+=source->quant_source_->expert_disk_reads_after_preload();
     return reads;
+}
+
+std::uint64_t MoeExpertCache::expert_disk_bytes_after_preload() const {
+    std::uint64_t bytes=0;
+    for(const auto& source:sources_)if(source->quant_source_)
+        bytes+=source->quant_source_->expert_disk_bytes_after_preload();
+    return bytes;
 }
 
 void MoeExpertCache::calibrate_pipeline_pcie() {
@@ -1638,6 +1728,7 @@ bool MoeExpertCache::prepare(
         throw std::runtime_error(
             "MoE cache must be finalized before inference");
     }
+
     finish_deferred_range_read(source);
     if (experts.empty()) return false;
 
@@ -1899,6 +1990,7 @@ bool moe_expert_cache_has_sources(
 std::vector<std::pair<std::string, double>> moe_expert_memory_metrics(
         const std::shared_ptr<MoeExpertCache>& cache) {
     return cache ? cache->memory_metrics() : std::vector<std::pair<std::string, double>>{
+        {"ssd_expert_enabled",0.0}, {"ssd_expert_payload_bytes",0.0}, {"ssd_expert_bytes_read",0.0},
         {"ram_expert_enabled", 0.0}, {"ram_expert_payload_bytes", 0.0},
         {"ram_expert_pcie_read_bytes", 0.0}};
 }
@@ -1913,6 +2005,9 @@ std::size_t moe_expert_cache_minimum_bytes(const std::shared_ptr<MoeExpertCache>
 }
 bool moe_expert_cache_layer_prefill_ready(const std::shared_ptr<MoeExpertCache>& cache) {
     return cache && cache->layer_prefill_ready();
+}
+bool moe_expert_cache_ssd_experts(const std::shared_ptr<MoeExpertCache>& cache) {
+    return cache && cache->ssd_experts();
 }
 std::size_t moe_expert_cache_budget_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
     return cache ? std::size_t(cache->budget_bytes()) : 0;

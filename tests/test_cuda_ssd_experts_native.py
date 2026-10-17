@@ -1,0 +1,126 @@
+"""Bounded RAM and actual checkpoint reads through eager and retained FFN graphs."""
+import os
+import subprocess
+import asyncio
+from contextlib import suppress
+
+import numpy as np
+import pytest
+
+from mfq.formats.header import FileHeader
+from mfq.formats.io import save
+from mfq.formats.mfe import MfePool, MfeTensor
+from mfq.formats.nint import NintSpec
+from mfq.quantize.nint_quant import quantize
+from tests.mixed_family_fixtures import make_flat_family
+
+
+def test_ssd_expert_streaming(tmp_path):
+    executable = os.environ.get("MFQ_CUDA_SSD_EXPERT_TEST")
+    if not executable:
+        pytest.skip("MFQ_CUDA_SSD_EXPERT_TEST required")
+    rng = np.random.default_rng(2038)
+    for family in ("nint", "nvq2j", "nvq3j", "nvq2j-l", "nvq2j-xl", "nvq3j-l"):
+        for projection in range(4 if family == "nint" else 3):
+            output = 192 if projection == 3 else 96
+            values = (quantize(rng.normal(0, .03, (64 * output, 96)).astype(np.float32), NintSpec(4, 24, 6))
+                      if family == "nint" else make_flat_family(family.upper(), rows=64 * output, neuron_len=96, seed=2038+projection))
+            save(tmp_path / f"{family}-{projection}.mfq", FileHeader(version=2, model_arch="qwen4_exp"),
+                 {"linear.weight": MfeTensor((64, output, 96), (MfePool(np.arange(64, dtype=np.int32), values),))})
+    env = dict(os.environ, MFQ_MOE_SSD_EXPERTS="1", MFQ_MOE_NVQ_DENSE="0", MFQ_MOE_PRELOAD_ALL="0", MFQ_MOE_ASSERT_RESIDENT="0",
+        MFQ_MOE_TRANSFER_CACHE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_PREFILL_LAYER="0",
+        MFQ_MOE_PREFILL_GROUPS="1", MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER="1", MFQ_MOE_RAM_PCIE_FRACTION="1",
+        MFQ_CUDA_WORKSPACE_RESERVE_GIB="0.01", CUDA_MODULE_LOADING="LAZY")
+    result = subprocess.run([executable, str(tmp_path)], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SSD expert streaming cases=189 PASS" in result.stdout
+
+
+@pytest.mark.parametrize("wide,grouped", [(False, True), (True, True), (True, False)])
+def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped):
+    from mfq.server.runtime.client import StdioRuntimeClient
+    from tests.test_cuda_flash_next_runtime import mtp_fixture, write_qwen_fixture
+    from tests.test_native_nint_ple import _worker_tokenizer
+
+    executable = os.environ.get("MFQ_CUDA_RESOURCE_TEST_RUNTIME")
+    if not executable:
+        pytest.skip("MFQ_CUDA_RESOURCE_TEST_RUNTIME required")
+    config, weights = mtp_fixture("qwen", 1, hidden=256 if wide else 16)
+    config["text_config"]["max_position_embeddings"] = 512
+    if wide:
+        config["text_config"].update(moe_intermediate_size=1024, shared_expert_intermediate_size=1024)
+    for name, value in list(weights.items()):
+        if name.endswith(".experts.gate_up.weight"):
+            for role, matrix in zip(("gate", "up"), np.split(value, 2, axis=1)):
+                weights[name.replace("gate_up", role)] = np.tile(matrix, (1, 64, 1)) if wide else matrix.copy()
+            del weights[name]
+        elif wide and name.endswith(".experts.down.weight"):
+            weights[name] = np.tile(value, (1, 1, 64)) / 64
+        elif wide and name.endswith((".shared_expert.gate.weight", ".shared_expert.up.weight")):
+            weights[name] = np.tile(value, (64, 1))
+        elif wide and name.endswith(".shared_expert.down.weight"):
+            weights[name] = np.tile(value, (1, 64)) / 64
+    for name, value in list(weights.items()):
+        if ".experts." in name:
+            experts, output, width = value.shape
+            packed = quantize(value.reshape(experts * output, width), NintSpec(4, 8, 6))
+            weights[name] = MfeTensor(value.shape, (MfePool(np.arange(experts, dtype=np.int32), packed),))
+        elif ".ngram.shard." in name:
+            weights[name] = quantize(value, NintSpec(4, 8, 6))
+    model = tmp_path / "streamed.mfq"
+    write_qwen_fixture(model, config, weights, True)
+    tokenizer = _worker_tokenizer(tmp_path)
+
+    async def run(ssd):
+        env = dict(os.environ, MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_SSD_EXPERTS="1",
+            MFQ_MOE_PRELOAD_ALL=str(int(not ssd)), MFQ_MOE_ASSERT_RESIDENT=str(int(not ssd)), MFQ_MOE_NVQ_DENSE="0",
+            MFQ_MOE_HOST_CACHE_BYTES=str((1 << 19 if wide else 4096) if ssd else 1 << 28), MFQ_MOE_RAM_PCIE="1", MFQ_MOE_RAM_PCIE_FRACTION="1",
+            MFQ_MOE_RESIDENCY_WARM="1", MFQ_MOE_RESIDENCY_PROJECTION_HEAT="1", MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER="1",
+            MFQ_MOE_PREFILL_LAYER="0", MFQ_RUNTIME_DISABLE_PREFIX_CACHE="1",
+            MFQ_KV_TURBOQUANT_BITS="0", MFQ_CUDA_WORKSPACE_RESERVE_GIB="0.01")
+        env.pop("MFQ_MOE_PREFILL_GROUPS", None)
+        if not grouped:
+            env["MFQ_MOE_PREFILL_GROUPS"] = "0"
+        with (tmp_path / f"worker-{ssd}.log").open("wb") as log:
+            process = await asyncio.create_subprocess_exec(executable, "--model", str(model), "--tokenizer", str(tokenizer),
+                "--transport", "stdio", "--ctx-size", "512", "--moe-gpu-cache-gb", "0.001" if wide else "0.000005", "--yarn-context-extension",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log, env=env)
+            client = StdioRuntimeClient(process, control_timeout_seconds=30)
+            try:
+                status = await client.status()
+                assert bool(status["ssd_expert_enabled"]) == ssd
+                startup_captures = (tmp_path / f"worker-{ssd}.log").read_text(errors="replace").count(
+                    "runtime_qwen4_graph_capture role=")
+                outputs = []
+                for mtp in (False, True, False):
+                    prompt = "ab" * 240
+                    async with client.generate(dict(messages=[dict(role="user", content=prompt)], mfq_preformatted_prompt=prompt,
+                        temperature=0, seed=1234, max_tokens=16, enable_mtp=mtp, mtp_max_draft_tokens=3,
+                        mfq_prefix_cache_enabled=False, stream=True)) as events:
+                        chunks = [event async for event in events if event]
+                    assert not any("error" in event for event in chunks), chunks
+                    status = await client.status()
+                    assert status["last_request"]["prompt_tokens"] > 128
+                    outputs.append("".join(choice.get("delta", {}).get("content", "")
+                        for event in chunks for choice in event.get("choices", [])))
+                    assert outputs[-1]
+                status = await client.status()
+                if ssd:
+                    assert status["ssd_expert_bytes_read"] > 0 and status["ram_expert_cache_evictions"] > 0
+                text = (tmp_path / f"worker-{ssd}.log").read_text(errors="replace")
+                captures = [line for line in text.splitlines() if "runtime_qwen4_graph_capture role=" in line]
+                assert captures
+                assert len(captures) == startup_captures, "requests captured additional decode graphs"
+                assert "runtime_mtp_depth_plan" not in text, "requests rebuilt startup graphs"
+                if ssd and grouped:
+                    assert "moe_ssd_prefill_dispatch path=grouped" in text
+                return outputs
+            finally:
+                with suppress(Exception):
+                    await client.aclose()
+                if process.returncode is None:
+                    process.terminate()
+                await asyncio.wait_for(process.wait(), 5)
+
+    expected = asyncio.run(run(False))
+    assert asyncio.run(run(True)) == expected

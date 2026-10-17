@@ -54,7 +54,7 @@ def test_cuda_auto_expert_budget_uses_selected_physical_device(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("available,enabled", [(52 * GIB, True), (8 * GIB, False)])
-def test_cuda_launch_enables_ram_pipeline_when_experts_fit(tmp_path, monkeypatch, available, enabled):
+def test_cuda_launch_selects_ram_or_ssd_expert_cache(tmp_path, monkeypatch, available, enabled):
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "discrete"})
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (64 * GIB, available))
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
@@ -66,14 +66,14 @@ def test_cuda_launch_enables_ram_pipeline_when_experts_fit(tmp_path, monkeypatch
     # Select the mocked GPU explicitly, independent of the test runner's
     # CUDA_VISIBLE_DEVICES setting.
     request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16, device_ids=["0"])
-    if not enabled:
-        with pytest.raises(JobExecutionError) as raised:
-            pool._launch_configuration(model, request, port=1234)
-        assert raised.value.detail.code == "runtime_ram_expert_budget_exceeded"
-        return
     command, environment = pool._launch_configuration(model, request, port=1234)
     assert "--moe-gpu-cache-gb" in command
     assert (environment.get("MFQ_MOE_PRELOAD_ALL") == "1") == enabled
+    assert environment["MFQ_MOE_SSD_EXPERTS"] == "1"
+    assert environment["MFQ_MOE_ASSERT_RESIDENT"] == str(int(enabled))
+    if not enabled:
+        assert int(environment["MFQ_MOE_HOST_CACHE_BYTES"]) == 6 * GIB
+        assert environment["MFQ_MOE_NVQ_DENSE"] == "0"
     if enabled:
         assert environment["MFQ_MOE_PIPELINE"] == "1"
         assert environment["MFQ_MOE_TWO_STAGE_FFN"] == "1"
@@ -93,6 +93,36 @@ def test_cuda_ram_pipeline_rejects_dense_expert_pools(tmp_path):
     save(path, FileHeader(version=2, model_arch="qwen4_exp"),
          {"model.block.0.mlp.experts.gate.weight": experts})
     assert not supports_cuda_ram_expert_pipeline(path)
+
+
+def test_cuda_ssd_experts_respect_explicit_ram_cache_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "discrete"})
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (64 * GIB, 52 * GIB))
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
+        "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", 24 * GIB),)))
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda", automatic_memory_budget=False)
+    pool.runtime_environment["MFQ_MOE_HOST_CACHE_BYTES"] = str(2 * GIB)
+    model = artifact(tmp_path)
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16, device_ids=["0"])
+    _, environment = pool._launch_configuration(model, request, port=1234)
+    assert environment["MFQ_MOE_HOST_CACHE_BYTES"] == str(2 * GIB)
+    assert environment["MFQ_MOE_PRELOAD_ALL"] == "0"
+    pool.runtime_environment["MFQ_MOE_SSD_EXPERTS"] = "0"
+    with pytest.raises(JobExecutionError) as raised:
+        pool._launch_configuration(model, request, port=1234)
+    assert raised.value.detail.code == "runtime_ram_expert_budget_exceeded"
+
+
+def test_cuda_expert_cache_leaves_ram_for_preallocated_kv(tmp_path, monkeypatch):
+    from mfq.server.runtime.kv_budget import KvTierBudget
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "discrete"})
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (64 * GIB, 12 * GIB))
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.checkpoint_kv_budget", lambda *args: KvTierBudget(0, 6 * GIB, 0, 6 * GIB, 0.1))
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda", automatic_memory_budget=False)
+    model = artifact(tmp_path)
+    request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16)
+    assert pool._cuda_expert_host_budget(model, request) == 4 * GIB
+    assert pool._kv_ram_limit(model, request) == 6 * GIB
 
 
 def test_cuda_ram_pipeline_accepts_packed_nint_predictor_experts(tmp_path):

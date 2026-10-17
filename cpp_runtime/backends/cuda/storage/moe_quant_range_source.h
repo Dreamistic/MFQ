@@ -36,6 +36,7 @@ public:
     std::uint64_t materializations() const { return materializations_.load(); }
     std::uint64_t dense_materializations() const { return dense_materializations_.load(); }
     std::uint64_t expert_disk_reads_after_preload() const { return disk_reads_after_preload_.load(); }
+    std::uint64_t expert_disk_bytes_after_preload() const { return disk_bytes_after_preload_.load(); }
 private:
     std::shared_ptr<mfq::MfeQuantExpertStore> store_;
     std::shared_ptr<MixedMoeRuntime> metadata_;
@@ -52,4 +53,5 @@ private:
     mutable std::atomic<std::uint64_t> sealed_disk_attempts_{0};
     std::atomic_bool preloaded_{false};
     mutable std::atomic<std::uint64_t> disk_reads_after_preload_{0};
+    mutable std::atomic<std::uint64_t> disk_bytes_after_preload_{0};
 };

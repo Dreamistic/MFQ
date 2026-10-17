@@ -411,7 +411,7 @@ MoeResidencyManager::MemorySample MoeResidencyManager::sample_host_memory() {ret
 
 MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer,MemoryProbe memory_probe)
     :impl_(std::make_unique<Impl>(cache,std::move(observer),std::move(memory_probe))) {
-    if(!cache || !cache->complete_residency_ || cache->pipeline_bundles_.empty())
+    if(!cache || !cache->pipeline_ready() || cache->pipeline_bundles_.empty())
         throw std::invalid_argument("adaptive tier requires resident expert bundles");
     auto& s=*impl_;s.first=std::numeric_limits<int>::max();s.last=std::numeric_limits<int>::min();
     std::cerr<<"moe_residency_policy retention="<<s.heat_retention<<" interval="<<s.interval
@@ -836,6 +836,7 @@ void MoeResidencyManager::prepare() {
             if(e.projection>=0) {
                 const auto& source=*cache.sources_[bundle[e.projection]];
                 if(source.quant_source_->gpu_resident(e.expert))return 1;
+                if(cache.ssd_experts() && !source.quant_source_->host_cache()->contains(source.quant_source_->host_key(e.expert)))return -1;
                 // A transfer-cache hit is temporary residency. Let a measured
                 // hot projection compete for permanent space when requested;
                 // the normal lease, inflight and publication guards still
@@ -850,6 +851,8 @@ void MoeResidencyManager::prepare() {
             bool hot=true,cold=true;
             for(int p=0;p<3;++p) {
                 const bool gpu=cache.sources_[bundle[p]]->quant_source_->gpu_resident(e.expert);
+                if(!gpu && cache.ssd_experts() && !cache.sources_[bundle[p]]->quant_source_->host_cache()->contains(
+                        cache.sources_[bundle[p]]->quant_source_->host_key(e.expert)))return -1;
                 hot&=gpu;cold&=!gpu;
             }
             return hot?1:cold?0:-1;

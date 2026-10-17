@@ -4408,11 +4408,44 @@ class RuntimePool:
                 return port
         raise RuntimeManagementError("unable to reserve a unique runtime port")
 
+    def _cuda_expert_host_budget(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int:
+        total, available = host_memory_capacity()
+        budget = max(0, min(available or 0, max(0, (total or 0) - (4 << 30))) - (2 << 30))
+        # KV has priority over the evictable expert tier. Price the target KV
+        # before filling RAM, so SSD experts do not consume its reservation.
+        try:
+            plan = checkpoint_kv_budget(artifact,
+                self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled),
+                request.kv_memory, request.kv_quantization)
+        except ValueError:
+            # Missing/unsupported KV metadata is validated by its own path.
+            plan = None
+        if plan is not None:
+            reserve = plan.ram_required_bytes
+            if not request.kv_memory.ram_preallocated:
+                reserve = min(reserve, request.kv_memory.ram_budget_bytes or (4 << 30))
+            budget = max(0, budget - reserve)
+        if memory_topology()["memory_architecture"] == "unified":
+            budget = max(0, budget - self._estimated_load_bytes(artifact, request))
+        configured = self.runtime_environment.get("MFQ_MOE_HOST_CACHE_BYTES", os.environ.get("MFQ_MOE_HOST_CACHE_BYTES"))
+        if configured is not None:
+            try:
+                value = int(configured)
+            except ValueError as error:
+                raise _job_error("runtime_ram_expert_budget_invalid", "expert RAM cache budget must be a non-negative byte count") from error
+            if value < 0:
+                raise _job_error("runtime_ram_expert_budget_invalid", "expert RAM cache budget must be a non-negative byte count")
+            budget = min(budget, value)
+        return budget
+
     def _kv_ram_limit(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int | None:
         _, available = host_memory_capacity()
         limit = request.kv_memory.ram_budget_bytes
         if available is not None:
             cold_experts = max(0, artifact.routed_expert_bytes - int((request.moe_gpu_cache_gb or 0) * (1 << 30)))
+            if (self.backend == "cuda" and (request.moe_gpu_cache_gb or 0) > 0
+                    and supports_cuda_ram_expert_pipeline(artifact.path)):
+                cold_experts = min(cold_experts, self._cuda_expert_host_budget(artifact, request))
             available = max(0, available - cold_experts - (2 << 30))
             limit = available if limit is None else min(limit, available)
         return limit
@@ -4487,15 +4520,15 @@ class RuntimePool:
         if self.backend == "cuda":
             process_environment.setdefault("MFQ_MEMORY_ARCHITECTURE", memory_topology()["memory_architecture"])
         if (self.backend == "cuda" and artifact.resource.format == "mfq"
-                and request.moe_gpu_cache_gb is not None and request.moe_gpu_cache_gb > 0
-                and memory_topology()["memory_architecture"] == "discrete"):
-            total, available = host_memory_capacity()
-            host_budget = max(0, min(available or 0, (total or 0) - (4 << 30)) - (2 << 30))
+                and request.moe_gpu_cache_gb is not None and request.moe_gpu_cache_gb > 0):
+            host_budget = self._cuda_expert_host_budget(artifact, request)
             cold_bytes = max(0, artifact.routed_expert_bytes - int(request.moe_gpu_cache_gb * (1 << 30)))
-            if host_budget < cold_bytes:
-                raise _job_error("runtime_ram_expert_budget_exceeded",
-                    "remaining experts do not fit in available RAM; reduce the model size or free host memory")
             if supports_cuda_ram_expert_pipeline(artifact.path):
+                streaming = host_budget < cold_bytes or process_environment.get("MFQ_MOE_PRELOAD_ALL") == "0"
+                allow_ssd = process_environment.get("MFQ_MOE_SSD_EXPERTS", "1") != "0"
+                if streaming and not allow_ssd:
+                    raise _job_error("runtime_ram_expert_budget_exceeded",
+                        "remaining experts do not fit in RAM; enable SSD expert streaming or reduce the model size")
                 defaults = {
                     "MFQ_MOE_HOST_CACHE_BYTES": str(host_budget),
                     "MFQ_MOE_PIPELINE": "1",
@@ -4520,7 +4553,16 @@ class RuntimePool:
                     defaults["MFQ_CUDA_VRAM_LIMIT_GIB"] = str(device_limit / float(1 << 30))
                 for name, value in defaults.items():
                     process_environment.setdefault(name, value)
+                process_environment["MFQ_MOE_HOST_CACHE_BYTES"] = str(host_budget)
+                process_environment["MFQ_MOE_SSD_EXPERTS"] = "1" if allow_ssd else "0"
+                if streaming:
+                    process_environment["MFQ_MOE_PRELOAD_ALL"] = "0"
+                    process_environment["MFQ_MOE_ASSERT_RESIDENT"] = "0"
+                    process_environment["MFQ_MOE_NVQ_DENSE"] = "0"
             else:
+                if host_budget < cold_bytes:
+                    raise _job_error("runtime_ram_expert_budget_exceeded",
+                        "this expert container requires complete RAM residency; use a canonical MFQ checkpoint for SSD streaming")
                 # Older expert containers use the resident CPU loader, followed
                 # by the same bounded GPU cache; they must not read SSD per step.
                 process_environment.setdefault("MFQ_DISABLE_MOE_SSD_RANGES", "1")

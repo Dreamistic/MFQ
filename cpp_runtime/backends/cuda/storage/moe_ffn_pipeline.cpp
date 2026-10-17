@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <functional>
 #include <future>
+#include <exception>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -451,7 +452,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         auto shared=shared_?shared_(execution,input):tb::Tensor{};
         const auto route_started=Clock::now();
         mfq::cuda::wait_route_publication(published,stream_);
-        stats.pipeline_route_wait_ns+=elapsed(route_started);++stats.pipeline_serves;++stats.pipeline_prefill_group_serves;
+        stats.pipeline_route_wait_ns+=elapsed(route_started);
+        if(cache_->ssd_experts() && !stats.pipeline_prefill_group_serves)
+            std::cerr<<"moe_ssd_prefill_dispatch path=grouped tokens="<<tokens<<" routes="<<routes<<'\n';
+        ++stats.pipeline_serves;++stats.pipeline_prefill_group_serves;
         // Publication follows every previous consumer of the shared ring and
         // pinned metadata. A completed previous DMA is implied by that consumer.
         if(cache_->transfer_ready_recorded_)MFQ_CUDA_CHECK(cudaEventSynchronize(cache_->transfer_ready_));
@@ -467,13 +471,19 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         std::vector<int> order;
         for(int e=0;e<experts_;++e)if(!positions[e].empty())order.push_back(e);
         const int groups=(int(order.size())+prefill_group_size-1)/prefill_group_size;
-        struct Upload {int cohort,slot;std::vector<tb::Tensor> fields;};
+        struct Upload {int cohort,slot,expert;std::vector<tb::Tensor> fields;};
         struct Group {
             int begin=0,rows=0;
             int route_offset=0,mma_tile_m=8,wide_tile_m=8;
             std::array<std::vector<Upload>,3> uploads;
+            std::vector<MoeHostExpertCache::Lease> leases;
         };
         std::vector<Group> work(groups);stats.pipeline_prefill_groups+=groups;
+        struct DrainFailedReads {
+            cudaStream_t stream;
+            int exceptions=std::uncaught_exceptions();
+            ~DrainFailedReads(){if(std::uncaught_exceptions()>exceptions)(void)cudaStreamSynchronize(stream);}
+        } drain{cache_->weight_stream_};
         std::array<int,3> map_offset{};int map_stride=0;
         for(int p=0;p<3;++p) {
             map_offset[p]=map_stride;
@@ -513,10 +523,14 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     const int hot=cohort.arena->book->slot_for({source.id_,c,e});
                     auto* map=maps+g*map_stride+map_offset[p]+2*c*prefill_group_size;
                     if(hot>=0) {map[q]=hot;continue;}
-                    cold_expert=true;auto lease=source.quant_source_->acquire_expert(e);
+                    cold_expert=true;
                     const int slot=next[p][c]++;map[prefill_group_size+q]=slot;
-                    group.uploads[p].push_back({c,slot,moe_cache_fields(lease->weights)});
-                    cache_->pipeline_dma_leases_.push_back(std::move(lease));
+                    if(cache_->ssd_experts())group.uploads[p].push_back({c,slot,e,{}});
+                    else {
+                        auto lease=source.quant_source_->acquire_expert(e);
+                        group.uploads[p].push_back({c,slot,e,moe_cache_fields(lease->weights)});
+                        cache_->pipeline_dma_leases_.push_back(std::move(lease));
+                    }
                 }
                 stats.ram_pcie_experts+=cold_expert;
             }
@@ -566,6 +580,24 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         const auto ram_end=ram_begin+cache_->pipeline_ram_registered_bytes_;
         const auto stage_group=[&](int g) {
             const auto started=Clock::now();auto& buffer=stream.buffers[g%2];
+            if(cache_->ssd_experts()) {
+                if(g>=2) {
+                    // Only the two active groups own CPU payloads. The H2D
+                    // fence protects their source storage; used protects the
+                    // GPU destination before this ring slot is overwritten.
+                    buffer.down_ready.synchronize();
+                    for(auto& uploads:work[g-2].uploads)for(auto& upload:uploads)upload.fields.clear();
+                    work[g-2].leases.clear();
+                }
+                std::vector<MoeExpertCache::SsdExpertRequest> requests;
+                for(int p=0;p<3;++p)for(const auto& upload:work[g].uploads[p])
+                    requests.emplace_back(sources_[p]->quant_source_.get(),upload.expert);
+                auto leases=cache_->read_ssd_experts(requests);
+                std::size_t at=0;
+                for(auto& uploads:work[g].uploads)for(auto& upload:uploads)
+                    upload.fields=moe_cache_fields(leases[at++]->weights);
+                work[g].leases=std::move(leases);
+            }
             if(g>=2)MFQ_CUDA_CHECK(cudaStreamWaitEvent(cache_->weight_stream_,buffer.used.get(),0));
             for(int p=0;p<3;++p) {
                 const auto& uploads=work[g].uploads[p];auto& source=*sources_[p];
@@ -675,6 +707,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         }
         MFQ_CUDA_CHECK(cudaEventRecord(cache_->transfer_ready_,cache_->weight_stream_));
         cache_->transfer_ready_recorded_=true;
+        if(cache_->ssd_experts())for(auto& group:work)for(auto& lease:group.leases)
+            cache_->pipeline_dma_leases_.push_back(std::move(lease));
         auto output=parts.reshape({tokens,routes,width_});
         if(shared.defined())output=moe_weighted_reduce_cuda(output,weights)+shared;
         cache_->record_compute_use();
@@ -1166,7 +1200,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         cell.in_window=window;
         const auto prefill_graph=mfq::cuda::runtime_options::moe_prefill_graph();
         cell.batch_decode=cell.tokens<=8 || (cell.tokens<=32 && execution.continuous_batch_cache_serial);
-        cell.graph_replay=window || cell.batch_decode || !prefill_graph || *prefill_graph!=0;
+        // SSD payloads are leased per demand. Eager prefill must bind this
+        // call's fields, rather than retain a graph over an evicted payload.
+        cell.graph_replay=window || cell.batch_decode ||
+            (!cache_->ssd_experts() && (!prefill_graph || *prefill_graph!=0));
         if(!cell.graph_replay) {
             cell.eager_done=std::make_unique<mfq::cuda::Event>(cudaEventDisableTiming);
             const auto key=std::to_string(cell.tokens)+":"+std::to_string(cell.routes)+":"+std::to_string(width_);
@@ -1274,7 +1311,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 }
             }
         }
-        cell.transfer_cache=cell.two_stage && cache_->pipeline_transfer_cache_ && cache_->pipeline_ram_registered_bytes_>0;
+        cell.transfer_cache=cell.two_stage && cache_->pipeline_transfer_cache_ &&
+            (cache_->pipeline_ram_registered_bytes_>0 || cache_->ssd_experts());
         cell.mapped_copy=cell.transfer_cache && cache_->pipeline_mapped_copy_;
         cell.phased_transfer=cell.transfer_cache && !cell.mapped_copy &&
             execution.config.moe_ffn_transfer_phases.value_or(mfq::cuda::runtime_options::phased_transfer());
@@ -1513,7 +1551,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             MFQ_CUDA_CHECK(mfq::cuda::moe_wire_launch_geometry(&cell.wire_blocks,&cell.wire_threads));
         }
         if(cell.native_dma_mode) {
-            if(!cache_->pipeline_ram_alias_)MFQ_CUDA_CHECK(cudaHostGetDevicePointer(
+            if(cache_->pipeline_ram_registered_bytes_ && !cache_->pipeline_ram_alias_)MFQ_CUDA_CHECK(cudaHostGetDevicePointer(
                 &cache_->pipeline_ram_alias_,cache_->pipeline_ram_complement_->data_ptr(),0));
             if(!cache_->pipeline_host_stage_alias_)MFQ_CUDA_CHECK(cudaHostGetDevicePointer(
                 &cache_->pipeline_host_stage_alias_,cache_->pipeline_host_stage_.data_ptr(),0));
@@ -1525,7 +1563,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 MFQ_CUDA_CHECK(cudaEventSynchronize(cache_->transfer_ready_));
                 cache_->transfer_ready_recorded_=false;cache_->pipeline_dma_leases_.clear();
             }
-            if(!cache_->pipeline_ram_alias_)MFQ_CUDA_CHECK(cudaHostGetDevicePointer(
+            if(cache_->pipeline_ram_registered_bytes_ && !cache_->pipeline_ram_alias_)MFQ_CUDA_CHECK(cudaHostGetDevicePointer(
                 &cache_->pipeline_ram_alias_,cache_->pipeline_ram_complement_->data_ptr(),0));
             if(!cache_->pipeline_host_stage_alias_)MFQ_CUDA_CHECK(cudaHostGetDevicePointer(
                 &cache_->pipeline_host_stage_alias_,cache_->pipeline_host_stage_.data_ptr(),0));
@@ -2979,7 +3017,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 }
             } else MFQ_CUDA_CHECK(cudaStreamWaitEvent(cache_->weight_stream_,cache_->compute_done_,0));
         }
-        if(cell.wire.defined() && cache_->pipeline_ram_registered_bytes_) {
+        if(cell.wire.defined() && (cache_->pipeline_ram_registered_bytes_ || cache_->ssd_experts())) {
             fetch_registered(cell);return;
         }
         auto* packed=cache_->pipeline_host_stage_.data_ptr<uint8_t>();int64_t offset=cell.wire_header_bytes;
@@ -3234,6 +3272,27 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         trace_serve(cell,"plan");
         time(stats.pipeline_plan_ns,[&]{plan(cell);});
         trace_serve(cell,"fetch");
+        // The demand plan already deduplicates the window's token routes.
+        // Parallel file reads share one immutable lease with CPU work and
+        // Gate/Up/Down uploads, including when the LRU budget is exhausted.
+        std::vector<MoeHostExpertCache::Lease> ssd_leases;
+        if(cache_->ssd_experts()) {
+            std::vector<MoeExpertCache::SsdExpertRequest> requests;
+            for(const auto& group:cell.plan.groups)if(group.kind!=mfq::MoeDispatchKind::GpuResident)
+                for(int p=0;p<3;++p) {
+                    if((combined_gate_up_ && p==1) || sources_[p]->quant_source_->gpu_resident(group.expert))continue;
+                    if(group.kind==mfq::MoeDispatchKind::GpuTransfer) {
+                        if(cell.cached_resident && (cached_expert_fields_->h<mfq::cuda::MfeCachedExpert>()[group.expert].ready_mask&(uint64_t(1)<<p)))continue;
+                        if(cell.transfer_cache && !cell.wire_fallback) {
+                            const auto& source=*sources_[p];const int c=source.expert_to_cohort_[group.expert];
+                            const auto* stage=cell.binding[p].stages[c];
+                            if(stage && stage->book && stage->book->slot_for({source.id_,c,group.expert})>=0)continue;
+                        }
+                    }
+                    requests.emplace_back(sources_[p]->quant_source_.get(),group.expert);
+                }
+            ssd_leases=cache_->read_ssd_experts(requests);
+        }
         const auto transferred=stats.ram_pcie_bytes,fetch_started=stats.pipeline_fetch_ns;
         if(cache_->pipeline_dma_profile_enabled_) {
             if(cell.dma_timing) {
@@ -3529,7 +3588,7 @@ public:
     }
     tb::Tensor forward(CudaExecutionContext& execution,const tb::Tensor& input,const tb::Tensor& ids,const tb::Tensor& weights) {
         if(failed_)throw std::runtime_error("MFQ FFN session requires recovery after its previous error");
-        if(!cache_->complete_residency())throw std::runtime_error("MFQ FFN needs completed startup residency");
+        if(!cache_->pipeline_ready())throw std::runtime_error("MFQ FFN needs completed startup cache initialization");
         const auto current=mfq_current_cuda_stream();
         if(stream_ && stream_!=current)throw std::runtime_error("MFQ FFN session changed its CUDA stream");
         stream_=current;
@@ -3556,8 +3615,8 @@ public:
         if(!cache_->moe_residency_)cache_->moe_residency_=std::make_unique<MoeResidencyManager>(cache_);
         if(!window)cache_->moe_residency_->before_layer(sources_[0]->layer_id_);
         const auto prefill_groups=mfq::cuda::runtime_options::moe_prefill_groups();
-        if(!window && !batch_decode && prefill_groups && *prefill_groups!=0 &&
-                cache_->pipeline_ram_registered_bytes_>0 && cache_->pipeline_dispatch_replay_.empty() &&
+        if(!window && !batch_decode && prefill_groups.value_or(cache_->ssd_experts()) &&
+                (cache_->pipeline_ram_registered_bytes_>0 || cache_->ssd_experts()) && cache_->pipeline_dispatch_replay_.empty() &&
                 execution.kl_mmq.mode==KlMmqMode::Default) {
             try {return streamed_prefill(execution,input,ids,weights);}
             catch(...) {handle_prefill_failure();throw;}
@@ -3567,7 +3626,8 @@ public:
         auto& cell=cells_[{tokens,routes,window,batch_decode,tile}];
         if(!cell) {
             const auto prefill_graph=mfq::cuda::runtime_options::moe_prefill_graph();
-            const bool eager=!window && !batch_decode && prefill_graph && *prefill_graph==0;
+            const bool eager=!window && !batch_decode &&
+                (cache_->ssd_experts() || (prefill_graph && *prefill_graph==0));
             cell=std::make_unique<Cell>(tokens,routes,width_,experts_,stream_,eager);
             initialize(*cell,execution,window!=nullptr);
         }

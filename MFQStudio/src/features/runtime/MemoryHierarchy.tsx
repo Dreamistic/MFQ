@@ -70,8 +70,7 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
       { id: 'ram-prefix' as const, title: tr('RAM 前缀缓存', 'RAM prefix cache'),
         detail: tr('低优先级，内存紧张时按 LRU 释放', 'Low priority; reclaimed by LRU under memory pressure') },
     ] : []),
-    { id: 'experts', title: tr('SSD 流式加载专家', 'SSD-streamed experts'), detail: separate && loaded.length && loaded.every(item => item.memory?.ssd_experts === false)
-      ? tr('当前设备尚未支持', 'Not yet supported on this device') : streamedCount('ssd_experts') },
+    { id: 'experts', title: tr('SSD 流式加载专家', 'SSD-streamed experts'), detail: streamedCount('ssd_experts') },
     { id: 'ple', title: tr('SSD 流式加载 PLE 表', 'SSD-streamed PLE tables'), detail: streamedCount('ssd_ple') },
     { id: 'ssd-kv', title: tr('SSD 流式 KV', 'SSD-streamed KV'), detail: streamedCount('ssd_kv') },
   ];
@@ -219,7 +218,7 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
                           ? memory?.ram_kv == null ? tr('未上报', 'Not reported') : memory.ram_kv ? `${tr('RAM 上限', 'RAM limit')} ${memory.ram_kv_limit_bytes == null ? '--' : resourceBytes(memory.ram_kv_limit_bytes)} · ${tr('LRU 淘汰后写入 SSD', 'LRU eviction spills to SSD')}` : tr('未启用 RAM 流式 KV', 'RAM-streamed KV disabled')
                       : tier.id === 'experts'
                         ? memory?.ssd_experts == null ? tr('未上报', 'Not reported') : memory.ssd_experts ? tr('按需从 SSD 加载', 'Loaded from SSD on demand')
-                          : separate ? tr('当前设备尚未支持 SSD 专家流式加载', 'SSD expert streaming is not yet supported on this device') : tr('专家全部常驻', 'All experts resident')
+                          : separate ? tr('专家全部常驻于显存或内存', 'Experts resident in VRAM or RAM') : tr('专家全部常驻', 'All experts resident')
                         : tier.id === 'ple'
                           ? memory?.ssd_ple == null ? tr('未上报', 'Not reported') : memory.ssd_ple ? tr('按行从 SSD 读取', 'Rows read from SSD') : tr('无 SSD PLE 表', 'No SSD PLE table')
                           : memory?.ssd_kv == null ? tr('未上报', 'Not reported') : memory.ssd_kv

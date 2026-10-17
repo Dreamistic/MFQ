@@ -66,8 +66,11 @@ MixedMoePool MoeQuantRangeSource::read_expert(int expert) const {
         ++sealed_disk_attempts_;
         throw std::runtime_error("expert disk read forbidden after complete residency preload");
     }
-    if (preloaded_.load()) ++disk_reads_after_preload_;
     const auto encoded=store_->read_expert(expert);
+    if (preloaded_.load()) {
+        ++disk_reads_after_preload_;
+        disk_bytes_after_preload_.fetch_add(encoded.payload.size(),std::memory_order_relaxed);
+    }
     return decode_expert(expert,encoded);
 }
 

@@ -51,6 +51,9 @@ struct MoeHostExpertCache::Impl {
     std::list<mfq::MoeCacheKey> lru;
     std::unordered_map<mfq::MoeCacheKey,Entry,mfq::MoeCacheKeyHash> entries;
     std::unordered_map<mfq::MoeCacheKey,std::shared_ptr<Flight>,mfq::MoeCacheKeyHash> flights;
+    // Bypassed payloads still have an active consumer. Reuse that immutable
+    // lease even when the RAM budget cannot retain it in the LRU.
+    std::unordered_map<mfq::MoeCacheKey,std::weak_ptr<const MoeHostExpert>,mfq::MoeCacheKeyHash> transient;
     std::unordered_set<mfq::MoeCacheKey,mfq::MoeCacheKeyHash> exchanging;
     std::condition_variable exchange_complete;
     std::size_t exchange_placeholders=0;
@@ -136,6 +139,10 @@ MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::MoeCacheKey key,std::
                 ++state.counters.hits;
                 return hit->second.value;
             }
+            if(const auto active=state.transient.find(key);active!=state.transient.end()) {
+                if(auto value=active->second.lock()) {++state.counters.coalesced;return value;}
+                state.transient.erase(active);
+            }
             const auto pending=state.flights.find(key);
             if (pending!=state.flights.end()) {
                 flight=pending->second;
@@ -161,6 +168,7 @@ MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::MoeCacheKey key,std::
         value->weights=load();
         std::lock_guard lock(state.mutex);
         if (managed && (!flight || flight->retain)) state.publish(key,value);
+        else if(retain) state.transient.insert_or_assign(key,value);
         if (flight) {
             flight->value=value;
             flight->ready=true;

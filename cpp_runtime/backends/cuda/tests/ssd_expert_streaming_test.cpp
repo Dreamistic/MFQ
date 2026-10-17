@@ -1,0 +1,204 @@
+#include "storage/moe_expert_cache.h"
+#include "storage/moe_expert_cache_internal.h"
+#include "storage/moe_ffn_pipeline.h"
+#include "storage/moe_quant_range_source.h"
+#include "storage/weight_loader.h"
+#include "runtime/decode_window.h"
+#include "mfq_cuda_context.h"
+#include "mfq/runtime.h"
+#include "nint_prefill_cache.h"
+#include <array>
+#include <cmath>
+#include <filesystem>
+#include <iostream>
+#include <map>
+
+namespace tb=mfq_tensor_backend;
+namespace {
+void check(bool value,const char* message){if(!value)throw std::runtime_error(message);}
+std::shared_ptr<MoeQuantRangeSource> source(const std::filesystem::path& path,const std::string& name="linear.weight") {
+    auto model=mfq::open_model_source(path.string());auto read=model->tensor_reader(name);
+    auto store=std::make_shared<mfq::MfeQuantExpertStore>(require_tensor(*model,name).nbytes,
+        [read](std::size_t offset,uint8_t* dst,std::size_t n){read(offset,reinterpret_cast<std::byte*>(dst),n);});
+    return std::make_shared<MoeQuantRangeSource>(std::move(store));
+}
+struct Run {
+    CudaExecutionContext execution;
+    std::shared_ptr<MoeExpertCache> cache;
+    std::vector<std::shared_ptr<MoeQuantRangeSource>> sources;
+    MoeFfnForward forward;
+    Run(const std::filesystem::path& path,bool streaming,bool automatic=false,bool combined=false,const std::string& prefix="") {
+        auto& c=execution.config;
+        c.moe_pipeline=true;c.moe_two_stage_ffn=true;c.moe_ram_pcie=true;c.moe_direct_ram=true;
+        c.moe_ram_pcie_fraction=1.;c.moe_preload_all=!streaming || automatic;c.moe_assert_resident=!streaming || automatic;
+        c.moe_host_cache_bytes=prefix.empty()?(streaming?32768:8*1024*1024):(streaming?32*1024*1024:4LL*1024*1024*1024);
+        c.moe_residency_adapt=streaming;c.moe_residency_warm=streaming;c.moe_residency_projection_heat=true;
+        cache=make_moe_expert_cache(prefix.empty()?32768:64*1024*1024,c);
+        const auto separator=prefix.find(';');
+        std::vector<std::string> prefixes=separator==std::string::npos?std::vector<std::string>{prefix}:
+            std::vector<std::string>{prefix.substr(0,separator),prefix.substr(separator+1)};
+        sources.resize(3*prefixes.size());
+        std::vector<MoeFfnForward> forwards;
+        for(int layer=0;layer<int(prefixes.size());++layer) {
+          std::vector<std::shared_ptr<MfeWeight>> gu,down;
+          for(int p=0;p<3;++p) {
+            const auto id=layer*3+p;
+            if(combined && p==1){sources[id]=sources[id-1];continue;}
+            sources[id]=prefix.empty()?source(path.parent_path()/(path.stem().string()+"-"+std::to_string(combined && p==0?3:p)+".mfq")):
+                source(path,prefixes[layer]+std::array<std::string,3>{".gate.weight",".up.weight",".down.weight"}[p]);
+            auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(cache,
+                std::to_string(id),sources[id],1,combined?-1:layer,std::to_string(p)));
+            (p==2?down:gu).push_back(std::move(weight));
+          }
+          if(prefix.empty())forwards.push_back(make_moe_ffn_pipeline(gu,down));
+          else {
+            auto model=mfq::open_model_source(path.string());
+            const auto shared_prefix=prefixes[layer].substr(0,prefixes[layer].size()-8)+".shared_expert";
+            std::array<std::shared_ptr<const QuantLinear>,3> shared;
+            for(int p=0;p<3;++p)shared[p]=std::make_shared<QuantLinear>(load_quant_linear(execution,*model,
+                shared_prefix+std::array<std::string,3>{".gate.weight",".up.weight",".down.weight"}[p]));
+            auto scalar=std::make_shared<QuantLinear>(load_quant_linear(execution,*model,shared_prefix+".router.weight"));
+            auto gate=[scalar](CudaExecutionContext& e,const tb::Tensor& x){return tb::sigmoid(scalar->forward(e,x));};
+            auto run_shared=[shared,gate](CudaExecutionContext& e,const tb::Tensor& x){
+                auto g=shared[0]->forward(e,x),u=shared[1]->forward(e,x);
+                return gate(e,x)*shared[2]->forward(e,(g*tb::sigmoid(g))*u);
+            };
+            forwards.push_back(make_moe_ffn_pipeline(gu,down,run_shared,{},MoeFfnSharedWeights{shared,gate,scalar}));
+          }
+        }
+        forward=[forwards=std::move(forwards)](CudaExecutionContext& e,const tb::Tensor& x,const tb::Tensor& ids,const tb::Tensor& weights) {
+            auto input=x;tb::Tensor output;
+            for(std::size_t l=0;l<forwards.size();++l) {
+                output=forwards[l](e,input,ids,weights);
+                if(l+1<forwards.size())input=(tb::tanh(output.dim()==3?output.mean(1):output)*.1).to(tb::kFloat16);
+            }
+            return output;
+        };
+        finalize_moe_expert_cache(cache);
+        if(!prefix.empty()) {
+            auto loan=std::make_shared<mfq::cuda::KvExpertLoan>();
+            auto storage=tb::empty({32*1024*1024},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+            loan->add(storage,storage.numel(),1,true,1,true,true);
+            set_moe_kv_expert_loan(cache,std::move(loan));
+        }
+        check(cache->ssd_experts()==streaming,"expert tier selection changed");
+    }
+    std::map<std::string,double> metrics()const {
+        const auto values=moe_expert_memory_metrics(cache);return {values.begin(),values.end()};
+    }
+};
+void check_output(const tb::Tensor& actual,const tb::Tensor& expected) {
+    auto a=actual.to(tb::kCPU).to(tb::kFloat32).contiguous();
+    auto e=expected.to(tb::kCPU).to(tb::kFloat32).contiguous();
+    check(a.sizes()==e.sizes(),"SSD expert output shape differs");
+    for(int64_t i=0;i<a.numel();++i) {
+        const auto x=a.data_ptr<float>()[i],y=e.data_ptr<float>()[i];
+        if(!std::isfinite(x) || std::abs(x-y)>5e-5f+.005f*std::abs(y))
+            throw std::runtime_error("SSD expert result differs from full-RAM pipeline at "+std::to_string(i)+
+                " actual="+std::to_string(x)+" expected="+std::to_string(y));
+    }
+}
+}
+int main(int argc,char** argv)try {
+    check(argc==2 || argc==3,"expected SSD expert fixture directory or model and expert tensor prefix");
+    const auto stream=mfq_current_cuda_stream();
+    auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    int cases=0;
+    for(const char* format:{"nint","nvq2j","nvq3j","nvq2j-l","nvq2j-xl","nvq3j-l","nint-combined"}) {
+        if(argc==3 && std::string(format)!="nint")continue;
+        const bool combined=std::string(format)=="nint-combined";
+        const auto path=argc==3?std::filesystem::path(argv[1]):std::filesystem::path(argv[1])/(std::string(combined?"nint":format)+".mfq");
+        const std::string prefix=argc==3?argv[2]:"";
+        Run reference(path,false,false,combined,prefix);
+        Run candidate(path,true,std::string(format)!="nvq2j",combined,prefix);
+        const int width=reference.sources[0]->metadata()->neuron_len;
+        const int experts=reference.sources[0]->metadata()->n_experts;
+        for(const int rows:{1,2,3,4,5,6,8,32,1024,143,1,1024})for(const bool graph:{false,true}) {
+            if(graph && rows>32)continue;
+            std::cerr<<"ssd_case format="<<format<<" rows="<<rows<<" graph="<<graph<<'\n';
+            reference.execution.continuous_batch_cache_serial=rows==32;
+            candidate.execution.continuous_batch_cache_serial=rows==32;
+            auto x=tb::zeros({rows,width},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+            auto ids=tb::zeros({rows,2},x.options().dtype(tb::kInt32));
+            auto weights=tb::full({rows,2},.5, x.options().dtype(tb::kFloat32));
+            const auto set_input=[&](int step) {
+                std::vector<float> input(rows*width);
+                for(std::size_t i=0;i<input.size();++i)input[i]=(prefix.empty()?.001f:.1f)*std::sin(float(i+step*17)*.027f);
+                std::vector<int32_t> routes(rows*2);
+                for(int i=0;i<rows*2;++i)routes[i]=rows>32?(i+step*19)%experts:(31+(i%2)+(step==2?11:0))%experts;
+                x.copy_(tb::tensor(input).reshape({rows,width}).to(tb::kFloat16).to(tb::kCUDA));
+                ids.copy_(tb::tensor(routes).reshape({rows,2}).to(tb::kCUDA));
+            };
+            std::vector<tb::Tensor> expected;
+            for(int step=0;step<3;++step) {
+                set_input(step);
+                expected.push_back(reference.forward(reference.execution,x,ids,weights).cpu().clone());
+            }
+            release_moe_decode_buffers(reference.cache);
+            tb::Tensor result;
+            std::unique_ptr<mfq::cuda::DecodeWindow> window;
+            if(graph) {
+                window=std::make_unique<mfq::cuda::DecodeWindow>(stream,false,rows==32);
+                window->capture([&]{result=candidate.forward(candidate.execution,x,ids,weights);},[]{},[&]{result={};});
+            }
+            for(int step=0;step<3;++step) {
+                set_input(step);
+                const auto before=candidate.metrics().at("ssd_expert_read_count");
+                if(graph)window->run();else result=candidate.forward(candidate.execution,x,ids,weights);
+                check_output(result,expected[step]);
+                finish_moe_expert_exchanges(candidate.cache);
+                const auto after=candidate.metrics();
+                if(rows<=32)check(after.at("ssd_expert_read_count")-before<=2*candidate.sources.size(),
+                    "one window reread an expert for repeated token routes");
+                check(after.at("ssd_expert_enabled")==1 && after.at("ssd_expert_payload_bytes")>0,
+                    "SSD expert residency was not reported");
+                check(candidate.sources[0]->host_cache()->stats().managed_peak_bytes<=candidate.execution.config.moe_host_cache_bytes,
+                    "SSD expert LRU exceeded its RAM budget");
+            }
+            window.reset();result={};
+            if(rows<=32)release_moe_decode_buffers(candidate.cache);
+            release_moe_decode_buffers(reference.cache);
+            ++cases;
+        }
+        {
+            const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16);
+            auto small=tb::full({1,width},.015,options),large=tb::full({1024,width},.015,options);
+            std::vector<int32_t> single(10);
+            for(std::size_t i=0;i<single.size();++i)single[i]=(31+int(i))%experts;
+            auto small_ids=tb::tensor(single).reshape({1,10}).to(tb::kCUDA);
+            std::vector<int32_t> routes(10240);
+            for(std::size_t i=0;i<routes.size();++i)routes[i]=int(i)%experts;
+            auto large_ids=tb::tensor(routes).reshape({1024,10}).to(tb::kCUDA);
+            auto small_weights=tb::full({1,10},.1,options.dtype(tb::kFloat32));
+            auto large_weights=tb::full({1024,10},.1,options.dtype(tb::kFloat32));
+            reference.execution.continuous_batch_cache_serial=false;
+            candidate.execution.continuous_batch_cache_serial=false;
+            auto expected_small=reference.forward(reference.execution,small,small_ids,small_weights).cpu().clone();
+            auto expected_large=reference.forward(reference.execution,large,large_ids,large_weights).cpu().clone();
+            release_moe_decode_buffers(reference.cache);
+            release_moe_decode_buffers(candidate.cache);
+            tb::Tensor result;
+            mfq::cuda::DecodeWindow retained(stream,false);
+            retained.capture([&]{result=candidate.forward(candidate.execution,small,small_ids,small_weights);},[]{},[&]{result={};});
+            for(int request=0;request<3;++request) {
+                std::cerr<<"ssd_retained_case format="<<format<<" request="<<request<<'\n';
+                {
+                    NintPrefillDecodeCacheScope reuse(true);
+                    check_output(candidate.forward(candidate.execution,large,large_ids,large_weights),expected_large);
+                }
+                retained.run();check_output(result,expected_small);
+                finish_moe_expert_exchanges(candidate.cache);
+                cases+=2;
+            }
+        }
+        release_moe_decode_buffers(candidate.cache);
+        const auto metrics=candidate.metrics();
+        check(metrics.at("ssd_expert_bytes_read")>0,"SSD expert path did not read checkpoint payloads");
+        check(metrics.at("ram_expert_cache_evictions")>0,"tiny RAM cache did not exercise eviction");
+        check(metrics.at("residency_committed_projections")>0,"SSD cache never adapted GPU expert residency");
+        std::cout<<"ssd_experts format="<<format<<" reads="<<metrics.at("ssd_expert_read_count")
+            <<" bytes="<<metrics.at("ssd_expert_bytes_read")<<" bounded_RAM=1 graph=1 PASS\n";
+        release_moe_decode_buffers(candidate.cache);
+    }
+    std::cout<<"SSD expert streaming cases="<<cases<<" PASS\n";
+}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

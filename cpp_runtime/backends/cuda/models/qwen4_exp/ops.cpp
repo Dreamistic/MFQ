@@ -371,9 +371,10 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
                                                                const Tensor &x) {
         auto source = x.reshape({-1, c.hidden}).to(tb::kFloat16);
         const auto layer_prefill = mfq::cuda::runtime_options::moe_prefill_layer();
-        const bool combined_prefill = source.size(0)>8 && layer_prefill && *layer_prefill!=0 &&
+        const bool combined_prefill = source.size(0)>8 &&
             execution.kl_mmq.mode==KlMmqMode::Default &&
-            moe_expert_cache_layer_prefill_ready(execution.moe_expert_cache);
+            ((layer_prefill && *layer_prefill!=0 && moe_expert_cache_layer_prefill_ready(execution.moe_expert_cache)) ||
+             moe_expert_cache_ssd_experts(execution.moe_expert_cache));
         const bool use_pipeline=pipeline && (gate_up.projections.size()!=1 ||
             combined_prefill ||
             ((source.size(0)<=8 || (source.size(0)<=32 && execution.continuous_batch_cache_serial)) &&

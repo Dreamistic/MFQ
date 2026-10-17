@@ -998,12 +998,12 @@ def test_qwen_native_disabled_predictor_retains_source_config(tmp_path):
     assert result.returncode==0 and "flash_next_check " in result.stdout
 
 
-def mtp_fixture(family,layers=2):
+def mtp_fixture(family,layers=2,*,hidden=16):
     rng=np.random.default_rng(3811 if family=="qwen" else 5311)
     rand=lambda shape:rng.normal(scale=.05,size=shape).astype(np.float32)
     if family=="qwen":
-        config,w=qwen_model_fixture(2,True,True)
-        _,head=qwen_model_fixture(1,True,False)
+        config,w=qwen_model_fixture(2,True,True,hidden=hidden)
+        _,head=qwen_model_fixture(1,True,False,hidden=hidden)
         h=config["text_config"]["hidden_size"];streams=config["text_config"]["hc_count"]
         config["text_config"]["mtp_num_hidden_layers"]=layers
         w["predictor.embedding_norm.weight"]=rand((h,));w["predictor.hidden_norm.weight"]=rand((streams*h,))

@@ -355,8 +355,13 @@ public:
 
     void prewarm();
     void preload_complete_residency();
+    void initialize_ssd_residency();
+    using SsdExpertRequest=std::pair<MoeQuantRangeSource*,int>;
+    std::vector<MoeHostExpertCache::Lease> read_ssd_experts(const std::vector<SsdExpertRequest>& requests);
     void calibrate_pipeline_pcie();
     bool complete_residency() const noexcept { return complete_residency_; }
+    bool pipeline_ready() const noexcept { return complete_residency_ || ssd_experts_; }
+    bool ssd_experts() const noexcept { return ssd_experts_; }
     double ram_pcie_fraction() const noexcept { return ram_pcie_fraction_; }
     void finish_pipeline_exchanges() { if(moe_residency_)moe_residency_->apply_pending(); }
     void prepare_predictor_exchange() { if(moe_residency_)moe_residency_->prepare_predictor(); }
@@ -759,7 +764,9 @@ public:
     std::vector<std::pair<std::string, double>> memory_metrics() const {
         const auto host = host_experts_->stats();
         const auto residency=moe_residency_?moe_residency_->stats():MoeResidencyManager::Stats{};
-        const auto resident = std::size_t(std::max<int64_t>(0, host_bytes_)) + host.resident_bytes;
+        const auto resident = std::size_t(std::max<int64_t>(0, host_bytes_)) + host.managed_bytes + host.transient_bytes;
+        const auto disk_reads=expert_disk_reads_after_preload();
+        const auto disk_read_bytes=expert_disk_bytes_after_preload();
         std::size_t gpu_weights=0;
         for(const auto& [signature,arena]:arenas_)
             for(const auto& field:arena->fields)gpu_weights+=std::size_t(tensor_nbytes(field));
@@ -768,7 +775,16 @@ public:
             if(arena->packed.defined())transfer_bytes+=std::size_t(tensor_nbytes(arena->packed));
             for(const auto& field:arena->fields)transfer_bytes+=std::size_t(tensor_nbytes(field));
         }
-        return {{"ram_expert_enabled", resident > 0 ? 1.0 : 0.0},
+        const auto cold=ssd_expert_total_bytes_>gpu_weights?ssd_expert_total_bytes_-gpu_weights:0;
+        return {{"ssd_expert_enabled", ssd_experts_ ? 1.0 : 0.0},
+            {"ssd_expert_payload_bytes",double(ssd_experts_ && cold>host.resident_bytes?cold-host.resident_bytes:0)},
+            {"ssd_expert_bytes_read",double(disk_read_bytes)},
+            {"ssd_expert_read_count",double(disk_reads)},
+            {"ram_expert_limit_bytes",double(host.budget_bytes)},
+            {"ram_expert_cache_hits",double(host.hits)},
+            {"ram_expert_cache_misses",double(host.misses)},
+            {"ram_expert_cache_evictions",double(host.evictions)},
+            {"ram_expert_enabled", resident > 0 ? 1.0 : 0.0},
             {"resident_expert_cache_bytes",double(gpu_weights+(kv_expert_loan_?kv_expert_loan_->bytes():0))},
             {"expert_decode_transfer_bytes",double(transfer_bytes)},
             {"expert_direct_cache_capacity_bytes",double(tensor_nbytes(pipeline_direct_cache_storage_))},
@@ -919,7 +935,11 @@ private:
         } catch(const std::ios_base::failure&) {} catch(const std::bad_alloc&) {}
     }
     std::uint64_t expert_disk_reads_after_preload() const;
+    std::uint64_t expert_disk_bytes_after_preload() const;
     bool complete_residency_=false;
+    bool ssd_experts_=false;
+    std::size_t ssd_expert_total_bytes_=0;
+    std::unique_ptr<mfq::HostParallelPool> ssd_read_pool_;
     CudaExecutionConfig config_;
     double ram_pcie_fraction_=0;
     double pipeline_pcie_gbps_=0;

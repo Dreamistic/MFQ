@@ -35,6 +35,19 @@ void wait_coalesced(const MoeHostExpertCache& cache,std::promise<void>& release)
 
 int main() try {
     {
+        MoeHostExpertCache cache(0);
+        int reads=0;
+        const auto load=[&]{++reads;return weight(64,23);};
+        auto first=cache.acquire(key(3),64,load);
+        auto second=cache.acquire(key(3),64,load);
+        check(first==second && reads==1,"active bypassed expert was reread for another token/projection");
+        check(cache.stats().managed_bytes==0 && cache.stats().transient_bytes==64,"bypassed expert accounting duplicated a lease");
+        first.reset();bytes_equal(second,23);second.reset();
+        check(cache.stats().transient_bytes==0,"expired bypassed expert retained its RAM payload");
+        auto next=cache.acquire(key(3),64,load);
+        check(reads==2,"expired transient weak lease returned stale weights");bytes_equal(next,23);
+    }
+    {
         MoeHostExpertCache cache(256);
         check(!cache.find(key(9,-2)),"missing immutable image created a lease");
         cache.acquire(key(0,-2),128,[]{return weight(128,17);});
