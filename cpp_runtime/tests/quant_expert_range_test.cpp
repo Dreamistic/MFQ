@@ -129,6 +129,62 @@ void check_group64_fields(int width) {
     rejected([&]{source.slice_rows_fields(0,1);});
     require(batches==10+int(vectors%3!=0),"group64 field batches were skipped");
 }
+void check_nint_direct_fields(int width,int gs,bool adaptive) {
+    constexpr int rows=34,k=6;
+    auto fixture=mfq::test::fixture(rows,width,gs,k,adaptive);
+    const int groups=(width+gs-1)/gs,padded=groups*gs;
+    std::size_t read_bytes=0;
+    const auto read=[&](std::size_t offset,std::uint8_t* output,std::size_t bytes) {
+        require(offset<=fixture.blob.size() && bytes<=fixture.blob.size()-offset,"NINT direct read exceeded source");
+        std::memcpy(output,fixture.blob.data()+offset,bytes);read_bytes+=bytes;
+    };
+    const mfq::NintRows source(fixture.blob.size(),read,false,[&](const std::vector<mfq::ReadSpan>& spans) {
+        for(const auto& span:spans)read(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
+    });
+    for(const auto range:{std::pair<int,int>{0,1},{1,18},{17,34},{0,34}}) {
+        const auto count=std::size_t(range.second-range.first);
+        const std::array<std::size_t,7> sizes={count*std::size_t(padded)+8,count,count*8,
+            count*groups,count*groups,count*2,count*2};
+        std::array<std::vector<std::uint8_t>,7> fields;
+        std::array<mfq::QuantFieldTarget,7> targets;
+        for(std::size_t f=0;f<7;++f) {
+            fields[f].assign(sizes[f]+2,0xa5);targets[f]={fields[f].data()+1,sizes[f]};
+        }
+        const auto selected=source.slice_rows_blob(range.first,range.second);
+        mfq::copy_nint_runtime_fields(selected,targets);
+        std::vector<std::uint8_t> expected_q(sizes[0],0);
+        std::uint64_t qbit=0;
+        for(int row=range.first;row<range.second;++row) {
+            const auto local=std::size_t(row-range.first);
+            const auto qb=adaptive?(row/4+row*3)%8+1:4;
+            const auto kb=adaptive?k-1+(row*5+1)%4:k;
+            std::int64_t offset;std::memcpy(&offset,targets[2].data+local*8,8);
+            require(targets[1].data[local]==qb && offset==std::int64_t(qbit),"NINT direct q row metadata changed");
+            for(int column=0;column<padded;++column) {
+                const auto value=(row*17+column*11+1)% (1<<qb);
+                for(int bit=0;bit<qb;++bit,++qbit)
+                    expected_q[std::size_t(qbit/8)]|=((value>>bit)&1u)<<(qbit&7);
+            }
+            for(int group=0;group<groups;++group) {
+                require(targets[3].data[local*groups+group]==(row*3+group*5+1)%(1<<kb) &&
+                    targets[4].data[local*groups+group]==(row+group*7)%(1<<kb),"NINT direct subgroup metadata changed");
+            }
+            std::uint16_t scale,minimum;
+            std::memcpy(&scale,targets[5].data+local*2,2);std::memcpy(&minimum,targets[6].data+local*2,2);
+            require(scale==(row%2?0x3800:0x3c00) && minimum==0x3400,"NINT direct neuron anchors changed");
+        }
+        require(std::memcmp(targets[0].data,expected_q.data(),sizes[0])==0,"NINT direct packed q or its guard changed");
+        for(const auto& field:fields)require(field.front()==0xa5 && field.back()==0xa5,"NINT direct copy overwrote its neighbour");
+        --targets[3].bytes;rejected([&]{mfq::copy_nint_runtime_fields(selected,targets);});++targets[3].bytes;
+        auto malformed=selected;malformed.pop_back();
+        rejected([&]{mfq::copy_nint_runtime_fields(malformed,targets);});
+        malformed=selected;malformed.push_back(0);
+        rejected([&]{mfq::copy_nint_runtime_fields(malformed,targets);});
+        malformed=selected;malformed[43]=0x7c;
+        rejected([&]{mfq::copy_nint_runtime_fields(malformed,targets);});
+    }
+}
+
 void append_pool(std::vector<std::uint8_t>& blob,const std::vector<int>& ids,
         const char* dtype,const std::vector<std::uint8_t>& body) {
     mfq::test::append<std::uint32_t>(blob,ids.size());
@@ -162,6 +218,8 @@ mfq::MfeQuantExpertStore memory_store(std::vector<std::uint8_t> blob,
 }
 void self_test() {
     for(int width:{1,7,8,9,23,24,25,53,64,127,128,191,192,193,200,640,2560})check_group64_fields(width);
+    for(bool adaptive:{false,true})for(int width:{53,128,640})for(int gs:{5,21,24,28})
+        check_nint_direct_fields(width,gs,adaptive);
     const auto flat = mfq::test::fixture(52, 53, 5, 6).blob;
     auto packed = std::make_shared<std::vector<std::uint8_t>>(flat.begin(), flat.begin() + 14);
     mfq::test::append<std::uint32_t>(*packed, 3);

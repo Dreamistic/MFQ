@@ -100,14 +100,26 @@ MoeQuantRangeSource::MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStor
 MixedMoePool MoeQuantRangeSource::read_expert(int expert) const {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
     const auto index=store_->expert_pool(expert);
-    if(pinned_arena_)if(auto block=pinned_arena_->allocate(arena_bytes_.at(index))) {
+    if(pinned_arena_) {
+        auto block=pinned_arena_->allocate(arena_bytes_.at(index));
+        std::shared_ptr<void> owner;
+        std::uint8_t* base=nullptr;
+        if(block) {owner=block;base=block->data();}
+        else {
+            // A fragmented or leased interval must retain the same direct
+            // field codec. One pageable allocation avoids constructing and
+            // cloning a second complete set of runtime tensors on this miss.
+            auto storage=std::make_shared<tb::Tensor>(tb::empty({std::int64_t(arena_bytes_.at(index))},
+                tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8)));
+            owner=storage;base=static_cast<std::uint8_t*>(storage->data_ptr());
+        }
         std::vector<tb::Tensor> fields;
         for(const auto& layout:field_layouts_.at(index)) {
             auto storage=std::make_shared<tb::TensorStorage>();
             const auto device=tb::Device{tb::kCPU,0};
-            auto* address=block->data()+layout.offset;
-            storage->owner=block;storage->base=address;storage->bytes=layout.bytes;
-            storage->device=device;storage->pinned=true;
+            auto* address=base+layout.offset;
+            storage->owner=owner;storage->base=address;storage->bytes=layout.bytes;
+            storage->device=device;storage->pinned=bool(block);
             fields.emplace_back(storage,tb::make_contiguous_view(address,layout.shape,layout.dtype,device));
         }
         copy_expert_fields(expert,fields);
@@ -199,6 +211,44 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
         throw std::runtime_error("expert disk copy forbidden after complete residency preload");
     }
     const auto& prototype=metadata_->pools.at(index);
+    if(prototype.family==MixedMoeFamily::Nint && targets.size()==7) {
+        using Clock=std::chrono::steady_clock;
+        const bool profile=profile_ssd_ && preloaded_.load();
+        const auto begin=profile?Clock::now():Clock::time_point{};
+        const auto rows=std::size_t(store_->out_per_expert());
+        std::array<std::vector<std::uint16_t>,2> anchors;
+        for(auto& anchor:anchors)anchor.resize(rows);
+        std::array<mfq::QuantFieldTarget,7> fields;
+        for(std::size_t f=0;f<5;++f)fields[f]={static_cast<std::uint8_t*>(targets[f].data_ptr()),
+            std::size_t(targets[f].numel()*targets[f].element_size())};
+        for(std::size_t f=5;f<7;++f) {
+            if(targets[f].numel()*targets[f].element_size()!=rows*4)
+                throw std::invalid_argument("NINT neuron target size differs");
+            fields[f]={reinterpret_cast<std::uint8_t*>(anchors[f-5].data()),rows*2};
+        }
+        std::size_t source_bytes=0;
+        if(!store_->copy_nint_fields(expert,fields,&source_bytes))
+            throw std::logic_error("NINT range source differs from prototype");
+        const auto read_done=profile?Clock::now():Clock::time_point{};
+        for(std::size_t f=5;f<7;++f) {
+            const auto converted=cpu_f16_to_f32_tensor(anchors[f-5],std::int64_t(rows));
+            std::memcpy(targets[f].data_ptr(),converted.data_ptr(),rows*4);
+        }
+        ++direct_field_reads_;++materializations_;
+        if(preloaded_.load()) {
+            ++disk_reads_after_preload_;
+            disk_bytes_after_preload_.fetch_add(source_bytes,std::memory_order_relaxed);
+        }
+        if(profile) {
+            const auto encoded_time=std::chrono::duration_cast<std::chrono::nanoseconds>(read_done-begin).count();
+            const auto materialize=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_done).count();
+            encoded_ns_.fetch_add(encoded_time,std::memory_order_relaxed);
+            materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
+            nint_materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
+            record_format_io(0,source_bytes,encoded_time,materialize);
+        }
+        return;
+    }
     if(!dense_groups_ && prototype.family==MixedMoeFamily::Nvq && targets.size()==4) {
         using Clock=std::chrono::steady_clock;
         const bool profile=profile_ssd_ && preloaded_.load();

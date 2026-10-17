@@ -18,6 +18,111 @@ template<class T> T value(const std::vector<std::uint8_t>& data,std::size_t offs
 }
 }
 
+void copy_nint_runtime_fields(const std::vector<std::uint8_t>& blob,
+        const std::array<QuantFieldTarget,7>& targets) {
+    if(blob.size()<42)throw std::runtime_error("truncated NINT runtime field source");
+    const bool adaptive=bool(blob[0]&128);
+    const auto nominal=blob[0]&127,sub_bits=int(blob[1]);
+    const auto gs=value<std::int32_t>(blob,2),width=value<std::int32_t>(blob,10);
+    const auto rows=value<std::uint32_t>(blob,34),groups=value<std::uint32_t>(blob,38);
+    if(nominal<1 || nominal>8 || sub_bits<1 || sub_bits>8 || gs<=0 || width<=0 || !rows || !groups ||
+        value<std::int32_t>(blob,6)!=0 || value<std::uint32_t>(blob,14)!=2 ||
+        value<std::int64_t>(blob,18)!=rows || value<std::int64_t>(blob,26)!=width ||
+        (std::uint64_t(width)+gs-1)/gs!=groups)
+        throw std::runtime_error("invalid NINT runtime field geometry");
+    const std::uint64_t values=std::uint64_t(groups)*gs;
+    std::size_t offset=42;
+    const auto bytes_for=[](std::uint64_t count,int bits) {
+        if(count>(std::numeric_limits<std::uint64_t>::max()-7)/bits ||
+            (count*bits+7)/8>std::numeric_limits<std::size_t>::max())
+            throw std::overflow_error("NINT runtime field size overflow");
+        return std::size_t((count*bits+7)/8);
+    };
+    const auto take=[&](std::size_t bytes) {
+        if(offset>blob.size() || bytes>blob.size()-offset)throw std::runtime_error("truncated NINT runtime field stream");
+        const auto* start=blob.data()+offset;offset+=bytes;return start;
+    };
+    const auto* neuron_scale=take(std::size_t(rows)*2);
+    const auto* neuron_min=take(std::size_t(rows)*2);
+    const auto unpack=[](const std::uint8_t* stream,std::size_t bytes,std::uint64_t bit,int bits) {
+        const auto byte=std::size_t(bit/8);
+        std::uint32_t word=stream[byte];
+        if(byte+1<bytes)word|=std::uint32_t(stream[byte+1])<<8;
+        return std::uint8_t((word>>(bit&7))&((1u<<bits)-1));
+    };
+    std::vector<std::uint8_t> ks(rows,0),qs(rows,0);
+    std::array<std::uint32_t,4> kcounts{};
+    std::array<std::uint32_t,8> qcounts{};
+    if(adaptive) {
+        const auto bytes=bytes_for(rows,2);const auto* stream=take(bytes);
+        for(std::size_t row=0;row<rows;++row)ks[row]=unpack(stream,bytes,row*2,2);
+    }
+    for(const auto k:ks)++kcounts[k];
+    struct Stream {const std::uint8_t* data=nullptr;std::size_t bytes=0;};
+    std::array<Stream,4> scale{},minimum{};
+    for(int k=0;k<4;++k)if(kcounts[k]) {
+        const auto bits=adaptive?sub_bits-1+k:sub_bits;
+        if(bits<1 || bits>8)throw std::runtime_error("invalid NINT runtime subgroup width");
+        const auto bytes=bytes_for(std::uint64_t(kcounts[k])*groups,bits);
+        scale[k]={take(bytes),bytes};minimum[k]={take(bytes),bytes};
+    }
+    if(adaptive) {
+        const auto bytes=bytes_for(rows,3);const auto* stream=take(bytes);
+        for(std::size_t row=0;row<rows;++row)qs[row]=unpack(stream,bytes,row*3,3);
+    }
+    for(const auto q:qs)++qcounts[q];
+    std::array<Stream,8> qstreams{};
+    std::uint64_t qbits=0;
+    for(int q=0;q<8;++q)if(qcounts[q]) {
+        const auto bits=adaptive?q+1:nominal;
+        if(values>std::numeric_limits<std::uint64_t>::max()/qcounts[q])
+            throw std::overflow_error("NINT runtime value count overflow");
+        const auto count=std::uint64_t(qcounts[q])*values;
+        const auto bytes=bytes_for(count,bits);
+        qstreams[q]={take(bytes),bytes};
+        if(count*bits>std::uint64_t(INT64_MAX)-qbits)throw std::overflow_error("NINT runtime bit offsets overflow");
+        qbits+=count*bits;
+    }
+    if(offset!=blob.size())throw std::runtime_error("trailing NINT runtime field bytes");
+    const std::array<std::size_t,7> sizes={bytes_for(qbits,1)+8,rows,std::size_t(rows)*8,
+        std::size_t(rows)*groups,std::size_t(rows)*groups,std::size_t(rows)*2,std::size_t(rows)*2};
+    for(int f=0;f<7;++f)
+        if((f==0?targets[f].bytes<sizes[f]:targets[f].bytes!=sizes[f]) ||
+            (targets[f].bytes && !targets[f].data))throw std::invalid_argument("NINT runtime field target size differs");
+    for(const auto* anchors:{neuron_scale,neuron_min})for(std::size_t row=0;row<rows;++row) {
+        std::uint16_t anchor;std::memcpy(&anchor,anchors+row*2,2);
+        if((anchor&0x7c00u)==0x7c00u)throw std::runtime_error("NINT neuron metadata must be finite");
+    }
+    std::memset(targets[0].data,0,targets[0].bytes);
+    std::memcpy(targets[5].data,neuron_scale,sizes[5]);std::memcpy(targets[6].data,neuron_min,sizes[6]);
+    std::array<std::uint32_t,4> knext{};
+    std::array<std::uint32_t,8> qnext{};
+    std::uint64_t destination=0;
+    for(std::size_t row=0;row<rows;++row) {
+        const auto q=qs[row],k=ks[row];const auto qb=adaptive?q+1:nominal,kb=adaptive?sub_bits-1+k:sub_bits;
+        targets[1].data[row]=std::uint8_t(qb);
+        const auto bit_offset=std::int64_t(destination);std::memcpy(targets[2].data+row*8,&bit_offset,8);
+        auto first=std::uint64_t(qnext[q]++)*values*qb,length=values*qb;
+        const auto* input=qstreams[q].data;
+        if(!((first|destination|length)&7)) {
+            std::memcpy(targets[0].data+std::size_t(destination/8),input+std::size_t(first/8),std::size_t(length/8));
+            destination+=length;
+        } else while(length) {
+            const auto source_shift=unsigned(first&7),destination_shift=unsigned(destination&7);
+            const auto bits=unsigned(std::min<std::uint64_t>(length,std::min(8-source_shift,8-destination_shift)));
+            const auto v=(input[std::size_t(first/8)]>>source_shift)&((1u<<bits)-1);
+            targets[0].data[std::size_t(destination/8)]|=std::uint8_t(v<<destination_shift);
+            first+=bits;destination+=bits;length-=bits;
+        }
+        const auto begin=std::uint64_t(knext[k]++)*groups*kb;
+        for(int f=3;f<5;++f) {
+            const auto& stream=f==3?scale[k]:minimum[k];
+            for(std::size_t group=0;group<groups;++group)
+                targets[f].data[row*groups+group]=unpack(stream.data,stream.bytes,begin+group*kb,kb);
+        }
+    }
+}
+
 std::shared_ptr<MfeQuantExpertStore> make_packed_nint_expert_store(
         std::size_t bytes, MfeQuantExpertStore::Read read) {
     if (!read || bytes < 50) throw std::runtime_error("truncated packed NINT expert header");
@@ -185,6 +290,18 @@ bool MfeQuantExpertStore::copy_nvq_fields(int expert,const std::array<NvqRows::F
     if(!pool.nvq)return false;
     const auto begin=std::int64_t(owner.local)*output_;
     return pool.nvq->copy_rows_fields(begin,begin+output_,targets,source_bytes);
+}
+
+bool MfeQuantExpertStore::copy_nint_fields(int expert,const std::array<QuantFieldTarget,7>& targets,
+        std::size_t* source_bytes) const {
+    if(expert<0 || expert>=experts_)throw std::out_of_range("mixed expert direct field ID");
+    const auto& owner=owners_[expert];const auto& pool=pools_[owner.pool];
+    if(!pool.nint)return false;
+    const auto begin=std::int64_t(owner.local)*output_;
+    const auto blob=pool.nint->slice_rows_blob(begin,begin+output_);
+    copy_nint_runtime_fields(blob,targets);
+    if(source_bytes)*source_bytes=blob.size();
+    return true;
 }
 
 void MfeQuantExpertStore::visit_pool_experts(std::size_t index,

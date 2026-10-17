@@ -14,6 +14,13 @@ class HostParallelPool;
 class MfeQuantRangeUnsupported : public std::runtime_error {
 public: using std::runtime_error::runtime_error;
 };
+struct QuantFieldTarget {std::uint8_t* data=nullptr;std::size_t bytes=0;};
+// Convert a compact canonical NINT row range into row-order runtime fields.
+// Targets: packed q (+8 guard bytes), q widths, int64 bit offsets, unpacked
+// subgroup scale/min, and raw FP16 neuron scale/min.
+void copy_nint_runtime_fields(const std::vector<std::uint8_t>& blob,
+    const std::array<QuantFieldTarget,7>& targets);
+
 struct MfeQuantExpert {
     std::string dtype;
     std::vector<std::uint8_t> payload;
@@ -39,6 +46,8 @@ public:
     std::optional<NvqRows::Fields> read_nvq_fields(int expert) const;
     bool copy_nvq_fields(int expert,const std::array<NvqRows::FieldTarget,4>& targets,
                          std::size_t* source_bytes=nullptr) const;
+    bool copy_nint_fields(int expert,const std::array<QuantFieldTarget,7>& targets,
+                          std::size_t* source_bytes=nullptr) const;
     // Startup-only sequential pool read; the temporary canonical pool is
     // released before advancing to the next pool. Visitors own each leaf.
     // An optional executor slices immutable pool bytes concurrently; callers

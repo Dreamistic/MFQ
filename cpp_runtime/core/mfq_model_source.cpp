@@ -1,10 +1,14 @@
 #include "mfq/mfq_model_source.h"
 #include "mfq/async_range_reader.h"
+#include "mfq/mapped_read_profile.h"
 
 #include "mfq_format_compat.h"
 #include "mfq_legacy_tensor_names.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cctype>
 #include <cstring>
 #include <cstdio>
@@ -42,11 +46,14 @@ constexpr std::uint64_t kMaxStringBytes = std::uint64_t{64} << 20;
 constexpr std::uint32_t kMaxMetadataEntries = std::uint32_t{1} << 16;
 constexpr std::uint32_t kMaxRecordEntries = std::uint32_t{1} << 20;
 constexpr std::string_view kAssetPrefix = "__mfq_asset__/";
+std::array<std::atomic<std::uint64_t>,5> mapped_read_totals{};
+using MappedClock=std::chrono::steady_clock;
 
 class MappedTensorRange {
     void* view_=nullptr;
     std::size_t mapped_bytes_=0,prefix_=0;
     std::uint64_t bytes_=0;
+    bool profile_=false;
 #ifdef _WIN32
     HANDLE file_=INVALID_HANDLE_VALUE,mapping_=nullptr;
 #else
@@ -64,6 +71,8 @@ class MappedTensorRange {
     }
 public:
     explicit MappedTensorRange(const MfqStoredRecord& record):bytes_(record.tensor.nbytes) {
+        const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");
+        profile_=profile && profile[0]=='1';
         if(!bytes_)return;
         try {
             std::uint64_t granularity=0,file_bytes=0;
@@ -108,7 +117,13 @@ public:
         if(offset>bytes_ || size>bytes_-offset)throw std::out_of_range("mapped tensor row range is out of bounds");
         if(!size)return;
         if(!destination)throw std::invalid_argument("mapped tensor destination is null");
+        const auto started=profile_?MappedClock::now():MappedClock::time_point{};
         std::memcpy(destination,static_cast<const std::byte*>(view_)+prefix_+static_cast<std::size_t>(offset),size);
+        if(profile_) {
+            mapped_read_totals[1].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(MappedClock::now()-started).count(),std::memory_order_relaxed);
+            mapped_read_totals[2].fetch_add(size,std::memory_order_relaxed);
+            mapped_read_totals[3].fetch_add(1,std::memory_order_relaxed);
+        }
     }
     void read_batch(const std::vector<ReadSpan>& spans)const {
         // Check the complete batch before touching any destination. A failed
@@ -123,6 +138,7 @@ public:
         // Like Strata's PLE prefetch, submit the independent pages together.
         // NINT stores q, sub-scale/min and neuron anchors in separate streams;
         // sequential mapped reads otherwise fault those five streams in turn.
+        const auto started=profile_?MappedClock::now():MappedClock::time_point{};
         std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
         ranges.reserve(std::min<std::size_t>(spans.size(),4096));
         const auto prefetch=[&] {
@@ -134,6 +150,10 @@ public:
             if(ranges.size()==4096)prefetch();
         }
         prefetch();
+        if(profile_) {
+            mapped_read_totals[0].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(MappedClock::now()-started).count(),std::memory_order_relaxed);
+            mapped_read_totals[4].fetch_add(1,std::memory_order_relaxed);
+        }
 #endif
         for(const auto& span:spans)if(span.size)read(span.offset,span.destination,span.size);
     }
@@ -440,6 +460,12 @@ struct MfqModelSource::Impl {
     std::unordered_map<std::string, std::size_t> records_by_name;
     std::unordered_map<std::string, std::size_t> tensors_by_name;
 };
+
+std::array<std::uint64_t,5> mapped_tensor_read_profile() {
+    std::array<std::uint64_t,5> result{};
+    for(std::size_t i=0;i<result.size();++i)result[i]=mapped_read_totals[i].load(std::memory_order_relaxed);
+    return result;
+}
 
 MfqModelSource::MfqModelSource(std::filesystem::path requested, FileReadMode mode)
     : impl_(std::make_unique<Impl>()) {

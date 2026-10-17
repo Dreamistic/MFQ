@@ -177,6 +177,20 @@ int main(int argc,char** argv)try {
         Run candidate(path,true,std::string(format)!="nvq2j",combined,prefix);
         const int width=reference.sources[0]->metadata()->neuron_len;
         const int experts=reference.sources[0]->metadata()->n_experts;
+        {
+            auto pageable=std::make_shared<MoeQuantRangeSource>(
+                std::make_shared<mfq::MfeQuantExpertStore>(candidate.sources[0]->store()));
+            pageable->bind_pinned_arena(std::make_shared<MoePinnedExpertArena>(16));
+            const auto expert=31%experts;
+            const auto actual=moe_cache_fields(pageable->read_expert(expert));
+            const auto decoded=moe_cache_fields(pageable->decode_expert(expert,pageable->store().read_expert(expert)));
+            check(actual.size()==decoded.size(),"pageable expert field count differs");
+            for(std::size_t f=0;f<actual.size();++f)
+                check(actual[f].numel()==decoded[f].numel() &&
+                    actual[f].scalar_type()==decoded[f].scalar_type() && (!actual[f].numel() ||
+                    !std::memcmp(actual[f].data_ptr(),decoded[f].data_ptr(),actual[f].numel()*actual[f].element_size())),
+                    "pageable expert fields changed when the pinned arena could not fit an expert");
+        }
         if(candidate.hybrid)for(std::size_t p=0;p<candidate.sources.size();++p)for(const int e:{31%experts,32%experts}) {
             const auto& source=candidate.sources[p];
             const auto direct=source->read_expert(e);

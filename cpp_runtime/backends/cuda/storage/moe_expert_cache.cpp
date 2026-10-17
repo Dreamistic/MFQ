@@ -4,6 +4,7 @@
 #include "mfq_cuda_resident_allocations.h"
 #include "mfq/host_parallel.h"
 #include "mfq/runtime.h"
+#include "mfq/mapped_read_profile.h"
 #include <thread>
 #include <map>
 #include <cmath>
@@ -1296,6 +1297,14 @@ std::array<std::uint64_t,4> MoeExpertCache::expert_disk_timings() const {
 }
 
 void MoeExpertCache::append_expert_format_metrics(std::vector<std::pair<std::string,double>>& metrics) const {
+    const auto mapped=mfq::mapped_tensor_read_profile();
+    if(mapped[3]) {
+        metrics.emplace_back("ssd_mapped_prefetch_ms",double(mapped[0])/1e6);
+        metrics.emplace_back("ssd_mapped_copy_ms",double(mapped[1])/1e6);
+        metrics.emplace_back("ssd_mapped_read_bytes",double(mapped[2]));
+        metrics.emplace_back("ssd_mapped_read_calls",double(mapped[3]));
+        metrics.emplace_back("ssd_mapped_batch_calls",double(mapped[4]));
+    }
     MoeQuantRangeSource::FormatIoStats totals{};
     for(const auto& source:sources_)if(source->quant_source_) {
         const auto values=source->quant_source_->format_io_stats();
