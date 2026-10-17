@@ -298,6 +298,35 @@ int main(int argc,char** argv)try {
         Run candidate(path,true,std::string(format)!="nvq2j",combined,prefix);
         const int width=reference.sources[0]->metadata()->neuron_len;
         const int experts=reference.sources[0]->metadata()->n_experts;
+        if(prefix.empty() && std::string(format)=="nint") {
+            auto* quant=candidate.sources[0].get();bool failed=false;
+            try{candidate.cache->queue_ssd_expert_copies({{quant,31,{}}}).get();}
+            catch(const std::invalid_argument&){failed=true;}
+            check(failed,"SSD prefill worker lost a read failure");
+            auto held=quant->acquire_expert(31);
+            const auto before=candidate.metrics();
+            const auto cached=candidate.cache->read_ssd_experts({{quant,31},{quant,31}});
+            const auto after=candidate.metrics();
+            check(cached.size()==2 && cached[0]==held && cached[1]==held &&
+                after.at("ssd_ram_read_fast_hits")==before.at("ssd_ram_read_fast_hits")+2 &&
+                after.at("ssd_scheduled_read_jobs")==before.at("ssd_scheduled_read_jobs"),
+                "RAM hits launched SSD worker jobs or lost their shared lease");
+            const auto expected=moe_cache_fields(quant->read_expert(31));
+            std::array<std::vector<tb::Tensor>,2> targets;
+            std::array<std::future<void>,2> reads;
+            for(int i=0;i<2;++i) {
+                for(const auto& field:expected) {
+                    auto target=field.clone();if(target.nbytes())std::memset(target.data_ptr(),0xa5,target.nbytes());
+                    targets[i].push_back(std::move(target));
+                }
+                reads[i]=candidate.cache->queue_ssd_expert_copies({{quant,31,targets[i]}});
+            }
+            for(int i=0;i<2;++i) {
+                reads[i].get();
+                for(std::size_t f=0;f<expected.size();++f)check(std::memcmp(targets[i][f].data_ptr(),expected[f].data_ptr(),expected[f].nbytes())==0,
+                    "SSD prefill worker did not recover or changed a queued packet");
+            }
+        }
         for(const auto& quant:candidate.sources)for(std::size_t pool=0;pool<quant->store().pool_count();++pool) {
             if(quant->metadata()->pools[pool].family!=MixedMoeFamily::Nvq)continue;
             const auto& members=quant->store().pool_expert_ids(pool);

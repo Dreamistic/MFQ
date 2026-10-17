@@ -17,6 +17,7 @@
 struct MoeFfnPrefillHostWorkspace;
 struct CudaProfiler;
 class MoePinnedExpertArena;
+struct MoeSsdPrefillReader;
 class MoeExpertCache {
 public:
     struct PrefillCopySubmission {
@@ -104,6 +105,7 @@ public:
     }
 
     ~MoeExpertCache() {
+        ssd_prefill_reader_.reset();
         try{finish_prefill_copies();}catch(const std::exception& error) {
             std::cerr<<"runtime_prefill_copy destructor_error="<<error.what()<<'\n';
         }
@@ -362,6 +364,7 @@ public:
     std::vector<MoeHostExpertCache::Lease> read_ssd_experts(const std::vector<SsdExpertRequest>& requests,bool background=false);
     struct SsdExpertCopy {MoeQuantRangeSource* source;int expert;std::vector<mfq_tensor_backend::Tensor> fields;};
     void copy_ssd_experts(const std::vector<SsdExpertCopy>& requests);
+    std::future<void> queue_ssd_expert_copies(std::vector<SsdExpertCopy> requests);
     void calibrate_pipeline_pcie();
     bool complete_residency() const noexcept { return complete_residency_; }
     bool pipeline_ready() const noexcept { return complete_residency_ || ssd_experts_; }
@@ -807,6 +810,8 @@ public:
             {"ssd_expert_read_count",double(disk_reads)},
             {"ssd_direct_field_reads",double(direct_reads)},
             {"ssd_bulk_field_reads",double(expert_bulk_field_reads())},
+            {"ssd_ram_read_fast_hits",double(ssd_ram_read_fast_hits_.load())},
+            {"ssd_scheduled_read_jobs",double(ssd_scheduled_read_jobs_.load())},
             {"ssd_reuse_promotions",double(kv_reuse.promotions)},
             {"ssd_reuse_policy_enabled",kv_reuse.enabled?1.0:0.0},
             {"ssd_ram_reuse_policy_enabled",host.reuse_priority?1.0:0.0},
@@ -1002,6 +1007,8 @@ private:
     std::size_t ssd_expert_total_bytes_=0;
     std::unique_ptr<mfq::HostParallelPool> ssd_read_pool_;
     std::unique_ptr<mfq::HostParallelPool> ssd_background_read_pool_;
+    std::shared_ptr<MoeSsdPrefillReader> ssd_prefill_reader_;
+    std::atomic<std::uint64_t> ssd_ram_read_fast_hits_{0},ssd_scheduled_read_jobs_{0};
     bool pipeline_residency_suspended_=false;
     CudaExecutionConfig config_;
     double ram_pcie_fraction_=0;

@@ -564,6 +564,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         initialize_prefill_stream(execution,ids);
         auto& stream=*prefill_stream_;auto& stats=cache_->stats_;
         const auto plan_before=stats.pipeline_plan_ns,fetch_before=stats.pipeline_fetch_ns;
+        const auto route_before=stats.pipeline_route_wait_ns;
         std::uint64_t read_join_ns=0,buffer_wait_ns=0,compute_submit_ns=0;
         const int prefill_group_size=stream.group_size;
         const int tokens=int(ids.size(0)),routes=int(ids.size(1)),entries=tokens*routes;
@@ -614,9 +615,13 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         std::vector<Group> work(groups);stats.pipeline_prefill_groups+=groups;
         struct DrainFailedReads {
             cudaStream_t stream;
+            std::vector<Group>& work;
             int exceptions=std::uncaught_exceptions();
-            ~DrainFailedReads(){if(std::uncaught_exceptions()>exceptions)(void)cudaStreamSynchronize(stream);}
-        } drain{cache_->weight_stream_};
+            ~DrainFailedReads(){
+                for(auto& group:work)if(group.pending.valid())group.pending.wait();
+                if(std::uncaught_exceptions()>exceptions)(void)cudaStreamSynchronize(stream);
+            }
+        } drain{cache_->weight_stream_,work};
         std::array<int,3> map_offset{};int map_stride=0;
         for(int p=0;p<3;++p) {
             map_offset[p]=map_stride;
@@ -805,9 +810,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             for(int p=0;p<3;++p)for(const auto& upload:work[g].uploads[p])
                 requests.push_back({sources_[p]->quant_source_.get(),upload.expert,upload.fields});
             if(requests.empty())return;
-            work[g].pending=std::async(std::launch::async,[cache=cache_,requests=std::move(requests)] {
-                cache->copy_ssd_experts(requests);
-            });
+            work[g].pending=cache_->queue_ssd_expert_copies(std::move(requests));
         };
         const auto retire_cpu_group=[&](int g) {
             const auto wait_started=Clock::now();
@@ -977,9 +980,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         cache_->moe_residency_->record_prefill_routes(sources_[0]->layer_id_,
             ids.contiguous().data_ptr<int32_t>(),tokens,routes,stream_);
         if(cache_->ssd_experts())if(const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");profile && profile[0]=='1')
-            std::fprintf(stderr,"moe_ssd_prefill_host layer=%d groups=%d tokens=%d wall_ms=%.3f plan_ms=%.3f read_join_ms=%.3f buffer_wait_ms=%.3f compute_submit_ms=%.3f fetch_ms=%.3f\n",
+            std::fprintf(stderr,"moe_ssd_prefill_host layer=%d groups=%d tokens=%d wall_ms=%.3f plan_ms=%.3f read_join_ms=%.3f buffer_wait_ms=%.3f compute_submit_ms=%.3f fetch_ms=%.3f route_wait_ms=%.3f\n",
                 sources_[0]->layer_id_,groups,tokens,elapsed(started)/1e6,(stats.pipeline_plan_ns-plan_before)/1e6,
-                read_join_ns/1e6,buffer_wait_ns/1e6,compute_submit_ns/1e6,(stats.pipeline_fetch_ns-fetch_before)/1e6);
+                read_join_ns/1e6,buffer_wait_ns/1e6,compute_submit_ns/1e6,(stats.pipeline_fetch_ns-fetch_before)/1e6,
+                (stats.pipeline_route_wait_ns-route_before)/1e6);
         MFQ_CUDA_CHECK(cudaGetLastError());return output;
     }
         struct LayerPrefill {
