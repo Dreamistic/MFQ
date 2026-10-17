@@ -62,7 +62,7 @@ LANGUAGES = {
         "generation_no_mtp": "Generation · MTP off",
         "generation_mtp": "Generation · MTP on",
         "prefill_note": "¹ MFQ: published prefill value; others: MTP off. oMLX includes first-token overhead.",
-        "comparison_note": "Shaded rows: similar weight size. Draft setups differ; oMLX uses adaptive MTP. See notes.",
+        "comparison_note": "Shaded rows: selected comparison tiers. Draft setups differ; oMLX uses adaptive MTP. See notes.",
     },
     "zh-CN": {
         "title": "Metal 运行时速度对比",
@@ -73,7 +73,7 @@ LANGUAGES = {
         "generation_no_mtp": "生成速度 · 关闭 MTP",
         "generation_mtp": "生成速度 · 开启 MTP",
         "prefill_note": "¹ MFQ 为已发布的提示词处理值；其余使用 MTP 关闭值。oMLX 计时包含首 token 开销。",
-        "comparison_note": "浅色底纹标出相近体积的档位；草稿配置不同，oMLX 使用自适应 MTP。详见基准说明。",
+        "comparison_note": "浅色底纹标出重点对比档位；草稿配置不同，oMLX 使用自适应 MTP。详见基准说明。",
     },
 }
 GROUPS = (
@@ -136,6 +136,7 @@ def selected_metric(row, metric):
 def comparable_size(row):
     return (row["method"], row["tier"]) in (
         ("mfq", "V3-XXS"), ("gsq-rco", "IQ3_S"),
+        ("jundot-oq", "oQ3.5e"),
     )
 
 
@@ -188,7 +189,8 @@ def generate(locale, text):
     for row, y in ROWS:
         highlight = comparable_size(row)
         if highlight:
-            tint = {"mfq": C["accent_soft"], "gsq-rco": "#eef1f8"}[row["method"]]
+            tint = {"mfq": C["accent_soft"], "gsq-rco": "#eef1f8",
+                    "jundot-oq": "#f1eef6"}[row["method"]]
             surface(fig, 64, y - 17, 1472, 34, tint, radius=6, zorder=0)
         method = {"mfq": "", "gsq-rco": "GSQ-RCO · ", "unsloth-ud": "Unsloth · ",
                   "jundot-oq": "Jundot · "}[row["method"]]

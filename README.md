@@ -135,11 +135,13 @@ Each runtime's tested quantization tiers are shown separately.
   <img src="./docs/figures/qwen38-flash-next-metal-runtime-comparison.svg" alt="Qwen3.8-Flash-Next on M5 Max: MFQ, Strata, llama.cpp and oMLX prompt processing and generation with MTP off and on, across 17 runtime/checkpoint configurations" width="1100">
 </p>
 
-Shading and bold labels mark a comparable-size pair:
-**MFQ V3-XXS (82.0 GB)** and **GSQ-RCO IQ3_S (83.6 GB)**.
+Shading and bold labels mark **MFQ V3-XXS (82.0 GB)** and the selected
+comparison tiers: **GSQ-RCO IQ3_S (83.6 GB)** and **Jundot oQ3.5e (about 93.9 GB)**.
+IQ3_S has a similar weight size to V3-XXS; oQ3.5e is larger.
 These weight sizes exclude the vision encoder and MTP head.
 With MTP enabled, V3-XXS reaches **105.4 tok/s**, while IQ3_S reaches
 **99.6 tok/s** in Strata and **59.3 tok/s** in llama.cpp.
+oQ3.5e reaches **111.0 tok/s** in oMLX with adaptive MTP.
 
 The MFQ source gives one prefill value per tier; all other prefill bars use
 MTP-off measurements. oMLX uses the official macOS 26/27 DMG with native NAX
