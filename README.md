@@ -116,6 +116,14 @@ followed by Gate, Up and Down, on a shared color scale.
 
 </details>
 
+MFQ Studio's built-in quantization visualization makes it easy to explore
+the precision allocation of any MoE checkpoint, with detailed views across
+layers, experts, and individual Gate, Up and Down projections.
+
+<p align="center">
+  <img src="./docs/figures/mfq-studio-analysis-en.png" alt="MFQ Studio Analysis: checkpoint architecture, model structure and projection-level precision details" width="1100">
+</p>
+
 Our calibration method is open source; see
 [Beyond Expert Rankings: Contrast Calibration for Mixed-Precision MoE Quantization](https://arxiv.org/abs/2610.20353).
 For BibTeX, see [Citation](#citation).

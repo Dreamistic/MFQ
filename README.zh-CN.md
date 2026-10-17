@@ -107,6 +107,13 @@ Gate、Up、Down 精度，四张热力图使用同一色阶。
 
 </details>
 
+MFQ Studio 原生集成量化可视化功能，可直观、详细地查看任意 MoE 检查点的
+精度分配，从各层、各专家一直细化到 Gate、Up、Down 投影。
+
+<p align="center">
+  <img src="./docs/figures/mfq-studio-analysis-zh.png" alt="MFQ Studio 分析：检查点架构、模型结构与投影级精度分配明细" width="1100">
+</p>
+
 我们的校准方法已开源，详见论文
 [Beyond Expert Rankings: Contrast Calibration for Mixed-Precision MoE Quantization](https://arxiv.org/abs/2610.20353)。
 BibTeX 格式见[引用](#引用)。
