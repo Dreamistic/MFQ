@@ -59,6 +59,9 @@ public:
     bool contains(mfq::MoeCacheKey key) const;
     // Read an already cached immutable image without invoking a loader.
     Lease find(mfq::MoeCacheKey key,bool touch=true);
+    // A dispatch preflight must not wait for another key's RAM publication.
+    // Busy keys remain eligible for the normal parallel acquisition path.
+    Lease try_find(mfq::MoeCacheKey key,bool touch=true);
     MoeHostExpertCacheStats stats() const;
     // A streaming scan must not evict repeatedly consumed decoded images.
     void enable_reuse_priority();

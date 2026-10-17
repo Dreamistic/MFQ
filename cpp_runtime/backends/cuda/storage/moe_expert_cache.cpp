@@ -598,7 +598,7 @@ std::vector<MoeHostExpertCache::Lease> MoeExpertCache::read_ssd_experts(
     std::uint64_t hits=0;
     for(std::size_t i=0;i<requests.size();++i) {
         const auto& [source,expert]=requests[i];
-        if(const auto& cache=source->host_cache())leases[i]=cache->find(source->host_key(expert));
+        if(const auto& cache=source->host_cache())leases[i]=cache->try_find(source->host_key(expert),!background);
         if(leases[i])++hits;
         else {if(missing.empty())missing.reserve(requests.size());missing.push_back(i);}
     }

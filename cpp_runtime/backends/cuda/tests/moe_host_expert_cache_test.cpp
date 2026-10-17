@@ -357,6 +357,10 @@ int main() try {
             }catch(const std::runtime_error&){return fail;}
         });
         entered.get_future().wait();
+        auto preflight=std::async(std::launch::async,[&] {
+            return !cache.try_find(key(0)) && !cache.try_find(key(1)) && bool(cache.try_find(key(7),false));
+        });
+        const bool preflight_ready=preflight.wait_for(std::chrono::seconds(1))==std::future_status::ready;
         auto unrelated=std::async(std::launch::async,[&] {
             bytes_equal(cache.acquire(key(7),64,[]{throw std::runtime_error("unrelated reread");return weight(64,0);}),7);
             bytes_equal(cache.acquire(key(8),64,[]{return weight(64,8);}),8);
@@ -373,6 +377,7 @@ int main() try {
         // global-lock regression; future destruction must never deadlock.
         release.set_value();
         check(exchange.get(),"keyed publication/rollback failed");
+        check(preflight_ready && preflight.get(),"RAM preflight waited for a key publication or read partially exchanged fields");
         check(unrelated_ready && unrelated.get(),"unrelated host expert was blocked or accounting changed");
         auto old=old_reader.get(),next=new_reader.get();
         check(old_blocked && new_blocked,"reader saw partially exchanged RAM");

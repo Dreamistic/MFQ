@@ -143,6 +143,16 @@ MoeHostExpertCache::Lease MoeHostExpertCache::find(mfq::MoeCacheKey key,bool tou
     return found->second.value;
 }
 
+MoeHostExpertCache::Lease MoeHostExpertCache::try_find(mfq::MoeCacheKey key,bool touch) {
+    std::unique_lock lock(impl_->mutex,std::try_to_lock);
+    if(!lock.owns_lock() || impl_->exchanging.contains(key))return {};
+    const auto found=impl_->entries.find(key);
+    if(found==impl_->entries.end())return {};
+    if(touch)impl_->touch(key,found->second);
+    ++impl_->counters.hits;
+    return found->second.value;
+}
+
 void MoeHostExpertCache::preserve_resident_experts() {
     std::lock_guard lock(impl_->mutex);
     impl_->preserve=true;
