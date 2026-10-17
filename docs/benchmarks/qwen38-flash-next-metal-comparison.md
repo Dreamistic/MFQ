@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next: Metal runtime comparison
 
 This comparison collects 17 runtime/checkpoint configurations from
-MFQ-Publicity revision `9b7c1f7900f1fa877eecf4b25076e3a048748f4b`.
+MFQ-Publicity revision `f2f9b0fa00005740097b87bd2612a2b92d21bbe8`.
 All reported results use an Apple M5 Max with a 40-core GPU and 128 GB memory.
 The Strata, llama.cpp and oMLX protocols identify the 4K Python-code input as the
 same input used for the MFQ measurements.
@@ -32,6 +32,15 @@ Strata is slightly faster: 72.8 tok/s versus MFQ's 70.8 tok/s; llama.cpp
 reports 45.4 tok/s. The MTP comparison includes each runtime's draft setup,
 as described below.
 
+The second highlighted pair is MFQ V4-XS (93.672 GB) and Jundot oQ3.5e
+(approximately 93.856 GB). The oQ3.5e size adds the rounded storage figures
+for the language backbone (61.856 GB) and N-gram embedding (32.000 GB) in its
+[revision-pinned model card](https://huggingface.co/Jundot/Qwen3.8-Flash-Next-oQ3.5e-mtp/blob/e8216051d1a75ec4a523ed8c6b0ed4a01667bcda/README.md),
+excluding the vision encoder and MTP head to match the MFQ size convention.
+With MTP enabled, V4-XS generates at 96.7 tok/s and oQ3.5e at 111.0 tok/s;
+with MTP off, their rates are 67.7 and 61.5 tok/s, respectively. Similar
+weight size does not imply the same quality or drafting policy.
+
 ## Measurement conditions
 
 The baseline workload uses 4,096 input tokens, 128 generated tokens, greedy
@@ -45,8 +54,10 @@ reuse is zero, and each measured run follows 60 seconds idle. Prompt processing
 uses the engine's prompt time. Generation measures the 127 token intervals
 between the first and last emitted tokens.
 
-oMLX also excludes warmup, loading and compilation, with zero prefix reuse
-and 60 seconds idle before each measured run. Its prefill timing includes
+oMLX also excludes warmup, loading and compilation, with zero prefix reuse.
+Its cooldown is 60 seconds for oQ2.5e and oQ3.5e, and 20 seconds for oQ4e
+with full-speed fans. The official 0.5-second GPU keep-warm tick remains
+active during the cooldown. Its prefill timing includes
 first-token overhead: 4,096 divided by the wall-clock time to the first
 producer-generated token. Generation uses 127 intervals between the first
 and last producer-generated token timestamps. These timings come from the
@@ -57,7 +68,7 @@ native streaming API, without HTTP transport or profiling.
 | MFQ | Not specified in the source table | Not specified | Not specified in the source table |
 | Strata | `v0.1.44.1` / `296b59d2` | Two; total tokens divided by total measured time | Q2_0 draft experts, default CJK vocabulary shortlist, `spec=2`: one draft token per round |
 | llama.cpp | `f74e2fa6a31cc33ab4ee4ae516641cfe62df3924` | One | Self-contained Unsloth Q8_0 MTP head, one draft token per round |
-| oMLX | `0.7.1.dev2`; MLX `0.32.4`; mlx-lm `0.31.4.dev132+g94cdcae13` | One | Each checkpoint's included draft head; default adaptive MTP, maximum draft depth 3; controller can reduce or pause drafting |
+| oMLX | Official macOS 26/27 `0.7.1.dev2` DMG with native NAX kernels; MLX `0.32.4`; mlx-lm `0.31.4.dev132+g94cdcae13` | One | Each checkpoint's included draft head; default adaptive MTP, maximum draft depth 3; controller can reduce or pause drafting |
 
 The MFQ table reports a single prompt-processing rate per tier without
 identifying its MTP mode. The figure uses that published value for MFQ and
@@ -125,39 +136,41 @@ MTP results include those differences.
 
 | Checkpoint | Prefill: MTP off | Generation: MTP off | Prefill: adaptive MTP | Generation: adaptive MTP | Draft acceptance |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Jundot oQ2.5e | 2,010.4 | 51.5 | 2,064.8 | 84.9 | 87.8% |
-| Jundot oQ3.5e | 1,448.9 | 60.2 | 1,443.8 | 108.4 | 90.6% |
-| Jundot oQ4e | 1,497.0 | 64.2 | 1,484.3 | 75.3 | 91.0% |
+| Jundot oQ2.5e | 2,630.2 | 51.6 | 2,405.2 | 94.3 | 88.0% |
+| Jundot oQ3.5e | 2,647.4 | 61.5 | 2,575.4 | 111.0 | 92.6% |
+| Jundot oQ4e | 2,843.4 | 65.0 | 2,766.7 | 108.3 | 88.4% |
 
-oMLX uses the official `VLMBatchedEngine` streaming API with a 4,096-token
-prefill step. Experts remain resident and PLE uses SSD-backed mmap. KV
-quantization, TurboQuant and ANE prefill are disabled. Normal warmup generates
+oMLX uses the official macOS 26/27 DMG with native NAX kernels and the
+`VLMBatchedEngine` streaming API, with a 4,096-token prefill step and prefill
+speed priority. The allocator buffer cache uses the device's physical-memory
+limit, matching the official server startup, while wired memory uses the
+recommended working-set limit. Experts remain resident and PLE uses SSD-backed
+mmap. KV quantization, TurboQuant and ANE prefill are disabled. Normal warmup generates
 16 tokens; adaptive-MTP warmup generates 128 tokens to exercise verification
 depths. Ordinary and adaptive-MTP output text matches within each tier.
 
 MTP uses `mtp_enabled=True`, `mtp_fixed_depth=None` and
 `mtp_adaptive_max_depth=None`, retaining the model's default maximum draft
 depth of 3. These adaptive results include a different drafting policy from
-the fixed-single-draft Strata and llama.cpp runs. They do not establish a
-comparison at matched model size or quality with MFQ V3-XXS or GSQ-RCO IQ3_S.
+the fixed-single-draft Strata and llama.cpp runs.
 
 The source pins oQ2.5e to revision
 `ebfb10474baa3c1c78d38453ce0d5228febd32e9` and oQ3.5e to
 `e8216051d1a75ec4a523ed8c6b0ed4a01667bcda`. oQ4e uses a previously downloaded
 checkpoint with 106,294,664,646 bytes of weight shards; its repository revision
-is not reported. All oMLX runs enable High Power Mode. The oQ2.5e ordinary
-run uses AC power, while oQ3.5e is measured on battery. Separate short power
-diagnostics are excluded from the throughput table and do not establish a
-battery-versus-AC speed difference.
+is not reported. All oMLX runs enable High Power Mode. The source reports
+1,620 MHz for all recorded prefill GPU-frequency samples and P13 dominance
+in performance-state samples contained within each request, with no
+P11-dominated run observed.
 
 ## Sources and regeneration
 
 The source tables are pinned to the same MFQ-Publicity commit:
 
-- [MFQ Apple table](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/README.md#local-inference-speed).
-- [Strata configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md).
-- [llama.cpp configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md).
-- [oMLX configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/9b7c1f7900f1fa877eecf4b25076e3a048748f4b/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md).
+- [MFQ Apple table](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/f2f9b0fa00005740097b87bd2612a2b92d21bbe8/Qwen3.8-Flash-Next-EW-MFQ/README.md#local-inference-speed).
+- [Strata configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/f2f9b0fa00005740097b87bd2612a2b92d21bbe8/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md).
+- [llama.cpp configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/f2f9b0fa00005740097b87bd2612a2b92d21bbe8/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md).
+- [oMLX configuration and measurements](https://fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity/src/commit/f2f9b0fa00005740097b87bd2612a2b92d21bbe8/Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md).
 
 The snapshot records source-file SHA-256 values and the input checksum.
 The original input excerpt is credited to the Apache-2.0

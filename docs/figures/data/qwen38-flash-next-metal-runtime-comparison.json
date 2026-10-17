@@ -17,7 +17,7 @@
   },
   "source": {
     "repository": "ssh://git@fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity.git",
-    "revision": "9b7c1f7900f1fa877eecf4b25076e3a048748f4b",
+    "revision": "f2f9b0fa00005740097b87bd2612a2b92d21bbe8",
     "files": [
       {
         "path": "Qwen3.8-Flash-Next-EW-MFQ/README.md",
@@ -33,11 +33,11 @@
       },
       {
         "path": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/README.md",
-        "sha256": "a32c35c958e4990dff7c0e1e5f1d3e227427eef1ae515b4854803bf020cce354"
+        "sha256": "71bbed21426c290f0eeba332a93546da9ee0bf7dc8eaf252a6699eb2784545d7"
       },
       {
         "path": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md",
-        "sha256": "e5ed7a6aace4f1fb00235fc68ed1b24d07072268a53227c0a6d0e896e2a9a47b"
+        "sha256": "ec925baa4a53a8eefd62ede7b558cb4a6df5e5e65d036fdbd57e6266165f1dbc"
       }
     ],
     "description": "Published benchmark tables from MFQ-Publicity; no new measurements. The full prompt is not copied into this snapshot."
@@ -86,18 +86,23 @@
         "mlx": "0.32.4",
         "mlx_lm": "0.31.4.dev132+g94cdcae13"
       },
-      "date_range": [
-        "2026-10-16",
-        "2026-10-17"
-      ],
       "measured_runs_per_mode": 1,
       "mtp_draft_setup": "Each checkpoint's included draft head; default adaptive policy with maximum draft depth 3; controller can reduce or pause drafting; not fixed-single-draft results",
       "prefill_timing": "4096 / wall-clock time to first producer-generated token, including first-token overhead",
       "generation_timing": "127 intervals between the first and last producer-generated token timestamps",
       "prefix_reuse_tokens": 0,
       "warmup_excluded": true,
-      "idle_seconds_before_run": 60,
-      "power_mode": "High Power Mode enabled for battery and AC; oQ2.5e ordinary run used AC; oQ3.5e measured on battery; short power diagnostics are not throughput measurements"
+      "date": "2026-10-17",
+      "distribution": "Official macOS 26/27 DMG, including native NAX kernels",
+      "cooldown_seconds_by_tier": {
+        "oQ2.5e": 60,
+        "oQ3.5e": 60,
+        "oQ4e": 20
+      },
+      "cooldown_conditions": "Official 0.5-second GPU keep-warm tick remains active; oQ4e uses full-speed fans",
+      "prefill_setup": "4096-token prefill step with prefill speed priority",
+      "memory_setup": "Allocator buffer cache uses physical-memory limit; wired memory uses recommended working-set limit",
+      "power_mode": "High Power Mode enabled for battery and AC; all recorded prefill GPU-frequency samples 1620 MHz; P13 dominant in request-contained performance-state samples"
     }
   ],
   "interpretation": [
@@ -107,7 +112,8 @@
     "Strata combines two measured runs per mode; llama.cpp and oMLX each report one. The source does not give uncertainty estimates or MFQ repeat counts.",
     "Strata ordinary and MTP outputs match for all four configurations; llama.cpp UD-Q4_K_XL diverges from output token 80, while its three GSQ-RCO outputs match.",
     "GSQ-RCO IQ2_XS is unsupported by this Strata Metal release and is not plotted as a zero-speed result.",
-    "oMLX ordinary and adaptive-MTP output text matches within each tier; its throughput uses producer-generated token timestamps through the native streaming API, without HTTP transport or profiling."
+    "oMLX ordinary and adaptive-MTP output text matches within each tier; its throughput uses producer-generated token timestamps through the native streaming API, without HTTP transport or profiling.",
+    "Shaded comparable-size pairs: MFQ V3-XXS (81.952 GB) / GSQ-RCO IQ3_S (83.618 GB); MFQ V4-XS (93.672 GB) / Jundot oQ3.5e (approximately 93.856 GB from rounded model-card components). All sizes exclude the vision encoder and MTP head; matching size does not imply matching quality or MTP setup."
   ],
   "measurements": [
     {
@@ -293,11 +299,11 @@
         "revision": "ebfb10474baa3c1c78d38453ce0d5228febd32e9"
       },
       "prefill_reported": null,
-      "prefill_no_mtp": 2010.4,
-      "generation_no_mtp": 51.5,
-      "prefill_mtp": 2064.8,
-      "generation_mtp": 84.9,
-      "draft_acceptance_percent": 87.8,
+      "prefill_no_mtp": 2630.2,
+      "generation_no_mtp": 51.6,
+      "prefill_mtp": 2405.2,
+      "generation_mtp": 94.3,
+      "draft_acceptance_percent": 88.0,
       "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md"
     },
     {
@@ -306,14 +312,25 @@
       "tier": "oQ3.5e",
       "checkpoint": {
         "repository": "Jundot/Qwen3.8-Flash-Next-oQ3.5e-mtp",
-        "revision": "e8216051d1a75ec4a523ed8c6b0ed4a01667bcda"
+        "revision": "e8216051d1a75ec4a523ed8c6b0ed4a01667bcda",
+        "comparison_weight_size": {
+          "approximate_gb": 93.856,
+          "unit": "GB = 10^9 bytes",
+          "exclusions": [
+            "vision encoder",
+            "MTP head"
+          ],
+          "basis": "Sum of rounded model-card storage: language backbone 61.856 GB + N-gram embedding 32.000 GB",
+          "url": "https://huggingface.co/Jundot/Qwen3.8-Flash-Next-oQ3.5e-mtp/raw/e8216051d1a75ec4a523ed8c6b0ed4a01667bcda/README.md",
+          "sha256": "f94a3dccb5d9a421d6a2a0f8ca2f18b9170275bde1fa00cb414b8a09e76b916d"
+        }
       },
       "prefill_reported": null,
-      "prefill_no_mtp": 1448.9,
-      "generation_no_mtp": 60.2,
-      "prefill_mtp": 1443.8,
-      "generation_mtp": 108.4,
-      "draft_acceptance_percent": 90.6,
+      "prefill_no_mtp": 2647.4,
+      "generation_no_mtp": 61.5,
+      "prefill_mtp": 2575.4,
+      "generation_mtp": 111.0,
+      "draft_acceptance_percent": 92.6,
       "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md"
     },
     {
@@ -327,11 +344,11 @@
         "note": "Previously downloaded checkpoint; source does not identify a repository revision."
       },
       "prefill_reported": null,
-      "prefill_no_mtp": 1497.0,
-      "generation_no_mtp": 64.2,
-      "prefill_mtp": 1484.3,
-      "generation_mtp": 75.3,
-      "draft_acceptance_percent": 91.0,
+      "prefill_no_mtp": 2843.4,
+      "generation_no_mtp": 65.0,
+      "prefill_mtp": 2766.7,
+      "generation_mtp": 108.3,
+      "draft_acceptance_percent": 88.4,
       "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/omlx-metal-4k.md"
     }
   ]
