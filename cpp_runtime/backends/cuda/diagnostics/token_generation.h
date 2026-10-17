@@ -1,5 +1,6 @@
 #pragma once
 #include "cuda_activity_trace.h"
+#include "inference.h"
 
 #include "mfq_cuda_sampling_ops.h"
 #include "cuda_execution.h"
@@ -50,7 +51,8 @@ int generate_diagnostic_tokens(
         bool profile,
         std::chrono::steady_clock::time_point t0,
         std::chrono::steady_clock::time_point t1,
-        const std::vector<int64_t>& decode_inputs = {}) {
+        const std::vector<int64_t>& decode_inputs = {},
+        const std::unordered_set<int64_t>& stop_token_ids = {}) {
         if(!decode_inputs.empty() && (gen<=1 || decode_inputs.size()!=size_t(gen-1)))
             throw std::invalid_argument("diagnostic decode input count differs from gen-1");
         mfq_tensor_backend::Tensor forced_inputs;
@@ -73,6 +75,8 @@ int generate_diagnostic_tokens(
         profiler.report("prefill");
         profiler.reset();
         if (gen == 0) return 0;
+        int produced = 1;
+        bool hit_eos = !stop_token_ids.empty() && stop_token_ids.contains(next.template item<int64_t>());
         auto generated_cuda = mfq_tensor_backend::empty({gen}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
         cudaStream_t stream = mfq_get_current_cuda_stream().stream();
         MFQ_CUDA_CHECK(cudaMemcpyAsync(generated_cuda.template data_ptr<int64_t>(), next.template data_ptr<int64_t>(),
@@ -102,7 +106,7 @@ int generate_diagnostic_tokens(
         auto last_window_done=t2;
         bool measured_last_window=false;
         if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStart());
-        if (use_cuda_graph) {
+        if (use_cuda_graph && !hit_eos) {
             auto static_input = mfq_tensor_backend::empty({1, 1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
             auto static_pos = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
             auto static_len = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
@@ -170,9 +174,17 @@ int generate_diagnostic_tokens(
             decode_replay_t0 = std::chrono::steady_clock::now();
             for (int i = 1; i < gen; ++i) {
                 graph.replay();
+                produced = i + 1;
+                if (!stop_token_ids.empty()) {
+                    MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
+                    if (stop_token_ids.contains(static_next.template item<int64_t>())) {
+                        hit_eos = true;
+                        break;
+                    }
+                }
             }
             MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
-        } else {
+        } else if (!hit_eos) {
             for (int i = 1; i < gen; ++i) {
                 next = profiler.measure("decode.eager_model", [&]() {
                     return model.next_token(diagnostic_decode_input(next,forced_inputs,i-1));
@@ -184,15 +196,20 @@ int generate_diagnostic_tokens(
                         cudaMemcpyDeviceToDevice, stream));
                     return 0;
                 });
-                if(i==1 && model.metadata.flash_next) {
+                produced = i + 1;
+                if (!stop_token_ids.empty() && stop_token_ids.contains(next.template item<int64_t>())) {
+                    hit_eos = true;
+                    break;
+                }
+                if(i==1 && model.metadata.flash_next && stop_token_ids.empty()) {
                     mfq_cuda_synchronize();first_decode_done=std::chrono::steady_clock::now();
                     measured_first_decode=true;
                 }
-                if(gen>=4 && i==gen/2 && model.metadata.flash_next) {
+                if(gen>=4 && i==gen/2 && model.metadata.flash_next && stop_token_ids.empty()) {
                     mfq_cuda_synchronize();halfway_done=std::chrono::steady_clock::now();
                     measured_halfway=true;
                 }
-                if(gen>256 && i==gen-1-128 && model.metadata.flash_next) {
+                if(gen>256 && i==gen-1-128 && model.metadata.flash_next && stop_token_ids.empty()) {
                     mfq_cuda_synchronize();last_window_done=std::chrono::steady_clock::now();
                     measured_last_window=true;
                 }
@@ -203,7 +220,8 @@ int generate_diagnostic_tokens(
         auto t3 = std::chrono::steady_clock::now();
         report_cuda_memory(execution.config, "decode_complete");
         profiler.report("decode");
-        auto generated_tensor = generated_cuda.to(mfq_tensor_backend::kCPU).contiguous();
+        gen = produced;
+        auto generated_tensor = generated_cuda.narrow(0, 0, produced).to(mfq_tensor_backend::kCPU).contiguous();
         auto generated_ptr = generated_tensor.template data_ptr<int64_t>();
         double load_s = std::chrono::duration<double>(t1 - t0).count();
         double prefill_s = std::chrono::duration<double>(t2 - t1).count();
@@ -211,6 +229,7 @@ int generate_diagnostic_tokens(
         double decode_replay_s = std::chrono::duration<double>(t3 - decode_replay_t0).count();
         std::cout << "load_sec=" << load_s << "\n";
         std::cout << "prefill_sec=" << prefill_s << "\n";
+        std::cout << "finish_reason=" << (hit_eos ? "stop" : "length") << "\n";
         std::cout << "decode_tokens=" << std::max(0, gen - 1) << "\n";
         std::cout << "decode_setup_sec=" << (decode_s - decode_replay_s) << "\n";
         std::cout << "decode_replay_sec=" << decode_replay_s << "\n";

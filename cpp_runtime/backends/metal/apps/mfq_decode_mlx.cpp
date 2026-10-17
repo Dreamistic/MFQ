@@ -2993,6 +2993,7 @@ int run_loaded_runtime(
     mfq::engine::EngineInfo info;
     info.max_context = transport_config.max_context;
     info.vocab_size = static_cast<std::int32_t>(vocabulary_size);
+    info.stop_token_ids = mfq::engine::model_stop_token_ids(model_config, info.vocab_size);
     info.model_type = transport_config.model_type;
     info.capabilities = *transport_config.model_capabilities;
     info.multimodal = static_cast<bool>(runtime_components.multimodal_generate);
