@@ -261,6 +261,22 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
             "SSD predictor overlap ignored shared arena ownership");
         check_output(forward[0](execution,x,ids,weights),target);
         check_output(forward[1](execution,x,ids,weights),predictor);
+        std::array<tb::Tensor,2> prefill_expected;
+        auto prompt=tb::full({143,96},.017,x.options());
+        std::vector<int32_t> prompt_routes(286);
+        for(std::size_t i=0;i<prompt_routes.size();++i)prompt_routes[i]=31+int(i%2);
+        auto prompt_ids=tb::tensor(prompt_routes).reshape({143,2}).to(tb::kCUDA);
+        auto prompt_weights=tb::full({143,2},.5,weights.options());
+        for(int phase:{0,1,0,1}) {
+            auto result=forward[phase](execution,prompt,prompt_ids,prompt_weights);
+            const auto raw=moe_expert_memory_metrics(cache);
+            const std::map<std::string,double> metrics(raw.begin(),raw.end());
+            check(metrics.at("ssd_prefill_group_size")>0 && metrics.at("ssd_prefill_predictor")==double(phase),
+                "SSD prefill reused the other phase's ring layout");
+            if(prefill_expected[phase].defined())check_output(result,prefill_expected[phase]);
+            else prefill_expected[phase]=result.cpu().clone();
+        }
+        release_moe_prefill_buffers(cache);
     }
 }
 }

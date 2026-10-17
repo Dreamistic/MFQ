@@ -377,6 +377,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     }
     void initialize_prefill_stream(CudaExecutionContext& execution,const tb::Tensor& ids) {
         if(prefill_stream_)return;
+        const bool predictor=sources_[0]->layer_id_<0;
+        if(cache_->ssd_experts() && cache_->pipeline_prefill_ring_.defined() &&
+                cache_->pipeline_prefill_predictor_!=predictor)
+            release_moe_prefill_buffers(cache_);
         auto prepared=std::make_unique<PrefillStream>();
         int capacity=cache_->pipeline_prefill_group_capacity_;
         if(!cache_->pipeline_prefill_ring_.defined()) {
@@ -385,6 +389,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 if(!std::getenv("MFQ_MOE_PREFILL_GROUP_SIZE"))capacity=64;
                 std::unordered_map<int,std::size_t> layer_expert_bytes;
                 for(const auto& source:cache_->sources_) {
+                    if((source->layer_id_<0)!=predictor)continue;
                     std::size_t largest=0;
                     for(const auto& cohort:source->cohorts_) {
                         std::size_t bytes=0;for(const auto size:cohort.bytes_per_expert)bytes+=size;
@@ -401,6 +406,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     struct Layer {int64_t baseline=0,largest=0;};
                     std::unordered_map<int,Layer> layers;
                     for(const auto& source:cache_->sources_) {
+                        // Backbone and predictor prefill execute separately.
+                        // A large MTP projection must not shrink every
+                        // backbone group or occupy its transfer workspace.
+                        if((source->layer_id_<0)!=predictor)continue;
                         auto& layer=layers[source->layer_id_];int64_t largest=0;
                         for(const auto& cohort:source->cohorts_) {
                             int64_t bytes=0;
@@ -437,7 +446,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             const auto bytes=ring_bytes(capacity);
             cache_->pipeline_prefill_ring_=tb::empty({bytes},ids.options().dtype(tb::kUInt8));
             cache_->pipeline_prefill_group_capacity_=capacity;
-            if(cache_->ssd_experts())std::cerr<<"moe_ssd_prefill_ring group_size="<<capacity<<" bytes="<<bytes<<'\n';
+            cache_->pipeline_prefill_predictor_=predictor;
+            if(cache_->ssd_experts())std::cerr<<"moe_ssd_prefill_ring group_size="<<capacity<<" bytes="<<bytes
+                <<" predictor="<<int(predictor)<<'\n';
         }
         prepared->group_size=std::min(capacity,experts_);
         const int prefill_group_size=prepared->group_size;

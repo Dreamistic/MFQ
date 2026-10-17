@@ -2201,6 +2201,7 @@ void release_moe_prefill_buffers(MoeExpertCache* cache) {
     cache->pipeline_prefill_activations_.reset();
     cache->pipeline_prefill_ring_={};
     cache->pipeline_prefill_group_capacity_=0;
+    cache->pipeline_prefill_predictor_=false;
     cache->pipeline_prefill_layer_buffer_={};
     cache->pipeline_prefill_layer_second_buffer_={};
     cache->pipeline_prefill_layer_down_buffer_={};cache->pipeline_prefill_layer_split_=0;

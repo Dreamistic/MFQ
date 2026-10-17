@@ -812,6 +812,8 @@ public:
             {"ssd_ram_reuse_promotions",double(host.reuse_promotions)},
             {"ssd_ram_scan_admissions",double(host.scan_admissions)},
             {"ssd_ram_scan_admitted_bytes",double(host.scan_admitted_bytes)},
+            {"ssd_prefill_group_size",double(pipeline_prefill_group_capacity_)},
+            {"ssd_prefill_predictor",pipeline_prefill_predictor_?1.0:0.0},
             {"ssd_ram_protected_bytes",double(host.reuse_protected_bytes)},
             {"ssd_reuse_hits",double(kv_reuse.protected_hits)},
             {"ssd_probation_evictions",double(kv_reuse.probation_evictions)},
@@ -1038,6 +1040,7 @@ private:
     std::shared_ptr<void> pipeline_prefill_dma_metadata_;
     mfq_tensor_backend::Tensor pipeline_prefill_ring_;
     int pipeline_prefill_group_capacity_=0;
+    bool pipeline_prefill_predictor_=false;
     mfq_tensor_backend::Tensor pipeline_prefill_host_ring_;
     mfq_tensor_backend::Tensor pipeline_prefill_metadata_host_;
     std::size_t pipeline_prefill_metadata_stride_=0;
