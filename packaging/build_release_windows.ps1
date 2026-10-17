@@ -286,12 +286,35 @@ function Initialize-BuildEnvironment {
 function Get-ReleasePathMappings {
     param([Parameter(Mandatory)][hashtable] $Context)
 
-    [pscustomobject]@{ Source = $Context.ProjectDirectory; Destination = "/mfq-src" }
-    [pscustomobject]@{ Source = $env:USERPROFILE; Destination = "/mfq-build/home" }
+    $mappings = @(
+        [pscustomobject]@{ Source = $Context.ProjectDirectory; Destination = "/mfq-src" }
+        [pscustomobject]@{ Source = $env:USERPROFILE; Destination = "/mfq-build/home" }
+    )
     if (-not [string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
-        [pscustomobject]@{
+        $mappings += [pscustomobject]@{
             Source = Resolve-BuildPath $env:CARGO_TARGET_DIR $Context.StudioDirectory
             Destination = "/mfq-build/target"
+        }
+    }
+    if (-not ('MfqRelease.BuildPaths' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+using System.Text;
+namespace MfqRelease {
+    public static class BuildPaths {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        public static extern uint GetShortPathName(string path, StringBuilder output, uint size);
+    }
+}
+'@
+    }
+    foreach ($mapping in $mappings) {
+        $mapping
+        # Native dependency generators can use Windows 8.3 path aliases.
+        $shortPath = [System.Text.StringBuilder]::new(32768)
+        $length = [MfqRelease.BuildPaths]::GetShortPathName($mapping.Source, $shortPath, $shortPath.Capacity)
+        if ($length -gt 0 -and $length -lt $shortPath.Capacity -and $shortPath.ToString() -ne $mapping.Source) {
+            [pscustomobject]@{ Source = $shortPath.ToString(); Destination = $mapping.Destination }
         }
     }
 }
@@ -329,6 +352,7 @@ function Initialize-ReleasePathMapping {
     $nativeFlags = @(Get-ReleaseNativeFlags $Context) -join ' '
     $env:CFLAGS = "$env:CFLAGS $nativeFlags".Trim()
     $env:CXXFLAGS = "$env:CXXFLAGS $nativeFlags".Trim()
+    $env:CC_SHELL_ESCAPED_FLAGS = "1"
 }
 
 function Assert-ReleasePaths {
