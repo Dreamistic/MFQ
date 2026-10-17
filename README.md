@@ -128,6 +128,9 @@ V4-XS. Shading marks `V3-XXS`; paired generation bars compare MTP off and on.
 See [Benchmarks](#benchmarks) for the complete table and
 [chart data](./docs/figures/data/qwen38-flash-next-inference-speed.json) for the plotted values.
 
+MFQ's Apple Metal backend is built on [MLX](https://github.com/ml-explore/mlx),
+with a native C++ runtime and custom Metal kernels for MFQ quantization formats.
+
 CUDA combines VRAM, system RAM and SSD to run models that exceed GPU memory
 capacity. Metal supports bounded expert residency and SSD streaming for MoE
 experts and PLE tables. CUDA and Metal kernels operate on the packed weights,

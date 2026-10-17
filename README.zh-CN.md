@@ -121,6 +121,9 @@ Metal 平台为 **M5 Max（40 核 GPU、128 GB）**。CUDA 平台为 **RTX 3090 
 完整表格见[性能与质量](#性能与质量)，
 绘图数值见[图表数据](./docs/figures/data/qwen38-flash-next-inference-speed.json)。
 
+MFQ 的 Apple Metal 后端基于 [MLX](https://github.com/ml-explore/mlx)，
+采用原生 C++ 运行时，并针对 MFQ 量化格式实现自定义 Metal 内核。
+
 CUDA 侧联合使用 VRAM、RAM 和 SSD，运行超出显存容量的模型；Metal 侧支持
 限制专家常驻量，并按需从 SSD 加载 MoE 专家与 PLE 表。CUDA 和 Metal 内核
 直接处理打包权重，并针对注意力、缓存与 I/O 进行优化。
