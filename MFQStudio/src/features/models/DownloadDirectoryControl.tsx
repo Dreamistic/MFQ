@@ -77,10 +77,10 @@ export function DownloadDirectoryControl({ onDirectoryChange }: { onDirectoryCha
     } catch (cause) { if (current()) setError(errorMessage(cause, tr)); }
     finally { if (current()) setSaving(false); }
   }
-  async function finder() {
+  async function openDirectory() {
     if (!browser?.current_id) return;
     const current = connectionScope();
-    try { await modelsApi.openModelDirectoryInFinder(browser.current_id); }
+    try { await modelsApi.openModelDirectory(browser.current_id); }
     catch (cause) { if (current()) setError(errorMessage(cause, tr)); }
   }
   async function jump(event: FormEvent<HTMLFormElement>) {
@@ -128,7 +128,7 @@ export function DownloadDirectoryControl({ onDirectoryChange }: { onDirectoryCha
       modelBrowser: browser, modelBrowserOpen: open, modelBrowserError: error, modelBrowserLoading: loading,
       modelFilesMode: false, setModelBrowserOpen: setOpen, modelBrowserTriggerRef: trigger, busy: saving || loading,
       jumpToModelDirectory: jump, openModelDirectory: browse, modelDirectoryPath: path, setModelDirectoryPath: setPath,
-      registerCurrentModelDirectory: choose, openCurrentDirectoryInFinder: finder,
+      registerCurrentModelDirectory: choose, openCurrentDirectory: openDirectory,
     }} />
   </>;
 }

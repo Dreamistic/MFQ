@@ -5,10 +5,10 @@ comparing true full-precision (BF16) MFQ conversions with their MFQ-quantized
 (S4-M) builds across the dense Qwen3.5 size ladder and Qwen3.8-27B, measuring
 speculative MTP decode, and referencing an independent llama.cpp run on the
 same GPU. Raw results:
-[`bench/hip-model-bench-20261017-bf16.json`](../bench/hip-model-bench-20261017-bf16.json),
-[`bench/hip-model-bench-20261017-quantized.json`](../bench/hip-model-bench-20261017-quantized.json),
-[`bench/hip-model-bench-20261017-mtp.json`](../bench/hip-model-bench-20261017-mtp.json),
-and [`bench/hip-llama-bench-20261017.txt`](../bench/hip-llama-bench-20261017.txt).
+[`bench/hip-model-bench-20261017-bf16.json`](../../bench/hip-model-bench-20261017-bf16.json),
+[`bench/hip-model-bench-20261017-quantized.json`](../../bench/hip-model-bench-20261017-quantized.json),
+[`bench/hip-model-bench-20261017-mtp.json`](../../bench/hip-model-bench-20261017-mtp.json),
+and [`bench/hip-llama-bench-20261017.txt`](../../bench/hip-llama-bench-20261017.txt).
 
 ## Method
 
@@ -19,7 +19,7 @@ decoded tokens per run. Each cell is the median of 3 runs after 1
 warmup run, batch 1, Release build. All runs set
 `MFQ_DISABLE_MMA_ATTENTION=1`, which the HIP backend still requires for
 prompts longer than 32 tokens (see the
-[HIP validation report](hip-native-runtime-validation.md)).
+[HIP validation report](hip-validation.md)).
 
 ```sh
 python bench/model_bench.py model-fp.mfq model-s4m.mfq \
@@ -98,7 +98,7 @@ prefill-sized cohorts.
 
 `bench/model_bench.py --mtp` repeats the decode matrix with
 `enable_mtp` and records drafted and accepted tokens. Raw results:
-[`bench/hip-model-bench-20261017-mtp.json`](../bench/hip-model-bench-20261017-mtp.json).
+[`bench/hip-model-bench-20261017-mtp.json`](../../bench/hip-model-bench-20261017-mtp.json).
 
 | Model | Precision | Plain tok/s | MTP tok/s | Ratio | Acceptance | Drafted/token |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
