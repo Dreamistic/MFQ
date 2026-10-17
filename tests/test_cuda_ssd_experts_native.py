@@ -61,7 +61,9 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode):
     executable = os.environ.get("MFQ_CUDA_RESOURCE_TEST_RUNTIME")
     if not executable:
         pytest.skip("MFQ_CUDA_RESOURCE_TEST_RUNTIME required")
+    # Consecutive backbone layers exercise shared pinned metadata retirement.
     config, weights = mtp_fixture("qwen", 1, hidden=256 if wide else 16)
+    assert config["text_config"]["num_hidden_layers"] >= 2
     config["text_config"]["max_position_embeddings"] = 512
     if wide:
         config["text_config"].update(moe_intermediate_size=1024, shared_expert_intermediate_size=1024)
@@ -111,8 +113,8 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode):
                 startup_captures = (tmp_path / f"worker-{ssd}.log").read_text(errors="replace").count(
                     "runtime_qwen4_graph_capture role=")
                 outputs = []
-                for mtp in (False, True, False):
-                    prompt = "ab" * 240
+                for mtp,repetitions in ((False,160),(True,240),(False,144)):
+                    prompt = "ab" * repetitions
                     async with client.generate(dict(messages=[dict(role="user", content=prompt)], mfq_preformatted_prompt=prompt,
                         temperature=0, seed=1234, max_tokens=16, enable_mtp=mtp, mtp_max_draft_tokens=3,
                         mfq_prefix_cache_enabled=False, stream=True)) as events:

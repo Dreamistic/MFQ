@@ -2328,7 +2328,8 @@ void release_moe_prefill_buffers(MoeExpertCache* cache) {
         MFQ_CUDA_CHECK(cudaMemPoolTrimTo(cache->pipeline_prefill_pool_,0));
         cache->pipeline_prefill_pool_=nullptr;
     }
-    cache->pipeline_prefill_dma_metadata_.reset();cache->pipeline_dma_leases_.clear();
+    cache->pipeline_prefill_dma_metadata_.reset();cache->pipeline_prefill_route_publication_.reset();
+    cache->pipeline_dma_leases_.clear();
     cache->transfer_ready_recorded_=false;
 }
 

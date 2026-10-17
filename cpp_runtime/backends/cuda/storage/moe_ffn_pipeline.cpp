@@ -342,8 +342,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     };
     struct PrefillStream {
         std::array<PrefillBuffer,2> buffers;
-        std::unique_ptr<Mapped> publication;
-        int capacity=0,group_size=prefill_group_capacity;
+        int group_size=prefill_group_capacity;
     };
     std::unique_ptr<PrefillStream> prefill_stream_;
 
@@ -568,14 +567,21 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         std::uint64_t read_join_ns=0,buffer_wait_ns=0,compute_submit_ns=0;
         const int prefill_group_size=stream.group_size;
         const int tokens=int(ids.size(0)),routes=int(ids.size(1)),entries=tokens*routes;
-        if(stream.capacity<entries) {
+        auto publication=std::static_pointer_cast<Mapped>(cache_->pipeline_prefill_route_publication_);
+        const auto publication_bytes=64+std::size_t(entries)*sizeof(int32_t);
+        // A caller may change compute streams between eager chunks. The
+        // preceding expert fence also retires its reads of the shared packet.
+        if(publication && cache_->compute_done_recorded_)
+            MFQ_CUDA_CHECK(cudaEventSynchronize(cache_->compute_done_));
+        if(!publication || publication->bytes<publication_bytes) {
             MFQ_CUDA_CHECK(cudaStreamSynchronize(stream_));
-            stream.publication=std::make_unique<Mapped>(64+std::size_t(entries)*sizeof(int32_t));
-            stream.capacity=entries;
+            publication=std::make_shared<Mapped>(publication_bytes);
+            cache_->pipeline_prefill_route_publication_=publication;
         }
-        auto* published=stream.publication->h<uint32_t>();*published=0;
+        const auto setup_ns=elapsed(started);
+        auto* published=publication->h<uint32_t>();*published=0;
         mfq::cuda::moe_publish_routes(nullptr,ids.data_ptr<int32_t>(),nullptr,
-            stream.publication->d<int32_t>()+16,stream.publication->d<uint32_t>(),0,entries,stream_);
+            publication->d<int32_t>()+16,publication->d<uint32_t>(),0,entries,stream_);
         auto shared=shared_?shared_(execution,input):tb::Tensor{};
         const auto route_started=Clock::now();
         mfq::cuda::wait_route_publication(published,stream_);
@@ -586,9 +592,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         // Publication follows every previous consumer of the shared ring and
         // pinned metadata. A completed previous DMA is implied by that consumer.
         if(cache_->transfer_ready_recorded_)MFQ_CUDA_CHECK(cudaEventSynchronize(cache_->transfer_ready_));
-        cache_->pipeline_dma_leases_.clear();cache_->pipeline_prefill_dma_metadata_.reset();
+        cache_->pipeline_dma_leases_.clear();
         const auto plan_started=Clock::now();
-        const auto* host_ids=stream.publication->h<int32_t>()+16;
+        const auto* host_ids=publication->h<int32_t>()+16;
         std::vector<std::vector<int32_t>> positions(experts_);
         for(int i=0;i<entries;++i) {
             const int e=host_ids[i];
@@ -627,16 +633,21 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             map_offset[p]=map_stride;
             map_stride+=int(stream.buffers[0].projections[p].pools.size())*prefill_group_size;
         }
-        // One immutable pinned allocation supplies all asynchronous metadata
-        // copies. It survives until the following layer publishes its routes.
+        // The following layer's route publication retires every preceding
+        // metadata read on this stream. Reuse its pinned packet instead of
+        // allocating/freeing locked memory and synchronizing GPU work per layer.
         const std::size_t index_bytes=std::size_t(entries)*2*sizeof(int64_t);
         const std::size_t id_bytes=std::size_t(entries)*sizeof(int32_t);
         const std::size_t map_bytes=std::size_t(groups)*map_stride*sizeof(int32_t);
         const int bounds_size=prefill_group_size+1;
         const int group_fixed=4*bounds_size+prefill_group_size;
         const std::size_t route_words=std::size_t(entries)*4+std::size_t(groups)*group_fixed;
-        auto metadata=std::make_shared<Mapped>(index_bytes+id_bytes+map_bytes+route_words*sizeof(int32_t));
-        cache_->pipeline_prefill_dma_metadata_=metadata;
+        const auto metadata_bytes=index_bytes+id_bytes+map_bytes+route_words*sizeof(int32_t);
+        auto metadata=std::static_pointer_cast<Mapped>(cache_->pipeline_prefill_dma_metadata_);
+        if(!metadata || metadata->bytes<metadata_bytes) {
+            metadata=std::make_shared<Mapped>(metadata_bytes);
+            cache_->pipeline_prefill_dma_metadata_=metadata;
+        }
         auto* token_indices=metadata->h<int64_t>();
         auto* pair_indices=token_indices+entries;
         auto* group_ids=reinterpret_cast<int32_t*>(pair_indices+entries);
@@ -980,10 +991,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         cache_->moe_residency_->record_prefill_routes(sources_[0]->layer_id_,
             ids.contiguous().data_ptr<int32_t>(),tokens,routes,stream_);
         if(cache_->ssd_experts())if(const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");profile && profile[0]=='1')
-            std::fprintf(stderr,"moe_ssd_prefill_host layer=%d groups=%d tokens=%d wall_ms=%.3f plan_ms=%.3f read_join_ms=%.3f buffer_wait_ms=%.3f compute_submit_ms=%.3f fetch_ms=%.3f route_wait_ms=%.3f\n",
+            std::fprintf(stderr,"moe_ssd_prefill_host layer=%d groups=%d tokens=%d wall_ms=%.3f plan_ms=%.3f read_join_ms=%.3f buffer_wait_ms=%.3f compute_submit_ms=%.3f fetch_ms=%.3f route_wait_ms=%.3f setup_ms=%.3f\n",
                 sources_[0]->layer_id_,groups,tokens,elapsed(started)/1e6,(stats.pipeline_plan_ns-plan_before)/1e6,
                 read_join_ns/1e6,buffer_wait_ns/1e6,compute_submit_ns/1e6,(stats.pipeline_fetch_ns-fetch_before)/1e6,
-                (stats.pipeline_route_wait_ns-route_before)/1e6);
+                (stats.pipeline_route_wait_ns-route_before)/1e6,setup_ns/1e6);
         MFQ_CUDA_CHECK(cudaGetLastError());return output;
     }
         struct LayerPrefill {

@@ -1047,6 +1047,7 @@ private:
     // Their quantization scratch can be reused across projections and layers.
     std::shared_ptr<MixedMoeRuntime> pipeline_prefill_activations_;
     std::shared_ptr<void> pipeline_prefill_dma_metadata_;
+    std::shared_ptr<void> pipeline_prefill_route_publication_;
     mfq_tensor_backend::Tensor pipeline_prefill_ring_;
     int pipeline_prefill_group_capacity_=0;
     bool pipeline_prefill_predictor_=false;
