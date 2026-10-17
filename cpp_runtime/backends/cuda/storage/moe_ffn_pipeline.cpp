@@ -424,8 +424,13 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             };
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
             const auto context=mfq::cuda::default_context(ids.get_device());
-            const auto available=context->available_memory()+context->workspace_available();
             const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes()/2;
+            auto available=context->available_memory()+context->workspace_available();
+            const auto requested=std::size_t(ring_bytes(capacity))+reserve;
+            if(cache_->ssd_experts() && available<requested && cache_->reserve_workspace_) {
+                cache_->reserve_workspace_(requested);
+                available=context->available_memory()+context->workspace_available();
+            }
             const auto limit=available>reserve?available-reserve:0;
             while(capacity>1 && std::uint64_t(ring_bytes(capacity))>limit)capacity=(capacity+1)/2;
 #endif
