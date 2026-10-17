@@ -334,6 +334,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     struct PrefillBuffer {
         std::array<MixedMoeRuntime,3> projections;
         tb::Tensor maps;
+        std::array<tb::Tensor,3> nvq_metadata;
         std::array<std::vector<MoeGpuArena*>,3> stages;
         mfq::cuda::Event gu_ready{cudaEventDisableTiming};
         mfq::cuda::Event down_ready{cudaEventDisableTiming};
@@ -396,6 +397,25 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     cache_->host_experts_->stats().budget_bytes/2/largest));
             }
             const auto ring_bytes=[&](int slots) {
+                if(cache_->ssd_experts()) {
+                    struct Layer {int64_t baseline=0,largest=0;};
+                    std::unordered_map<int,Layer> layers;
+                    for(const auto& source:cache_->sources_) {
+                        auto& layer=layers[source->layer_id_];int64_t largest=0;
+                        for(const auto& cohort:source->cohorts_) {
+                            int64_t bytes=0;
+                            for(const auto size:cohort.bytes_per_expert) {
+                                bytes+=size;layer.baseline+=prefill_align(size);
+                            }
+                            largest=std::max(largest,bytes);
+                        }
+                        layer.largest+=largest;
+                    }
+                    int64_t bytes=0;
+                    for(const auto& [layer,budget]:layers)
+                        bytes=std::max(bytes,2*prefill_align(budget.baseline+slots*budget.largest));
+                    return bytes;
+                }
                 std::unordered_map<int,int64_t> layers;
                 for(const auto& source:cache_->sources_)for(const auto& cohort:source->cohorts_)
                     layers[source->layer_id_]+=prefill_cohort_bytes(cohort,slots);
@@ -420,13 +440,29 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         for(int p=0;p<3;++p) {
             if(combined_gate_up_ && p==1) { stages[p]=stages[0]; continue; }
             for(auto& cohort:sources_[p]->cohorts_)
-                stages[p].push_back(&prefill_stage(p,cohort,stage_offset,capacity));
+                stages[p].push_back(&prefill_stage(p,cohort,stage_offset,cache_->ssd_experts()?1:capacity));
         }
         if(execution.config.moe_ffn_fused_activation && !cache_->pipeline_sigmoid_table_.defined())
             cache_->pipeline_sigmoid_table_=moe_swiglu_sigmoid_table_cuda();
         int map_count=0;
         for(const auto& source:sources_)map_count+=2*int(source->cohorts_.size())*prefill_group_size;
         for(auto& buffer:prepared->buffers)buffer.maps=tb::full({map_count},-1,ids.options());
+        constexpr int64_t nvq_descriptor_bytes=5*8+3*8+7*4;
+        if(cache_->ssd_experts() && !cache_->pipeline_prefill_metadata_host_.defined()) {
+            std::unordered_map<int,int64_t> layers;
+            for(const auto& source:cache_->sources_) {
+                int64_t count=0;
+                for(const auto& cohort:source->cohorts_)count+=cohort.active.family==MixedMoeFamily::Nvq;
+                layers[source->layer_id_]+=prefill_align(2*count*nvq_descriptor_bytes);
+            }
+            int64_t stride=0;for(const auto& [layer,bytes]:layers)stride=std::max(stride,bytes);
+            if(stride) {
+                cache_->pipeline_prefill_metadata_host_=tb::empty({2*stride},
+                    tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true));
+                cache_->pipeline_prefill_metadata_stride_=std::size_t(stride);
+            }
+        }
+        std::array<int64_t,2> metadata_offsets{};
         for(int b=0;b<2;++b)for(int p=0;p<3;++p) {
             auto& buffer=prepared->buffers[b];auto& runtime=buffer.projections[p];
             auto& source=*sources_[p];
@@ -453,12 +489,54 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 runtime.pools.push_back(std::move(hot));runtime.pools.push_back(std::move(cold));++cohort_index;
             }
             const auto mma=mfq::cuda::runtime_options::moe_prefill_compact_mma();
-            initialize_mixed_nvq_dispatch(runtime,execution.config,!mma || *mma!=0);
+            // These maps were just initialized to -1. Supplying their known
+            // host values avoids reading each one back from the GPU, which
+            // otherwise serializes construction with preceding layer work.
+            const std::vector<std::vector<int32_t>> initial_maps(runtime.pools.size(),
+                std::vector<int32_t>(prefill_group_size,-1));
+            initialize_mixed_nvq_dispatch(runtime,execution.config,!mma || *mma!=0,&initial_maps);
+            if(cache_->ssd_experts() && runtime.nvq_dispatch && !(combined_gate_up_ && p==1)) {
+                const auto bytes=runtime.nvq_dispatch->pool_count*nvq_descriptor_bytes;
+                const auto stride=cache_->pipeline_prefill_metadata_stride_;
+                if(std::uint64_t(metadata_offsets[b]+bytes)>stride)
+                    throw std::logic_error("prefill NVQ descriptor packet exceeds its buffer");
+                buffer.nvq_metadata[p]=cache_->pipeline_prefill_metadata_host_.narrow(0,
+                    int64_t(b*stride)+metadata_offsets[b],bytes);
+                metadata_offsets[b]+=prefill_align(bytes);
+            }
         }
         prefill_stream_=std::move(prepared);
         cache_->pipeline_prefill_release_.push_back([owner=weak_from_this()] {
             if(auto pipeline=owner.lock())pipeline->prefill_stream_.reset();
         });
+    }
+    void upload_prefill_nvq_metadata(PrefillBuffer& buffer,int projection) {
+        auto& runtime=buffer.projections[projection];
+        if(!buffer.nvq_metadata[projection].defined())return;
+        auto& dispatch=*runtime.nvq_dispatch;
+        auto* base=static_cast<uint8_t*>(buffer.nvq_metadata[projection].data_ptr());
+        const auto count=dispatch.pool_count;
+        auto* pointers=reinterpret_cast<int64_t*>(base);
+        auto* sizes=reinterpret_cast<int64_t*>(base+count*5*8);
+        auto* params=reinterpret_cast<int32_t*>(base+count*8*8);
+        int index=0;
+        for(const auto& pool:runtime.pools)if(pool.family==MixedMoeFamily::Nvq) {
+            if(index>=count)throw std::logic_error("prefill NVQ pool count changed");
+            const auto& w=pool.nvq;
+            const std::array<tb::Tensor,5> fields={w.indices_packed,w.aux_packed,w.sub_scale_packed,w.neuron_scale,w.codebook};
+            for(int f=0;f<5;++f)pointers[index*5+f]=int64_t(reinterpret_cast<uintptr_t>(fields[f].data_ptr()));
+            sizes[index*3]=w.indices_packed.numel();sizes[index*3+1]=w.aux_packed.numel();sizes[index*3+2]=w.sub_scale_packed.numel();
+            const int format=int(w.kernel_format);
+            const bool d4=format==3 || format==10 || format==11 || format==12 || format==15 || format==17;
+            const std::array<int32_t,7> row={pool.local_experts,int(w.ng),
+                (runtime.neuron_len+(d4?3:7))/(d4?4:8),(runtime.neuron_len+7)/8,
+                int(w.sub_bits),int(w.sign_mode),format};
+            std::copy(row.begin(),row.end(),params+index*7);++index;
+        }
+        if(index!=count)throw std::logic_error("prefill NVQ descriptor packet lost a pool");
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(dispatch.weight_ptrs.data_ptr(),pointers,std::size_t(count)*5*8,cudaMemcpyHostToDevice,cache_->weight_stream_));
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(dispatch.weight_sizes.data_ptr(),sizes,std::size_t(count)*3*8,cudaMemcpyHostToDevice,cache_->weight_stream_));
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(dispatch.pool_params.data_ptr(),params,std::size_t(count)*7*4,cudaMemcpyHostToDevice,cache_->weight_stream_));
     }
     tb::Tensor streamed_prefill(CudaExecutionContext& execution,const tb::Tensor& input,
             const tb::Tensor& ids,const tb::Tensor& weights) {
@@ -641,6 +719,33 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         const auto queue_group=[&](int g) {
             std::size_t offset=0;
             auto& buffer=stream.buffers[g%2];
+            // All formats share this half of the ring. Only the group's
+            // actual cold experts need weight storage, with one valid dummy
+            // slot for maps that contain no routed expert of that format.
+            int64_t device_offset=int64_t(g%2)*cache_->pipeline_prefill_ring_.numel()/2;
+            const int64_t device_end=int64_t(g%2+1)*cache_->pipeline_prefill_ring_.numel()/2;
+            for(int p=0;p<3;++p) {
+                if(combined_gate_up_ && p==1)continue;
+                for(std::size_t c=0;c<sources_[p]->cohorts_.size();++c) {
+                    const auto& cohort=sources_[p]->cohorts_[c];
+                    const auto count=std::max<std::size_t>(1,std::count_if(work[g].uploads[p].begin(),work[g].uploads[p].end(),
+                        [&](const auto& upload){return upload.cohort==int(c);}));
+                    std::vector<tb::Tensor> fields;
+                    for(std::size_t f=0;f<cohort.bytes_per_expert.size();++f) {
+                        device_offset=prefill_align(device_offset);
+                        const auto bytes=int64_t(count)*cohort.bytes_per_expert[f];
+                        if(bytes>device_end-device_offset)throw std::logic_error("compact prefill group exceeded its shared ring");
+                        auto shape=cohort.arena->layouts[f].slot_shape;shape[0]*=int64_t(count);
+                        fields.push_back(tb::from_blob(cache_->pipeline_prefill_ring_.data_ptr<uint8_t>()+device_offset,shape,
+                            tb::TensorOptions().device(tb::kCUDA).dtype(cohort.arena->layouts[f].scalar_type)));
+                        device_offset+=bytes;
+                    }
+                    auto& cold=buffer.projections[p].pools[2*c+1];
+                    const auto map=cold.expert_local;
+                    cold=fields_pool(cohort.active,fields,int(count),buffer.projections[p].out_per_expert);
+                    cold.expert_local=map;
+                }
+            }
             for(int p=0;p<3;++p)for(std::size_t c=0;c<sources_[p]->cohorts_.size();++c) {
                 std::vector<Upload*> uploads;
                 for(auto& upload:work[g].uploads[p])if(upload.cohort==int(c))uploads.push_back(&upload);
@@ -683,6 +788,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             }
             if(g>=2)MFQ_CUDA_CHECK(cudaStreamWaitEvent(cache_->weight_stream_,buffer.used.get(),0));
             for(int p=0;p<3;++p) {
+                if(cache_->ssd_experts())upload_prefill_nvq_metadata(buffer,p);
                 const auto& uploads=work[g].uploads[p];auto& source=*sources_[p];
                 for(std::size_t c=0;c<source.cohorts_.size();++c) {
                     std::vector<const Upload*> cohort_uploads;

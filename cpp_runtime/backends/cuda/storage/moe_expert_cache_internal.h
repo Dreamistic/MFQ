@@ -128,7 +128,8 @@ public:
         for(auto& batch:pipeline_dma_batches_)batch.reset();
         if(pipeline_pool_context_)
             pipeline_pool_context_->end_graph_pool(pipeline_pool_stream_);
-        if ((!registered_host_fields_.empty() || pinned_expert_arena_) &&
+        if ((!registered_host_fields_.empty() || pinned_expert_arena_ ||
+                pipeline_prefill_host_ring_.defined() || pipeline_prefill_metadata_host_.defined()) &&
                 weight_stream_ != nullptr) {
             (void)cudaStreamSynchronize(weight_stream_);
         }
@@ -802,7 +803,7 @@ public:
             {"ssd_expert_materialize_ms",double(disk_times[1])/1e6},
             {"ssd_expert_nint_materialize_ms",double(disk_times[2])/1e6},
             {"ssd_expert_nvq_materialize_ms",double(disk_times[3])/1e6},
-            {"ssd_prefill_host_stage_bytes",double(tensor_nbytes(pipeline_prefill_host_ring_))},
+            {"ssd_prefill_host_stage_bytes",double(tensor_nbytes(pipeline_prefill_host_ring_)+tensor_nbytes(pipeline_prefill_metadata_host_))},
             {"ram_expert_limit_bytes",double(host.budget_bytes)},
             {"ram_expert_pinned_bytes",double(pinned_bytes)},
             {"ram_expert_pinned_used_bytes",double(pinned_used)},
@@ -1019,6 +1020,8 @@ private:
     mfq_tensor_backend::Tensor pipeline_prefill_ring_;
     int pipeline_prefill_group_capacity_=0;
     mfq_tensor_backend::Tensor pipeline_prefill_host_ring_;
+    mfq_tensor_backend::Tensor pipeline_prefill_metadata_host_;
+    std::size_t pipeline_prefill_metadata_stride_=0;
     std::size_t pipeline_prefill_host_stride_=0;
     bool pipeline_prefill_layer_layout_=false;
     std::map<int,std::pair<int64_t,int64_t>> pipeline_prefill_layers_;

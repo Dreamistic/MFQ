@@ -29,6 +29,17 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction):
                       if family == "nint" else make_flat_family(family.upper(), rows=64 * output, neuron_len=width, seed=2038+projection))
             save(tmp_path / f"{family}-{projection}.mfq", FileHeader(version=2, model_arch="qwen4_exp"),
                  {"linear.weight": MfeTensor((64, output, width), (MfePool(np.arange(64, dtype=np.int32), values),))})
+    families = ("nint", "nvq2j", "nvq3j", "nvq2j-l", "nvq2j-xl", "nvq3j-l")
+    for projection in range(3):
+        pools = []
+        for index, family in enumerate(families):
+            ids = np.arange(index, 128, len(families), dtype=np.int32)
+            values = (quantize(rng.normal(0, .03, (len(ids) * 128, 128)).astype(np.float32), NintSpec(4, 24, 6))
+                      if family == "nint" else make_flat_family(family.upper(), rows=len(ids) * 128,
+                          neuron_len=128, seed=4096+projection*len(families)+index))
+            pools.append(MfePool(ids, values))
+        save(tmp_path / f"mixed-{projection}.mfq", FileHeader(version=2, model_arch="qwen4_exp"),
+             {"linear.weight": MfeTensor((128, 128, 128), tuple(pools))})
     env = dict(os.environ, MFQ_MOE_SSD_EXPERTS="1", MFQ_MOE_NVQ_DENSE="0", MFQ_MOE_PRELOAD_ALL="0", MFQ_MOE_ASSERT_RESIDENT="0",
         MFQ_MOE_TRANSFER_CACHE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_PREFILL_LAYER="0",
         MFQ_MOE_PREFILL_GROUPS="1", MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER="1", MFQ_MOE_RAM_PCIE_FRACTION="1",
@@ -37,7 +48,7 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction):
         MFQ_CUDA_WORKSPACE_RESERVE_GIB="0.01", CUDA_MODULE_LOADING="LAZY")
     result = subprocess.run([executable, str(tmp_path)], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "SSD expert streaming cases=189 PASS" in result.stdout
+    assert "SSD expert streaming cases=216 PASS" in result.stdout
 
 
 @pytest.mark.parametrize("wide,grouped", [(False, True), (True, True), (True, False)])

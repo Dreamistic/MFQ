@@ -94,11 +94,12 @@ struct Run {
         if(const auto* fraction=std::getenv("MFQ_SSD_EXPERT_TEST_PCIE_FRACTION")) {
             c.moe_ram_pcie_fraction=std::stod(fraction);hybrid=*c.moe_ram_pcie_fraction<1;
         }
-        c.moe_host_cache_bytes=prefix.empty()?(streaming?32768:8*1024*1024):(streaming?32*1024*1024:4LL*1024*1024*1024);
+        const bool mixed=path.stem()=="mixed";
+        c.moe_host_cache_bytes=prefix.empty()?(streaming?(mixed?512*1024:32768):8*1024*1024):(streaming?32*1024*1024:4LL*1024*1024*1024);
         // CPU/GPU arithmetic parity needs the same placement in both runs.
         // The GPU-only variant separately exercises adaptive exchanges.
         c.moe_residency_adapt=streaming && !hybrid;c.moe_residency_warm=streaming && !hybrid;c.moe_residency_projection_heat=true;
-        cache=make_moe_expert_cache(prefix.empty()?32768:64*1024*1024,c);
+        cache=make_moe_expert_cache(prefix.empty()?(mixed?512*1024:32768):64*1024*1024,c);
         const auto separator=prefix.find(';');
         std::vector<std::string> prefixes=separator==std::string::npos?std::vector<std::string>{prefix}:
             std::vector<std::string>{prefix.substr(0,separator),prefix.substr(separator+1)};
@@ -221,7 +222,7 @@ int main(int argc,char** argv)try {
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     int cases=0;
     if(argc==2)check_ssd_predictor_overlap(argv[1]);
-    for(const char* format:{"nint","nvq2j","nvq3j","nvq2j-l","nvq2j-xl","nvq3j-l","nint-combined"}) {
+    for(const char* format:{"nint","nvq2j","nvq3j","nvq2j-l","nvq2j-xl","nvq3j-l","nint-combined","mixed"}) {
         if(argc==3 && std::string(format)!="nint")continue;
         const bool combined=std::string(format)=="nint-combined";
         const auto path=argc==3?std::filesystem::path(argv[1]):std::filesystem::path(argv[1])/(std::string(combined?"nint":format)+".mfq");
@@ -365,6 +366,14 @@ int main(int argc,char** argv)try {
             check_output(candidate.forward(candidate.execution,input,ids,weights),
                 reference.forward(reference.execution,input,ids,weights));
             release_moe_prefill_buffers(candidate.cache);
+        }
+        if(std::string(format)=="mixed") {
+            finish_moe_expert_exchanges(candidate.cache);
+            for(const auto& source:candidate.sources)for(int expert=0;expert<experts;++expert)
+                if(!source->gpu_resident(expert)) {
+                    const auto lease=source->acquire_expert(expert);
+                    check(bool(lease),"mixed SSD working set lost a cold expert");
+                }
         }
         const auto metrics=candidate.metrics();
         check(metrics.at("ram_expert_pinned_bytes")>0,"SSD RAM cache did not allocate reusable pinned storage");
