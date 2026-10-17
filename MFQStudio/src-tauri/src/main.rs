@@ -1,6 +1,8 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 mod updater;
+#[cfg(target_os = "windows")]
+mod windows_icon;
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -580,6 +582,7 @@ fn main() {
         .setup(|app| {
             #[cfg(target_os = "windows")]
             if let Some(window) = app.get_webview_window("main") {
+                windows_icon::set(&window)?;
                 window.set_decorations(false)?;
             }
             #[cfg(not(target_os = "windows"))]

@@ -107,6 +107,12 @@ fn write_icons(directory: &Path) {
     write_png(&directory.join("128x128.png"), 128, png_scale);
     write_png(&directory.join("256x256.png"), 256, png_scale);
 
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let output = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        fs::write(output.join("window-icon.rgba"), render(256, 1.0))
+            .expect("failed to write high-resolution Windows window icon");
+    }
+
     let mut ico = IconDir::new(ResourceType::Icon);
     for size in [16, 24, 32, 48, 64, 128, 256] {
         let image = IconImage::from_rgba_data(size, size, render(size, 1.0));
