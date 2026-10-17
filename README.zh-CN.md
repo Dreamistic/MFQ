@@ -121,6 +121,23 @@ Metal 平台为 **M5 Max（40 核 GPU、128 GB）**。CUDA 平台为 **RTX 3090 
 完整表格见[性能与质量](#性能与质量)，
 绘图数值见[图表数据](./docs/figures/data/qwen38-flash-next-inference-speed.json)。
 
+<details>
+<summary>Metal 运行时对比：MFQ、Strata 与 llama.cpp</summary>
+
+以下结果使用同一台 M5 Max 和同一份 4K Python 代码输入，按各运行时实际测试的
+量化档位分别展示。
+
+<p align="center">
+  <img src="./docs/figures/qwen38-flash-next-metal-runtime-comparison.zh-CN.svg" alt="M5 Max 上的 Qwen3.8-Flash-Next：MFQ、Strata 与 llama.cpp 共 14 个运行时和检查点配置的提示词处理速度及 MTP 开关生成速度" width="1100">
+</p>
+
+MFQ 来源表每档只给出一组提示词处理值；GGUF 的提示词处理柱使用 MTP 关闭值。
+各组的量化档位、草稿配置和测量次数不同，完整条件与表格见
+[基准说明](./docs/benchmarks/qwen38-flash-next-metal-comparison.md)，
+全部已发布数值及来源见[对比数据](./docs/figures/data/qwen38-flash-next-metal-runtime-comparison.json)。
+
+</details>
+
 MFQ 的 Apple Metal 后端基于 [MLX](https://github.com/ml-explore/mlx)，
 采用原生 C++ 运行时，并针对 MFQ 量化格式实现自定义 Metal 内核。
 

@@ -128,6 +128,25 @@ V4-XS. Shading marks `V3-XXS`; paired generation bars compare MTP off and on.
 See [Benchmarks](#benchmarks) for the complete table and
 [chart data](./docs/figures/data/qwen38-flash-next-inference-speed.json) for the plotted values.
 
+<details>
+<summary>Compare Metal runtimes: MFQ, Strata and llama.cpp</summary>
+
+The following measurements use the same M5 Max and 4K Python-code input,
+with each runtime's tested quantization tiers shown separately.
+
+<p align="center">
+  <img src="./docs/figures/qwen38-flash-next-metal-runtime-comparison.svg" alt="Qwen3.8-Flash-Next on M5 Max: MFQ, Strata and llama.cpp prompt processing and generation with MTP off and on, across 14 runtime/checkpoint configurations" width="1100">
+</p>
+
+The MFQ source gives one prefill value per tier; the GGUF prefill bars use
+MTP-off measurements. Quantization tiers, draft configurations and repeat
+counts differ. See the [benchmark notes](./docs/benchmarks/qwen38-flash-next-metal-comparison.md)
+for complete conditions and tables, and the
+[comparison data](./docs/figures/data/qwen38-flash-next-metal-runtime-comparison.json)
+for all published values and their sources.
+
+</details>
+
 MFQ's Apple Metal backend is built on [MLX](https://github.com/ml-explore/mlx),
 with a native C++ runtime and custom Metal kernels for MFQ quantization formats.
 

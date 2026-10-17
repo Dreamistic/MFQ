@@ -1,0 +1,262 @@
+{
+  "model": "Qwen3.8-Flash-Next",
+  "hardware": {
+    "device": "Apple M5 Max",
+    "gpu_cores": 40,
+    "memory_gb": 128,
+    "backend": "Metal"
+  },
+  "workload": {
+    "input_tokens": 4096,
+    "output_tokens": 128,
+    "batch_size": 1,
+    "sampling": "greedy",
+    "corpus_sha256": "f0b97fa3cc6b13fda04d41998d14cf358c38e3edd9e744257d37d1e5a065a248",
+    "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/README.md",
+    "note": "The Strata and llama.cpp protocols identify the 4K code continuation as the same workload used for MFQ. Their context limit is 16384; the MFQ table does not report its context limit."
+  },
+  "source": {
+    "repository": "ssh://git@fogejo.laplacecat.heiyu.space/yangjuncheng/MFQ-Publicity.git",
+    "revision": "a4b2f83959b50611043e1f86cdb80bb81f1cb3c9",
+    "files": [
+      {
+        "path": "Qwen3.8-Flash-Next-EW-MFQ/README.md",
+        "sha256": "aba9d1068f75ba6bdaac7372836a6e753e402e63f87a539565cb922d0f4c9f06"
+      },
+      {
+        "path": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md",
+        "sha256": "4591d78b64737b251cc257ecdbe14dcbc1d3aadc7cd5fee46e50c1f434d77d61"
+      },
+      {
+        "path": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md",
+        "sha256": "a660d8817dde0ce51915b900aa3a1cf0ee8002073c2a341d6e1f311dc615ccd3"
+      },
+      {
+        "path": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/README.md",
+        "sha256": "c2ccc02b3b037f53f0682ba9c00416ffdaebf18720445693671355ec7eab6390"
+      }
+    ],
+    "description": "Published benchmark tables from MFQ-Publicity; no new measurements. The full prompt is not copied into this snapshot."
+  },
+  "runtimes": [
+    {
+      "id": "mfq",
+      "label": "MFQ",
+      "version": null,
+      "measured_runs_per_mode": null,
+      "prefill_mode": "not specified in the published table",
+      "mtp_draft_setup": "not specified in the published table"
+    },
+    {
+      "id": "strata",
+      "label": "Strata",
+      "version": "v0.1.44.1",
+      "commit": "296b59d2",
+      "date": "2026-10-16",
+      "measured_runs_per_mode": 2,
+      "aggregate": "total tokens / total measured time",
+      "mtp_draft_setup": "Q2_0 draft experts; default CJK vocabulary shortlist; spec=2 (one draft token per round)",
+      "generation_timing": "127 intervals between the first and last of 128 output tokens",
+      "prefix_reuse_tokens": 0,
+      "warmup_excluded": true,
+      "idle_seconds_before_run": 60
+    },
+    {
+      "id": "llamacpp",
+      "label": "llama.cpp",
+      "version": "f74e2fa6",
+      "commit": "f74e2fa6a31cc33ab4ee4ae516641cfe62df3924",
+      "date": "2026-10-16",
+      "measured_runs_per_mode": 1,
+      "mtp_draft_setup": "Self-contained Unsloth Q8_0 MTP head; one draft token per round",
+      "generation_timing": "127 intervals between the first and last of 128 output tokens",
+      "prefix_reuse_tokens": 0,
+      "warmup_excluded": true,
+      "idle_seconds_before_run": 60
+    }
+  ],
+  "interpretation": [
+    "Rows are runtime/checkpoint configurations, with different quantization tiers; they are not matched-precision or matched-quality comparisons.",
+    "The chart uses the one published MFQ prefill value and MTP-off prefill values for the two GGUF runtimes. Missing MFQ prefill mode values remain null.",
+    "MTP draft weights and head configurations differ between Strata and llama.cpp; MFQ draft settings are not specified in this source.",
+    "Strata combines two measured runs per mode; llama.cpp reports one. The source does not give uncertainty estimates or MFQ repeat counts.",
+    "Strata ordinary and MTP outputs match for all four configurations; llama.cpp UD-Q4_K_XL diverges from output token 80, while its three GSQ-RCO outputs match.",
+    "GSQ-RCO IQ2_XS is unsupported by this Strata Metal release and is not plotted as a zero-speed result."
+  ],
+  "measurements": [
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "V1-M",
+      "reported_weight_residency_gib": 43.36,
+      "prefill_reported": 2538.5,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 71.6,
+      "generation_mtp": 101.2,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "S2-L",
+      "reported_weight_residency_gib": 47.41,
+      "prefill_reported": 2538.9,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 71.0,
+      "generation_mtp": 97.9,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "V3-XXS",
+      "reported_weight_residency_gib": 50.33,
+      "prefill_reported": 2527.6,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 70.8,
+      "generation_mtp": 105.4,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "S3-L",
+      "reported_weight_residency_gib": 57.95,
+      "prefill_reported": 2565.6,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 68.1,
+      "generation_mtp": 98.2,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "V4-XS",
+      "reported_weight_residency_gib": 61.48,
+      "prefill_reported": 2540.1,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 67.7,
+      "generation_mtp": 96.7,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "mfq",
+      "method": "mfq",
+      "tier": "S4-L",
+      "reported_weight_residency_gib": 78.25,
+      "prefill_reported": 2481.7,
+      "prefill_no_mtp": null,
+      "prefill_mtp": null,
+      "generation_no_mtp": 63.6,
+      "generation_mtp": 93.6,
+      "draft_acceptance_percent": null,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/README.md"
+    },
+    {
+      "runtime": "strata",
+      "method": "gsq-rco",
+      "tier": "Q2_0",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1796.3,
+      "generation_no_mtp": 84.4,
+      "prefill_mtp": 1698.0,
+      "generation_mtp": 122.8,
+      "draft_acceptance_percent": 95.4,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md"
+    },
+    {
+      "runtime": "strata",
+      "method": "gsq-rco",
+      "tier": "IQ3_XXS",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1487.5,
+      "generation_no_mtp": 76.2,
+      "prefill_mtp": 1401.4,
+      "generation_mtp": 105.7,
+      "draft_acceptance_percent": 85.5,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md"
+    },
+    {
+      "runtime": "strata",
+      "method": "gsq-rco",
+      "tier": "IQ3_S",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1469.7,
+      "generation_no_mtp": 72.8,
+      "prefill_mtp": 1362.1,
+      "generation_mtp": 99.6,
+      "draft_acceptance_percent": 82.9,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md"
+    },
+    {
+      "runtime": "strata",
+      "method": "unsloth-ud",
+      "tier": "UD-Q4_K_XL",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1363.7,
+      "generation_no_mtp": 58.4,
+      "prefill_mtp": 1242.0,
+      "generation_mtp": 85.9,
+      "draft_acceptance_percent": 89.6,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/strata-metal-4k.md"
+    },
+    {
+      "runtime": "llamacpp",
+      "method": "gsq-rco",
+      "tier": "Q2_0",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1259.9,
+      "generation_no_mtp": 49.0,
+      "prefill_mtp": 1171.9,
+      "generation_mtp": 66.9,
+      "draft_acceptance_percent": 95.4,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md"
+    },
+    {
+      "runtime": "llamacpp",
+      "method": "gsq-rco",
+      "tier": "IQ3_XXS",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1208.5,
+      "generation_no_mtp": 46.5,
+      "prefill_mtp": 1112.6,
+      "generation_mtp": 62.9,
+      "draft_acceptance_percent": 96.9,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md"
+    },
+    {
+      "runtime": "llamacpp",
+      "method": "gsq-rco",
+      "tier": "IQ3_S",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1192.8,
+      "generation_no_mtp": 45.4,
+      "prefill_mtp": 1108.4,
+      "generation_mtp": 59.3,
+      "draft_acceptance_percent": 86.8,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md"
+    },
+    {
+      "runtime": "llamacpp",
+      "method": "unsloth-ud",
+      "tier": "UD-Q4_K_XL",
+      "prefill_reported": null,
+      "prefill_no_mtp": 1191.7,
+      "generation_no_mtp": 42.5,
+      "prefill_mtp": 1103.2,
+      "generation_mtp": 57.7,
+      "draft_acceptance_percent": 88.1,
+      "source": "Qwen3.8-Flash-Next-EW-MFQ/benchmarks/llamacpp-metal-4k.md"
+    }
+  ]
+}
