@@ -358,6 +358,8 @@ public:
     void initialize_ssd_residency();
     using SsdExpertRequest=std::pair<MoeQuantRangeSource*,int>;
     std::vector<MoeHostExpertCache::Lease> read_ssd_experts(const std::vector<SsdExpertRequest>& requests);
+    struct SsdExpertCopy {MoeQuantRangeSource* source;int expert;std::vector<mfq_tensor_backend::Tensor> fields;};
+    void copy_ssd_experts(const std::vector<SsdExpertCopy>& requests);
     void calibrate_pipeline_pcie();
     bool complete_residency() const noexcept { return complete_residency_; }
     bool pipeline_ready() const noexcept { return complete_residency_ || ssd_experts_; }
@@ -540,6 +542,8 @@ public:
                << " pipeline_route_wait_ns=" << stats_.pipeline_route_wait_ns
                << " pipeline_plan_ns=" << stats_.pipeline_plan_ns
                << " pipeline_fetch_ns=" << stats_.pipeline_fetch_ns
+               << " pipeline_ssd_read_ns=" << stats_.pipeline_ssd_read_ns
+               << " pipeline_window_ssd_read_ns=" << stats_.pipeline_window_ssd_read_ns
                << " pipeline_cpu_ns=" << stats_.pipeline_cpu_ns
                << " pipeline_gpu_ns=" << stats_.pipeline_gpu_ns
                << " pipeline_gpu_interval_can_include_cpu_wait=" << (stats_.pipeline_two_stage_serves>0)
@@ -768,6 +772,7 @@ public:
         const auto disk_reads=expert_disk_reads_after_preload();
         const auto disk_read_bytes=expert_disk_bytes_after_preload();
         const auto disk_times=expert_disk_timings();
+        const auto direct_reads=expert_prefill_direct_reads();
         std::size_t gpu_weights=0;
         for(const auto& [signature,arena]:arenas_)
             for(const auto& field:arena->fields)gpu_weights+=std::size_t(tensor_nbytes(field));
@@ -781,6 +786,9 @@ public:
             {"ssd_expert_payload_bytes",double(ssd_experts_ && cold>host.resident_bytes?cold-host.resident_bytes:0)},
             {"ssd_expert_bytes_read",double(disk_read_bytes)},
             {"ssd_expert_read_count",double(disk_reads)},
+            {"ssd_prefill_direct_reads",double(direct_reads)},
+            {"ssd_decode_read_wait_ms",double(stats_.pipeline_window_ssd_read_ns)/1e6},
+            {"ssd_expert_read_wait_ms",double(stats_.pipeline_ssd_read_ns)/1e6},
             {"ssd_expert_encoded_ms",double(disk_times[0])/1e6},
             {"ssd_expert_materialize_ms",double(disk_times[1])/1e6},
             {"ssd_expert_nint_materialize_ms",double(disk_times[2])/1e6},
@@ -944,6 +952,7 @@ private:
     }
     std::uint64_t expert_disk_reads_after_preload() const;
     std::uint64_t expert_disk_bytes_after_preload() const;
+    std::uint64_t expert_prefill_direct_reads() const;
     std::array<std::uint64_t,4> expert_disk_timings() const;
     bool complete_residency_=false;
     bool ssd_experts_=false;

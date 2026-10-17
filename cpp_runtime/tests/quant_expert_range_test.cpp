@@ -82,6 +82,7 @@ void check_group64_fields() {
         for(const auto& span:spans)read(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
     });
     require(source.group64(),"group64 row storage was not detected");
+    require(!source.copy_rows_fields(0,1,{}),"group64 direct targets changed the physical layout");
     for(const auto range:{std::pair<int,int>{0,1},{1,18},{17,34},{0,34}}) {
         const auto fields=source.slice_rows_fields(range.first,range.second);
         require(bool(fields),"group64 fields were unavailable");
@@ -270,6 +271,33 @@ void self_test() {
         std::memcpy(out,single.data()+offset,size);
     };
     const mfq::NvqRows rows(single.size(),nvq_reader);
+    for(const bool batch:{false,true}) {
+        mfq::NvqRows::ReadBatch read_batch;
+        if(batch)read_batch=[&](const std::vector<mfq::ReadSpan>& spans) {
+            require(spans.size()==4,"direct NVQ fields were not read together");
+            for(const auto& span:spans)nvq_reader(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
+        };
+        const mfq::NvqRows direct(single.size(),nvq_reader,read_batch);
+        const auto expected=nvq(8,16);
+        std::array<std::vector<std::uint8_t>,4> buffers;
+        std::array<mfq::NvqRows::FieldTarget,4> targets;
+        const std::array<std::size_t,4> sizes={16,9,77,3};
+        std::size_t cursor=40;
+        for(int f=0;f<4;++f) {
+            buffers[f].resize(sizes[f]+8,0xa5);targets[f]={buffers[f].data()+3,sizes[f]};
+        }
+        require(direct.copy_rows_fields(8,16,targets),"aligned NVQ direct fields were unavailable");
+        for(int f=0;f<4;++f) {
+            require(std::equal(buffers[f].begin()+3,buffers[f].end()-5,expected.begin()+cursor),
+                "direct NVQ target differs from independent encoding");
+            require(std::all_of(buffers[f].begin(),buffers[f].begin()+3,[](auto value){return value==0xa5;}) &&
+                std::all_of(buffers[f].end()-5,buffers[f].end(),[](auto value){return value==0xa5;}),
+                "direct NVQ fields overwrote a target guard");
+            cursor+=sizes[f];
+        }
+        require(!direct.copy_rows_fields(1,9,targets),"unaligned NVQ target copy was accepted");
+        --targets[1].bytes;rejected([&]{direct.copy_rows_fields(8,16,targets);});
+    }
     for(const std::uint16_t anchor:{0x7c00,0x7e01,0x8000,0xbc00}) {
         auto bad=single;std::memcpy(bad.data()+40,&anchor,2);
         mfq::NvqRows invalid(bad.size(),[&](std::size_t offset,std::uint8_t* output,std::size_t count) {

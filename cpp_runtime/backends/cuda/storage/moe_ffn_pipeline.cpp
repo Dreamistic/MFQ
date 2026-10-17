@@ -512,8 +512,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             int begin=0,rows=0;
             int route_offset=0,mma_tile_m=8,wide_tile_m=8;
             std::array<std::vector<Upload>,3> uploads;
-            std::vector<MoeHostExpertCache::Lease> leases;
-            std::future<std::vector<MoeHostExpertCache::Lease>> pending;
+            std::future<void> pending;
         };
         std::vector<Group> work(groups);stats.pipeline_prefill_groups+=groups;
         struct DrainFailedReads {
@@ -640,29 +639,47 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             }
         }
         const auto queue_group=[&](int g) {
-            std::vector<MoeExpertCache::SsdExpertRequest> requests;
+            std::size_t offset=0;
+            auto& buffer=stream.buffers[g%2];
+            for(int p=0;p<3;++p)for(std::size_t c=0;c<sources_[p]->cohorts_.size();++c) {
+                std::vector<Upload*> uploads;
+                for(auto& upload:work[g].uploads[p])if(upload.cohort==int(c))uploads.push_back(&upload);
+                if(uploads.empty())continue;
+                const auto fields=moe_cache_fields(buffer.projections[p].pools[2*c+1]);
+                for(auto* upload:uploads)upload->fields.resize(fields.size());
+                for(std::size_t f=0;f<fields.size();++f) {
+                    const auto bytes=std::size_t(sources_[p]->cohorts_[c].bytes_per_expert[f]);
+                    if(bytes)offset=prefill_align(offset);
+                    if(offset>cache_->pipeline_prefill_host_stride_ ||
+                            uploads.size()*bytes>cache_->pipeline_prefill_host_stride_-offset)
+                        throw std::logic_error("SSD prefill direct target exceeded its packet");
+                    auto* target=cache_->pipeline_prefill_host_ring_.data_ptr<uint8_t>()+
+                        std::size_t(g%2)*cache_->pipeline_prefill_host_stride_+offset;
+                    for(std::size_t i=0;i<uploads.size();++i)
+                        uploads[i]->fields[f]=tb::from_blob(target+i*bytes,
+                            {int64_t(bytes/fields[f].element_size())},
+                            tb::TensorOptions().device(tb::kCPU).dtype(fields[f].scalar_type()));
+                    offset+=uploads.size()*bytes;
+                }
+            }
+            std::vector<MoeExpertCache::SsdExpertCopy> requests;
             for(int p=0;p<3;++p)for(const auto& upload:work[g].uploads[p])
-                requests.emplace_back(sources_[p]->quant_source_.get(),upload.expert);
+                requests.push_back({sources_[p]->quant_source_.get(),upload.expert,upload.fields});
             if(requests.empty())return;
             work[g].pending=std::async(std::launch::async,[cache=cache_,requests=std::move(requests)] {
-                return cache->read_ssd_experts(requests);
+                cache->copy_ssd_experts(requests);
             });
         };
         const auto retire_cpu_group=[&](int g) {
             stream.buffers[g%2].down_ready.synchronize();
             for(auto& uploads:work[g].uploads)for(auto& upload:uploads)upload.fields.clear();
-            work[g].leases.clear();
         };
         const auto stage_group=[&](int g) {
             const auto started=Clock::now();auto& buffer=stream.buffers[g%2];
             std::size_t host_offset=0;
             if(cache_->ssd_experts()) {
                 if(g>=2)buffer.down_ready.synchronize();
-                auto leases=work[g].pending.valid()?work[g].pending.get():std::vector<MoeHostExpertCache::Lease>{};
-                std::size_t at=0;
-                for(auto& uploads:work[g].uploads)for(auto& upload:uploads)
-                    upload.fields=moe_cache_fields(leases[at++]->weights);
-                work[g].leases=std::move(leases);
+                if(work[g].pending.valid())work[g].pending.get();
             }
             if(g>=2)MFQ_CUDA_CHECK(cudaStreamWaitEvent(cache_->weight_stream_,buffer.used.get(),0));
             for(int p=0;p<3;++p) {
@@ -687,7 +704,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                             for(std::size_t i=0;i<count;++i) {
                                 if(cohort_uploads[i]->slot!=int(i))
                                     throw std::logic_error("SSD prefill cohort slots are not contiguous");
-                                std::memcpy(packed+i*bytes,cohort_uploads[i]->fields[f].data_ptr(),bytes);
+                                if(cohort_uploads[i]->fields[f].data_ptr()!=packed+i*bytes)
+                                    throw std::logic_error("SSD prefill field was not read into its pinned packet");
                             }
                             MFQ_CUDA_CHECK(cudaMemcpyAsync(destination_base,packed,total,
                                 cudaMemcpyHostToDevice,cache_->weight_stream_));
@@ -805,8 +823,6 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         }
         MFQ_CUDA_CHECK(cudaEventRecord(cache_->transfer_ready_,cache_->weight_stream_));
         cache_->transfer_ready_recorded_=true;
-        if(cache_->ssd_experts())for(auto& group:work)for(auto& lease:group.leases)
-            cache_->pipeline_dma_leases_.push_back(std::move(lease));
         auto output=parts.reshape({tokens,routes,width_});
         if(shared.defined())output=moe_weighted_reduce_cuda(output,weights)+shared;
         cache_->record_compute_use();
@@ -3398,7 +3414,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     }
                     requests.emplace_back(sources_[p]->quant_source_.get(),group.expert);
                 }
-            ssd_leases=cache_->read_ssd_experts(requests);
+            const auto before=stats.pipeline_ssd_read_ns;
+            time(stats.pipeline_ssd_read_ns,[&]{ssd_leases=cache_->read_ssd_experts(requests);});
+            if(cell.in_window)stats.pipeline_window_ssd_read_ns+=stats.pipeline_ssd_read_ns-before;
         }
         const auto transferred=stats.ram_pcie_bytes,fetch_started=stats.pipeline_fetch_ns;
         if(cache_->pipeline_dma_profile_enabled_) {

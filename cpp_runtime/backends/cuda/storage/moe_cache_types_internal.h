@@ -370,6 +370,7 @@ struct MoeCacheStats {
     int64_t pipeline_two_stage_serves=0;
     int64_t pipeline_transfer_cache_hits=0,pipeline_transfer_cache_misses=0,pipeline_transfer_cache_saved_bytes=0;
     int64_t pipeline_fetch_ns=0,pipeline_cpu_ns=0;
+    int64_t pipeline_ssd_read_ns=0,pipeline_window_ssd_read_ns=0;
     int64_t pipeline_window_serves=0,pipeline_window_route_ns=0,pipeline_window_plan_ns=0;
     int64_t pipeline_window_fetch_ns=0,pipeline_window_cpu_ns=0,pipeline_window_gpu_ns=0;
     // Host dispatch plans for three/four-row windows; routed experts only.

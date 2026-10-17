@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -32,6 +33,10 @@ public:
     // Reuse a validated pool's immutable codebook. Deinterleave group64 into
     // the same packed fields without constructing another complete NVQ blob.
     std::optional<Fields> slice_rows_fields(std::int64_t begin,std::int64_t end) const;
+    struct FieldTarget {std::uint8_t* data=nullptr;std::size_t bytes=0;};
+    // Anchor (FP16), states, indices and auxiliary bits. Unsupported physical
+    // layouts return false before reading or touching any target.
+    bool copy_rows_fields(std::int64_t begin,std::int64_t end,const std::array<FieldTarget,4>& targets) const;
     std::size_t row_range_nbytes(std::int64_t begin,std::int64_t end) const;
 private:
     Read read_;

@@ -272,6 +272,8 @@ int main(int argc,char** argv)try {
             std::uint64_t cpu=0;for(const auto& source:candidate.sources)cpu+=source->cpu_projections();
             check(cpu>0,"SSD hybrid test did not execute CPU expert projections");
         }
+        if(prefix.empty() && std::string(format).starts_with("nvq") && std::string(format)!="nvq2j-xl")
+            check(metrics.at("ssd_prefill_direct_reads")>0,"prefill did not read NVQ fields directly into pinned targets");
         std::cout<<"ssd_experts format="<<format<<" reads="<<metrics.at("ssd_expert_read_count")
             <<" bytes="<<metrics.at("ssd_expert_bytes_read")<<" bounded_RAM=1 graph=1 PASS\n";
         release_moe_decode_buffers(candidate.cache);

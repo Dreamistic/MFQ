@@ -34,14 +34,17 @@ tb::Tensor nvq_field_view(const std::shared_ptr<NvqFieldOwner>& owner,std::vecto
     return tb::Tensor(storage,tb::make_contiguous_view(bytes.data(),shape,tb::kUInt8,device));
 }
 #endif
-std::size_t expert_fields_bytes(const MixedMoePool& pool) {
+std::vector<tb::Tensor> expert_field_tensors(const MixedMoePool& pool) {
     std::vector<tb::Tensor> fields;
     if (pool.family==MixedMoeFamily::Nint)
         fields={pool.nint.q_packed,pool.nint.row_q_bits,pool.nint.row_q_bit_offsets,
             pool.nint.sub_scale,pool.nint.sub_min,pool.nint.neuron_scale,pool.nint.neuron_min};
     else fields={pool.nvq.indices_packed,pool.nvq.aux_packed,pool.nvq.sub_scale_packed,pool.nvq.neuron_scale};
+    return fields;
+}
+std::size_t expert_fields_bytes(const MixedMoePool& pool) {
     std::size_t bytes=0;
-    for (const auto& field:fields) bytes+=field.numel()*field.element_size();
+    for (const auto& field:expert_field_tensors(pool)) bytes+=field.numel()*field.element_size();
     return bytes;
 }
 }
@@ -127,6 +130,65 @@ MixedMoePool MoeQuantRangeSource::read_expert(int expert) const {
         (result.family==MixedMoeFamily::Nint?nint_materialize_ns_:nvq_materialize_ns_).fetch_add(materialize,std::memory_order_relaxed);
     }
     return result;
+}
+
+void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Tensor>& targets) const {
+    const auto index=store_->expert_pool(expert);
+    std::size_t bytes=0;
+    for(const auto& target:targets) {
+        if(!target.is_cpu())throw std::invalid_argument("SSD field copy requires host targets");
+        bytes+=target.numel()*target.element_size();
+    }
+    if(bytes!=field_bytes_.at(index))throw std::invalid_argument("SSD field copy layout differs");
+    const auto copy=[&](const MixedMoePool& pool) {
+        const auto fields=expert_field_tensors(pool);
+        if(fields.size()!=targets.size())throw std::invalid_argument("SSD field copy count differs");
+        for(std::size_t f=0;f<fields.size();++f) {
+            const auto size=fields[f].numel()*fields[f].element_size();
+            if(size!=targets[f].numel()*targets[f].element_size())
+                throw std::invalid_argument("SSD field copy shape differs");
+            if(size)std::memcpy(targets[f].data_ptr(),fields[f].data_ptr(),size);
+        }
+    };
+    if(host_cache_)if(auto cached=host_cache_->find(host_key(expert))) {copy(cached->weights);return;}
+    if(disk_sealed_.load()) {
+        ++sealed_disk_attempts_;
+        throw std::runtime_error("expert disk copy forbidden after complete residency preload");
+    }
+    const auto& prototype=metadata_->pools.at(index);
+    if(!dense_groups_ && prototype.family==MixedMoeFamily::Nvq && targets.size()==4) {
+        using Clock=std::chrono::steady_clock;
+        const bool profile=profile_ssd_ && preloaded_.load();
+        const auto begin=profile?Clock::now():Clock::time_point{};
+        std::vector<std::uint16_t> anchors(store_->out_per_expert());
+        const auto target=[&](std::size_t f) {
+            return mfq::NvqRows::FieldTarget{static_cast<std::uint8_t*>(targets[f].data_ptr()),
+                std::size_t(targets[f].numel()*targets[f].element_size())};
+        };
+        const std::array<mfq::NvqRows::FieldTarget,4> fields={
+            mfq::NvqRows::FieldTarget{reinterpret_cast<std::uint8_t*>(anchors.data()),anchors.size()*2},
+            target(2),target(0),target(1)};
+        if(store_->copy_nvq_fields(expert,fields)) {
+            const auto read_done=profile?Clock::now():Clock::time_point{};
+            if(targets[3].numel()*targets[3].element_size()!=anchors.size()*4)
+                throw std::invalid_argument("SSD neuron scale target differs");
+            const auto scale=cpu_f16_to_f32_tensor(anchors,store_->out_per_expert());
+            std::memcpy(targets[3].data_ptr(),scale.data_ptr(),anchors.size()*4);
+            ++prefill_direct_reads_;++materializations_;
+            if(preloaded_.load()) {
+                ++disk_reads_after_preload_;
+                disk_bytes_after_preload_.fetch_add(bytes-anchors.size()*2,std::memory_order_relaxed);
+            }
+            if(profile) {
+                encoded_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(read_done-begin).count(),std::memory_order_relaxed);
+                const auto materialize=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_done).count();
+                materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
+                nvq_materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
+            }
+            return;
+        }
+    }
+    const auto lease=acquire_expert(expert);copy(lease->weights);
 }
 
 MixedMoePool MoeQuantRangeSource::decode_expert(int expert,const mfq::MfeQuantExpert& encoded) const {

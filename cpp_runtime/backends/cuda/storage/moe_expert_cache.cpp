@@ -531,6 +531,15 @@ std::vector<MoeHostExpertCache::Lease> MoeExpertCache::read_ssd_experts(
     return leases;
 }
 
+void MoeExpertCache::copy_ssd_experts(const std::vector<SsdExpertCopy>& requests) {
+    if(requests.empty())return;
+    if(!ssd_read_pool_)throw std::logic_error("SSD expert copy pool is not initialized");
+    ssd_read_pool_->run(0,int64_t(requests.size()),1,std::max(1,config_.moe_ssd_io_workers),
+        [&](int64_t begin,int64_t end) {
+            for(auto i=begin;i<end;++i)requests[i].source->copy_expert_fields(requests[i].expert,requests[i].fields);
+        });
+}
+
 std::size_t MoeExpertCache::prefill_transfer_bytes(bool predictor) const {
     std::size_t maximum=0;
     std::size_t layers=0;
@@ -1234,6 +1243,12 @@ std::uint64_t MoeExpertCache::expert_disk_reads_after_preload() const {
     std::uint64_t reads=0;
     for (const auto& source:sources_) if (source->quant_source_)
         reads+=source->quant_source_->expert_disk_reads_after_preload();
+    return reads;
+}
+
+std::uint64_t MoeExpertCache::expert_prefill_direct_reads() const {
+    std::uint64_t reads=0;
+    for(const auto& source:sources_)if(source->quant_source_)reads+=source->quant_source_->prefill_direct_reads();
     return reads;
 }
 

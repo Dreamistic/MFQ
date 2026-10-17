@@ -211,6 +211,36 @@ std::optional<NvqRows::Fields> NvqRows::slice_rows_fields(std::int64_t begin,std
     return result;
 }
 
+bool NvqRows::copy_rows_fields(std::int64_t begin,std::int64_t end,
+        const std::array<FieldTarget,4>& targets) const {
+    if(begin<0 || end<=begin || end>rows_)throw std::out_of_range("NVQ direct field range");
+    if(group64_)return false;
+    const auto rows=std::uint64_t(end-begin);
+    const int aux_items=aux_bits_==1?groups_:signs_;
+    const std::array<std::uint64_t,4> first={std::uint64_t(begin)*16,
+        std::uint64_t(begin)*groups_*state_bits_,std::uint64_t(begin)*vectors_*index_bits_,
+        std::uint64_t(begin)*aux_items*aux_bits_};
+    const std::array<std::uint64_t,4> counts={rows*16,rows*groups_*state_bits_,
+        rows*vectors_*index_bits_,rows*aux_items*aux_bits_};
+    const std::array<std::size_t,4> offsets={anchor_,states_,indices_,aux_};
+    for(int f=0;f<4;++f)if((first[f]|counts[f])&7)return false;
+    std::vector<ReadSpan> spans;
+    for(int f=0;f<4;++f) {
+        if(targets[f].bytes!=counts[f]/8 || (targets[f].bytes && !targets[f].data))
+            throw std::invalid_argument("NVQ direct field target size differs");
+        if(targets[f].bytes)spans.push_back({offsets[f]+first[f]/8,
+            reinterpret_cast<std::byte*>(targets[f].data),targets[f].bytes});
+    }
+    if(read_batch_)read_batch_(spans);
+    else for(const auto& span:spans)read_(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
+    for(std::size_t row=0;row<std::size_t(rows);++row) {
+        std::uint16_t anchor;std::memcpy(&anchor,targets[0].data+row*2,2);
+        if((anchor&0x7c00u)==0x7c00u || (anchor&0x8000u))
+            throw std::runtime_error("NVQ neuron anchors must be finite and non-negative");
+    }
+    return true;
+}
+
 std::size_t NvqRows::row_range_nbytes(std::int64_t begin,std::int64_t end) const {
     if (begin<0 || end<=begin || end>rows_) throw std::out_of_range("NVQ contiguous row range");
     const auto rows=static_cast<std::uint64_t>(end-begin);
