@@ -110,22 +110,9 @@ BibTeX 格式见[引用](#引用)。
 **M5 Max 上的 105.4 tok/s**，以及 **RTX 3090 Ti + 32 GiB RAM 上的
 61.0 tok/s**。
 
-<p align="center">
-  <img src="./docs/figures/qwen38-flash-next-inference-speed.zh-CN.svg" alt="MFQ Qwen3.8-Flash-Next 推理速度横向柱状图：Apple Metal 与 NVIDIA CUDA 的 MTP 开关生成速度和提示词处理速度，底纹突出 V3-XXS" width="1100">
-</p>
-
-全部结果均使用 **Qwen3.8-Flash-Next，输入长度为 4,096 tokens**。
-Metal 平台为 **M5 Max（40 核 GPU、128 GB）**。CUDA 平台为 **RTX 3090 Ti**，
-其中 V1-S、V1-M、S2-L、V3-XXS 配备 **32 GiB RAM**，S3-L、V4-XS 配备
-**64 GiB RAM**。浅色底纹标出 `V3-XXS`，生成速度的两根柱分别对应 MTP 关闭和开启。
-完整表格见[性能与质量](#性能与质量)，
-绘图数值见[图表数据](./docs/figures/data/qwen38-flash-next-inference-speed.json)。
-
-<details>
-<summary>Metal 运行时对比：MFQ、Strata 与 llama.cpp</summary>
-
-以下结果使用同一台 M5 Max 和同一份 4K Python 代码输入，按各运行时实际测试的
-量化档位分别展示。
+下图对比 MFQ、Strata 与 llama.cpp，均使用同一台 **M5 Max（40 核 GPU、128 GB）**，
+运行 **Qwen3.8-Flash-Next**，输入为同一份 **4,096 tokens 的 Python 代码**。
+各运行时按实际测试的量化档位分别展示。
 
 <p align="center">
   <img src="./docs/figures/qwen38-flash-next-metal-runtime-comparison.zh-CN.svg" alt="M5 Max 上的 Qwen3.8-Flash-Next：MFQ、Strata 与 llama.cpp 共 14 个运行时和检查点配置的提示词处理速度及 MTP 开关生成速度" width="1100">
@@ -140,8 +127,7 @@ MFQ 来源表每档只给出一组提示词处理值；GGUF 的提示词处理�
 各组的量化档位、草稿配置和测量次数不同，完整条件与表格见
 [基准说明](./docs/benchmarks/qwen38-flash-next-metal-comparison.md)，
 全部已发布数值及来源见[对比数据](./docs/figures/data/qwen38-flash-next-metal-runtime-comparison.json)。
-
-</details>
+CUDA 结果与 MFQ 的完整速度表格见[性能与质量](#性能与质量)。
 
 MFQ 的 Apple Metal 后端基于 [MLX](https://github.com/ml-explore/mlx)，
 采用原生 C++ 运行时，并针对 MFQ 量化格式实现自定义 Metal 内核。

@@ -117,22 +117,9 @@ expert work while preserving each projection's selected format. The **V3-XXS**
 tier shown above reaches **105.4 tok/s on M5 Max** and **61.0 tok/s on
 RTX 3090 Ti + 32 GiB RAM**, with MTP enabled.
 
-<p align="center">
-  <img src="./docs/figures/qwen38-flash-next-inference-speed.svg" alt="MFQ Qwen3.8-Flash-Next horizontal speed charts: Apple Metal and NVIDIA CUDA generation with MTP off and on, plus prompt processing; V3-XXS is highlighted" width="1100">
-</p>
-
-All measurements use **Qwen3.8-Flash-Next with 4,096-token inputs**. Metal runs
-on an **M5 Max (40-core GPU, 128 GB)**. CUDA runs on an **RTX 3090 Ti**, with
-**32 GiB RAM** for V1-S, V1-M, S2-L and V3-XXS, and **64 GiB RAM** for S3-L and
-V4-XS. Shading marks `V3-XXS`; paired generation bars compare MTP off and on.
-See [Benchmarks](#benchmarks) for the complete table and
-[chart data](./docs/figures/data/qwen38-flash-next-inference-speed.json) for the plotted values.
-
-<details>
-<summary>Compare Metal runtimes: MFQ, Strata and llama.cpp</summary>
-
-The following measurements use the same M5 Max and 4K Python-code input,
-with each runtime's tested quantization tiers shown separately.
+The chart compares MFQ, Strata and llama.cpp on the same **M5 Max (40-core GPU,
+128 GB)**, using **Qwen3.8-Flash-Next** and a **4,096-token Python-code input**.
+Each runtime's tested quantization tiers are shown separately.
 
 <p align="center">
   <img src="./docs/figures/qwen38-flash-next-metal-runtime-comparison.svg" alt="Qwen3.8-Flash-Next on M5 Max: MFQ, Strata and llama.cpp prompt processing and generation with MTP off and on, across 14 runtime/checkpoint configurations" width="1100">
@@ -149,8 +136,7 @@ counts differ. See the [benchmark notes](./docs/benchmarks/qwen38-flash-next-met
 for complete conditions and tables, and the
 [comparison data](./docs/figures/data/qwen38-flash-next-metal-runtime-comparison.json)
 for all published values and their sources.
-
-</details>
+For CUDA results and complete MFQ speed tables, see [Benchmarks](#benchmarks).
 
 MFQ's Apple Metal backend is built on [MLX](https://github.com/ml-explore/mlx),
 with a native C++ runtime and custom Metal kernels for MFQ quantization formats.
