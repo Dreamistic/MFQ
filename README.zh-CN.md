@@ -45,6 +45,7 @@ OpenAI 和 Anthropic 兼容 API 接入应用与 Agent。
 | 关注点 | 实测结果 | 配置与条件 |
 | --- | --- | --- |
 | 量化质量 | **KLD 降低 37.4%**，**Top1 一致率提高 5.03 个百分点** | V1-M 与 Unsloth UD IQ1_M 对比；WikiText-2；权重大小约 74.5 GB |
+| 基础格式重构 | **平均 SSE 降低 4.04%–25.16%** | 7 组 MFQ/GGUF 格式按表中实际 bpw 对比；第 0 层全部 512 个专家 × Gate/Up/Down |
 | 权重常驻需求 | **43.36 GiB 常驻权重** | Metal 上的 V1-M，PLE 表按需从 SSD 读取 |
 | Apple／Metal 生成速度 | **101.2 tok/s** | V1-M；M5 Max，40 核 GPU，128 GB；输入 4,096 tokens；开启 MTP |
 | NVIDIA／CUDA 生成速度 | **87.0 tok/s** | V1-S；RTX 3090 Ti + 32 GiB RAM；输入 4,096 tokens；开启 MTP |
@@ -52,16 +53,22 @@ OpenAI 和 Anthropic 兼容 API 接入应用与 Agent。
 常驻权重大小不包含 KV Cache 与运行时的额外内存分配。各档位的完整速度和质量
 数据见[性能与质量](#性能与质量)。
 
-下图展示模型大小与参考模型一致性的关系：KL 散度（KLD）越低、Top1 一致率
-越高，表示量化后的模型越接近参考模型。
+下图同时展示模型质量与基础格式保真度。上方两图展示模型大小与参考模型一致性的关系：
+KL 散度（KLD）越低、Top1 一致率越高，表示量化后的模型越接近参考模型。
+下方用横向柱状图展示 7 组 MFQ/GGUF 基础格式的重构 SSE 降低幅度，并标出实际 bpw。
 
 <p align="center">
-  <img src="./docs/figures/qwen38-flash-next-quality.zh-CN.svg" alt="Qwen3.8-Flash-Next：MFQ、Unsloth UD 与 GSQ-RCO 的模型大小、KLD 和 Top1 一致率对比" width="1100">
+  <img src="./docs/figures/qwen38-flash-next-quality.zh-CN.svg" alt="Qwen3.8-Flash-Next：MFQ、Unsloth UD 与 GSQ-RCO 的模型大小、KLD 和 Top1 一致率对比，以及 7 组基础格式的实际 bpw 与 MFQ 平均重构 SSE 降低 4.04%–25.16% 的对比" width="1100">
 </p>
 
 质量对比中的权重大小不含视觉编码器与 MTP 层，GB = 10⁹ 字节。
 完整对比与档位选择建议见[模型卡](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ)，
-全部绘图数值与来源见[图表数据](./docs/figures/data/qwen38-flash-next-quality.json)。
+各检查点的绘图数值与来源见[模型质量数据](./docs/figures/data/qwen38-flash-next-quality.json)。
+
+基础格式的 SSE 为**第 0 层全部 1,536 个矩阵的等权平均值**，覆盖 512 个专家的
+Gate、Up、Down 投影。各对比格式的实际 bpw 相近，但存在差异。
+完整 SSE 表格见[格式基准说明](./docs/benchmarks/qwen38-flash-next-base-format-sse.md)，
+原始数值与来源见[格式数据](./docs/figures/data/qwen38-flash-next-base-format-sse.json)。
 
 <a id="功能特性"></a>
 
