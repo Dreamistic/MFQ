@@ -1,241 +1,213 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="740" viewBox="0 0 1600 740" role="img" aria-labelledby="title desc" xml:lang="en">
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="760" viewBox="0 0 1600 760" role="img" aria-labelledby="title desc" xml:lang="en">
 <title id="title">Expert × projection precision</title>
 <desc id="desc">Qwen3.8-Flash-Next, layer 0, experts 0–11. This packed GGUF recipe uses one format per projection tensor; MFQ selects profiles per expert projection. Colors distinguish profiles. GGUF block-level parameters can still vary.</desc>
-<metadata>{&quot;model&quot;:&quot;Qwen3.8-Flash-Next&quot;,&quot;layer&quot;:0,&quot;expert_ids&quot;:[0,1,2,3,4,5,6,7,8,9,10,11],&quot;mfq_revision&quot;:&quot;3cdfba425c44177019d3fdac94fbfa5d17379505&quot;,&quot;gguf_revision&quot;:&quot;38bb39ee97821de2c9009abb7e93950eec396e66&quot;,&quot;repository&quot;:&quot;https://github.com/Tylogi/MFQ&quot;,&quot;source&quot;:&quot;data/qwen38-flash-next-layer0-allocation.json&quot;}</metadata>
-<rect x="0" y="0" width="1600" height="740" rx="0" fill="#ffffff" stroke="none"/>
-<g font-family="Noto Sans CJK SC, Noto Sans, Arial, sans-serif">
-<text x="48" y="49" font-size="32" font-weight="700" fill="#14243a" text-anchor="start">Expert × projection precision</text>
-<text x="48" y="81" font-size="18" font-weight="400" fill="#62758d" text-anchor="start">Qwen3.8-Flash-Next · Layer 0 · Experts 0–11 / 512</text>
-<g transform="translate(0 36)">
-<rect x="48" y="78" width="1504" height="244" rx="16" fill="#f6f8fb" stroke="#dce3ec"/>
-<text x="76" y="120" font-size="26" font-weight="700" fill="#25354a" text-anchor="start">GGUF · Unsloth UD IQ3_XXS</text>
-<text x="1496" y="118" font-size="32" font-weight="700" fill="#52647b" text-anchor="end">3</text>
-<text x="1496" y="144" font-size="14" font-weight="400" fill="#62758d" text-anchor="end">slots / layer</text>
-<text x="76" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="start">Expert →</text>
-<text x="244" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">0</text>
-<text x="352" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">1</text>
-<text x="460" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">2</text>
-<text x="568" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">3</text>
-<text x="676" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">4</text>
-<text x="784" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">5</text>
-<text x="892" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">6</text>
-<text x="1000" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">7</text>
-<text x="1108" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">8</text>
-<text x="1216" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">9</text>
-<text x="1324" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">10</text>
-<text x="1432" y="164" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">11</text>
-<text x="76" y="205" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Gate</text>
-<rect x="190" y="179" width="1296" height="36" rx="7" fill="#dce9f6" stroke="#b0c7dd"/>
-<path d="M298 183v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M406 183v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M514 183v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M622 183v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M730 183v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M838 183v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M946 183v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1054 183v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1162 183v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1270 183v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1378 183v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<rect x="774" y="181" width="128" height="32" rx="0" fill="#dce9f6" stroke="none"/>
-<text x="838" y="205" font-size="18" font-weight="600" fill="#214461" text-anchor="middle">IQ2_S</text>
-<text x="76" y="249" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Up</text>
-<rect x="190" y="223" width="1296" height="36" rx="7" fill="#dce9f6" stroke="#b0c7dd"/>
-<path d="M298 227v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M406 227v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M514 227v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M622 227v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M730 227v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M838 227v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M946 227v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1054 227v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1162 227v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1270 227v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1378 227v28" fill="none" stroke="#b0c7dd" stroke-dasharray="3 4" opacity="0.65"/>
-<rect x="774" y="225" width="128" height="32" rx="0" fill="#dce9f6" stroke="none"/>
-<text x="838" y="249" font-size="18" font-weight="600" fill="#214461" text-anchor="middle">IQ2_S</text>
-<text x="76" y="293" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Down</text>
-<rect x="190" y="267" width="1296" height="36" rx="7" fill="#f2dfbd" stroke="#d5ba89"/>
-<path d="M298 271v28" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M406 271v28" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M514 271v28" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M622 271v28" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M730 271v28" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M838 271v28" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M946 271v28" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1054 271v28" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1162 271v28" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1270 271v28" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
-<path d="M1378 271v28" fill="none" stroke="#d5ba89" stroke-dasharray="3 4" opacity="0.65"/>
-<rect x="774" y="269" width="128" height="32" rx="0" fill="#f2dfbd" stroke="none"/>
-<text x="838" y="293" font-size="18" font-weight="600" fill="#654717" text-anchor="middle">IQ4_NL</text>
-<text x="800" y="363" font-size="28" font-weight="700" fill="#976229" text-anchor="middle">512×</text>
-<rect x="48" y="386" width="1504" height="254" rx="16" fill="#fbfaf7" stroke="#dfd4c3"/>
-<rect x="48" y="404" width="4" height="40" rx="2" fill="#a77338" stroke="none"/>
-<text x="76" y="428" font-size="26" font-weight="700" fill="#25354a" text-anchor="start">MFQ · V3-XXS</text>
-<text x="1496" y="426" font-size="32" font-weight="700" fill="#976229" text-anchor="end">1,536</text>
-<text x="1496" y="452" font-size="14" font-weight="400" fill="#62758d" text-anchor="end">slots / layer</text>
-<text x="76" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="start">Expert →</text>
-<text x="244" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">0</text>
-<text x="352" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">1</text>
-<text x="460" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">2</text>
-<text x="568" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">3</text>
-<text x="676" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">4</text>
-<text x="784" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">5</text>
-<text x="892" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">6</text>
-<text x="1000" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">7</text>
-<text x="1108" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">8</text>
-<text x="1216" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">9</text>
-<text x="1324" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">10</text>
-<text x="1432" y="473" font-size="15" font-weight="500" fill="#62758d" text-anchor="middle">11</text>
-<text x="76" y="516" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Gate</text>
+<metadata>{&quot;model&quot;:&quot;Qwen3.8-Flash-Next&quot;,&quot;layer&quot;:0,&quot;expert_ids&quot;:[0,1,2,3,4,5,6,7,8,9,10,11],&quot;mfq_revision&quot;:&quot;3cdfba425c44177019d3fdac94fbfa5d17379505&quot;,&quot;gguf_revision&quot;:&quot;38bb39ee97821de2c9009abb7e93950eec396e66&quot;,&quot;repository&quot;:&quot;https://github.com/Tylogi/MFQ&quot;,&quot;source&quot;:&quot;data/qwen38-flash-next-layer0-allocation.json&quot;,&quot;theme&quot;:&quot;studio-figure-theme.json&quot;}</metadata>
+<rect x="0" y="0" width="1600" height="760" rx="0" fill="#f6f7f9" stroke="none"/>
+<g font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Noto Sans CJK SC, Helvetica Neue, Arial, sans-serif">
+<text x="48" y="63" font-size="30" font-weight="700" fill="#111213" text-anchor="start">Expert × projection precision</text>
+<text x="48" y="96" font-size="17" font-weight="400" fill="#5f6264" text-anchor="start">Qwen3.8-Flash-Next · Layer 0 · Experts 0–11 / 512</text>
+<g transform="translate(1434 38) scale(0.5)">
+<rect x="1" y="1" width="62" height="62" rx="17" fill="#0e1010" stroke="none"/>
+<path d="M16 44V20L32 37 48 20V44" fill="none" stroke="#f1f2ef" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="48" cy="44" r="3" fill="#d6aa73"/></g>
+<text x="1480" y="62" font-size="21" font-weight="700" fill="#111213" text-anchor="start">MFQ</text>
+<rect x="48" y="128" width="1504" height="250" rx="12" fill="#ffffff" stroke="#e4e4e5"/>
+<text x="76" y="169" font-size="24" font-weight="700" fill="#111213" text-anchor="start">GGUF</text>
+<text x="164" y="168" font-size="17" font-weight="400" fill="#5f6264" text-anchor="start">Unsloth UD · IQ3_XXS</text>
+<text x="1312" y="170" font-size="30" font-weight="600" fill="#202122" text-anchor="end">3</text>
+<text x="1332" y="168" font-size="15" font-weight="400" fill="#5f6264" text-anchor="start">allocation slots / layer</text>
+<path d="M76 192H1524" fill="none" stroke="#ededed"/>
+<text x="76" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="start">Expert</text>
+<text x="244" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">0</text>
+<text x="352" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">1</text>
+<text x="460" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">2</text>
+<text x="568" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">3</text>
+<text x="676" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">4</text>
+<text x="784" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">5</text>
+<text x="892" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">6</text>
+<text x="1000" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">7</text>
+<text x="1108" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">8</text>
+<text x="1216" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">9</text>
+<text x="1324" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">10</text>
+<text x="1432" y="221" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">11</text>
+<text x="76" y="263" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Gate</text>
+<rect x="192" y="238" width="1291" height="36" rx="4" fill="#eceef0" stroke="none"/>
+<text x="838" y="263" font-size="17" font-weight="500" fill="#454748" text-anchor="middle">IQ2_S</text>
+<text x="76" y="307" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Up</text>
+<rect x="192" y="282" width="1291" height="36" rx="4" fill="#eceef0" stroke="none"/>
+<text x="838" y="307" font-size="17" font-weight="500" fill="#454748" text-anchor="middle">IQ2_S</text>
+<text x="76" y="351" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Down</text>
+<rect x="192" y="326" width="1291" height="36" rx="4" fill="#d8dbdf" stroke="none"/>
+<text x="838" y="351" font-size="17" font-weight="500" fill="#454748" text-anchor="middle">IQ4_NL</text>
+<path d="M48 409H734" fill="none" stroke="#e4e4e5"/>
+<text x="800" y="417" font-size="23" font-weight="600" fill="#9f6232" text-anchor="middle">512×</text>
+<path d="M866 409H1552" fill="none" stroke="#e4e4e5"/>
+<rect x="48" y="440" width="1504" height="250" rx="12" fill="#ffffff" stroke="#e4e4e5"/>
+<text x="76" y="481" font-size="24" font-weight="700" fill="#111213" text-anchor="start">MFQ</text>
+<text x="151" y="480" font-size="17" font-weight="400" fill="#5f6264" text-anchor="start">V3-XXS</text>
+<text x="1312" y="482" font-size="30" font-weight="600" fill="#9f6232" text-anchor="end">1,536</text>
+<text x="1332" y="480" font-size="15" font-weight="400" fill="#5f6264" text-anchor="start">allocation slots / layer</text>
+<path d="M76 504H1524" fill="none" stroke="#ededed"/>
+<text x="76" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="start">Expert</text>
+<text x="244" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">0</text>
+<text x="352" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">1</text>
+<text x="460" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">2</text>
+<text x="568" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">3</text>
+<text x="676" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">4</text>
+<text x="784" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">5</text>
+<text x="892" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">6</text>
+<text x="1000" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">7</text>
+<text x="1108" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">8</text>
+<text x="1216" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">9</text>
+<text x="1324" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">10</text>
+<text x="1432" y="533" font-size="15" font-weight="400" fill="#6c6f71" text-anchor="middle">11</text>
+<text x="76" y="575" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Gate</text>
 <g data-projection="gate" data-expert="0" data-profile="NVQ3J">
-<rect x="192" y="488" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="244" y="515" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="192" y="550" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="244" y="575" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="gate" data-expert="1" data-profile="NVQ3J-512">
-<rect x="300" y="488" width="103" height="40" rx="7" fill="#b2bce8" stroke="#8898cf"/>
-<text x="352" y="515" font-size="15" font-weight="700" fill="#303d70" text-anchor="middle">NVQ3J-512</text>
+<rect x="300" y="550" width="103" height="36" rx="4" fill="#d1d5db" stroke="none"/>
+<text x="352" y="575" font-size="14.5" font-weight="500" fill="#35383c" text-anchor="middle">NVQ3J-512</text>
 </g>
 <g data-projection="gate" data-expert="2" data-profile="NVQ3J">
-<rect x="408" y="488" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="460" y="515" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="408" y="550" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="460" y="575" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="gate" data-expert="3" data-profile="NVQ2J-XL">
-<rect x="516" y="488" width="103" height="40" rx="7" fill="#77c2cb" stroke="#4399a5"/>
-<text x="568" y="515" font-size="15" font-weight="700" fill="#123e49" text-anchor="middle">NVQ2J-XL</text>
+<rect x="516" y="550" width="103" height="36" rx="4" fill="#cab39f" stroke="none"/>
+<text x="568" y="575" font-size="14.5" font-weight="500" fill="#49392c" text-anchor="middle">NVQ2J-XL</text>
 </g>
 <g data-projection="gate" data-expert="4" data-profile="NVQ3J-L">
-<rect x="624" y="488" width="103" height="40" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
-<text x="676" y="515" font-size="15" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<rect x="624" y="550" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="676" y="575" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
 </g>
 <g data-projection="gate" data-expert="5" data-profile="NVQ3J">
-<rect x="732" y="488" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="784" y="515" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="732" y="550" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="784" y="575" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="gate" data-expert="6" data-profile="NVQ1-S">
-<rect x="840" y="488" width="103" height="40" rx="7" fill="#faedc7" stroke="#e3cd8e"/>
-<text x="892" y="515" font-size="15" font-weight="700" fill="#614b14" text-anchor="middle">NVQ1-S</text>
+<rect x="840" y="550" width="103" height="36" rx="4" fill="#f5ede5" stroke="none"/>
+<text x="892" y="575" font-size="14.5" font-weight="500" fill="#685442" text-anchor="middle">NVQ1-S</text>
 </g>
 <g data-projection="gate" data-expert="7" data-profile="NVQ3J-L">
-<rect x="948" y="488" width="103" height="40" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
-<text x="1000" y="515" font-size="15" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<rect x="948" y="550" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1000" y="575" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
 </g>
 <g data-projection="gate" data-expert="8" data-profile="NVQ3J">
-<rect x="1056" y="488" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="1108" y="515" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="1056" y="550" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="1108" y="575" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="gate" data-expert="9" data-profile="NVQ3J-L">
-<rect x="1164" y="488" width="103" height="40" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
-<text x="1216" y="515" font-size="15" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<rect x="1164" y="550" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1216" y="575" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
 </g>
 <g data-projection="gate" data-expert="10" data-profile="NVQ3J-L">
-<rect x="1272" y="488" width="103" height="40" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
-<text x="1324" y="515" font-size="15" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<rect x="1272" y="550" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1324" y="575" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
 </g>
 <g data-projection="gate" data-expert="11" data-profile="NVQ2J-L">
-<rect x="1380" y="488" width="103" height="40" rx="7" fill="#a4dcd4" stroke="#6cb9ae"/>
-<text x="1432" y="515" font-size="15" font-weight="700" fill="#164e47" text-anchor="middle">NVQ2J-L</text>
+<rect x="1380" y="550" width="103" height="36" rx="4" fill="#e4d6c8" stroke="none"/>
+<text x="1432" y="575" font-size="14.5" font-weight="500" fill="#584535" text-anchor="middle">NVQ2J-L</text>
 </g>
-<text x="76" y="562" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Up</text>
+<text x="76" y="619" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Up</text>
 <g data-projection="up" data-expert="0" data-profile="NVQ3J">
-<rect x="192" y="534" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="244" y="561" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="192" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="244" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="up" data-expert="1" data-profile="NVQ3J">
-<rect x="300" y="534" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="352" y="561" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="300" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="352" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="up" data-expert="2" data-profile="NVQ3J">
-<rect x="408" y="534" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="460" y="561" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="408" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="460" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="up" data-expert="3" data-profile="NVQ3J">
-<rect x="516" y="534" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="568" y="561" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="516" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="568" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="up" data-expert="4" data-profile="NVQ3J-L">
-<rect x="624" y="534" width="103" height="40" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
-<text x="676" y="561" font-size="15" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<rect x="624" y="594" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="676" y="619" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
 </g>
 <g data-projection="up" data-expert="5" data-profile="NVQ3J">
-<rect x="732" y="534" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="784" y="561" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="732" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="784" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="up" data-expert="6" data-profile="NVQ1-S">
-<rect x="840" y="534" width="103" height="40" rx="7" fill="#faedc7" stroke="#e3cd8e"/>
-<text x="892" y="561" font-size="15" font-weight="700" fill="#614b14" text-anchor="middle">NVQ1-S</text>
+<rect x="840" y="594" width="103" height="36" rx="4" fill="#f5ede5" stroke="none"/>
+<text x="892" y="619" font-size="14.5" font-weight="500" fill="#685442" text-anchor="middle">NVQ1-S</text>
 </g>
 <g data-projection="up" data-expert="7" data-profile="NVQ3J-L">
-<rect x="948" y="534" width="103" height="40" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
-<text x="1000" y="561" font-size="15" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<rect x="948" y="594" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1000" y="619" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
 </g>
 <g data-projection="up" data-expert="8" data-profile="NVQ3J">
-<rect x="1056" y="534" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="1108" y="561" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="1056" y="594" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="1108" y="619" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="up" data-expert="9" data-profile="NVQ3J-L">
-<rect x="1164" y="534" width="103" height="40" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
-<text x="1216" y="561" font-size="15" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<rect x="1164" y="594" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1216" y="619" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
 </g>
 <g data-projection="up" data-expert="10" data-profile="NVQ3J-L">
-<rect x="1272" y="534" width="103" height="40" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
-<text x="1324" y="561" font-size="15" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<rect x="1272" y="594" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1324" y="619" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
 </g>
 <g data-projection="up" data-expert="11" data-profile="NVQ2J-L">
-<rect x="1380" y="534" width="103" height="40" rx="7" fill="#a4dcd4" stroke="#6cb9ae"/>
-<text x="1432" y="561" font-size="15" font-weight="700" fill="#164e47" text-anchor="middle">NVQ2J-L</text>
+<rect x="1380" y="594" width="103" height="36" rx="4" fill="#e4d6c8" stroke="none"/>
+<text x="1432" y="619" font-size="14.5" font-weight="500" fill="#584535" text-anchor="middle">NVQ2J-L</text>
 </g>
-<text x="76" y="608" font-size="19" font-weight="600" fill="#25354a" text-anchor="start">Down</text>
+<text x="76" y="663" font-size="18" font-weight="500" fill="#454748" text-anchor="start">Down</text>
 <g data-projection="down" data-expert="0" data-profile="NVQ3J">
-<rect x="192" y="580" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="244" y="607" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="192" y="638" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="244" y="663" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="down" data-expert="1" data-profile="NVQ3J-512">
-<rect x="300" y="580" width="103" height="40" rx="7" fill="#b2bce8" stroke="#8898cf"/>
-<text x="352" y="607" font-size="15" font-weight="700" fill="#303d70" text-anchor="middle">NVQ3J-512</text>
+<rect x="300" y="638" width="103" height="36" rx="4" fill="#d1d5db" stroke="none"/>
+<text x="352" y="663" font-size="14.5" font-weight="500" fill="#35383c" text-anchor="middle">NVQ3J-512</text>
 </g>
 <g data-projection="down" data-expert="2" data-profile="NVQ3J-512">
-<rect x="408" y="580" width="103" height="40" rx="7" fill="#b2bce8" stroke="#8898cf"/>
-<text x="460" y="607" font-size="15" font-weight="700" fill="#303d70" text-anchor="middle">NVQ3J-512</text>
+<rect x="408" y="638" width="103" height="36" rx="4" fill="#d1d5db" stroke="none"/>
+<text x="460" y="663" font-size="14.5" font-weight="500" fill="#35383c" text-anchor="middle">NVQ3J-512</text>
 </g>
 <g data-projection="down" data-expert="3" data-profile="NVQ3J">
-<rect x="516" y="580" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="568" y="607" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="516" y="638" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="568" y="663" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="down" data-expert="4" data-profile="NVQ3J-L">
-<rect x="624" y="580" width="103" height="40" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
-<text x="676" y="607" font-size="15" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<rect x="624" y="638" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="676" y="663" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
 </g>
 <g data-projection="down" data-expert="5" data-profile="NVQ3J">
-<rect x="732" y="580" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="784" y="607" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="732" y="638" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="784" y="663" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="down" data-expert="6" data-profile="NVQ1-S">
-<rect x="840" y="580" width="103" height="40" rx="7" fill="#faedc7" stroke="#e3cd8e"/>
-<text x="892" y="607" font-size="15" font-weight="700" fill="#614b14" text-anchor="middle">NVQ1-S</text>
+<rect x="840" y="638" width="103" height="36" rx="4" fill="#f5ede5" stroke="none"/>
+<text x="892" y="663" font-size="14.5" font-weight="500" fill="#685442" text-anchor="middle">NVQ1-S</text>
 </g>
 <g data-projection="down" data-expert="7" data-profile="NVQ3J-L">
-<rect x="948" y="580" width="103" height="40" rx="7" fill="#d4c2ee" stroke="#ae92d2"/>
-<text x="1000" y="607" font-size="15" font-weight="700" fill="#503576" text-anchor="middle">NVQ3J-L</text>
+<rect x="948" y="638" width="103" height="36" rx="4" fill="#d2b194" stroke="none"/>
+<text x="1000" y="663" font-size="14.5" font-weight="500" fill="#49311f" text-anchor="middle">NVQ3J-L</text>
 </g>
 <g data-projection="down" data-expert="8" data-profile="NVQ3J">
-<rect x="1056" y="580" width="103" height="40" rx="7" fill="#c4dcf7" stroke="#91b6e2"/>
-<text x="1108" y="607" font-size="15" font-weight="700" fill="#22466c" text-anchor="middle">NVQ3J</text>
+<rect x="1056" y="638" width="103" height="36" rx="4" fill="#e6e8eb" stroke="none"/>
+<text x="1108" y="663" font-size="14.5" font-weight="500" fill="#454748" text-anchor="middle">NVQ3J</text>
 </g>
 <g data-projection="down" data-expert="9" data-profile="NINT4">
-<rect x="1164" y="580" width="103" height="40" rx="7" fill="#efc590" stroke="#d39b52"/>
-<text x="1216" y="607" font-size="15" font-weight="700" fill="#654014" text-anchor="middle">NINT4</text>
+<rect x="1164" y="638" width="103" height="36" rx="4" fill="#9f6232" stroke="none"/>
+<text x="1216" y="663" font-size="14.5" font-weight="500" fill="#ffffff" text-anchor="middle">NINT4</text>
 </g>
 <g data-projection="down" data-expert="10" data-profile="NINT4">
-<rect x="1272" y="580" width="103" height="40" rx="7" fill="#efc590" stroke="#d39b52"/>
-<text x="1324" y="607" font-size="15" font-weight="700" fill="#654014" text-anchor="middle">NINT4</text>
+<rect x="1272" y="638" width="103" height="36" rx="4" fill="#9f6232" stroke="none"/>
+<text x="1324" y="663" font-size="14.5" font-weight="500" fill="#ffffff" text-anchor="middle">NINT4</text>
 </g>
 <g data-projection="down" data-expert="11" data-profile="NVQ2J">
-<rect x="1380" y="580" width="103" height="40" rx="7" fill="#d3eee5" stroke="#9ecdbd"/>
-<text x="1432" y="607" font-size="15" font-weight="700" fill="#204f44" text-anchor="middle">NVQ2J</text>
-</g>
+<rect x="1380" y="638" width="103" height="36" rx="4" fill="#c9cdd2" stroke="none"/>
+<text x="1432" y="663" font-size="14.5" font-weight="500" fill="#35383c" text-anchor="middle">NVQ2J</text>
 </g>
 <a id="repository-url" href="https://github.com/Tylogi/MFQ">
-<text x="1552" y="716" font-size="14" font-weight="400" fill="#62758d" text-anchor="end">https://github.com/Tylogi/MFQ</text>
+<text x="1552" y="734" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="end">https://github.com/Tylogi/MFQ</text>
 </a></g></svg>
