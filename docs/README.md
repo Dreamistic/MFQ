@@ -28,6 +28,7 @@ matches what you want to do.
 - [Flash-Next continuous batching](runtime/cuda-continuous-batching.md)
 - [MiniCPM-o 4.5 multimodal runtime](runtime/minicpmo45.md)
 - [HIP runtime validation](runtime/hip-validation.md)
+- [HIP model benchmarks](runtime/hip-model-benchmarks.md)
 - [C++ runtime layout](../cpp_runtime/README.md)
 
 ## APIs
