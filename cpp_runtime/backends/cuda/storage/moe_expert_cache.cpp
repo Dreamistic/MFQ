@@ -572,12 +572,62 @@ std::vector<MoeHostExpertCache::Lease> MoeExpertCache::read_ssd_experts(
 void MoeExpertCache::copy_ssd_experts(const std::vector<SsdExpertCopy>& requests) {
     if(requests.empty())return;
     if(!ssd_read_pool_)throw std::logic_error("SSD expert copy pool is not initialized");
-    ssd_read_pool_->run(0,int64_t(requests.size()),1,std::max(1,config_.moe_ssd_io_workers),
+    struct Item {std::size_t index;int source,pool,local;bool bulk;};
+    std::vector<Item> order;order.reserve(requests.size());
+    for(std::size_t i=0;i<requests.size();++i) {
+        const auto& request=requests[i];const auto& source=*request.source;
+        const auto pool=source.store().expert_pool(request.expert);
+        const auto host=source.host_cache();
+        const auto memory=host?host->stats():MoeHostExpertCacheStats{};
+        const bool spare=memory.managed_bytes<=memory.budget_bytes &&
+            source.expert_field_bytes(request.expert)<=memory.budget_bytes-memory.managed_bytes;
+        const bool bulk=source.metadata()->pools[pool].family==MixedMoeFamily::Nvq && !spare &&
+            (!host || !host->contains(source.host_key(request.expert)));
+        order.push_back({i,source.host_key(request.expert).source,pool,source.store().expert_local(request.expert),bulk});
+    }
+    std::sort(order.begin(),order.end(),[&](const Item& a,const Item& b) {
+        if(a.source!=b.source)return a.source<b.source;
+        return a.pool!=b.pool?a.pool<b.pool:a.local<b.local;
+    });
+    const auto workers=std::max(1,config_.moe_ssd_io_workers);
+    const auto batch_limit=std::max<std::size_t>(1,(requests.size()+workers-1)/workers);
+    std::vector<std::pair<std::size_t,std::size_t>> jobs;
+    for(std::size_t first=0;first<order.size();) {
+        auto last=first+1;
+        while(order[first].bulk && last<order.size() && last-first<batch_limit) {
+            const auto& previous=order[last-1];const auto& next=order[last];
+            const auto& a=requests[previous.index];const auto& b=requests[next.index];
+            if(!next.bulk || a.source!=b.source || previous.pool!=next.pool || next.local!=previous.local+1 ||
+                    a.fields.size()!=4 || b.fields.size()!=4)break;
+            bool adjacent=true;
+            for(int f=0;f<4;++f)if(a.fields[f].nbytes()!=b.fields[f].nbytes() ||
+                    (a.fields[f].nbytes() && reinterpret_cast<std::uintptr_t>(a.fields[f].data_ptr())+a.fields[f].nbytes()!=
+                        reinterpret_cast<std::uintptr_t>(b.fields[f].data_ptr())))adjacent=false;
+            if(!adjacent)break;
+            ++last;
+        }
+        jobs.emplace_back(first,last);first=last;
+    }
+    ssd_read_pool_->run(0,int64_t(jobs.size()),1,workers,
         [&](int64_t begin,int64_t end) {
             const mfq::MappedPrefetchScope prefetch(true);
             // A prompt scans most experts once. Reuse decoded images without
             // promoting that scan above the preceding decode's working set.
-            for(auto i=begin;i<end;++i)requests[i].source->copy_expert_fields(requests[i].expert,requests[i].fields,false);
+            for(auto job=begin;job<end;++job) {
+                const auto [first,last]=jobs[job];const auto& initial=requests[order[first].index];
+                if(last-first>1) {
+                    std::vector<int> experts;experts.reserve(last-first);
+                    for(auto i=first;i<last;++i)experts.push_back(requests[order[i].index].expert);
+                    std::array<mfq_tensor_backend::Tensor,4> fields;
+                    for(int f=0;f<4;++f)fields[f]=initial.fields[f].nbytes()?mfq_tensor_backend::from_blob(
+                        initial.fields[f].data_ptr(),{initial.fields[f].numel()*int64_t(last-first)},initial.fields[f].options()):initial.fields[f];
+                    if(initial.source->copy_nvq_expert_fields(experts,fields))continue;
+                }
+                for(auto i=first;i<last;++i) {
+                    const auto& request=requests[order[i].index];
+                    request.source->copy_expert_fields(request.expert,request.fields,false);
+                }
+            }
         });
 }
 
@@ -1298,6 +1348,12 @@ std::uint64_t MoeExpertCache::expert_direct_field_reads() const {
     std::uint64_t reads=0;
     for(const auto& source:sources_)if(source->quant_source_)reads+=source->quant_source_->direct_field_reads();
     return reads;
+}
+
+std::uint64_t MoeExpertCache::expert_bulk_field_reads() const {
+    std::uint64_t count=0;
+    for(const auto& source:sources_)if(source->quant_source_)count+=source->quant_source_->bulk_field_reads();
+    return count;
 }
 
 std::array<std::uint64_t,4> MoeExpertCache::expert_disk_timings() const {

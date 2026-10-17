@@ -298,6 +298,28 @@ int main(int argc,char** argv)try {
         Run candidate(path,true,std::string(format)!="nvq2j",combined,prefix);
         const int width=reference.sources[0]->metadata()->neuron_len;
         const int experts=reference.sources[0]->metadata()->n_experts;
+        for(const auto& quant:candidate.sources)for(std::size_t pool=0;pool<quant->store().pool_count();++pool) {
+            if(quant->metadata()->pools[pool].family!=MixedMoeFamily::Nvq)continue;
+            const auto& members=quant->store().pool_expert_ids(pool);
+            if(members.size()<2)continue;
+            const std::vector<int> selected{members[0],members[1]};
+            const auto prototype=moe_cache_fields(quant->read_expert(selected[0]));
+            std::array<tb::Tensor,4> storage,targets;
+            for(int f=0;f<4;++f) {
+                storage[f]=tb::full({int64_t(prototype[f].nbytes()*2+32)},0xa5,tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8));
+                targets[f]=tb::from_blob(storage[f].data_ptr<uint8_t>()+16,{prototype[f].numel()*2},prototype[f].options());
+            }
+            check(quant->copy_nvq_expert_fields(selected,targets),"aligned NVQ experts could not share their canonical reads");
+            for(int i=0;i<2;++i) {
+                const auto expected=moe_cache_fields(quant->decode_expert(selected[i],quant->store().read_expert(selected[i])));
+                for(int f=0;f<4;++f)check(std::memcmp(static_cast<const uint8_t*>(targets[f].data_ptr())+i*prototype[f].nbytes(),
+                    expected[f].data_ptr(),prototype[f].nbytes())==0,"bulk NVQ runtime fields changed canonical bytes");
+            }
+            for(int f=0;f<4;++f) {
+                const auto* bytes=storage[f].data_ptr<uint8_t>();
+                for(int i=0;i<16;++i)check(bytes[i]==0xa5 && bytes[storage[f].numel()-1-i]==0xa5,"bulk NVQ runtime copy overwrote guards");
+            }
+        }
         {
             auto pageable=std::make_shared<MoeQuantRangeSource>(
                 std::make_shared<mfq::MfeQuantExpertStore>(candidate.sources[0]->store()));

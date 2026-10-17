@@ -243,6 +243,14 @@ std::optional<NvqRows::Fields> NvqRows::slice_rows_fields(std::int64_t begin,std
     return result;
 }
 
+bool NvqRows::byte_aligned_rows(std::int64_t rows) const noexcept {
+    if(rows<=0 || rows>rows_)return false;
+    const auto n=std::uint64_t(rows);
+    const auto auxiliary=aux_bits_==1?groups_:signs_;
+    return ((n*groups_*(group64_?4:state_bits_) | n*vectors_*index_bits_ |
+        n*auxiliary*aux_bits_)&7)==0;
+}
+
 bool NvqRows::copy_rows_fields(std::int64_t begin,std::int64_t end,
         const std::array<FieldTarget,4>& targets,std::size_t* source_bytes) const {
     if(begin<0 || end<=begin || end>rows_)throw std::out_of_range("NVQ direct field range");

@@ -18,6 +18,8 @@ public:
     const mfq::MfeQuantExpertStore& store() const { return *store_; }
     MixedMoePool read_expert(int expert) const;
     void copy_expert_fields(int expert,const std::vector<mfq_tensor_backend::Tensor>& targets,bool touch_cache=true) const;
+    bool copy_nvq_expert_fields(const std::vector<int>& experts,
+        const std::array<mfq_tensor_backend::Tensor,4>& targets) const;
     MixedMoePool decode_expert(int expert,const mfq::MfeQuantExpert& encoded) const;
     void mark_preload_complete(bool assert_resident) { disk_sealed_.store(assert_resident); preloaded_.store(true); }
     bool expert_disk_sealed() const { return disk_sealed_.load(); }
@@ -46,12 +48,13 @@ public:
     std::uint64_t expert_nint_materialize_ns() const { return nint_materialize_ns_.load(); }
     std::uint64_t expert_nvq_materialize_ns() const { return nvq_materialize_ns_.load(); }
     std::uint64_t direct_field_reads() const { return direct_field_reads_.load(); }
+    std::uint64_t bulk_field_reads() const { return bulk_field_reads_.load(); }
     // Per-format totals: reads, source bytes, encoded read ns, materialization ns.
     using FormatIoStats=std::array<std::array<std::uint64_t,4>,18>;
     FormatIoStats format_io_stats() const;
 private:
     void record_format_io(int format,std::uint64_t bytes,std::uint64_t encoded_ns,
-                          std::uint64_t materialize_ns) const;
+                          std::uint64_t materialize_ns,std::uint64_t reads=1) const;
     MixedMoePool read_expert_canonical(int expert) const;
     struct FieldLayout {
         std::vector<std::int64_t> shape;
@@ -81,5 +84,6 @@ private:
     mutable std::atomic<std::uint64_t> encoded_ns_{0},materialize_ns_{0};
     mutable std::atomic<std::uint64_t> nint_materialize_ns_{0},nvq_materialize_ns_{0};
     mutable std::atomic<std::uint64_t> direct_field_reads_{0};
+    mutable std::atomic<std::uint64_t> bulk_field_reads_{0};
     mutable std::array<std::array<std::atomic<std::uint64_t>,4>,18> format_io_{};
 };

@@ -83,6 +83,10 @@ void check_group64_fields(int width) {
         for(const auto& span:spans)read(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
     });
     require(source.group64(),"group64 row storage was not detected");
+    for(int count=1;count<=rows;++count)
+        require(source.byte_aligned_rows(count)==(((std::uint64_t(count)*groups*4 |
+            std::uint64_t(count)*vectors*12 | std::uint64_t(count)*vectors*7)&7)==0),
+            "group64 field concatenation ignored packed bit boundaries");
     rejected([&]{source.copy_rows_fields(0,1,{});});
     for(const auto range:{std::pair<int,int>{0,1},{1,18},{17,34},{0,34}}) {
         const auto fields=source.slice_rows_fields(range.first,range.second);
@@ -217,6 +221,37 @@ mfq::MfeQuantExpertStore memory_store(std::vector<std::uint8_t> blob,
     return {source->size(),read,std::move(batch)};
 }
 void self_test() {
+    {
+        const std::vector<int> ids{5,2,7,0,6,1,4,3};
+        std::vector<std::uint8_t> blob{'M','F','E','1'};
+        for(unsigned value:{8,8,53,1})mfq::test::append<std::uint32_t>(blob,value);
+        append_pool(blob,ids,"NVQ",nvq(0,64));
+        auto store=memory_store(blob,std::make_shared<std::atomic<std::size_t>>(0),true);
+        const auto first=store.read_nvq_fields(ids[1]);
+        const std::array<std::size_t,4> leaf={first->neuron_scale.size()*2,first->states.size(),first->indices.size(),first->aux.size()};
+        std::array<std::vector<std::uint8_t>,4> bytes;
+        std::array<mfq::NvqRows::FieldTarget,4> targets;
+        for(int f=0;f<4;++f) {bytes[f].assign(3*leaf[f]+2,0xa5);targets[f]={bytes[f].data()+1,3*leaf[f]};}
+        const auto untouched=bytes;
+        const std::vector<int> skipped{ids[1],ids[3]};
+        require(!store.copy_nvq_fields(skipped,targets) && bytes==untouched,"nonconsecutive bulk experts changed destinations");
+        const std::vector<int> invalid{ids[1],-1};
+        rejected([&]{store.copy_nvq_fields(invalid,targets);});
+        require(bytes==untouched,"invalid bulk expert changed a destination");
+        const std::vector<int> selected{ids[1],ids[2],ids[3]};
+        std::size_t source_bytes=0;
+        require(store.copy_nvq_fields(selected,targets,&source_bytes),"consecutive pool-local experts could not share a read");
+        std::size_t expected_bytes=0;
+        for(std::size_t i=0;i<selected.size();++i) {
+            const auto expected=store.read_nvq_fields(selected[i]);expected_bytes+=expected->source_nbytes;
+            const std::array<const std::uint8_t*,4> fields={reinterpret_cast<const std::uint8_t*>(expected->neuron_scale.data()),
+                expected->states.data(),expected->indices.data(),expected->aux.data()};
+            for(int f=0;f<4;++f)require(std::memcmp(bytes[f].data()+1+i*leaf[f],fields[f],leaf[f])==0,
+                "bulk NVQ fields differ from independent expert slices");
+        }
+        for(const auto& field:bytes)require(field.front()==0xa5 && field.back()==0xa5,"bulk NVQ copy overwrote guards");
+        require(source_bytes==expected_bytes,"bulk NVQ source byte accounting changed");
+    }
     for(int bits=1;bits<=8;++bits)check_nint_direct_fields(53,5,false,bits);
     for(int bits:{2,4})check_nint_direct_fields(640,48,true,bits);
     for(int width:{1,7,8,9,23,24,25,53,64,127,128,191,192,193,200,640,2560})check_group64_fields(width);

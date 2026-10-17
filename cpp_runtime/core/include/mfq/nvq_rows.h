@@ -20,6 +20,7 @@ public:
     int width() const noexcept { return width_; }
     int format() const noexcept { return format_; }
     bool group64() const noexcept { return group64_; }
+    bool byte_aligned_rows(std::int64_t rows) const noexcept;
     std::size_t index_nbytes() const noexcept { return prefix_.size(); }
     std::vector<std::uint8_t> slice_rows_blob(std::int64_t begin,std::int64_t end) const;
     struct Fields {

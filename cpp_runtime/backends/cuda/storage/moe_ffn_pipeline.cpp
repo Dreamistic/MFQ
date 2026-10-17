@@ -560,8 +560,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         const auto elapsed=[](Clock::time_point started) {
             return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-started).count();
         };
+        const auto started=Clock::now();
         initialize_prefill_stream(execution,ids);
         auto& stream=*prefill_stream_;auto& stats=cache_->stats_;
+        const auto plan_before=stats.pipeline_plan_ns,fetch_before=stats.pipeline_fetch_ns;
+        std::uint64_t read_join_ns=0,buffer_wait_ns=0,compute_submit_ns=0;
         const int prefill_group_size=stream.group_size;
         const int tokens=int(ids.size(0)),routes=int(ids.size(1)),entries=tokens*routes;
         if(stream.capacity<entries) {
@@ -601,7 +604,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             return a<b;
         });
         const int groups=(int(order.size())+prefill_group_size-1)/prefill_group_size;
-        struct Upload {int cohort,slot,expert;std::vector<tb::Tensor> fields;};
+        struct Upload {int cohort,slot,expert;std::vector<tb::Tensor> fields;int route=0;};
         struct Group {
             int begin=0,rows=0;
             int route_offset=0,mma_tile_m=8,wide_tile_m=8;
@@ -655,7 +658,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     if(hot>=0) {map[q]=hot;continue;}
                     cold_expert=true;
                     const int slot=next[p][c]++;map[prefill_group_size+q]=slot;
-                    if(cache_->ssd_experts())group.uploads[p].push_back({c,slot,e,{}});
+                    if(cache_->ssd_experts())group.uploads[p].push_back({c,slot,e,{},q});
                     else {
                         auto lease=source.quant_source_->acquire_expert(e);
                         group.uploads[p].push_back({c,slot,e,moe_cache_fields(lease->weights)});
@@ -663,6 +666,21 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     }
                 }
                 stats.ram_pcie_experts+=cold_expert;
+            }
+            if(cache_->ssd_experts())for(int p=0;p<3;++p) {
+                auto& uploads=group.uploads[p];const auto& store=sources_[p]->quant_source_->store();
+                // Compute order is shared by all projections, while their
+                // physical expert rows differ. Pack each cold projection in
+                // its own file order and publish the corresponding map.
+                std::sort(uploads.begin(),uploads.end(),[&](const Upload& a,const Upload& b) {
+                    return a.cohort!=b.cohort?a.cohort<b.cohort:store.expert_local(a.expert)<store.expert_local(b.expert);
+                });
+                int cohort=-1,slot=0;
+                for(auto& upload:uploads) {
+                    if(cohort!=upload.cohort){cohort=upload.cohort;slot=0;}
+                    upload.slot=slot++;
+                    maps[g*map_stride+map_offset[p]+(2*cohort+1)*prefill_group_size+upload.route]=upload.slot;
+                }
             }
             group.rows=row-group.begin;
         }
@@ -792,15 +810,21 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             });
         };
         const auto retire_cpu_group=[&](int g) {
+            const auto wait_started=Clock::now();
             stream.buffers[g%2].down_ready.synchronize();
+            buffer_wait_ns+=elapsed(wait_started);
             for(auto& uploads:work[g].uploads)for(auto& upload:uploads)upload.fields.clear();
         };
         const auto stage_group=[&](int g) {
             const auto started=Clock::now();auto& buffer=stream.buffers[g%2];
             std::size_t host_offset=0;
             if(cache_->ssd_experts()) {
+                const auto wait_started=Clock::now();
                 if(g>=2)buffer.down_ready.synchronize();
+                buffer_wait_ns+=elapsed(wait_started);
+                const auto read_started=Clock::now();
                 if(work[g].pending.valid())work[g].pending.get();
+                read_join_ns+=elapsed(read_started);
             }
             if(g>=2)MFQ_CUDA_CHECK(cudaStreamWaitEvent(cache_->weight_stream_,buffer.used.get(),0));
             for(int p=0;p<3;++p) {
@@ -892,6 +916,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(groups>1 && !cache_->ssd_experts())stage_group(1);
         for(int g=0;g<groups;++g) {
             if(cache_->ssd_experts() && g)stage_group(g);
+            const auto submit_started=Clock::now();
             auto& buffer=stream.buffers[g%2];const auto& group=work[g];
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(stream_,buffer.gu_ready.get(),0));
             MFQ_CUDA_CHECK(cudaMemcpyAsync(buffer.maps.data_ptr(),maps+g*map_stride,
@@ -935,6 +960,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             auto down=projection(2,hidden).reshape({group.rows,width_});
             parts.index_copy_(0,pair_device.narrow(0,group.begin,group.rows),down);
             buffer.used.record(stream_);
+            compute_submit_ns+=elapsed(submit_started);
             if(g+2<groups) {
                 if(cache_->ssd_experts()) {
                     // Retire the H2D source while its GPU copy is in use.
@@ -950,6 +976,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         cache_->record_compute_use();
         cache_->moe_residency_->record_prefill_routes(sources_[0]->layer_id_,
             ids.contiguous().data_ptr<int32_t>(),tokens,routes,stream_);
+        if(cache_->ssd_experts())if(const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");profile && profile[0]=='1')
+            std::fprintf(stderr,"moe_ssd_prefill_host layer=%d groups=%d tokens=%d wall_ms=%.3f plan_ms=%.3f read_join_ms=%.3f buffer_wait_ms=%.3f compute_submit_ms=%.3f fetch_ms=%.3f\n",
+                sources_[0]->layer_id_,groups,tokens,elapsed(started)/1e6,(stats.pipeline_plan_ns-plan_before)/1e6,
+                read_join_ns/1e6,buffer_wait_ns/1e6,compute_submit_ns/1e6,(stats.pipeline_fetch_ns-fetch_before)/1e6);
         MFQ_CUDA_CHECK(cudaGetLastError());return output;
     }
         struct LayerPrefill {

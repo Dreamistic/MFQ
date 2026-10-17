@@ -38,6 +38,7 @@ public:
     std::size_t pool_count() const noexcept { return pools_.size(); }
     const std::vector<std::int32_t>& pool_expert_ids(std::size_t pool) const { return pools_.at(pool).ids; }
     int expert_pool(int expert) const;
+    int expert_local(int expert) const;
     std::uint64_t expert_values_bits(int expert) const;
     std::size_t index_nbytes() const noexcept;
     const std::string& expert_dtype(int expert) const;
@@ -45,6 +46,10 @@ public:
     MfeQuantExpert read_expert(int expert) const;
     std::optional<NvqRows::Fields> read_nvq_fields(int expert) const;
     bool copy_nvq_fields(int expert,const std::array<NvqRows::FieldTarget,4>& targets,
+                         std::size_t* source_bytes=nullptr) const;
+    // Adjacent pool rows can fill a contiguous runtime packet together.
+    // Other selections return false without modifying the destinations.
+    bool copy_nvq_fields(const std::vector<int>& experts,const std::array<NvqRows::FieldTarget,4>& targets,
                          std::size_t* source_bytes=nullptr) const;
     bool copy_nint_fields(int expert,const std::array<QuantFieldTarget,7>& targets,
                           std::size_t* source_bytes=nullptr) const;

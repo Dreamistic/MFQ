@@ -291,10 +291,53 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
     copy(read_expert_canonical(expert));
 }
 
+bool MoeQuantRangeSource::copy_nvq_expert_fields(const std::vector<int>& experts,
+        const std::array<tb::Tensor,4>& targets) const {
+    if(experts.size()<2 || dense_groups_)return false;
+    if(disk_sealed_.load())throw std::runtime_error("bulk expert disk read forbidden after complete residency preload");
+    const auto index=store_->expert_pool(experts.front());
+    const auto& prototype=metadata_->pools.at(index);
+    if(prototype.family!=MixedMoeFamily::Nvq)return false;
+    for(const auto& target:targets)if(!target.is_cpu() || !target.is_contiguous())
+        throw std::invalid_argument("bulk NVQ fields require contiguous host targets");
+    using Clock=std::chrono::steady_clock;
+    const bool profile=profile_ssd_ && preloaded_.load();
+    const auto begin=profile?Clock::now():Clock::time_point{};
+    const auto rows=std::size_t(store_->out_per_expert())*experts.size();
+    if(targets[3].nbytes()!=rows*4)throw std::invalid_argument("bulk NVQ neuron target differs");
+    std::vector<std::uint16_t> anchors(rows);
+    const auto field=[&](std::size_t f) {
+        return mfq::NvqRows::FieldTarget{static_cast<std::uint8_t*>(targets[f].data_ptr()),std::size_t(targets[f].nbytes())};
+    };
+    const std::array<mfq::NvqRows::FieldTarget,4> fields={
+        mfq::NvqRows::FieldTarget{reinterpret_cast<std::uint8_t*>(anchors.data()),rows*2},field(2),field(0),field(1)};
+    std::size_t source_bytes=0;
+    if(!store_->copy_nvq_fields(experts,fields,&source_bytes))return false;
+    const auto read_done=profile?Clock::now():Clock::time_point{};
+    const auto scale=cpu_f16_to_f32_tensor(anchors,std::int64_t(rows));
+    std::memcpy(targets[3].data_ptr(),scale.data_ptr(),rows*4);
+    direct_field_reads_.fetch_add(experts.size(),std::memory_order_relaxed);
+    materializations_.fetch_add(experts.size(),std::memory_order_relaxed);
+    ++bulk_field_reads_;
+    if(preloaded_.load()) {
+        disk_reads_after_preload_.fetch_add(experts.size(),std::memory_order_relaxed);
+        disk_bytes_after_preload_.fetch_add(source_bytes,std::memory_order_relaxed);
+    }
+    if(profile) {
+        const auto encoded=std::chrono::duration_cast<std::chrono::nanoseconds>(read_done-begin).count();
+        const auto materialize=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_done).count();
+        encoded_ns_.fetch_add(encoded,std::memory_order_relaxed);
+        materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
+        nvq_materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
+        record_format_io(prototype.nvq.kernel_format,source_bytes,encoded,materialize,experts.size());
+    }
+    return true;
+}
+
 void MoeQuantRangeSource::record_format_io(int format,std::uint64_t bytes,
-        std::uint64_t encoded_ns,std::uint64_t materialize_ns) const {
+        std::uint64_t encoded_ns,std::uint64_t materialize_ns,std::uint64_t reads) const {
     if(format<0 || std::size_t(format)>=format_io_.size())return;
-    const std::array<std::uint64_t,4> values{1,bytes,encoded_ns,materialize_ns};
+    const std::array<std::uint64_t,4> values{reads,bytes,encoded_ns,materialize_ns};
     for(std::size_t i=0;i<values.size();++i)
         format_io_[format][i].fetch_add(values[i],std::memory_order_relaxed);
 }

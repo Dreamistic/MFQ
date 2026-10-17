@@ -346,6 +346,20 @@ bool MfeQuantExpertStore::copy_nvq_fields(int expert,const std::array<NvqRows::F
     return pool.nvq->copy_rows_fields(begin,begin+output_,targets,source_bytes);
 }
 
+bool MfeQuantExpertStore::copy_nvq_fields(const std::vector<int>& experts,
+        const std::array<NvqRows::FieldTarget,4>& targets,std::size_t* source_bytes) const {
+    if(experts.empty())throw std::invalid_argument("missing NVQ expert group");
+    for(int expert:experts)if(expert<0 || expert>=experts_)throw std::out_of_range("NVQ expert group ID");
+    const auto& first=owners_[experts.front()];const auto& pool=pools_[first.pool];
+    if(!pool.nvq || !pool.nvq->byte_aligned_rows(output_))return false;
+    for(std::size_t i=0;i<experts.size();++i) {
+        const auto& owner=owners_[experts[i]];
+        if(owner.pool!=first.pool || std::size_t(owner.local)!=std::size_t(first.local)+i)return false;
+    }
+    const auto begin=std::int64_t(first.local)*output_;
+    return pool.nvq->copy_rows_fields(begin,begin+std::int64_t(experts.size())*output_,targets,source_bytes);
+}
+
 bool MfeQuantExpertStore::copy_nint_fields(int expert,const std::array<QuantFieldTarget,7>& targets,
         std::size_t* source_bytes) const {
     if(expert<0 || expert>=experts_)throw std::out_of_range("mixed expert direct field ID");
@@ -399,6 +413,11 @@ std::size_t MfeQuantExpertStore::expert_payload_nbytes(int expert) const {
 int MfeQuantExpertStore::expert_pool(int expert) const {
     if (expert<0 || expert>=experts_) throw std::out_of_range("mixed expert ID");
     return owners_[expert].pool;
+}
+
+int MfeQuantExpertStore::expert_local(int expert) const {
+    if(expert<0 || expert>=experts_)throw std::out_of_range("mixed expert ID");
+    return owners_[expert].local;
 }
 
 std::uint64_t MfeQuantExpertStore::expert_values_bits(int expert) const {

@@ -806,6 +806,7 @@ public:
             {"ssd_expert_bytes_read",double(disk_read_bytes)},
             {"ssd_expert_read_count",double(disk_reads)},
             {"ssd_direct_field_reads",double(direct_reads)},
+            {"ssd_bulk_field_reads",double(expert_bulk_field_reads())},
             {"ssd_reuse_promotions",double(kv_reuse.promotions)},
             {"ssd_reuse_policy_enabled",kv_reuse.enabled?1.0:0.0},
             {"ssd_ram_reuse_policy_enabled",host.reuse_priority?1.0:0.0},
@@ -992,6 +993,7 @@ private:
     std::uint64_t expert_disk_reads_after_preload() const;
     std::uint64_t expert_disk_bytes_after_preload() const;
     std::uint64_t expert_direct_field_reads() const;
+    std::uint64_t expert_bulk_field_reads() const;
     std::pair<std::size_t,std::size_t> pinned_expert_memory() const;
     std::array<std::uint64_t,4> expert_disk_timings() const;
     void append_expert_format_metrics(std::vector<std::pair<std::string,double>>& metrics) const;
