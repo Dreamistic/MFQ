@@ -7,6 +7,7 @@ import {createHash} from 'node:crypto';
 
 const source = new URL('./data/qwen38-flash-next-layer0-allocation.json', import.meta.url);
 const data = JSON.parse(fs.readFileSync(source, 'utf8'));
+const formatData = JSON.parse(fs.readFileSync(new URL('./data/qwen38-flash-next-base-format-sse.json', import.meta.url), 'utf8'));
 const recipeText = fs.readFileSync(new URL('../../mfq/calibration/recipes/IQ3_XXS.json', import.meta.url), 'utf8');
 const recipe = JSON.parse(recipeText);
 const expertIds = Array.from({length: 12}, (_, id) => id);
@@ -16,6 +17,14 @@ const nLayers = data.mfq.layer_count;
 const repositoryUrl = 'https://github.com/Tylogi/MFQ';
 assert.equal(nExperts, 512);
 assert.equal(nLayers, 48);
+assert.equal(formatData.model, data.mfq.model);
+assert.equal(formatData.evaluation.layer, data.mfq.layer);
+assert.equal(formatData.evaluation.experts, nExperts);
+assert.equal(formatData.evaluation.matrices, nExperts * projections.length);
+assert.equal(formatData.measurements.length, 7);
+for (const row of formatData.measurements) {
+  assert(Math.abs(100 * (1 - row.mfq_sse / row.gguf_sse) - row.sse_reduction_percent) < 0.005);
+}
 assert.equal(recipe.revision, data.gguf.revision);
 assert.equal(createHash('sha256').update(recipeText).digest('hex'), data.gguf.recipe_sha256);
 
@@ -40,18 +49,30 @@ for (const projection of data.mfq.projections) {
 
 const language = {
   en: {
-    title: 'Expert × projection precision',
-    context: `${data.mfq.model} · Layer ${data.mfq.layer} · Experts ${expertIds[0]}–${expertIds.at(-1)} / ${nExperts}`,
-    description: 'Qwen3.8-Flash-Next, layer 0, experts 0–11. This packed GGUF recipe uses one format per projection tensor; MFQ selects profiles per expert projection. Colors distinguish profiles. GGUF block-level parameters can still vary.',
+    title: 'Fine-grained precision & format fidelity',
+    context: `${data.mfq.model} · Layer ${data.mfq.layer} · ${nExperts} experts`,
+    description: 'Qwen3.8-Flash-Next, layer 0. The allocation panels show experts 0–11: this packed GGUF recipe uses one format per projection tensor; MFQ selects profiles per expert projection. Colors distinguish profiles. GGUF block-level parameters can still vary. The base-format panel shows mean reconstruction SSE reductions over all 512 experts, with actual bpw for each of seven format pairs.',
     slots: 'allocation slots / layer',
     expert: 'Expert',
+    formatTitle: 'Base-format reconstruction',
+    formatScope: 'Layer 0 · 512 experts × Gate / Up / Down · 1,536 matrices · equal matrix weighting',
+    mfqFormat: 'MFQ format · actual bpw',
+    ggufFormat: 'GGUF format · actual bpw',
+    reduction: 'SSE reduction',
+    maximum: value => `Up to ${value.toFixed(2)}% lower SSE`,
   },
   'zh-CN': {
-    title: '专家 × 投影精度分配',
-    context: `${data.mfq.model} · 第 ${data.mfq.layer} 层 · 专家 ${expertIds[0]}–${expertIds.at(-1)} / ${nExperts}`,
-    description: 'Qwen3.8-Flash-Next 第 0 层、专家 0–11 的真实档位。该 GGUF 配方的每个打包投影张量共用一种格式，MFQ 则按专家投影分配档位。颜色区分档位，GGUF 块内参数仍可变化。',
+    title: '细粒度精度与基础格式保真度',
+    context: `${data.mfq.model} · 第 ${data.mfq.layer} 层 · ${nExperts} 个专家`,
+    description: 'Qwen3.8-Flash-Next 第 0 层。分配面板展示专家 0–11 的真实档位：该 GGUF 配方的每个打包投影张量共用一种格式，MFQ 则按专家投影分配档位。颜色区分档位，GGUF 块内参数仍可变化。基础格式面板展示全部 512 个专家的平均重构 SSE 降低幅度，并列出 7 组格式的实际 bpw。',
     slots: '个分配位置／层',
     expert: '专家',
+    formatTitle: '基础格式的重构误差',
+    formatScope: '第 0 层 · 512 个专家 × Gate / Up / Down · 1,536 个矩阵 · 各矩阵等权平均',
+    mfqFormat: 'MFQ 格式 · 实际 bpw',
+    ggufFormat: 'GGUF 格式 · 实际 bpw',
+    reduction: 'SSE 降低',
+    maximum: value => `最高降低 ${value.toFixed(2)}% SSE`,
   },
 };
 
@@ -66,11 +87,11 @@ for (const [locale, t] of Object.entries(language)) {
   const line = (x1, y, x2, stroke = c.line_soft) =>
     parts.push(`<path d="M${x1} ${y}H${x2}" fill="none" stroke="${stroke}"/>`);
 
-  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="760" viewBox="0 0 1600 760" role="img" aria-labelledby="title desc" xml:lang="${locale}">`);
+  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1280" viewBox="0 0 1600 1280" role="img" aria-labelledby="title desc" xml:lang="${locale}">`);
   parts.push(`<title id="title">${xml(t.title)}</title>`);
   parts.push(`<desc id="desc">${xml(t.description)}</desc>`);
-  parts.push(`<metadata>${xml(JSON.stringify({model:data.mfq.model, layer:data.mfq.layer, expert_ids:expertIds, mfq_revision:data.mfq.revision, gguf_revision:data.gguf.revision, repository:repositoryUrl, source:'data/qwen38-flash-next-layer0-allocation.json', theme:'studio-figure-theme.json'}))}</metadata>`);
-  rect(0, 0, 1600, 760, c.canvas, 'none', 0);
+  parts.push(`<metadata>${xml(JSON.stringify({model:data.mfq.model, layer:data.mfq.layer, expert_ids:expertIds, mfq_revision:data.mfq.revision, gguf_revision:data.gguf.revision, repository:repositoryUrl, source:'data/qwen38-flash-next-layer0-allocation.json', base_format_source:'data/qwen38-flash-next-base-format-sse.json', base_format_evaluation:formatData.evaluation, theme:'studio-figure-theme.json'}))}</metadata>`);
+  rect(0, 0, 1600, 1280, c.canvas, 'none', 0);
   parts.push('<g font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Noto Sans CJK SC, Helvetica Neue, Arial, sans-serif">');
   text(48, 63, t.title, 30, 700, c.strong);
   text(48, 96, t.context, 17, 400, c.muted);
@@ -121,8 +142,33 @@ for (const [locale, t] of Object.entries(language)) {
       parts.push('</g>');
     }
   }
+  rect(48, 716, 1504, 496, c.surface, c.line, 12);
+  text(76, 760, t.formatTitle, 25, 700, c.strong);
+  text(1524, 760, t.maximum(Math.max(...formatData.measurements.map(row => row.sse_reduction_percent))), 23, 700, c.accent_ink, 'end');
+  text(76, 790, t.formatScope, 16, 400, c.muted);
+  text(76, 828, t.mfqFormat, 16, 400, c.muted);
+  text(430, 828, t.ggufFormat, 16, 400, c.muted);
+  text(800, 828, t.reduction, 16, 400, c.muted);
+  for (const value of [0, 10, 20, 30]) {
+    const x = 800 + value / 30 * 640;
+    parts.push(`<path d="M${x} 842V1152" fill="none" stroke="${c.line_soft}"/>`);
+    text(x, 1186, `${value}%`, 14, 400, c.muted_light, 'middle');
+  }
+  for (const [index, row] of formatData.measurements.entries()) {
+    const y = 864 + index * 44;
+    text(76, y-3, row.mfq_format, 19, 700, c.accent_ink);
+    text(76, y+17, row.mfq_bpw.toFixed(4), 16, 400, c.muted);
+    text(430, y-3, row.gguf_format, 19, 400, c.soft);
+    text(430, y+17, row.gguf_bpw.toFixed(4), 16, 400, c.muted);
+    parts.push(`<g id="base-format-sse-${row.gguf_format}" data-reduction-percent="${row.sse_reduction_percent}" data-mfq-bpw="${row.mfq_bpw}" data-gguf-bpw="${row.gguf_bpw}" data-mfq-sse="${row.mfq_sse}" data-gguf-sse="${row.gguf_sse}">`);
+    parts.push(`<title>${xml(`${row.mfq_format} (${row.mfq_bpw.toFixed(4)} bpw), SSE ${row.mfq_sse}; ${row.gguf_format} (${row.gguf_bpw.toFixed(4)} bpw), SSE ${row.gguf_sse}; reduction ${row.sse_reduction_percent.toFixed(2)}%`)}</title>`);
+    const width = row.sse_reduction_percent / 30 * 640;
+    rect(800, y-9, width, 18, c.accent, 'none', 3);
+    text(808 + width, y+6, `${row.sse_reduction_percent.toFixed(2)}%`, 19, 700, c.accent_ink);
+    parts.push('</g>');
+  }
   parts.push(`<a id="repository-url" href="${repositoryUrl}">`);
-  text(1552, 734, repositoryUrl, 14, 400, c.muted_light, 'end');
+  text(1552, 1254, repositoryUrl, 14, 400, c.muted_light, 'end');
   parts.push('</a></g></svg>');
   const suffix = locale === 'en' ? '' : '.zh-CN';
   const output = new URL(`./qwen38-flash-next-allocation-comparison${suffix}.svg`, import.meta.url);

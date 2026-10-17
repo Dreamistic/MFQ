@@ -48,7 +48,6 @@ measurement conditions shown for each result.
 | What matters | Measured result | Configuration |
 | --- | --- | --- |
 | Quantization quality | **37.4% lower KLD**; Top1 agreement **up 5.03 percentage points** | V1-M vs. Unsloth UD IQ1_M on WikiText-2, at approximately 74.5 GB weight size |
-| Base-format reconstruction | **4.04%–25.16% lower mean SSE** | Seven MFQ/GGUF format pairs at their reported actual bpw; layer 0, all 512 experts × Gate/Up/Down |
 | Weight residency | **43.36 GiB resident weights** | V1-M on Metal, with the PLE table read from SSD |
 | Apple / Metal generation | **101.2 tok/s** | V1-M; M5 Max, 40-core GPU, 128 GB; 4,096-token input; MTP enabled |
 | NVIDIA / CUDA generation | **87.0 tok/s** | V1-S; RTX 3090 Ti + 32 GiB RAM; 4,096-token input; MTP enabled |
@@ -56,25 +55,17 @@ measurement conditions shown for each result.
 Weight residency excludes KV cache and runtime allocations. Full speed and
 quality measurements are in [Benchmarks](#benchmarks).
 
-The figure connects model quality with base-format fidelity. The upper panels
-plot model size against agreement with the reference model: lower KL divergence
-(KLD) and higher Top1 agreement are better. The lower panel shows the reduction
-in reconstruction SSE for seven MFQ/GGUF format pairs, with their actual bpw.
+The quality comparison below shows model size against agreement with the
+reference model: lower KL divergence (KLD) and higher Top1 agreement are better.
 
 <p align="center">
-  <img src="./docs/figures/qwen38-flash-next-quality.svg" alt="Qwen3.8-Flash-Next: model size versus KLD and Top1 agreement for MFQ, Unsloth UD and GSQ-RCO, plus seven base-format comparisons showing actual bpw and 4.04%–25.16% lower mean reconstruction SSE for MFQ" width="1100">
+  <img src="./docs/figures/qwen38-flash-next-quality.svg" alt="Qwen3.8-Flash-Next: MFQ, Unsloth UD and GSQ-RCO model size versus KLD and Top1 agreement" width="1100">
 </p>
 
-Model-quality weight sizes exclude the vision encoder and MTP head;
+Quality-comparison weight sizes exclude the vision encoder and MTP head;
 GB = 10⁹ bytes. See the [model card](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ)
-for the full model comparison and tier selection guide, and the
-[model-quality data](./docs/figures/data/qwen38-flash-next-quality.json) for the plotted checkpoints.
-
-Base-format SSE is the equally weighted mean across **1,536 matrices in layer 0**:
-all 512 experts' Gate, Up and Down projections. Actual bpw differs within each
-format pair. See the [format benchmark notes](./docs/benchmarks/qwen38-flash-next-base-format-sse.md)
-for the complete SSE table and the [format data](./docs/figures/data/qwen38-flash-next-base-format-sse.json)
-for the supplied values and their source.
+for the full comparison and tier selection guide. The
+[plot data](./docs/figures/data/qwen38-flash-next-quality.json) records all comparison points and their source.
 
 <a id="features"></a>
 
@@ -88,20 +79,30 @@ vector formats can coexist within the same layer, with independent choices for
 each expert's Gate, Up and Down projections. The native runtimes execute these
 mixed formats directly.
 
+MFQ's base formats also reduce reconstruction error. Across the seven listed
+MFQ/GGUF format pairs, mean SSE is **4.04%–25.16% lower** on the tested layer-0
+expert matrices. The figure shows the actual bpw for each pair.
+
 For **Qwen3.8-Flash-Next**, the packed expert tensors in the Unsloth UD
 `IQ3_XXS` recipe select one GGUF format for each layer's Gate, Up and Down
 projections. MFQ `V3-XXS` selects a profile for **each expert projection**:
 **1,536 allocation slots per layer**, compared with **3** in that recipe.
 
 <p align="center">
-  <img src="./docs/figures/qwen38-flash-next-allocation-comparison.svg" alt="Actual layer 0 allocation: Unsloth UD IQ3_XXS shares one format across each packed expert projection; MFQ V3-XXS assigns profiles independently to each expert's Gate, Up and Down" width="1100">
+  <img src="./docs/figures/qwen38-flash-next-allocation-comparison.svg" alt="Qwen3.8-Flash-Next layer 0: GGUF versus MFQ expert-projection precision allocation, plus seven base-format comparisons with actual bpw and 4.04%–25.16% lower mean reconstruction SSE for MFQ" width="1100">
 </p>
 
-The figure shows **Qwen3.8-Flash-Next, layer 0, experts 0–11**. Colors identify
+The allocation panels show **Qwen3.8-Flash-Next, layer 0, experts 0–11**. Colors identify
 the selected profiles. Expert 9 uses **NVQ3J-L for Gate and Up** and **NINT4 for
 Down**. The **512×** ratio compares allocation slots per layer for MFQ and this
 GGUF recipe; GGUF block-level quantization parameters can still vary. See the
 [allocation data and sources](./docs/figures/data/qwen38-flash-next-layer0-allocation.json).
+
+The lower panel's SSE is the equally weighted mean across **1,536 matrices in
+layer 0**: all 512 experts' Gate, Up and Down projections. Actual bpw differs
+within each format pair. See the [format benchmark notes](./docs/benchmarks/qwen38-flash-next-base-format-sse.md)
+for the complete SSE table and the [format data](./docs/figures/data/qwen38-flash-next-base-format-sse.json)
+for the supplied values and their source.
 
 <details>
 <summary>Full-model precision heatmaps</summary>

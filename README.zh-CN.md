@@ -45,7 +45,6 @@ OpenAI 和 Anthropic 兼容 API 接入应用与 Agent。
 | 关注点 | 实测结果 | 配置与条件 |
 | --- | --- | --- |
 | 量化质量 | **KLD 降低 37.4%**，**Top1 一致率提高 5.03 个百分点** | V1-M 与 Unsloth UD IQ1_M 对比；WikiText-2；权重大小约 74.5 GB |
-| 基础格式重构 | **平均 SSE 降低 4.04%–25.16%** | 7 组 MFQ/GGUF 格式按表中实际 bpw 对比；第 0 层全部 512 个专家 × Gate/Up/Down |
 | 权重常驻需求 | **43.36 GiB 常驻权重** | Metal 上的 V1-M，PLE 表按需从 SSD 读取 |
 | Apple／Metal 生成速度 | **101.2 tok/s** | V1-M；M5 Max，40 核 GPU，128 GB；输入 4,096 tokens；开启 MTP |
 | NVIDIA／CUDA 生成速度 | **87.0 tok/s** | V1-S；RTX 3090 Ti + 32 GiB RAM；输入 4,096 tokens；开启 MTP |
@@ -53,22 +52,16 @@ OpenAI 和 Anthropic 兼容 API 接入应用与 Agent。
 常驻权重大小不包含 KV Cache 与运行时的额外内存分配。各档位的完整速度和质量
 数据见[性能与质量](#性能与质量)。
 
-下图同时展示模型质量与基础格式保真度。上方两图展示模型大小与参考模型一致性的关系：
-KL 散度（KLD）越低、Top1 一致率越高，表示量化后的模型越接近参考模型。
-下方用横向柱状图展示 7 组 MFQ/GGUF 基础格式的重构 SSE 降低幅度，并标出实际 bpw。
+下图展示模型大小与参考模型一致性的关系：KL 散度（KLD）越低、Top1 一致率
+越高，表示量化后的模型越接近参考模型。
 
 <p align="center">
-  <img src="./docs/figures/qwen38-flash-next-quality.zh-CN.svg" alt="Qwen3.8-Flash-Next：MFQ、Unsloth UD 与 GSQ-RCO 的模型大小、KLD 和 Top1 一致率对比，以及 7 组基础格式的实际 bpw 与 MFQ 平均重构 SSE 降低 4.04%–25.16% 的对比" width="1100">
+  <img src="./docs/figures/qwen38-flash-next-quality.zh-CN.svg" alt="Qwen3.8-Flash-Next：MFQ、Unsloth UD 与 GSQ-RCO 的模型大小、KLD 和 Top1 一致率对比" width="1100">
 </p>
 
 质量对比中的权重大小不含视觉编码器与 MTP 层，GB = 10⁹ 字节。
 完整对比与档位选择建议见[模型卡](https://huggingface.co/Tylogi/Qwen3.8-Flash-Next-EW-MFQ)，
-各检查点的绘图数值与来源见[模型质量数据](./docs/figures/data/qwen38-flash-next-quality.json)。
-
-基础格式的 SSE 为**第 0 层全部 1,536 个矩阵的等权平均值**，覆盖 512 个专家的
-Gate、Up、Down 投影。各对比格式的实际 bpw 相近，但存在差异。
-完整 SSE 表格见[格式基准说明](./docs/benchmarks/qwen38-flash-next-base-format-sse.md)，
-原始数值与来源见[格式数据](./docs/figures/data/qwen38-flash-next-base-format-sse.json)。
+全部绘图数值与来源见[图表数据](./docs/figures/data/qwen38-flash-next-quality.json)。
 
 <a id="功能特性"></a>
 
@@ -80,19 +73,27 @@ MFQ 按专家、投影、Chunk 或神经元分配精度，让敏感权重保留�
 同一层内可以混用 NINT 标量与 NVQ 向量格式，每个专家的 Gate、Up、Down
 投影都能独立选择格式和精度，并由原生运行时直接执行。
 
+MFQ 的基础格式也能降低重构误差：在图中列出的 7 组 MFQ/GGUF 格式对比中，
+第 0 层专家矩阵的**平均 SSE 降低 4.04%–25.16%**。各组的实际 bpw 均在图中列出。
+
 以 **Qwen3.8-Flash-Next** 为例，Unsloth UD `IQ3_XXS` 配方为每层的
 Gate、Up、Down 打包专家张量各选择一种 GGUF 格式；MFQ `V3-XXS` 则为
 **每个专家的每个投影**独立选择档位，每层有 **1,536 个分配位置**，
 对应上述 GGUF 配方的 **3 个**。
 
 <p align="center">
-  <img src="./docs/figures/qwen38-flash-next-allocation-comparison.zh-CN.svg" alt="第 0 层真实分配对比：Unsloth UD IQ3_XXS 在每个打包专家投影内共用一种格式，MFQ V3-XXS 则为每个专家的 Gate、Up、Down 独立分配档位" width="1100">
+  <img src="./docs/figures/qwen38-flash-next-allocation-comparison.zh-CN.svg" alt="Qwen3.8-Flash-Next 第 0 层：GGUF 与 MFQ 的专家投影精度分配，以及 7 组基础格式的实际 bpw 与 MFQ 平均重构 SSE 降低 4.04%–25.16% 的对比" width="1100">
 </p>
 
-图中展示 **Qwen3.8-Flash-Next 第 0 层、专家 0–11** 的真实档位，颜色用于
+分配面板展示 **Qwen3.8-Flash-Next 第 0 层、专家 0–11** 的真实档位，颜色用于
 区分所选格式。专家 9 的 **Gate、Up 使用
 NVQ3J-L，Down 使用 NINT4**。**512 倍**指上述打包张量配方的分配位置之比，
 GGUF 的块内量化参数仍可变化。具体分配与来源见[数据记录](./docs/figures/data/qwen38-flash-next-layer0-allocation.json)。
+
+下方基础格式面板的 SSE 为**第 0 层全部 1,536 个矩阵的等权平均值**，覆盖
+512 个专家的 Gate、Up、Down 投影。各对比格式的实际 bpw 相近，但存在差异。
+完整 SSE 表格见[格式基准说明](./docs/benchmarks/qwen38-flash-next-base-format-sse.md)，
+原始数值与来源见[格式数据](./docs/figures/data/qwen38-flash-next-base-format-sse.json)。
 
 <details>
 <summary>查看全模型精度热力图</summary>

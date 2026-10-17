@@ -1,7 +1,8 @@
 # Qwen3.8-Flash-Next: base-format reconstruction
 
-The README's first figure combines model-quality curves with the following
-base-format reconstruction comparison. The values below are transcribed from
+The expert-allocation figure in the README's **Why MFQ → Preserve quality with
+fine-grained precision** section includes the following base-format
+reconstruction comparison. The values below are transcribed from
 the table supplied for the figure; no new measurements were run. The
 [data snapshot](../figures/data/qwen38-flash-next-base-format-sse.json)
 preserves all seven pairs and the source image's SHA-256.
@@ -26,13 +27,13 @@ The actual bpw values differ within each pair and are shown alongside the
 formats. The chart preserves the listed pairs and their order, including
 both NINT4 comparisons.
 
-This panel measures reconstruction on the listed layer-0 matrices. The upper
-panels separately report whole-model KLD and Top1 agreement on WikiText-2,
+This panel measures reconstruction on the listed layer-0 matrices. The README's
+opening quality figure separately reports whole-model KLD and Top1 agreement on WikiText-2,
 using the [model-quality data](../figures/data/qwen38-flash-next-quality.json).
 Their weight sizes exclude the vision encoder and MTP head.
 
-Regenerate the combined English and Chinese SVGs and the English PNG:
+Regenerate the English and Chinese allocation/format comparison SVGs:
 
 ```bash
-uv run --no-project --no-config --with matplotlib python docs/figures/generate-quantization-quality.py
+node docs/figures/generate-expert-allocation-comparison.mjs
 ```

@@ -1,4 +1,4 @@
-"""Plot model quality and base-format reconstruction with MFQ Studio's theme.
+"""Redraw the published quality comparison with MFQ Studio's figure theme.
 
 uv run --no-project --no-config --with matplotlib python docs/figures/generate-quantization-quality.py
 """
@@ -23,12 +23,9 @@ from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
 
 ROOT = Path(__file__).resolve().parent
 DATA = json.loads((ROOT / "data/qwen38-flash-next-quality.json").read_text())
-BASE_FORMATS = json.loads((ROOT / "data/qwen38-flash-next-base-format-sse.json").read_text())
-assert BASE_FORMATS["model"] == DATA["model"]
-assert len(BASE_FORMATS["measurements"]) == 7
 C = json.loads((ROOT / "studio-figure-theme.json").read_text())["colors"]
 REPOSITORY_URL = "https://github.com/Tylogi/MFQ"
-WIDTH, HEIGHT = 1600, 1536
+WIDTH, HEIGHT = 1600, 1020
 
 families = ["DejaVu Sans"]
 for font_path in (
@@ -60,37 +57,25 @@ STYLES = {
 LANGUAGES = {
     "en": {
         "title": "Quantization quality",
-        "subtitle": DATA["model"],
+        "subtitle": f"{DATA['model']} · WikiText-2",
         "kld": "Mean KL divergence",
-        "kld_hint": "Lower is better · WikiText-2 · log scale",
+        "kld_hint": "Lower is better · log scale",
         "top1": "Top-1 agreement",
-        "top1_hint": "Higher is better · WikiText-2",
+        "top1_hint": "Higher is better",
         "size": "Weight size (GB)",
         "exclusions": "Weight sizes exclude the vision encoder and MTP head. GB = 10⁹ bytes.",
         "protocol": "MFQ · EW / GSQ-RCO: WT2 · 580 × 512 · 147,900 positions.",
-        "base_title": "Base-format reconstruction",
-        "base_scope": "Layer 0 · 512 experts × Gate / Up / Down · 1,536 matrices · equal matrix weighting",
-        "base_mfq": "MFQ format · actual bpw",
-        "base_gguf": "GGUF format · actual bpw",
-        "base_reduction": "SSE reduction",
-        "base_max": "Up to {value:.2f}% lower SSE",
     },
     "zh-CN": {
         "title": "量化质量",
-        "subtitle": DATA["model"],
+        "subtitle": f"{DATA['model']} · WikiText-2",
         "kld": "平均 KL 散度",
-        "kld_hint": "越低越好 · WikiText-2 · 对数刻度",
+        "kld_hint": "越低越好 · 对数刻度",
         "top1": "Top-1 一致率",
-        "top1_hint": "越高越好 · WikiText-2",
+        "top1_hint": "越高越好",
         "size": "权重大小（GB）",
         "exclusions": "权重大小不含视觉编码器与 MTP 层。GB = 10⁹ 字节。",
         "protocol": "MFQ · EW / GSQ-RCO：WT2 · 580 × 512 · 147,900 个位置。",
-        "base_title": "基础格式的重构误差",
-        "base_scope": "第 0 层 · 512 个专家 × Gate / Up / Down · 1,536 个矩阵 · 各矩阵等权平均",
-        "base_mfq": "MFQ 格式 · 实际 bpw",
-        "base_gguf": "GGUF 格式 · 实际 bpw",
-        "base_reduction": "SSE 降低",
-        "base_max": "最高降低 {value:.2f}% SSE",
     },
 }
 
@@ -208,48 +193,6 @@ def panel(fig, x, metric, text):
     return ax
 
 
-def base_format_panel(fig, text):
-    fig.add_artist(FancyBboxPatch(
-        bounds(48, 984, 1504, 496)[:2], 1504 / WIDTH, 496 / HEIGHT,
-        boxstyle=f"round,pad=0,rounding_size={12 / WIDTH}",
-        mutation_aspect=WIDTH / HEIGHT, transform=fig.transFigure,
-        facecolor=C["surface"], edgecolor=C["line"], linewidth=0.8, zorder=-1,
-    ))
-    label(fig, 76, 1028, text["base_title"], 25, C["strong"], "bold")
-    maximum = max(row["sse_reduction_percent"] for row in BASE_FORMATS["measurements"])
-    label(fig, 1524, 1028, text["base_max"].format(value=maximum), 23,
-          C["accent_ink"], "bold", ha="right")
-    label(fig, 76, 1058, text["base_scope"], 16, C["muted"])
-    for x, key in ((76, "base_mfq"), (430, "base_gguf"), (800, "base_reduction")):
-        label(fig, x, 1096, text[key], 16, C["muted"])
-    ax = fig.add_axes(bounds(800, 1110, 640, 310), facecolor="none")
-    ax.set_xlim(0, 30)
-    ax.set_ylim(1420, 1110)
-    ax.set_xticks((0, 10, 20, 30))
-    ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0f}%"))
-    ax.set_yticks([])
-    ax.grid(axis="x", color=C["line_soft"], linewidth=0.7)
-    ax.tick_params(axis="x", length=0, pad=10, labelsize=14)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    pixels_per_x = 640 / 30
-    for index, row in enumerate(BASE_FORMATS["measurements"]):
-        y = 1132 + index * 44
-        label(fig, 76, y - 3, row["mfq_format"], 19, C["accent_ink"], "bold")
-        label(fig, 76, y + 17, f'{row["mfq_bpw"]:.4f}', 16, C["muted"])
-        label(fig, 430, y - 3, row["gguf_format"], 19, C["soft"])
-        label(fig, 430, y + 17, f'{row["gguf_bpw"]:.4f}', 16, C["muted"])
-        value = row["sse_reduction_percent"]
-        bar = FancyBboxPatch((0, y - 9), value, 18,
-                            boxstyle=f"round,pad=0,rounding_size={3 / pixels_per_x}",
-                            mutation_aspect=pixels_per_x, facecolor=C["accent"], linewidth=0, zorder=3)
-        bar.set_gid(f'base-format-sse-{row["gguf_format"]}')
-        ax.add_patch(bar)
-        ax.text(value + 8 / pixels_per_x, y, f"{value:.2f}%", fontsize=19,
-                color=C["accent_ink"], weight="bold", va="center")
-    return ax
-
-
 def generate(locale, text):
     fig = plt.figure(figsize=(WIDTH / 72, HEIGHT / 72), facecolor=C["canvas"])
     label(fig, 48, 63, text["title"], 32, C["strong"], "bold")
@@ -265,16 +208,14 @@ def generate(locale, text):
     panel(fig, 812, "top1_agreement_percent", text)
     label(fig, 48, 926, text["exclusions"], 14, C["muted_light"])
     label(fig, 48, 952, text["protocol"], 14, C["muted_light"])
-    base_format_panel(fig, text)
-    footer = label(fig, 1552, 1512, REPOSITORY_URL, 14, C["muted_light"], ha="right")
+    footer = label(fig, 1552, 996, REPOSITORY_URL, 14, C["muted_light"], ha="right")
     footer.set_gid("repository-url")
     footer.set_url(REPOSITORY_URL)
 
     suffix = "" if locale == "en" else ".zh-CN"
     target = ROOT / f"qwen38-flash-next-quality{suffix}.svg"
     description = ". ".join((text["subtitle"], text["kld_hint"], text["top1_hint"],
-                              text["exclusions"], text["protocol"], text["base_title"],
-                              text["base_scope"], REPOSITORY_URL))
+                              text["exclusions"], text["protocol"], REPOSITORY_URL))
     fig.savefig(target, metadata={"Title": text["title"], "Description": description,
                                   "Creator": "MFQ", "Date": None})
     svg = target.read_text()
@@ -292,16 +233,6 @@ def generate(locale, text):
                 attributes = (f' data-size-gb="{row["weight_size_gb"]}" data-kld="{row["kld"]}"'
                               f' data-top1="{row["top1_agreement_percent"]}"')
                 svg = svg.replace(group, group[:-1] + attributes + f'><title>{escape(title)}</title>', 1)
-    for row in BASE_FORMATS["measurements"]:
-        group = f'<g id="base-format-sse-{row["gguf_format"]}">'
-        assert group in svg
-        title = (f'{row["mfq_format"]} ({row["mfq_bpw"]:.4f} bpw), SSE {row["mfq_sse"]}; '
-                 f'{row["gguf_format"]} ({row["gguf_bpw"]:.4f} bpw), SSE {row["gguf_sse"]}; '
-                 f'reduction {row["sse_reduction_percent"]:.2f}%')
-        attributes = (f' data-reduction-percent="{row["sse_reduction_percent"]}"'
-                      f' data-mfq-bpw="{row["mfq_bpw"]}" data-gguf-bpw="{row["gguf_bpw"]}"'
-                      f' data-mfq-sse="{row["mfq_sse"]}" data-gguf-sse="{row["gguf_sse"]}"')
-        svg = svg.replace(group, group[:-1] + attributes + f'><title>{escape(title)}</title>', 1)
     target.write_text("\n".join(line.rstrip() for line in svg.splitlines()) + "\n")
     png = ROOT / "qwen38-flash-next-quality.png" if locale == "en" else Path("/tmp/mfq-quantization-quality.zh-CN.png")
     fig.savefig(png, dpi=108, facecolor=C["canvas"], metadata={"Title": text["title"], "Description": description})
