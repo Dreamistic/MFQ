@@ -319,6 +319,12 @@ async def runtime_status(
     return await service.runtime_status(instance_id)
 
 
+@router.get("/api/v1/runtime/serving", responses=ERROR_RESPONSES, tags=["runtime"])
+async def serving_statistics(service: ServiceDependency,
+    scope: Literal["session", "alltime"] = "session", model: str | None = None) -> dict[str, Any]:
+    return await service.serving_statistics(scope, model)
+
+
 @router.get(
     "/api/v1/runtime/metrics",
     response_model=RuntimeMetricList,

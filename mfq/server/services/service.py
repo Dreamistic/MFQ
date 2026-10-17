@@ -314,6 +314,7 @@ class ServerService:
         self.stream_keepalive_seconds = max(0.01, stream_keepalive_seconds)
         self._active_responses: dict[UUID, tuple[UUID, asyncio.Task[Any]]] = {}
         self._runtime_metric_state: dict[str, tuple[float, tuple[Any, ...]]] = {}
+        self._serving_started_at = time.time()
         self._close_lock = asyncio.Lock()
         self._download_job_lock = asyncio.Lock()
         self._closed = False
@@ -1373,6 +1374,13 @@ class ServerService:
                 model=str(status.get("model")) if status.get("model") is not None else None,
             )
         return status
+
+    async def serving_statistics(self, scope: str, model: str | None = None) -> dict[str, Any]:
+        totals = await asyncio.to_thread(self.store.serving_statistics,
+            self._serving_started_at if scope == "session" else None, model)
+        activity = getattr(self.runtime_manager, "serving_activity", None)
+        return {"scope": scope, "started_at": self._serving_started_at, "totals": totals,
+            "activity": await activity() if callable(activity) else []}
 
     async def runtime_metrics(
         self,

@@ -76,6 +76,9 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const initializationVersion = useRef(0);
   const selectedRef = useRef(selectedModel);
   selectedRef.current = selectedModel;
+  const transientRuntime = useRef(false);
+  transientRuntime.current = Boolean(runtime?.reloading || runtime?.runtime_state === 'loading' ||
+    instances.some((instance) => instance.state === 'loading' || instance.state === 'unloading'));
 
   const requireAuthentication = useCallback(() => {
     ++requestVersion.current;
@@ -286,12 +289,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         useJobStore.getState().setJobs(jobs);
         retryJobStreams();
         const active = useJobStore.getState().activeJobIds;
-        if (previous.slice().sort().join(',') !== active.slice().sort().join(',')) void refreshRuntime();
+        if (previous.slice().sort().join(',') !== active.slice().sort().join(',') || transientRuntime.current) await refreshRuntime();
       } catch {
         if (!disposed) retryJobStreams();
       } finally {
         running = false;
-        if (!disposed) timer = setTimeout(() => void syncJobs(), useJobStore.getState().activeJobIds.length ? 1000 : 5000);
+        if (!disposed) timer = setTimeout(() => void syncJobs(), useJobStore.getState().activeJobIds.length || transientRuntime.current ? 1000 : 5000);
       }
     };
     const resume = () => {

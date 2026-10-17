@@ -101,6 +101,13 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         candidate_groups: { NVQ: ['NVQ3J-L'], NINT: ['NINT4', 'NINT8'] }, official_imatrix_url: null });
     if (path === '/api/v1/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/mfq/prefix-cache' });
     if (path === '/api/v1/runtime/model-aliases') return json({ aliases: {} });
+    if (path === '/api/v1/runtime/serving') return json({
+      scope: new URL(route.request().url()).searchParams.get('scope') || 'session',
+      started_at: Date.now() / 1000, activity: [],
+      totals: { completed_requests: 0, prompt_tokens: 0, prefill_tokens: 0,
+        completion_tokens: 0, cached_tokens: 0, prefill_tps: null, decode_tps: null,
+        ttft_ms: null, cache_hit_rate: null },
+    });
     if (path === '/api/v1/runtime/resources') return json({ sampled_at: 1, interval_seconds: 2,
       cpu_utilization_percent: null, gpus: [], disks: [], weights: [], memory_bandwidth_bytes_per_second: null,
       memory_bandwidth_limit_bytes_per_second: null, memory_bandwidth_utilization_percent: null });

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import tempfile
+from copy import copy
 from pathlib import Path
 from typing import Any
 
@@ -41,23 +42,31 @@ class RuntimeServer(uvicorn.Server):
         )
 
     async def startup(self, sockets=None) -> None:
-        await super().startup(sockets)
-        self.started = False
+        owned_sockets = []
+        listeners = list(sockets) if sockets is not None else []
+        try:
+            if sockets is None:
+                listener = self.config.bind_socket()
+                owned_sockets.append(listener)
+                listener.listen(self.config.backlog)
+                listeners.append(listener)
+            if self.anthropic_port is not None:
+                config = copy(self.config)
+                config.port = self.anthropic_port
+                config.fd = config.uds = None
+                listener = config.bind_socket()
+                owned_sockets.append(listener)
+                listener.listen(config.backlog)
+                listeners.append(listener)
+            await super().startup(listeners)
+        except BaseException:
+            for listener in owned_sockets:
+                listener.close()
+            raise
         if self.config.port == 0 and self.servers[0].sockets:
             self.config.port = self.servers[0].sockets[0].getsockname()[1]
-        try:
-            if self.anthropic_port is not None:
-                listener = await self._new_listener(self.anthropic_port)
-                self.servers.append(listener)
-                await listener.start_serving()
-                self.anthropic_port = listener.sockets[0].getsockname()[1]
-        except BaseException:
-            for listener in self.servers:
-                listener.close()
-                await listener.wait_closed()
-            await self.lifespan.shutdown()
-            raise
-        self.started = True
+        if self.anthropic_port is not None and self.servers[-1].sockets:
+            self.anthropic_port = self.servers[-1].sockets[0].getsockname()[1]
 
     def _save_port(self, port: int, anthropic_port: int | None) -> None:
         if self.settings_path is None:
