@@ -89,10 +89,16 @@ MfeWeight load_mfe_gpu(
         }
         if (reader) {
             if (record.dtype == "NINT") {
+                if(batch_reader)batch_reader=[batch=std::move(batch_reader)](const std::vector<mfq::ReadSpan>& spans) {
+                    static std::atomic_bool reported{false};
+                    if(!reported.exchange(true))
+                        std::fprintf(stderr,"moe_nint_expert_batch_dispatch fields=%zu\n",spans.size());
+                    batch(spans);
+                };
                 auto store = mfq::make_packed_nint_expert_store(record.nbytes,
                     [reader](std::size_t offset, std::uint8_t* output, std::size_t bytes) {
                         reader(offset, reinterpret_cast<std::byte*>(output), bytes);
-                    });
+                    },std::move(batch_reader));
                 const int minimum = std::min(execution.moe_cache_registration_min_slots, store->num_experts());
                 return cache_quant_moe_weight(cache, name,
                     std::make_shared<MoeQuantRangeSource>(std::move(store)), minimum, layer_id, projection_role);

@@ -53,7 +53,11 @@ void AsyncRangeReader::read(const std::vector<ReadSpan>& spans) const {
     // ranges need no second buffer and copy-back in this batching wrapper.
     // Keep sector coalescing when requests overlap or touch.
     if(merged.size()==intervals.size()) {
-        state.file.read_batch(spans);
+        if(alignment>1 && spans.size()>1) {
+            auto ordered=spans;
+            std::sort(ordered.begin(),ordered.end(),[](const ReadSpan& a,const ReadSpan& b){return a.offset<b.offset;});
+            state.file.read_batch(ordered);
+        }else state.file.read_batch(spans);
         std::uint64_t logical=0;for(const auto& span:spans)logical+=span.size;
         state.logical.fetch_add(logical,std::memory_order_relaxed);
         return;

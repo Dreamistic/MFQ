@@ -237,10 +237,20 @@ void self_test() {
     require(packed_store->num_experts() == 4 && packed_store->out_per_expert() == 13 && packed_store->neuron_len() == 53,
         "packed NINT expert geometry changed");
     require(*packed_reads < packed->size() / 4, "packed NINT index read weight payloads");
+    int packed_batches=0;
+    const auto packed_batch_store=mfq::make_packed_nint_expert_store(packed->size(),read_packed,
+        [&](const std::vector<mfq::ReadSpan>& spans) {
+            ++packed_batches;require(spans.size()>2,"packed NINT did not batch its independent fields");
+            for(const auto& span:spans)read_packed(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
+        });
     mfq::NintRows flat_rows(flat.data(), flat.size());
-    for (int expert = 0; expert < 4; ++expert)
+    for (int expert = 0; expert < 4; ++expert) {
         require(packed_store->read_expert(expert).payload == flat_rows.slice_rows_blob(expert * 13, (expert + 1) * 13),
             "packed NINT expert bytes changed");
+        require(packed_batch_store->read_expert(expert).payload==packed_store->read_expert(expert).payload,
+            "packed NINT batched field offsets or rebasing changed bytes");
+    }
+    require(packed_batches==4,"packed NINT did not read each expert's fields in one batch");
     rejected([&] { mfq::make_packed_nint_expert_store(49, read_packed); });
     (*packed)[14] = 2;
     rejected([&] { mfq::make_packed_nint_expert_store(packed->size(), read_packed); });

@@ -546,6 +546,7 @@ void MoeExpertCache::initialize_ssd_residency() {
     if(kv_expert_loan_)kv_expert_loan_->set_reuse_priority(true);
     const auto host=host_experts_->stats();
     std::cerr<<"moe_ssd_experts_ready gpu_bytes="<<allocated_bytes_<<" ram_budget_bytes="<<host.budget_bytes
+        <<" io_workers="<<config_.moe_ssd_io_workers
         <<" ram_pinned_bytes="<<pipeline_ram_registered_bytes_
         <<" ram_bytes="<<host.resident_bytes<<" expert_bytes="<<ssd_expert_total_bytes_
         <<" disk_reads_sealed=0\n";

@@ -159,7 +159,7 @@ void copy_nint_runtime_fields(const std::vector<std::uint8_t>& blob,
 }
 
 std::shared_ptr<MfeQuantExpertStore> make_packed_nint_expert_store(
-        std::size_t bytes, MfeQuantExpertStore::Read read) {
+        std::size_t bytes, MfeQuantExpertStore::Read read,NintRows::ReadBatch batch) {
     if (!read || bytes < 50) throw std::runtime_error("truncated packed NINT expert header");
     std::vector<std::uint8_t> original(50);
     read(0, original.data(), original.size());
@@ -197,6 +197,25 @@ std::shared_ptr<MfeQuantExpertStore> make_packed_nint_expert_store(
     if (bytes - 50 > std::numeric_limits<std::size_t>::max() - prefix->size())
         throw std::overflow_error("packed NINT expert source size overflow");
     const auto size = prefix->size() + bytes - 50;
+    NintRows::ReadBatch virtual_batch;
+    if(batch)virtual_batch=[prefix,batch=std::move(batch),size](const std::vector<ReadSpan>& spans) {
+        for(const auto& span:spans) {
+            if(span.offset>size || span.size>size-span.offset)
+                throw std::runtime_error("packed NINT expert batch exceeds source");
+            if(span.size && !span.destination)throw std::invalid_argument("null packed NINT batch target");
+        }
+        std::vector<ReadSpan> physical;physical.reserve(spans.size());
+        for(auto span:spans) {
+            if(!span.size)continue;
+            if(span.offset<prefix->size()) {
+                const auto count=std::min(span.size,prefix->size()-std::size_t(span.offset));
+                if(count)std::memcpy(span.destination,prefix->data()+span.offset,count);
+                span.offset+=count;span.destination+=count;span.size-=count;
+            }
+            if(span.size){span.offset=span.offset-prefix->size()+50;physical.push_back(span);}
+        }
+        if(!physical.empty())batch(physical);
+    };
     return std::make_shared<MfeQuantExpertStore>(size,
         [prefix, read = std::move(read), size](std::size_t offset, std::uint8_t* out, std::size_t count) {
             if (offset > size || count > size - offset)
@@ -207,7 +226,7 @@ std::shared_ptr<MfeQuantExpertStore> make_packed_nint_expert_store(
                 offset += copied; out += copied; count -= copied;
             }
             if (count) read(offset - prefix->size() + 50, out, count);
-        });
+        },std::move(virtual_batch));
 }
 
 MfeQuantExpertStore::MfeQuantExpertStore(std::size_t bytes,Read reader,NintRows::ReadBatch batch)
