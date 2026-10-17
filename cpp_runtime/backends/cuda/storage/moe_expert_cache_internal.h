@@ -358,13 +358,18 @@ public:
     void preload_complete_residency();
     void initialize_ssd_residency();
     using SsdExpertRequest=std::pair<MoeQuantRangeSource*,int>;
-    std::vector<MoeHostExpertCache::Lease> read_ssd_experts(const std::vector<SsdExpertRequest>& requests);
+    std::vector<MoeHostExpertCache::Lease> read_ssd_experts(const std::vector<SsdExpertRequest>& requests,bool background=false);
     struct SsdExpertCopy {MoeQuantRangeSource* source;int expert;std::vector<mfq_tensor_backend::Tensor> fields;};
     void copy_ssd_experts(const std::vector<SsdExpertCopy>& requests);
     void calibrate_pipeline_pcie();
     bool complete_residency() const noexcept { return complete_residency_; }
     bool pipeline_ready() const noexcept { return complete_residency_ || ssd_experts_; }
     bool ssd_experts() const noexcept { return ssd_experts_; }
+    bool suspend_residency(bool suspended) {
+        if(suspended)finish_pipeline_exchanges();
+        const bool previous=pipeline_residency_suspended_;
+        pipeline_residency_suspended_=suspended;return previous;
+    }
     double ram_pcie_fraction() const noexcept { return ram_pcie_fraction_; }
     void finish_pipeline_exchanges() { if(moe_residency_)moe_residency_->apply_pending(); }
     void prepare_predictor_exchange() { if(moe_residency_)moe_residency_->prepare_predictor(); }
@@ -972,6 +977,8 @@ private:
     bool ssd_experts_=false;
     std::size_t ssd_expert_total_bytes_=0;
     std::unique_ptr<mfq::HostParallelPool> ssd_read_pool_;
+    std::unique_ptr<mfq::HostParallelPool> ssd_background_read_pool_;
+    bool pipeline_residency_suspended_=false;
     CudaExecutionConfig config_;
     double ram_pcie_fraction_=0;
     double pipeline_pcie_gbps_=0;

@@ -5,6 +5,7 @@
 #include "mfq/host_parallel.h"
 #include "mfq/runtime.h"
 #include "mfq/mapped_read_profile.h"
+#include "mfq/mapped_prefetch_scope.h"
 #include <thread>
 #include <map>
 #include <cmath>
@@ -536,6 +537,7 @@ void MoeExpertCache::initialize_ssd_residency() {
         initialize_mixed_nvq_dispatch(*source->active_,config_);
     }
     ssd_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
+    ssd_background_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
     ssd_experts_=true;
     const auto host=host_experts_->stats();
     std::cerr<<"moe_ssd_experts_ready gpu_bytes="<<allocated_bytes_<<" ram_budget_bytes="<<host.budget_bytes
@@ -546,11 +548,15 @@ void MoeExpertCache::initialize_ssd_residency() {
 }
 
 std::vector<MoeHostExpertCache::Lease> MoeExpertCache::read_ssd_experts(
-        const std::vector<SsdExpertRequest>& requests) {
+        const std::vector<SsdExpertRequest>& requests,bool background) {
     std::vector<MoeHostExpertCache::Lease> leases(requests.size());
     if(requests.empty())return leases;
-    if(!ssd_read_pool_)throw std::logic_error("SSD expert read pool is not initialized");
-    ssd_read_pool_->run(0,int64_t(requests.size()),1,std::max(1,config_.moe_ssd_io_workers),
+    auto* pool=background?ssd_background_read_pool_.get():ssd_read_pool_.get();
+    if(!pool)throw std::logic_error("SSD expert read pool is not initialized");
+    // An adaptive batch must not hold the demand executor's dispatch mutex
+    // while a predictor is waiting for just its current routed experts.
+    const int workers=std::max(1,background?config_.moe_ssd_io_workers/2:config_.moe_ssd_io_workers);
+    pool->run(0,int64_t(requests.size()),1,workers,
         [&](int64_t begin,int64_t end) {
             for(auto i=begin;i<end;++i)leases[i]=requests[i].first->acquire_expert(requests[i].second);
         });
@@ -562,6 +568,7 @@ void MoeExpertCache::copy_ssd_experts(const std::vector<SsdExpertCopy>& requests
     if(!ssd_read_pool_)throw std::logic_error("SSD expert copy pool is not initialized");
     ssd_read_pool_->run(0,int64_t(requests.size()),1,std::max(1,config_.moe_ssd_io_workers),
         [&](int64_t begin,int64_t end) {
+            const mfq::MappedPrefetchScope prefetch(true);
             for(auto i=begin;i<end;++i)requests[i].source->copy_expert_fields(requests[i].expert,requests[i].fields);
         });
 }
@@ -2258,6 +2265,10 @@ void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache) {
 }
 void prepare_moe_predictor_exchange(const std::shared_ptr<MoeExpertCache>& cache) {
     if(cache)cache->prepare_predictor_exchange();
+}
+
+bool suspend_moe_residency(const std::shared_ptr<MoeExpertCache>& cache,bool suspended) {
+    return cache?cache->suspend_residency(suspended):false;
 }
 void begin_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,int rows) {
     const auto* option=std::getenv("MFQ_MOE_MTP_COMMITTED_HEAT");

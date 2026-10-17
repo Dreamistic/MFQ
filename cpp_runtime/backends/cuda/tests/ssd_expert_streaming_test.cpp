@@ -11,10 +11,13 @@
 #include "nint_prefill_cache.h"
 #include "format.h"
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <mutex>
 
 namespace tb=mfq_tensor_backend;
 namespace {
@@ -160,6 +163,55 @@ void check_output(const tb::Tensor& actual,const tb::Tensor& expected) {
                 " actual="+std::to_string(x)+" expected="+std::to_string(y));
     }
 }
+void check_ssd_predictor_overlap(const std::filesystem::path& root) {
+    for(bool shared_arena:{false,true}) {
+        CudaExecutionContext execution;auto& config=execution.config;
+        config.moe_pipeline=true;config.moe_two_stage_ffn=true;config.moe_direct_ram=true;
+        config.moe_ram_pcie=true;config.moe_ram_pcie_fraction=1.;
+        config.moe_preload_all=false;config.moe_assert_resident=false;
+        config.moe_residency_adapt=true;config.moe_residency_warm=true;config.moe_residency_projection_heat=true;
+        config.moe_host_cache_bytes=128*1024;
+        auto cache=make_moe_expert_cache(64*1024,config);
+        std::array<MoeFfnForward,2> forward;
+        for(int layer=0;layer<2;++layer) {
+            std::vector<std::shared_ptr<MfeWeight>> gu,down;
+            for(int p=0;p<3;++p) {
+                const auto family=layer && !shared_arena?"nint":"nvq3j";
+                auto quant=source(root/(std::string(family)+"-"+std::to_string(p)+".mfq"));
+                auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(cache,
+                    "ssd-overlap/"+std::to_string(layer)+"/"+std::to_string(p),quant,1,layer?-1:0,std::to_string(p)));
+                (p==2?down:gu).push_back(std::move(weight));
+            }
+            forward[layer]=make_moe_ffn_pipeline(gu,down);
+        }
+        finalize_moe_expert_cache(cache);
+        auto x=tb::full({1,96},.017,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+        auto ids=tb::tensor(std::vector<int32_t>{31,32}).reshape({1,2}).to(tb::kCUDA);
+        auto weights=tb::full({1,2},.5,x.options().dtype(tb::kFloat32));
+        const auto target=forward[0](execution,x,ids,weights).cpu().clone();
+        const auto predictor=forward[1](execution,x,ids,weights).cpu().clone();
+        std::mutex mutex;std::condition_variable changed;bool held=false,release=false;
+        MoeResidencyManager manager(cache.get(),[&](const char* event,std::size_t) {
+            if(std::string(event)!="ssd_predictor_overlap_ready")return;
+            std::unique_lock lock(mutex);held=true;changed.notify_all();
+            if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return release;}))
+                throw std::runtime_error("SSD predictor waited for a held background read");
+        });
+        for(int i=0;i<8;++i)manager.after_layer(0,std::vector<int32_t>(10,31),1);
+        manager.prepare_predictor();
+        if(!shared_arena) {
+            {std::unique_lock lock(mutex);
+                check(changed.wait_for(lock,std::chrono::seconds(5),[&]{return held;}),"SSD predictor did not overlap a background read");}
+            check_output(forward[1](execution,x,ids,weights),predictor);
+        }
+        {std::lock_guard lock(mutex);release=true;}changed.notify_all();
+        manager.apply_pending();
+        check(bool(manager.stats().predictor_overlap_serves)==!shared_arena,
+            "SSD predictor overlap ignored shared arena ownership");
+        check_output(forward[0](execution,x,ids,weights),target);
+        check_output(forward[1](execution,x,ids,weights),predictor);
+    }
+}
 }
 int main(int argc,char** argv)try {
     check_packed_metadata();
@@ -168,6 +220,7 @@ int main(int argc,char** argv)try {
     const auto stream=mfq_current_cuda_stream();
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     int cases=0;
+    if(argc==2)check_ssd_predictor_overlap(argv[1]);
     for(const char* format:{"nint","nvq2j","nvq3j","nvq2j-l","nvq2j-xl","nvq3j-l","nint-combined"}) {
         if(argc==3 && std::string(format)!="nint")continue;
         const bool combined=std::string(format)=="nint-combined";

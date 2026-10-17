@@ -4,6 +4,7 @@
 #include "runtime/native_dma_batch.h"
 #include "storage/moe_cached_source_internal.h"
 #include "mfq/cpu_expert_pool.h"
+#include "mfq/runtime.h"
 #include "host_memory_copy.h"
 #include "mfq_cuda_resident_allocations.h"
 #include "mfq/moe_residency_ranker.h"
@@ -12,6 +13,7 @@
 #include <exception>
 #include <map>
 #include <set>
+#include <unordered_set>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -320,6 +322,9 @@ struct MoeResidencyManager::Impl {
         return !option || option[0]!='0';
     }();
     bool predictor_overlap_scope=false,predictor_overlap_allowed=false;
+    bool ssd_predictor_isolated=false;
+    bool ssd_copies_permitted=false;
+    std::size_t ssd_stage_capacity=0;
     std::optional<mfq::cuda::KvExpertLoan::ExchangeReadGuard> exchange_reads;
     std::atomic<std::uint64_t> predictor_overlap_rounds{0},predictor_overlap_serves{0};
     std::exception_ptr error;
@@ -495,6 +500,25 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
     }
     if(native_residency_dma_enabled() && cache->pipeline_ram_registered_bytes_ && !cache->pipeline_ram_alias_)
         MFQ_CUDA_CHECK(cudaHostGetDevicePointer(&cache->pipeline_ram_alias_,cache->pipeline_ram_complement_->data_ptr(),0));
+    if(cache->ssd_experts()) {
+        // cudaHostAlloc can synchronize with a graph waiting for host-side
+        // expert publication. Reserve both directions before any replay and
+        // keep adaptation batches within this fixed workspace thereafter.
+        const auto memory=s.memory_probe();
+        auto capacity=std::min<std::uint64_t>({cache->host_experts_->stats().budget_bytes/4,
+            std::uint64_t(256)<<20,memory.available_bytes/8});
+        if(cache->config_.moe_host_physical_bytes)
+            capacity=std::min(capacity,memory.resident_bytes>=cache->config_.moe_host_physical_bytes?std::uint64_t(0):
+                (cache->config_.moe_host_physical_bytes-memory.resident_bytes)/8);
+        const auto options=tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true);
+        for(capacity=capacity/4096*4096;capacity;capacity=capacity/2/4096*4096) {
+            try {
+                s.backup=tb::empty({std::int64_t(capacity)},options);
+                s.upload=tb::empty({std::int64_t(capacity)},options);
+                s.ssd_stage_capacity=std::size_t(capacity);break;
+            } catch(const MfqResourceExhausted&) {s.backup={};s.upload={};}
+        }
+    }
     MFQ_CUDA_CHECK(cudaStreamCreateWithFlags(&s.stream,cudaStreamNonBlocking));
     const auto event=cudaEventCreateWithFlags(&s.done,cudaEventDisableTiming);
     if(event!=cudaSuccess){cudaStreamDestroy(s.stream);s.stream=nullptr;MFQ_CUDA_CHECK(event);}
@@ -720,6 +744,7 @@ void MoeResidencyManager::discard_speculative_routes() noexcept {
 }
 void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,int tokens,bool window_inflight,bool independent_sequences) {
     auto& s=*impl_;
+    if(s.cache->pipeline_residency_suspended_)return;
     for(std::size_t b=0;b<s.cache->pipeline_bundles_.size();++b)
         if(s.cache->sources_[s.cache->pipeline_bundles_[b][0]]->layer_id_==layer) {
             if(s.speculative_rows && layer>=0) {
@@ -778,7 +803,7 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
                     device_ready=true;
                 }
                 prepare();
-                if(state.async_publish) {
+                if(state.async_publish && !state.ssd_predictor_isolated) {
                     std::unique_lock<std::mutex> finish_lock(state.worker_mutex);
                     state.work_finished.wait(finish_lock,[&]{return !state.window_inflight || state.stopping;});
                     const bool publish=!state.stopping;finish_lock.unlock();
@@ -801,6 +826,7 @@ void MoeResidencyManager::after_layer(int layer,const std::vector<int32_t>& ids,
     });
     s.work_pending.store(true,std::memory_order_release);
     {std::lock_guard<std::mutex> lock(s.worker_mutex);s.window_inflight=window_inflight;s.work_requested=true;
+        s.ssd_predictor_isolated=false;s.ssd_copies_permitted=false;
         s.work_ready=false;s.predictor_overlap_allowed=false;}
     s.work_available.notify_one();
 }
@@ -863,7 +889,8 @@ void MoeResidencyManager::prepare() {
     }
     if(!cache.config_.moe_residency_warm && pairs.size()>32)pairs.resize(32);
     s.direct=cache.config_.moe_direct_ram && cache.pipeline_ram_registered_bytes_>0;
-    const bool shared_backup=cache.config_.moe_residency_warm && s.direct && cache.pipeline_host_stage_.defined();
+    const bool shared_backup=cache.config_.moe_residency_warm && s.direct && cache.pipeline_host_stage_.defined() &&
+        !cache.ssd_experts();
     // The next layer waits for publication before using the transfer workspace.
     // Reuse its pinned storage between windows instead of allocating a second
     // model-sized backup alongside graph preparation.
@@ -881,9 +908,12 @@ void MoeResidencyManager::prepare() {
             std::uint64_t(s.upload.defined()?s.upload.numel():0);
         stage_limit=(available+reusable)/(s.direct?1:2);
         if(shared_backup)stage_limit=std::min(stage_limit,std::uint64_t(s.backup.numel()));
+        else if(cache.ssd_experts() && cache.pipeline_host_stage_.defined())
+            stage_limit=std::min(stage_limit,std::uint64_t(cache.pipeline_host_stage_.numel()));
     }
     std::map<std::pair<int,int>,MoeHostExpertCache::Lease> ssd_images;
     if(cache.ssd_experts()) {
+        stage_limit=std::min(stage_limit,std::uint64_t(s.ssd_stage_capacity));
         // A small LRU mostly contains the last layers after a decode window.
         // Rank all cold experts, then read only the selected replacements;
         // otherwise early-layer hotspots can never become GPU residents.
@@ -925,8 +955,34 @@ void MoeResidencyManager::prepare() {
             }
         }
         pairs.swap(selected);
+        // Only independent predictor arenas may run beside a backbone
+        // transaction. Keep publication on the caller after that predictor;
+        // it may still own the current packet and its host/DMA leases.
+        s.ssd_predictor_isolated=s.predictor_overlap && s.pending_tokens<=8 && !pairs.empty();
+        if(s.ssd_predictor_isolated) {
+            std::unordered_set<MoeGpuArena*> predictor_arenas;
+            for(const auto& source:cache.sources_)if(source->layer_id_<0)
+                for(const auto& cohort:source->cohorts_)predictor_arenas.insert(cohort.arena);
+            if(predictor_arenas.empty())s.ssd_predictor_isolated=false;
+            for(const auto& pair:pairs) {
+                const int count=pair.incoming.projection<0?3:1;
+                for(int i=0;i<count;++i)for(const auto& expert:{pair.incoming,pair.outgoing}) {
+                    const int p=count==3?i:expert.projection;
+                    const auto& source=*cache.sources_[cache.pipeline_bundles_[expert.bundle][p]];
+                    if(source.layer_id_<0 || predictor_arenas.contains(source.cohorts_[source.expert_to_cohort_[expert.expert]].arena))
+                        s.ssd_predictor_isolated=false;
+                }
+            }
+        }
+        if(s.ssd_predictor_isolated) {
+            {std::lock_guard<std::mutex> lock(s.worker_mutex);s.predictor_overlap_allowed=true;}
+            s.work_finished.notify_all();
+            if(++s.predictor_overlap_rounds==1)
+                std::fprintf(stderr,"moe_ssd_predictor_exchange_overlap separate_readers=1 separate_backup=1 separate_arenas=1 deferred_publication=1\n");
+            s.observe("ssd_predictor_overlap_ready",0);
+        }
         s.ssd_load_requests+=requests.size();s.ssd_load_bytes+=selected_bytes;
-        auto images=cache.read_ssd_experts(requests);
+        auto images=cache.read_ssd_experts(requests,true);
         for(std::size_t i=0;i<images.size();++i)ssd_images.at(keys[i])=std::move(images[i]);
     }
     s.pending.reserve(pairs.size()*3);int64_t bytes=0;
@@ -994,7 +1050,7 @@ void MoeResidencyManager::prepare() {
                 }
                 if(!valid)break;
             }
-            if(s.reuse_transfer && s.direct && cache.pipeline_transfer_cache_) {
+            if(s.reuse_transfer && s.direct && cache.pipeline_transfer_cache_ && !s.ssd_predictor_isolated) {
                 auto* arena=s.transfer_stages[move.incoming_source][move.cohort].arena;
                 const int slot=arena && arena->book ? arena->book->slot_for(
                     incoming.quant_source_->host_key(move.incoming)) : -1;
@@ -1055,6 +1111,15 @@ void MoeResidencyManager::prepare() {
         }
     }
     finish_plan();
+    if(s.ssd_predictor_isolated) {
+        // Overlap immutable file reads and CPU packing with the drafts. WDDM
+        // can stall copy-engine notifications if a background transaction
+        // also submits DMA beside a graph polling for its next expert packet.
+        // The next target joins before launch and releases these copies.
+        std::unique_lock lock(s.worker_mutex);
+        s.work_finished.wait(lock,[&]{return s.ssd_copies_permitted || s.stopping;});
+        if(s.stopping)throw std::runtime_error("SSD expert exchange cancelled before DMA");
+    }
     if(s.pending_window) {
         if(s.pending_expert_fence) {
             const PhaseClock wait_clock(s.expert_fence_wait_ns,nullptr);
@@ -1665,6 +1730,8 @@ void MoeResidencyManager::rollback() {
 void MoeResidencyManager::apply_pending() {
     auto& s=*impl_;s.predictor_overlap_scope=false;
     if(!s.work_pending.load(std::memory_order_acquire) && s.pending.empty() && !s.error)return;
+    {std::lock_guard lock(s.worker_mutex);s.ssd_copies_permitted=true;}
+    s.work_finished.notify_all();
     const bool decode=s.pending_tokens<=8;
     const PhaseClock apply_clock(s.apply_ns,decode?&s.decode_apply_ns:nullptr);
     const auto started=std::chrono::steady_clock::now();

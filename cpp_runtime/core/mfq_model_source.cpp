@@ -1,6 +1,7 @@
 #include "mfq/mfq_model_source.h"
 #include "mfq/async_range_reader.h"
 #include "mfq/mapped_read_profile.h"
+#include "mfq/mapped_prefetch_scope.h"
 
 #include "mfq_format_compat.h"
 #include "mfq_legacy_tensor_names.h"
@@ -48,12 +49,14 @@ constexpr std::uint32_t kMaxRecordEntries = std::uint32_t{1} << 20;
 constexpr std::string_view kAssetPrefix = "__mfq_asset__/";
 std::array<std::atomic<std::uint64_t>,5> mapped_read_totals{};
 using MappedClock=std::chrono::steady_clock;
+thread_local bool mapped_prefetch_context=false;
 
 class MappedTensorRange {
     void* view_=nullptr;
     std::size_t mapped_bytes_=0,prefix_=0;
     std::uint64_t bytes_=0;
     bool profile_=false;
+    int prefetch_override_=-1;
 #ifdef _WIN32
     HANDLE file_=INVALID_HANDLE_VALUE,mapping_=nullptr;
 #else
@@ -73,6 +76,8 @@ public:
     explicit MappedTensorRange(const MfqStoredRecord& record):bytes_(record.tensor.nbytes) {
         const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");
         profile_=profile && profile[0]=='1';
+        const auto* prefetch=std::getenv("MFQ_MAPPED_BATCH_PREFETCH");
+        if(prefetch)prefetch_override_=prefetch[0]!='0';
         if(!bytes_)return;
         try {
             std::uint64_t granularity=0,file_bytes=0;
@@ -139,6 +144,7 @@ public:
         // NINT stores q, sub-scale/min and neuron anchors in separate streams;
         // sequential mapped reads otherwise fault those five streams in turn.
         const auto started=profile_?MappedClock::now():MappedClock::time_point{};
+        if(prefetch_override_<0?mapped_prefetch_context:prefetch_override_!=0) {
         std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
         ranges.reserve(std::min<std::size_t>(spans.size(),4096));
         const auto prefetch=[&] {
@@ -150,6 +156,7 @@ public:
             if(ranges.size()==4096)prefetch();
         }
         prefetch();
+        }
         if(profile_) {
             mapped_read_totals[0].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(MappedClock::now()-started).count(),std::memory_order_relaxed);
             mapped_read_totals[4].fetch_add(1,std::memory_order_relaxed);
@@ -466,6 +473,11 @@ std::array<std::uint64_t,5> mapped_tensor_read_profile() {
     for(std::size_t i=0;i<result.size();++i)result[i]=mapped_read_totals[i].load(std::memory_order_relaxed);
     return result;
 }
+
+MappedPrefetchScope::MappedPrefetchScope(bool enabled):previous_(mapped_prefetch_context) {
+    mapped_prefetch_context=enabled;
+}
+MappedPrefetchScope::~MappedPrefetchScope(){mapped_prefetch_context=previous_;}
 
 MfqModelSource::MfqModelSource(std::filesystem::path requested, FileReadMode mode)
     : impl_(std::make_unique<Impl>()) {

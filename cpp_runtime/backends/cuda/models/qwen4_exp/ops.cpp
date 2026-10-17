@@ -1591,9 +1591,12 @@ void qwen4_warmup_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp,int maximum_
     // Saving every recurrent state during each capture needlessly doubles its
     // transient footprint. Request-time captures still restore their real state.
     struct WarmupScope {
-        WarmupScope(){Qwen4DecodeGraph::startup_warmup=true;}
-        ~WarmupScope(){Qwen4DecodeGraph::startup_warmup=false;}
-    } startup_scope;
+        std::shared_ptr<MoeExpertCache> cache;
+        bool previous;
+        explicit WarmupScope(std::shared_ptr<MoeExpertCache> value):cache(std::move(value)),
+            previous(suspend_moe_residency(cache,true)){Qwen4DecodeGraph::startup_warmup=true;}
+        ~WarmupScope(){Qwen4DecodeGraph::startup_warmup=false;suspend_moe_residency(cache,previous);}
+    } startup_scope(model.execution->moe_expert_cache);
     namespace tb=mfq_tensor_backend;
     const auto start=std::chrono::steady_clock::now();
     auto scope=model.execution_scope();
