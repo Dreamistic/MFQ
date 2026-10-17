@@ -18,6 +18,20 @@ The [data snapshot](../figures/data/qwen38-flash-next-metal-runtime-comparison.j
 preserves every published value, including the MTP-on prefill measurements
 that are available for the two GGUF runtimes.
 
+## Comparable weight sizes
+
+Shading and bold labels link MFQ V3-XXS with GSQ-RCO IQ3_S in both GGUF
+runtimes. The [quality data snapshot](../figures/data/qwen38-flash-next-quality.json)
+reports 81.952 GB for V3-XXS and 83.618 GB for IQ3_S, excluding the vision
+encoder and MTP head, with 1 GB = 10⁹ bytes. These are similar weight sizes;
+they do not imply identical weights, quality or runtime memory use.
+
+With MTP enabled, MFQ V3-XXS generates at 105.4 tok/s, compared with 99.6 tok/s
+for Strata and 59.3 tok/s for llama.cpp using GSQ-RCO IQ3_S. With MTP off,
+Strata is slightly faster: 72.8 tok/s versus MFQ's 70.8 tok/s; llama.cpp
+reports 45.4 tok/s. The MTP comparison includes each runtime's draft setup,
+as described below.
+
 ## Measurement conditions
 
 The baseline workload uses 4,096 input tokens, 128 generated tokens, greedy

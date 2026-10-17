@@ -61,7 +61,7 @@ LANGUAGES = {
         "generation_no_mtp": "Generation · MTP off",
         "generation_mtp": "Generation · MTP on",
         "prefill_note": "¹ MFQ: published prefill value; Strata / llama.cpp: MTP off.",
-        "comparison_note": "Quantization tiers and MTP draft setups differ. See the benchmark notes.",
+        "comparison_note": "Shaded rows: similar weight size. MTP draft setups differ; see the benchmark notes.",
     },
     "zh-CN": {
         "title": "Metal 运行时速度对比",
@@ -72,7 +72,7 @@ LANGUAGES = {
         "generation_no_mtp": "生成速度 · 关闭 MTP",
         "generation_mtp": "生成速度 · 开启 MTP",
         "prefill_note": "¹ MFQ 为已发布的提示词处理值；Strata / llama.cpp 使用 MTP 关闭值。",
-        "comparison_note": "量化档位与 MTP 草稿配置不同，详细条件见基准说明。",
+        "comparison_note": "浅色底纹标出相近体积的档位；MTP 草稿配置不同，详细条件见基准说明。",
     },
 }
 GROUPS = (
@@ -131,6 +131,10 @@ def selected_metric(row, metric):
     return metric
 
 
+def comparable_size(row):
+    return (row["method"], row["tier"]) in (("mfq", "V3-XXS"), ("gsq-rco", "IQ3_S"))
+
+
 def panel(fig, left, width, metric, text):
     limit = 3000 if metric == "prefill" else 140
     ticks = (0, 1000, 2000, 3000) if metric == "prefill" else (0, 40, 80, 120, 140)
@@ -157,7 +161,8 @@ def panel(fig, left, width, metric, text):
                             mutation_aspect=pixels_per_x, facecolor=fill, linewidth=0, zorder=3)
         bar.set_gid(f'{row["runtime"]}-{row["method"]}-{row["tier"]}-{metric}')
         ax.add_patch(bar)
-        ax.text(value + 6 / pixels_per_x, y, f"{value:,.1f}", fontsize=17, color=ink, va="center")
+        ax.text(value + 6 / pixels_per_x, y, f"{value:,.1f}", fontsize=17, color=ink,
+                weight="bold" if comparable_size(row) else "normal", va="center")
     return ax
 
 
@@ -177,12 +182,13 @@ def generate(locale, text):
     for _, title, heading_y, _ in GROUPS:
         label(fig, 76, heading_y, title, 20, C["strong"], "bold")
     for row, y in ROWS:
-        highlight = row["runtime"] == "mfq" and row["tier"] == "V3-XXS"
+        highlight = comparable_size(row)
         if highlight:
-            surface(fig, 64, y - 17, 1472, 34, C["accent_soft"], radius=6, zorder=0)
+            tint = C["accent_soft"] if row["method"] == "mfq" else "#eef1f8"
+            surface(fig, 64, y - 17, 1472, 34, tint, radius=6, zorder=0)
         method = {"mfq": "", "gsq-rco": "GSQ-RCO · ", "unsloth-ud": "Unsloth · "}[row["method"]]
         label(fig, 76, y + 6, method + row["tier"], 17,
-              C["accent_ink"] if highlight else C["soft"], "bold" if highlight else "normal")
+              COLORS[row["method"]][1] if highlight else C["soft"], "bold" if highlight else "normal")
     panel(fig, 360, 330, "prefill", text)
     panel(fig, 820, 300, "generation_no_mtp", text)
     panel(fig, 1210, 300, "generation_mtp", text)

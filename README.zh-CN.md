@@ -131,6 +131,11 @@ Metal 平台为 **M5 Max（40 核 GPU、128 GB）**。CUDA 平台为 **RTX 3090 
   <img src="./docs/figures/qwen38-flash-next-metal-runtime-comparison.zh-CN.svg" alt="M5 Max 上的 Qwen3.8-Flash-Next：MFQ、Strata 与 llama.cpp 共 14 个运行时和检查点配置的提示词处理速度及 MTP 开关生成速度" width="1100">
 </p>
 
+浅色底纹和加粗标注对应相近体积的 **MFQ V3-XXS（82.0 GB）** 与
+**GSQ-RCO IQ3_S（83.6 GB）**，大小均不含视觉编码器与 MTP 层。
+开启 MTP 时，MFQ 的生成速度为 **105.4 tok/s**，Strata 为 **99.6 tok/s**，
+llama.cpp 为 **59.3 tok/s**。
+
 MFQ 来源表每档只给出一组提示词处理值；GGUF 的提示词处理柱使用 MTP 关闭值。
 各组的量化档位、草稿配置和测量次数不同，完整条件与表格见
 [基准说明](./docs/benchmarks/qwen38-flash-next-metal-comparison.md)，
