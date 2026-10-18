@@ -7,6 +7,7 @@
 #include "core/decode_graph.h"
 #include "core/full_block.h"
 #include "storage/moe_expert_cache.h"
+#include "models/qwen4_exp/ops.h"
 #include "mfq_tensor_backend.h"
 #include "mfq/model_source.h"
 
@@ -17,6 +18,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <type_traits>
 #include <vector>
 
 namespace mfq::cuda::internal {
@@ -53,7 +55,8 @@ int generate_diagnostic_tokens(
         std::chrono::steady_clock::time_point t0,
         std::chrono::steady_clock::time_point t1,
         const std::vector<int64_t>& decode_inputs = {},
-        const std::unordered_set<int64_t>& stop_token_ids = {}) {
+        const std::unordered_set<int64_t>& stop_token_ids = {},
+        bool production_prefill = false) {
         if(!decode_inputs.empty() && (gen<=1 || decode_inputs.size()!=size_t(gen-1)))
             throw std::invalid_argument("diagnostic decode input count differs from gen-1");
         mfq_tensor_backend::Tensor forced_inputs;
@@ -63,7 +66,18 @@ int generate_diagnostic_tokens(
         auto& profiler = execution.profiler;
         report_source_file_io(model.source.get(), "prefill_begin");
         profiler.reset();
-        auto next = model.next_token(ids);
+        auto next = [&] {
+            if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                if(production_prefill && ids.size(1)>128 && !qwen4_layer_major_prefill_eligible(model,ids.size(1)))
+                    throw std::invalid_argument("router audit requires production prefill; enable MFQ_MOE_PIPELINE and MFQ_MOE_PREFILL_LAYER");
+                if(production_prefill && qwen4_layer_major_prefill_eligible(model,ids.size(1))) {
+                    std::cout<<"diagnostic_prefill path=production_layer_major tokens="<<ids.size(1)<<std::endl;
+                    auto hidden=qwen4_layer_major_prefill_hidden(model,ids,1024,true);
+                    return model.adapter_next_token(model.lm_head,model.last_hidden(std::move(hidden)));
+                }
+            }
+            return model.next_token(ids);
+        }();
         mfq_cuda_synchronize();
         auto t2 = std::chrono::steady_clock::now();
         report_cuda_memory(execution.config, "prefill");
