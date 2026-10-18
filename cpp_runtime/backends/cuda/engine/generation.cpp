@@ -153,8 +153,6 @@ template <typename Model> struct CudaGenerationOps {
                                       .contiguous())
                               .reshape({1, -1});
             pending = mfq::cuda::sample_logits(sampler, std::move(logits), counts, constraint);
-            if constexpr(std::is_same_v<Model,Qwen4CausalLm>)
-                if(model.restore_decode_workspace)model.restore_decode_workspace();
         }
         const auto elapsed=timer.elapsed_ms();
         if(graph_config.trace)std::cerr<<"runtime_prefill_chunk offset="<<chunk.offset
@@ -164,7 +162,15 @@ template <typename Model> struct CudaGenerationOps {
             <<" timing=before_cache_restore"<<'\n';
         return elapsed;
     }
-    std::int64_t first_token() { return pending.template item<int64_t>(); }
+    std::int64_t first_token() {
+        const auto token=pending.template item<int64_t>();
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            // prefill()'s sequence-sized temporaries have now retired. Cache
+            // restoration remains before token publication, inside TTFT.
+            if(model.restore_decode_workspace)model.restore_decode_workspace();
+        }
+        return token;
+    }
 
     bool graph_eligible() const {
         const auto &execution = *model.execution;

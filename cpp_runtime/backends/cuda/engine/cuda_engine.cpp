@@ -18,6 +18,7 @@
 #include <cuda_runtime_api.h>
 #include "mfq_cuda_kv_quantization.h"
 #include <algorithm>
+#include <limits>
 #include <variant>
 #include <set>
 
@@ -42,28 +43,42 @@ struct CudaEngineState {
     std::shared_ptr<KvExpertLoan> graph_expert_loan;
     mfq_tensor_backend::Tensor graph_expert_storage;
     std::optional<std::size_t> graph_expert_region;
-    mfq_tensor_backend::Tensor workspace_expert_storage;
-    std::optional<std::size_t> workspace_expert_region;
+    struct WorkspaceExpertRegion {mfq_tensor_backend::Tensor storage;std::size_t region;};
+    std::vector<WorkspaceExpertRegion> workspace_expert_regions;
+    std::uint64_t workspace_expert_reclaimed_used_bytes=0;
     int graph_draft_depth=3;
     bool preparing_graph_depth=true;
 
-    void release_graph_expert_space() {
-        if(!graph_expert_region && !workspace_expert_region)return;
+    std::size_t workspace_expert_capacity() const {
+        std::size_t bytes=0;for(const auto& part:workspace_expert_regions)bytes+=part.storage.nbytes();return bytes;
+    }
+    std::size_t workspace_expert_used() const {
+        std::size_t bytes=0;
+        if(graph_expert_loan)for(const auto& part:workspace_expert_regions)bytes+=graph_expert_loan->region_bytes(part.region);
+        return bytes;
+    }
+    void release_graph_expert_space(std::size_t required_available=std::numeric_limits<std::size_t>::max()) {
+        if(!graph_expert_region && workspace_expert_regions.empty())return;
         finish_moe_expert_exchanges(execution->moe_expert_cache);
         MFQ_CUDA_CHECK(cudaDeviceSynchronize());
-        if(workspace_expert_region) {
-            const auto bytes=workspace_expert_storage.nbytes();
-            graph_expert_loan->remove(*workspace_expert_region);
-            workspace_expert_region.reset();workspace_expert_storage={};
-            std::cerr<<"runtime_prefill_workspace_cache action=reclaim bytes="<<bytes<<'\n';
+        auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
+        const bool all=required_available==std::numeric_limits<std::size_t>::max();
+        while(!workspace_expert_regions.empty() && (all || context->available_memory()<required_available)) {
+            const auto& part=workspace_expert_regions.back();
+            const auto bytes=part.storage.nbytes();
+            const auto used=graph_expert_loan->region_bytes(part.region);
+            workspace_expert_reclaimed_used_bytes+=used;
+            graph_expert_loan->remove(part.region);
+            workspace_expert_regions.pop_back();
+            context->reclaim_idle_memory();
+            std::cerr<<"runtime_prefill_workspace_cache action=reclaim bytes="<<bytes<<" used_bytes="<<used<<'\n';
         }
-        if(graph_expert_region) {
+        if(graph_expert_region && (all || context->available_memory()<required_available)) {
             const auto bytes=graph_expert_storage.nbytes();
             graph_expert_loan->remove(*graph_expert_region);
             graph_expert_region.reset();graph_expert_storage={};
             std::cerr<<"runtime_mtp_workspace_cache action=reclaim bytes="<<bytes<<'\n';
         }
-        auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
         context->reclaim_idle_memory();
     }
 
@@ -96,8 +111,11 @@ struct CudaEngineState {
     }
 
     void restore_graph_expert_space() {
+        if(preparing_graph_depth)return;
+        release_moe_prefill_buffers(execution->moe_expert_cache);
+        mfq::cuda::default_context(execution->layer_placement.primary_device())->reclaim_idle_memory();
         restore_mtp_expert_space();
-        if(preparing_graph_depth || workspace_expert_region || !graph_expert_loan)return;
+        if(!graph_expert_loan)return;
         bool ssd=false;std::size_t transfer=0;
         for(const auto& [name,value]:moe_expert_memory_metrics(execution->moe_expert_cache)) {
             if(name=="ssd_expert_enabled")ssd=value!=0;
@@ -110,23 +128,34 @@ struct CudaEngineState {
         const auto reserve=runtime_options::workspace_reserve_bytes();
         const auto decode=(std::size_t(1280)<<20)+transfer;
         if(reserve<=decode)return;
+        const auto existing=workspace_expert_capacity();
+        if(existing>=reserve-decode)return;
         auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
         const auto available=context->available_memory(),headroom=std::size_t(256)<<20;
-        auto bytes=std::min(reserve-decode,available>headroom?available-headroom:0);
+        auto bytes=std::min(reserve-decode-existing,available>headroom?available-headroom:0);
         bytes=bytes/KvExpertLoan::page*KvExpertLoan::page;
         if(!bytes)return;
         ResidentAllocationScope resident;
-        try {
-            workspace_expert_storage=mfq_tensor_backend::empty({int64_t(bytes)},
-                mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kUInt8));
-        }catch(const std::exception& error) {
-            const std::string message=error.what();
-            if(message.find("VRAM limit")==std::string::npos && message.find("out of memory")==std::string::npos)throw;
-            return;
+        // Small KV or prefix growth returns only the required chunks, keeping
+        // the rest of the decoded expert working set available to MTP.
+        while(bytes) {
+            const auto chunk=std::min(bytes,std::size_t(256)<<20);
+            mfq_tensor_backend::Tensor storage;
+            try {
+                storage=mfq_tensor_backend::empty({int64_t(chunk)},
+                    mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kUInt8));
+            }catch(const std::exception& error) {
+                const std::string message=error.what();
+                if(message.find("VRAM limit")==std::string::npos && message.find("out of memory")==std::string::npos)throw;
+                break;
+            }
+            workspace_expert_regions.reserve(workspace_expert_regions.size()+1);
+            const auto region=graph_expert_loan->add(storage,int64_t(chunk),1,true,1,true,true);
+            workspace_expert_regions.push_back({std::move(storage),region});
+            bytes-=chunk;
         }
-        try {workspace_expert_region=graph_expert_loan->add(workspace_expert_storage,int64_t(bytes),1,true,1,true,true);}
-        catch(...) {workspace_expert_storage={};throw;}
-        std::cerr<<"runtime_prefill_workspace_cache action=lend bytes="<<bytes<<" reserve_bytes="<<reserve<<'\n';
+        std::cerr<<"runtime_prefill_workspace_cache action=lend bytes="<<workspace_expert_capacity()-existing
+            <<" capacity_bytes="<<workspace_expert_capacity()<<" reserve_bytes="<<reserve<<'\n';
     }
 
     void prepare_graph_depth(const InferenceRequest& input) {
@@ -176,7 +205,11 @@ struct CudaEngineState {
         auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
         const auto available=context->available_memory();
         if(available>=bytes)return;
-        if(graph_expert_region || workspace_expert_region)release_graph_expert_space();
+        if(graph_expert_region || !workspace_expert_regions.empty()) {
+            std::cerr<<"runtime_workspace_cache_reclaim reason=workspace requested_bytes="<<bytes
+                <<" available_bytes="<<available<<'\n';
+            release_graph_expert_space(bytes);
+        }
         if(context->available_memory()>=bytes)return;
         std::size_t hot=0;
         for(const auto& [name,value]:cache.metrics())
@@ -229,7 +262,11 @@ struct CudaEngineState {
                 const auto device = execution->layer_placement.primary_device();
                 auto context = mfq::cuda::default_context(device);
                 if (context->available_memory() >= bytes) return;
-                if(graph_expert_region || workspace_expert_region)release_graph_expert_space();
+                if(graph_expert_region || !workspace_expert_regions.empty()) {
+                    std::cerr<<"runtime_workspace_cache_reclaim reason=kv_growth requested_bytes="<<bytes
+                        <<" available_bytes="<<context->available_memory()<<'\n';
+                    release_graph_expert_space(bytes);
+                }
                 if(context->available_memory()>=bytes)return;
                 std::size_t hot = 0;
                 for (const auto& [name,value] : cache.metrics())
@@ -416,9 +453,9 @@ struct CudaEngineState {
                 {"mtp_flexible_expert_capacity_bytes",double(graph_expert_storage.defined()?graph_expert_storage.nbytes():0)},
                 {"mtp_flexible_expert_used_bytes",double(graph_expert_loan && graph_expert_region?
                     graph_expert_loan->region_bytes(*graph_expert_region):0)},
-                {"prefill_workspace_expert_capacity_bytes",double(workspace_expert_storage.defined()?workspace_expert_storage.nbytes():0)},
-                {"prefill_workspace_expert_used_bytes",double(graph_expert_loan && workspace_expert_region?
-                    graph_expert_loan->region_bytes(*workspace_expert_region):0)},
+                {"prefill_workspace_expert_capacity_bytes",double(workspace_expert_capacity())},
+                {"prefill_workspace_expert_used_bytes",double(workspace_expert_used())},
+                {"prefill_workspace_expert_reclaimed_used_bytes",double(workspace_expert_reclaimed_used_bytes)},
                 {"kv_memory_supported",std::is_same_v<Model,Qwen4CausalLm>?1.0:0.0},
                 {"kv_quantization_supported",(std::is_same_v<Model,Qwen4CausalLm>||std::is_same_v<Model,Qwen35CausalLm>)?1.0:0.0},
                 {"kv_quantization_bits",(std::is_same_v<Model,Qwen4CausalLm>||std::is_same_v<Model,Qwen35CausalLm>)?cuda_kv_quantization().bits:0.0},
