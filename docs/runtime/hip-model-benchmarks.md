@@ -47,21 +47,39 @@ files against S4-M. Weight sizes below are the stored tensor bytes.
 
 ## Decode and prefill (2026-10-18, fused-kernel build, 2048-token cohort)
 
-| Model | Weights BF16/S4-M | Decode BF16 | Decode S4-M | Speedup | Prefill BF16 | Prefill S4-M |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Qwen3.5-0.8B | 1.6 / 0.8 GiB | 165.1 | 254.5 | 1.54x | 16866 | 16512 |
-| Qwen3.5-2B | 4.2 / 1.9 GiB | 172.4 | 212.9 | 1.24x | 15110 | 14659 |
-| Qwen3.5-4B | 8.7 / 3.2 GiB | 116.2 | 135.6 | 1.17x | 8635 | 8462 |
-| Qwen3.5-9B | 18.0 / 6.8 GiB | 71.2 | 101.1 | 1.42x | 7129 | 6823 |
-| Qwen3.5-27B | 51.8 / 17.5 GiB | 22.0 | 42.2 | 1.92x | 2768 | 2517 |
-| Qwen3.8-27B | 51.8 / 17.5 GiB | 21.9 | 42.2 | 1.93x | 2762 | 2440 |
+Decode, tokens per second. The llama.cpp columns are `tg256` from the
+same GPU (see the llama.cpp section for its build and conversion);
+llama-bench runs generation at its default context, so treat them as
+the nearby-KV reference rather than an exact-cohort match.
 
-Decode speedup by cohort: at 32 tokens 1.17x (4B) to 1.96x (both 27B
-models); at 8192 tokens 1.11x to 1.69x. S4-M decode wins at every size
-and the gain grows with model weight; effective S4-M weight streaming
-reaches 0.74 TB/s on 27B. Prefill is 1-8% slower for S4-M at 512-2048
-tokens and remains launch-bound at 32 tokens where the dequant fallback
-cannot amortize (see diagnosis).
+| Model | MFQ BF16 | llama F16 | MFQ S4-M | llama Q4_K_M | S4-M vs BF16 | S4-M vs llama Q4_K_M |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.5-0.8B | 165.1 | 406.8 | 254.5 | 414.4 | 1.54x | 0.61x |
+| Qwen3.5-2B | 172.4 | 290.7 | 212.9 | 375.6 | 1.24x | 0.57x |
+| Qwen3.5-4B | 116.2 | 180.3 | 135.6 | 242.6 | 1.17x | 0.56x |
+| Qwen3.5-9B | 71.2 | 122.9 | 101.1 | 193.8 | 1.42x | 0.52x |
+| Qwen3.5-27B | 22.0 | 40.7 | 42.2 | 77.1 | 1.92x | 0.55x |
+| Qwen3.8-27B | 21.9 | 40.6 | 42.2 | 76.9 | 1.93x | 0.55x |
+
+Prefill at the same cohort, tokens per second (`pp2048` for llama.cpp):
+
+| Model | MFQ BF16 | llama F16 | MFQ S4-M | llama Q4_K_M |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3.5-0.8B | 16866 | 19732 | 16512 | 27772 |
+| Qwen3.5-2B | 15110 | 15495 | 14659 | 20636 |
+| Qwen3.5-4B | 8635 | 8427 | 8462 | 11762 |
+| Qwen3.5-9B | 7129 | 6582 | 6823 | 8235 |
+| Qwen3.5-27B | 2768 | 2523 | 2517 | 2763 |
+| Qwen3.8-27B | 2762 | 2519 | 2440 | 2761 |
+
+S4-M decode wins over BF16 at every size, with the gain growing from
+1.17x (4B) to 1.9x (both 27B models); by cohort the speedup spans
+1.17-1.96x at 32 tokens and 1.11-1.69x at 8192 tokens. Effective S4-M
+weight streaming reaches 0.74 TB/s on 27B. Against llama.cpp, MFQ BF16
+prefill matches or beats llama F16 from 4B upward while MFQ S4-M
+prefill trails llama Q4_K_M by 1.1-1.7x (the M > 8 dequant fallback);
+decode reaches 0.52-0.61x of llama Q4_K_M, which is the remaining
+kernel gap quantified in the diagnosis below.
 
 ## Diagnosis: where quantized speed is lost
 
