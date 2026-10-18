@@ -379,6 +379,14 @@ struct CudaEngineState {
                 {"mtp_supported", double(capabilities.mtp_supported)}, {"mtp_available", double(capabilities.mtp_available)}};
             auto experts = moe_expert_memory_metrics(execution->moe_expert_cache);
             metrics.insert(metrics.end(), experts.begin(), experts.end());
+            if(language.source) {
+                const auto io=language.source->file_read_stats();
+                metrics.insert(metrics.end(),{{"model_io_direct",io.mode==mfq::FileReadMode::Direct?1.0:0.0},
+                    {"model_io_read_calls",double(io.calls)},{"model_io_logical_bytes",double(io.logical_bytes)},
+                    {"model_io_physical_bytes",double(io.physical_bytes)},{"model_io_read_ms",double(io.read_nanoseconds)/1e6},
+                    {"model_io_staging_bytes",double(io.staging_bytes)},{"model_io_cached_staging_bytes",double(io.staging_cached_bytes)},
+                    {"model_io_staging_allocations",double(io.staging_allocations)}});
+            }
             if(execution->kv_memory) {
                 auto kv=execution->kv_memory->metrics();
                 metrics.insert(metrics.end(),kv.begin(),kv.end());

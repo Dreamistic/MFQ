@@ -125,6 +125,10 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode,p
                 assert bool(status["ssd_expert_enabled"]) == ssd
                 assert bool(status["ssd_reuse_policy_enabled"]) == ssd
                 assert bool(status["ssd_ram_reuse_policy_enabled"]) == ssd
+                if read_mode == "direct":
+                    assert status["model_io_direct"] == 1
+                    assert status["model_io_physical_bytes"] >= status["model_io_logical_bytes"] > 0
+                    assert status["model_io_cached_staging_bytes"] > 0
                 if ssd:
                     assert status["ssd_ram_reuse_promotions"] == 0, "startup learned synthetic RAM cache priority"
                 startup_captures = (tmp_path / f"worker-{ssd}.log").read_text(errors="replace").count(
