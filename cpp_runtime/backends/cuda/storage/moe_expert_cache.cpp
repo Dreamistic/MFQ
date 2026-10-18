@@ -2456,7 +2456,7 @@ void MoeExpertCache::bind_host_device_cache_hints() {
     for(const auto [source,offset]:sources)kv_expert_loan_->observe_projections(source,
         [weak=std::weak_ptr(hints),offset](int64_t expert,const void* base,const std::array<std::size_t,8>&) {
             if(const auto hints=weak.lock())hints->publish(offset+std::size_t(expert),base!=nullptr);
-        },hints);
+        },hints,true);
 }
 void set_moe_kv_expert_loan(const std::shared_ptr<MoeExpertCache>& cache,std::shared_ptr<mfq::cuda::KvExpertLoan> loan) {
     if(cache) {

@@ -81,8 +81,9 @@ public:
         struct Impl;
         std::unique_ptr<Impl> impl_;
     };
-    // Under RAM pressure, discard idle duplicate images before unique images.
-    // Hints affect placement only; the checkpoint remains authoritative.
+    // Under RAM pressure, discard idle one-use duplicates before unique
+    // one-use images. Keep repeatedly consumed RAM backups of revocable GPU
+    // storage. Hints affect placement only; the checkpoint is authoritative.
     void set_device_cache_hints(std::shared_ptr<DeviceCacheHints> hints);
     bool exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey outgoing,
         const Lease& expected,const std::function<MixedMoePool(const MixedMoePool&)>& copy);

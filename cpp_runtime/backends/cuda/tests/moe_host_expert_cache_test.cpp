@@ -40,7 +40,7 @@ int main() try {
             std::vector<mfq::MoeCacheKey>{key(0),key(1),key(2),key(3),key(4)});
         cache.set_device_cache_hints(hints);
         for(int e:{0,1,2})cache.acquire(key(e),64,[e]{return weight(64,e+1);});
-        bytes_equal(cache.find(key(1)),2);
+        if(reuse)bytes_equal(cache.find(key(2)),3);
         hints->publish(1,true);
         cache.acquire(key(3),64,[]{return weight(64,4);});
         check(cache.contains(key(0)) && !cache.contains(key(1)) && cache.contains(key(2)),
@@ -52,6 +52,16 @@ int main() try {
         cache.acquire(key(4),64,[]{return weight(64,5);});
         check(cache.contains(key(3)) && !cache.contains(key(0)),"revoked GPU hint still biased RAM eviction");
         check(cache.stats().managed_peak_bytes==192,"exclusive cache exceeded its byte budget");
+    }
+    {
+        MoeHostExpertCache cache(192);cache.enable_reuse_priority();
+        auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(std::vector<mfq::MoeCacheKey>{key(1)});
+        cache.set_device_cache_hints(hints);
+        for(int e:{0,1,2})cache.acquire(key(e),64,[e]{return weight(64,e+1);});
+        bytes_equal(cache.find(key(1)),2);hints->publish(0,true);
+        for(int e=3;e<8;++e)cache.acquire(key(e),64,[e]{return weight(64,e+1);});
+        check(cache.contains(key(1)) && !cache.stats().device_duplicate_evictions,
+            "revocable GPU copy displaced a frequently reused RAM backup");
     }
     {
         MoeHostExpertCache cache(128);

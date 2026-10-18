@@ -38,6 +38,7 @@ public:
         reuse_priority_=enabled;reuse_pages_=0;reuse_heads_={};reuse_tails_={};
         for(auto* entries:{&lru_,&retired_})for(auto& entry:*entries) {
             entry.reused=false;entry.reuse_linked=false;entry.reuse_prev=entry.reuse_next=nullptr;
+            if(entry.published)notify_projection(entry,true,true);
         }
         if(enabled)rebuild_reuse_queues();
     }
@@ -179,14 +180,16 @@ public:
     }
     using ProjectionFill=std::function<void(void*,const std::array<std::size_t,8>&)>;
     using ProjectionObserver=std::function<void(int64_t,const void*,const std::array<std::size_t,8>&)>;
-    void observe_projections(int64_t source,ProjectionObserver observer,std::shared_ptr<void> owner={}) {
+    // RAM eviction may use only repeatedly consumed GPU images. One-use
+    // transfer pages are too short-lived to replace a protected RAM image.
+    void observe_projections(int64_t source,ProjectionObserver observer,std::shared_ptr<void> owner={},bool reuse_only=false) {
         if(!observer)throw std::invalid_argument("empty KV projection observer");
         std::lock_guard<std::mutex> lock(mutex_);
         for(const auto& entry:lru_)if(entry.key[0]==source && entry.projection && entry.published)
-            observer(entry.key[1],pointer(entry),entry.projection->offsets);
+            observer(entry.key[1],!reuse_only || entry.reused?pointer(entry):nullptr,entry.projection->offsets);
         auto& observers=observers_[source];
         std::erase_if(observers,[](const auto& value){return value.managed && value.owner.expired();});
-        observers.push_back({std::move(observer),owner,bool(owner)});
+        observers.push_back({std::move(observer),owner,bool(owner),reuse_only});
     }
     // Route publication has fenced the previous readers. Check complete hits
     // before acquiring RAM expert slices or reserving transfer-stage slots.
@@ -471,6 +474,7 @@ private:
         if(entry.reused==value)return;
         reuse_unlink(entry);
         entry.reused=value;
+        if(entry.published)notify_projection(entry,true,true);
         if(value){reuse_pages_+=entry.pages;++reuse_stats_.promotions;}
         else reuse_pages_-=entry.pages;
         if(reuse_priority_ && !entry.retired)reuse_touch(entry);
@@ -526,12 +530,12 @@ private:
         return {regions_.size(),0};
     }
     void* pointer(const Entry& e) const {return static_cast<uint8_t*>(regions_[e.region].owner.data_ptr())+e.first*page;}
-    void notify_projection(const Entry& entry,bool valid) {
+    void notify_projection(const Entry& entry,bool valid,bool reuse_change=false) {
         if(!entry.projection)return;
         if(auto found=observers_.find(entry.key[0]);found!=observers_.end()) {
             std::erase_if(found->second,[](const auto& value){return value.managed && value.owner.expired();});
-            for(const auto& observer:found->second)
-                observer.callback(entry.key[1],valid?pointer(entry):nullptr,entry.projection->offsets);
+            for(const auto& observer:found->second)if(!reuse_change || observer.reuse_only)
+                observer.callback(entry.key[1],valid && (!observer.reuse_only || entry.reused)?pointer(entry):nullptr,entry.projection->offsets);
         }
     }
     void erase(std::list<Entry>::iterator it) {
@@ -557,7 +561,7 @@ private:
     std::vector<Region> regions_;
     std::list<Entry> lru_,retired_;
     std::unordered_map<Key,std::list<Entry>::iterator,KeyHash> entries_;
-    struct Observer {ProjectionObserver callback;std::weak_ptr<void> owner;bool managed=false;};
+    struct Observer {ProjectionObserver callback;std::weak_ptr<void> owner;bool managed=false,reuse_only=false;};
     std::unordered_map<int64_t,std::vector<Observer>> observers_;
     std::vector<Key> pending_publications_;
     uint64_t packet_=1;

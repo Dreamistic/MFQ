@@ -92,6 +92,9 @@ struct MoeHostExpertCache::Impl {
         if(exchanging.contains(key))exchange_complete.wait(lock,[&]{return !exchanging.contains(key);});
     }
     void device_duplicate(Entry& entry,bool valid) noexcept {
+        // Borrowed GPU storage can be revoked by prefill or KV growth. Keep
+        // repeatedly consumed RAM backups ahead of one-use unique images.
+        valid=valid && !entry.reused;
         if(entry.device_duplicate==valid)return;
         if(valid) {
             entry.device_prev=nullptr;entry.device_next=device_head;
@@ -133,6 +136,7 @@ struct MoeHostExpertCache::Impl {
         reused.splice(reused.begin(),entry.reused?reused:lru,entry.position);
         if(!entry.reused) {
             entry.reused=true;counters.reuse_protected_bytes+=entry.value->bytes;++counters.reuse_promotions;
+            device_duplicate(entry,false);
         }
         const auto limit=budget-budget/4;
         while(counters.reuse_protected_bytes>limit && !reused.empty()) {
@@ -142,6 +146,7 @@ struct MoeHostExpertCache::Impl {
             auto& old=entries.at(*candidate);
             counters.reuse_protected_bytes-=old.value->bytes;old.reused=false;
             lru.splice(lru.begin(),reused,old.position);
+            device_duplicate(old,device_cached.contains(*old.position));
         }
     }
     bool make_room(std::size_t bytes) {
