@@ -148,7 +148,7 @@ void run(bool dspark,bool metal_policy=false,bool inherited_park=false) {
     Predictor mtp;
     mtp.legacy = dspark;
     if(inherited_park) {
-        mtp::BatchDepthPolicy previous({"previous"},3);
+        mtp::v1::BatchDepthPolicy previous({"previous"},3);
         previous.start_parked(128);
         mtp.policy_state.park_batch(previous);
     }

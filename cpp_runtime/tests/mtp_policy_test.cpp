@@ -20,33 +20,33 @@ template<class F> void rejects(F&& fn) {
 int main() {
     using namespace mfq::engine::mtp;
     {
-        // The CUDA bridge must make the same decisions as Metal's real batch
-        // policy, including host gaps, excluded maintenance, parking and retry.
+        // Keep CUDA on the previously measured policy, including host gaps,
+        // excluded maintenance, parking and retry.
         using Clock=BatchDepthPolicy::Clock;
         GenerationPolicy<DsparkDepthController> policy(3,false,nullptr,true,true);
-        BatchDepthPolicy metal({"cuda-mtp"},3);
+        v1::BatchDepthPolicy previous({"cuda-mtp"},3);
         Clock::time_point cursor{};
         std::uint64_t reentries=0;
         for(int cycle=0;cycle<1600;++cycle) {
-            require(policy.depth()==metal.depth());
+            require(policy.depth()==previous.depth());
             const int depth=policy.depth();
-            const bool parked=metal.remaining()!=0;
+            const bool parked=previous.remaining()!=0;
             const bool valid=cycle%31!=17;
             const double ms=!valid?9000.0:depth==0?20.0:cycle<500?10.0+2.0*depth:35.0+30.0*depth;
             const auto started=cursor+std::chrono::microseconds(400);
             cursor=started+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double,std::milli>(ms));
-            const std::array<BatchAcceptance,1> accepted{{{depth,depth}}};
-            metal.observe(accepted,started,cursor,valid,false);
+            const std::array<int,1> accepted{depth};
+            previous.observe(depth,accepted,started,cursor,valid,false);
             if(parked)policy.observe_plain_window(started,cursor,valid);
             else policy.observe_window(depth,depth,started,cursor,valid);
-            if(parked && !metal.remaining())++reentries;
-            require(policy.depth()==metal.depth() && policy.parked()==bool(metal.remaining()));
-            require(policy.parks()==metal.parks() && policy.reentries()==reentries);
-            for(int width=0;width<=3;++width)require(policy.measured_cycle_ms(width)==metal.cost(width));
+            if(parked && !previous.remaining())++reentries;
+            require(policy.depth()==previous.depth() && policy.parked()==bool(previous.remaining()));
+            require(policy.parks()==previous.parks() && policy.reentries()==reentries);
+            for(int width=0;width<=3;++width)require(policy.measured_cycle_ms(width)==previous.cost(width));
             if(cycle==499)require(policy.parks()==0);
         }
         require(policy.parks()>0 && policy.reentries()>0);
-        std::cout<<"Metal-policy CUDA bridge matches 1600 timed windows, exclusions and retries\n";
+        std::cout<<"CUDA v1 policy matches 1600 timed windows, exclusions and retries\n";
     }
     {
         // Wide-window caches can warm without a 10% change in scalar cost.
