@@ -34,6 +34,67 @@ void wait_coalesced(const MoeHostExpertCache& cache,std::promise<void>& release)
 }
 
 int main() try {
+    for(bool reuse:{false,true}) {
+        MoeHostExpertCache cache(192);if(reuse)cache.enable_reuse_priority();
+        auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(
+            std::vector<mfq::MoeCacheKey>{key(0),key(1),key(2),key(3),key(4)});
+        cache.set_device_cache_hints(hints);
+        for(int e:{0,1,2})cache.acquire(key(e),64,[e]{return weight(64,e+1);});
+        bytes_equal(cache.find(key(1)),2);
+        hints->publish(1,true);
+        cache.acquire(key(3),64,[]{return weight(64,4);});
+        check(cache.contains(key(0)) && !cache.contains(key(1)) && cache.contains(key(2)),
+            "GPU-duplicated RAM image displaced a unique RAM expert");
+        check(cache.stats().device_duplicate_evictions==1 && cache.stats().device_duplicate_evicted_bytes==64,
+            "duplicate RAM eviction accounting differs from released payloads");
+        // A late removal supersedes an earlier publication of the same key.
+        hints->publish(3,true);hints->publish(3,false);
+        cache.acquire(key(4),64,[]{return weight(64,5);});
+        check(cache.contains(key(3)) && !cache.contains(key(0)),"revoked GPU hint still biased RAM eviction");
+        check(cache.stats().managed_peak_bytes==192,"exclusive cache exceeded its byte budget");
+    }
+    {
+        MoeHostExpertCache cache(128);
+        auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(std::vector<mfq::MoeCacheKey>{key(1),key(2)});
+        cache.set_device_cache_hints(hints);
+        cache.acquire(key(0),64,[]{return weight(64,1);});
+        auto held=cache.acquire(key(1),64,[]{return weight(64,2);});
+        hints->publish(0,true);
+        cache.acquire(key(2),64,[]{return weight(64,3);});
+        check(cache.contains(key(1)) && !cache.contains(key(0)),"GPU hint evicted a leased RAM image");
+        bytes_equal(held,2);held.reset();
+        hints->publish(1,true);
+        cache.set_device_cache_hints({});
+        cache.find(key(1));
+        cache.acquire(key(3),64,[]{return weight(64,4);});
+        check(cache.contains(key(1)) && !cache.contains(key(2)),"detached GPU cache retained eviction priority");
+    }
+    {
+        MoeHostExpertCache cache(128);cache.preserve_resident_experts();
+        auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(std::vector<mfq::MoeCacheKey>{key(0)});
+        cache.set_device_cache_hints(hints);
+        cache.acquire(key(0),64,[]{return weight(64,1);});hints->publish(0,true);
+        cache.acquire(key(1),64,[]{return weight(64,2);});
+        check(cache.contains(key(0)) && !cache.stats().evictions,"GPU hint removed an image without RAM pressure");
+        cache.acquire(key(2),64,[]{return weight(64,3);});
+        check(cache.contains(key(0)) && cache.contains(key(1)) && !cache.contains(key(2)),
+            "GPU hint discarded the last reserved RAM copy in complete residency mode");
+    }
+    for(bool batch:{false,true}) {
+        MoeHostExpertCache cache(128);
+        auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(std::vector<mfq::MoeCacheKey>{key(0),key(2)});
+        cache.set_device_cache_hints(hints);hints->publish(0,true);
+        cache.acquire(key(0),64,[]{return weight(64,1);});
+        cache.acquire(key(1),64,[]{return weight(64,2);});
+        auto held=cache.find(key(0));
+        if(batch)check(cache.exchange_batch({{key(0),key(2),&held,
+                [](const MixedMoePool&){return weight(64,3);},[](const MixedMoePool&){}}}),"duplicate batch exchange failed");
+        else check(cache.exchange(key(0),key(2),held,[](const MixedMoePool&){return weight(64,3);}),"duplicate exchange failed");
+        held.reset();hints->publish(1,true);
+        cache.acquire(key(3),64,[]{return weight(64,4);});
+        check(!cache.contains(key(2)) && cache.contains(key(1)),"exchange corrupted the duplicate eviction queue");
+        check(cache.stats().device_duplicate_evictions==1,"exchanged duplicate was omitted from eviction accounting");
+    }
     {
         MoeHostExpertCache cache(192);cache.enable_reuse_priority();
         bytes_equal(cache.acquire(key(0),64,[]{return weight(64,1);}),1);

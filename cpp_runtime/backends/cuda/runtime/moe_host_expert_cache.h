@@ -30,6 +30,7 @@ struct MoeHostExpertCacheStats {
     std::size_t reuse_protected_bytes=0;
     std::uint64_t reuse_promotions=0;
     std::uint64_t scan_admissions=0,scan_admitted_bytes=0;
+    std::uint64_t device_duplicate_evictions=0,device_duplicate_evicted_bytes=0;
 };
 
 // Engine-wide, byte-bounded LRU for immutable CPU expert fields. CPU leases
@@ -68,6 +69,21 @@ public:
     void set_reuse_learning(bool enabled);
     // Complete-residency mode cannot evict the last copy of an expert.
     void preserve_resident_experts();
+    // Notifications take a separate lock and never call back into a device
+    // cache. Each registered key has one bounded, coalesced pending update.
+    class DeviceCacheHints {
+    public:
+        explicit DeviceCacheHints(std::vector<mfq::MoeCacheKey> keys);
+        ~DeviceCacheHints();
+        void publish(std::size_t index,bool resident);
+    private:
+        friend class MoeHostExpertCache;
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
+    };
+    // Under RAM pressure, discard idle duplicate images before unique images.
+    // Hints affect placement only; the checkpoint remains authoritative.
+    void set_device_cache_hints(std::shared_ptr<DeviceCacheHints> hints);
     bool exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey outgoing,
         const Lease& expected,const std::function<MixedMoePool(const MixedMoePool&)>& copy);
     struct Exchange {

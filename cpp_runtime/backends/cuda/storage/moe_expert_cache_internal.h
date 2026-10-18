@@ -362,6 +362,7 @@ public:
     void prewarm();
     void preload_complete_residency();
     void initialize_ssd_residency();
+    void bind_host_device_cache_hints();
     void initialize_ssd_readers();
     struct SsdPlacementStats {std::size_t experts=0,bytes=0,batches=0,peak=0;};
     void prepare_ssd_placement(MoeCachedSource& source,const std::vector<int32_t>& experts,SsdPlacementStats& stats);
@@ -540,6 +541,8 @@ public:
                << " host_cache_hits=" << host.hits
                << " host_cache_misses=" << host.misses
                << " host_cache_evictions=" << host.evictions
+               << " host_device_duplicate_evictions=" << host.device_duplicate_evictions
+               << " host_device_duplicate_evicted_bytes=" << host.device_duplicate_evicted_bytes
                << " host_cache_promotions=" << host.promotions
                << " host_cache_demotions=" << host.gpu_demotions
                << " complete_residency=" << complete_residency_
@@ -873,6 +876,8 @@ public:
             {"ram_expert_cache_hits",double(host.hits)},
             {"ram_expert_cache_misses",double(host.misses)},
             {"ram_expert_cache_evictions",double(host.evictions)},
+            {"ram_expert_device_duplicate_evictions",double(host.device_duplicate_evictions)},
+            {"ram_expert_device_duplicate_evicted_bytes",double(host.device_duplicate_evicted_bytes)},
             {"ram_expert_enabled", resident > 0 ? 1.0 : 0.0},
             {"resident_expert_cache_bytes",double(gpu_weights+(kv_expert_loan_?kv_expert_loan_->bytes():0))},
             {"expert_decode_transfer_bytes",double(transfer_bytes)},

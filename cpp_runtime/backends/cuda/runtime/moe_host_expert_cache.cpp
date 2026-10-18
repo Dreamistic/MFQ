@@ -36,8 +36,31 @@ struct MoeHostExpertReservation {
     }
 };
 
+struct MoeHostExpertCache::DeviceCacheHints::Impl {
+    std::mutex mutex;
+    std::vector<mfq::MoeCacheKey> keys;
+    std::vector<std::uint8_t> flags;
+    std::vector<std::size_t> pending;
+    explicit Impl(std::vector<mfq::MoeCacheKey> value):keys(std::move(value)),flags(keys.size()) {
+        pending.reserve(keys.size());
+    }
+};
+MoeHostExpertCache::DeviceCacheHints::DeviceCacheHints(std::vector<mfq::MoeCacheKey> keys)
+    :impl_(std::make_unique<Impl>(std::move(keys))) {}
+MoeHostExpertCache::DeviceCacheHints::~DeviceCacheHints()=default;
+void MoeHostExpertCache::DeviceCacheHints::publish(std::size_t index,bool resident) {
+    auto& state=*impl_;std::lock_guard lock(state.mutex);
+    auto& flags=state.flags.at(index);
+    if(bool(flags&1)==resident)return;
+    if(!(flags&2))state.pending.push_back(index);
+    flags=std::uint8_t(2|(resident?1:0));
+}
+
 struct MoeHostExpertCache::Impl {
-    struct Entry { Lease value; std::list<mfq::MoeCacheKey>::iterator position; bool reused=false; };
+    struct Entry {
+        Lease value;std::list<mfq::MoeCacheKey>::iterator position;bool reused=false;
+        Entry *device_prev=nullptr,*device_next=nullptr;bool device_duplicate=false;
+    };
     struct Flight {
         bool ready=false;
         bool retain=true;
@@ -60,12 +83,41 @@ struct MoeHostExpertCache::Impl {
     std::size_t exchange_placeholders=0;
     MoeHostExpertCacheStats counters;
     bool preserve=false,reuse_learning=true;
+    std::shared_ptr<DeviceCacheHints> device_hints;
+    std::unordered_set<mfq::MoeCacheKey,mfq::MoeCacheKeyHash> device_cached;
+    Entry *device_head=nullptr,*device_tail=nullptr;
 
     explicit Impl(std::size_t bytes):budget(bytes) {}
     void wait_exchange(std::unique_lock<std::mutex>& lock,mfq::MoeCacheKey key) {
         if(exchanging.contains(key))exchange_complete.wait(lock,[&]{return !exchanging.contains(key);});
     }
+    void device_duplicate(Entry& entry,bool valid) noexcept {
+        if(entry.device_duplicate==valid)return;
+        if(valid) {
+            entry.device_prev=nullptr;entry.device_next=device_head;
+            if(device_head)device_head->device_prev=&entry;else device_tail=&entry;
+            device_head=&entry;
+        }else {
+            if(entry.device_prev)entry.device_prev->device_next=entry.device_next;else device_head=entry.device_next;
+            if(entry.device_next)entry.device_next->device_prev=entry.device_prev;else device_tail=entry.device_prev;
+            entry.device_prev=entry.device_next=nullptr;
+        }
+        entry.device_duplicate=valid;
+    }
+    void refresh_device_hints() {
+        if(!device_hints)return;
+        auto& hints=*device_hints->impl_;std::lock_guard lock(hints.mutex);
+        for(const auto index:hints.pending) {
+            const auto key=hints.keys[index];const bool resident=hints.flags[index]&1;
+            if(resident)device_cached.insert(key);else device_cached.erase(key);
+            if(!exchanging.contains(key))if(auto found=entries.find(key);found!=entries.end())
+                device_duplicate(found->second,resident);
+            hints.flags[index]&=1;
+        }
+        hints.pending.clear();
+    }
     void remove(decltype(entries)::iterator found) {
+        device_duplicate(found->second,false);
         counters.resident_bytes-=found->second.value->bytes;
         if(found->first.source<0)counters.optional_bytes-=found->second.value->bytes;
         if(found->second.reused)counters.reuse_protected_bytes-=found->second.value->bytes;
@@ -74,6 +126,7 @@ struct MoeHostExpertCache::Impl {
     }
     void touch(mfq::MoeCacheKey key,Entry& entry) {
         if(!reuse_learning)return;
+        if(entry.device_duplicate){device_duplicate(entry,false);device_duplicate(entry,true);}
         if(!counters.reuse_priority || key.source<0) {
             lru.splice(lru.begin(),lru,entry.position);return;
         }
@@ -93,6 +146,21 @@ struct MoeHostExpertCache::Impl {
     }
     bool make_room(std::size_t bytes) {
         if (!bytes || bytes>budget) return false;
+        refresh_device_hints();
+        // Keep the ordinary two-queue policy among unique RAM images. A
+        // separate intrusive queue avoids scanning the whole RAM cache on
+        // every miss, and skips leases and transactions just like normal LRU.
+        for(auto* candidate=device_tail;ledger->managed.load()>budget-bytes && candidate;) {
+            auto* previous=candidate->device_prev;const auto key=*candidate->position;
+            if(!exchanging.contains(key) && !(preserve && key.source>=0) && candidate->value.use_count()==1) {
+                counters.device_duplicate_evicted_bytes+=candidate->value->bytes;
+                remove(entries.find(key));++counters.evictions;
+                if(++counters.device_duplicate_evictions==1)std::fprintf(stderr,
+                    "moe_ram_device_duplicate_dispatch scope=first_eviction enabled=1\n");
+            }
+            candidate=previous;
+        }
+        if(ledger->managed.load()<=budget-bytes)return true;
         for(auto* queue:{&lru,&reused}) {
           auto candidate=queue->end();
           while (ledger->managed.load()>budget-bytes && candidate!=queue->begin()) {
@@ -106,6 +174,7 @@ struct MoeHostExpertCache::Impl {
             // Externally held payloads stay charged even after removal. Keep
             // their lookup entry rather than evicting useful pinned data.
             if (found->second.value.use_count()!=1) continue;
+            device_duplicate(found->second,false);
             candidate=queue->erase(candidate);
             counters.resident_bytes-=found->second.value->bytes;
             if(found->first.source<0)counters.optional_bytes-=found->second.value->bytes;
@@ -120,8 +189,10 @@ struct MoeHostExpertCache::Impl {
     void publish(mfq::MoeCacheKey key,Lease value) {
         lru.push_front(key);
         try {
-            if (!entries.emplace(key,Entry{value,lru.begin()}).second)
+            const auto [found,inserted]=entries.emplace(key,Entry{value,lru.begin()});
+            if (!inserted)
                 throw std::logic_error("duplicate host expert publication");
+            device_duplicate(found->second,device_cached.contains(key));
         }
         catch (...) { lru.pop_front(); throw; }
         counters.resident_bytes+=value->bytes;
@@ -136,6 +207,11 @@ void MoeHostExpertCache::enable_reuse_priority() {
 }
 void MoeHostExpertCache::set_reuse_learning(bool enabled) {
     std::lock_guard lock(impl_->mutex);impl_->reuse_learning=enabled;
+}
+void MoeHostExpertCache::set_device_cache_hints(std::shared_ptr<DeviceCacheHints> hints) {
+    auto& state=*impl_;std::lock_guard lock(state.mutex);
+    while(state.device_head)state.device_duplicate(*state.device_head,false);
+    state.device_cached.clear();state.device_hints=std::move(hints);
 }
 
 MoeHostExpertCache::Lease MoeHostExpertCache::find(mfq::MoeCacheKey key,bool touch) {
@@ -314,6 +390,7 @@ std::size_t MoeHostExpertCache::reclaim_optional(std::size_t bytes) {
         const auto found=state.entries.find(*candidate);
         if(found->second.value.use_count()!=1)continue;
         released+=found->second.value->bytes;
+        state.device_duplicate(found->second,false);
         candidate=state.lru.erase(candidate);
         state.counters.resident_bytes-=found->second.value->bytes;
         state.counters.optional_bytes-=found->second.value->bytes;
@@ -339,7 +416,9 @@ bool MoeHostExpertCache::exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey out
     state.entries.emplace(outgoing,Impl::Entry{value,position});
     try {value->weights=copy(expected->weights);}
     catch(...) {state.entries.erase(outgoing);throw;}
+    state.device_duplicate(state.entries.at(incoming),false);
     state.entries.erase(incoming);*position=outgoing;
+    state.device_duplicate(state.entries.at(outgoing),state.device_cached.contains(outgoing));
     if(incoming.source<0)state.counters.optional_bytes-=value->bytes;
     if(outgoing.source<0)state.counters.optional_bytes+=value->bytes;
     if(was_reused)state.counters.reuse_protected_bytes-=value->bytes;
@@ -414,7 +493,9 @@ bool MoeHostExpertCache::exchange_batch(const std::vector<Exchange>& changes,
     }
     if(!lock.owns_lock())lock.lock();
     for(std::size_t i=0;i<changes.size();++i) {
+        state.device_duplicate(state.entries.at(changes[i].incoming),false);
         state.entries.erase(changes[i].incoming);*prepared[i].position=changes[i].outgoing;
+        state.device_duplicate(state.entries.at(changes[i].outgoing),state.device_cached.contains(changes[i].outgoing));
         if(changes[i].incoming.source<0)state.counters.optional_bytes-=prepared[i].value->bytes;
         if(changes[i].outgoing.source<0)state.counters.optional_bytes+=prepared[i].value->bytes;
         if(prepared[i].reused)state.counters.reuse_protected_bytes-=prepared[i].value->bytes;

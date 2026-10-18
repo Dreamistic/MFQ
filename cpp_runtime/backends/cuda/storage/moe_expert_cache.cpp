@@ -609,6 +609,7 @@ void MoeExpertCache::initialize_ssd_residency() {
     }
     ssd_experts_=true;
     host_experts_->enable_reuse_priority();
+    bind_host_device_cache_hints();
     if(kv_expert_loan_)kv_expert_loan_->set_reuse_priority(true);
     const auto host=host_experts_->stats();
     std::cerr<<"moe_ssd_experts_ready gpu_bytes="<<allocated_bytes_<<" ram_budget_bytes="<<host.budget_bytes
@@ -2443,12 +2444,28 @@ void MoeExpertCache::release_direct_transfer_cache() {
     }
     pipeline_direct_cache_storage_={};
 }
+void MoeExpertCache::bind_host_device_cache_hints() {
+    if(!ssd_experts_ || !kv_expert_loan_){host_experts_->set_device_cache_hints({});return;}
+    std::vector<mfq::MoeCacheKey> keys;std::vector<std::pair<int,std::size_t>> sources;
+    for(const auto& source:sources_)if(source->quant_source_) {
+        sources.emplace_back(source->id_,keys.size());
+        for(int e=0;e<source->n_experts();++e)keys.push_back(source->quant_source_->host_key(e));
+    }
+    auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(std::move(keys));
+    host_experts_->set_device_cache_hints(hints);
+    for(const auto [source,offset]:sources)kv_expert_loan_->observe_projections(source,
+        [weak=std::weak_ptr(hints),offset](int64_t expert,const void* base,const std::array<std::size_t,8>&) {
+            if(const auto hints=weak.lock())hints->publish(offset+std::size_t(expert),base!=nullptr);
+        },hints);
+}
 void set_moe_kv_expert_loan(const std::shared_ptr<MoeExpertCache>& cache,std::shared_ptr<mfq::cuda::KvExpertLoan> loan) {
     if(cache) {
-        if(cache->kv_expert_loan_!=loan)cache->release_direct_transfer_cache();
+        const bool changed=cache->kv_expert_loan_!=loan;
+        if(changed)cache->release_direct_transfer_cache();
         if(loan && cache->ssd_experts())loan->set_reuse_priority(true);
         if(loan)loan->set_reuse_learning(cache->reuse_learning());
         cache->kv_expert_loan_=std::move(loan);
+        if(changed)cache->bind_host_device_cache_hints();
     }
 }
 void prepare_moe_decode_residency(const std::shared_ptr<MoeExpertCache>& cache) {
