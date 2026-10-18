@@ -116,23 +116,30 @@ struct CudaEngineState {
         mfq::cuda::default_context(execution->layer_placement.primary_device())->reclaim_idle_memory();
         restore_mtp_expert_space();
         if(!graph_expert_loan)return;
-        bool ssd=false;std::size_t transfer=0;
+        bool ssd=false;std::size_t transfer=0,streamed=0;
         for(const auto& [name,value]:moe_expert_memory_metrics(execution->moe_expert_cache)) {
             if(name=="ssd_expert_enabled")ssd=value!=0;
             if(name=="expert_decode_stage_budget_bytes")transfer=std::size_t(value);
+            if(name=="ram_expert_payload_bytes" || name=="ssd_expert_payload_bytes")streamed+=std::size_t(value);
         }
         if(!ssd)return;
-        // Lend the prefill-only portion of the existing workspace reserve.
-        // Primary expert allocation retains its original budget; these pages
-        // are returned through the same prefill and KV growth callbacks.
+        if(const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");profile && profile[0]=='1' && language.source) {
+            const auto io=language.source->file_read_stats();
+            std::cerr<<"runtime_model_io_stats boundary=prefill_end calls="<<io.calls
+                <<" logical_bytes="<<io.logical_bytes<<" physical_bytes="<<io.physical_bytes
+                <<" read_ms="<<double(io.read_nanoseconds)/1e6<<'\n';
+        }
+        // Spare device memory can hold revocable copies of streamed experts.
+        // Primary arenas retain their configured budget. Prefill, KV growth
+        // and online resident budgets return these chunks before allocation.
         const auto reserve=runtime_options::workspace_reserve_bytes();
         const auto decode=(std::size_t(1280)<<20)+transfer;
-        if(reserve<=decode)return;
         const auto existing=workspace_expert_capacity();
-        if(existing>=reserve-decode)return;
+        const auto target=std::max(streamed,reserve>decode?reserve-decode:0);
+        if(existing>=target)return;
         auto context=mfq::cuda::default_context(execution->layer_placement.primary_device());
         const auto available=context->available_memory(),headroom=std::size_t(256)<<20;
-        auto bytes=std::min(reserve-decode-existing,available>headroom?available-headroom:0);
+        auto bytes=std::min(target-existing,available>headroom?available-headroom:0);
         bytes=bytes/KvExpertLoan::page*KvExpertLoan::page;
         if(!bytes)return;
         ResidentAllocationScope resident;

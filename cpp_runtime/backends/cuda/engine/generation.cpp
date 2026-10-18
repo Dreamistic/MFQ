@@ -359,6 +359,12 @@ template <class Model> struct CudaGenerationContext {
         if (!enabled || batching || std::uncaught_exceptions()) return;
         std::cerr << "moe_request_cache_stats boundary=" << boundary << '\n';
         print_moe_expert_cache_stats(model.execution->moe_expert_cache,std::cerr);
+        if(model.source) {
+            const auto io=model.source->file_read_stats();
+            std::cerr<<"runtime_model_io_stats boundary="<<boundary<<" calls="<<io.calls
+                <<" logical_bytes="<<io.logical_bytes<<" physical_bytes="<<io.physical_bytes
+                <<" read_ms="<<double(io.read_nanoseconds)/1e6<<'\n';
+        }
     }
     void prepare_request(const mfq::engine::InferenceRequest& input) {
         trace_expert_cache("begin");
