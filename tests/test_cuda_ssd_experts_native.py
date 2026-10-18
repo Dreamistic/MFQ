@@ -105,6 +105,7 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode,p
     tokenizer = _worker_tokenizer(tmp_path)
 
     async def run(ssd):
+        workspace_cache=ssd and wide and grouped and read_mode=="direct" and not preload_requested
         env = dict(os.environ, MFQ_MODEL_FILE_IO=read_mode, MFQ_PLE_FILE_MAP="0", MFQ_PROFILE_SSD_EXPERTS="1",
             MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_SSD_EXPERTS="1",
             MFQ_MOE_PRELOAD_ALL=str(int(not ssd or preload_requested)), MFQ_MOE_ASSERT_RESIDENT=str(int(not ssd)), MFQ_MOE_NVQ_DENSE="0",
@@ -112,6 +113,7 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode,p
             MFQ_MOE_RESIDENCY_WARM="1", MFQ_MOE_RESIDENCY_PROJECTION_HEAT="1", MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER="1",
             MFQ_MOE_PREFILL_LAYER="0", MFQ_RUNTIME_DISABLE_PREFIX_CACHE="1",
             MFQ_KV_TURBOQUANT_BITS="0", MFQ_CUDA_WORKSPACE_RESERVE_GIB="0.01")
+        if workspace_cache:env["MFQ_CUDA_WORKSPACE_RESERVE_GIB"]="1.5"
         env.pop("MFQ_MOE_PREFILL_GROUPS", None)
         if not grouped:
             env["MFQ_MOE_PREFILL_GROUPS"] = "0"
@@ -131,6 +133,8 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode,p
                     assert status["model_io_cached_staging_bytes"] > 0
                 if ssd:
                     assert status["ssd_ram_reuse_promotions"] == 0, "startup learned synthetic RAM cache priority"
+                if workspace_cache:
+                    assert status["prefill_workspace_expert_capacity_bytes"] > 0
                 startup_captures = (tmp_path / f"worker-{ssd}.log").read_text(errors="replace").count(
                     "runtime_qwen4_graph_capture role=")
                 outputs = []
@@ -160,6 +164,14 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode,p
                 if ssd:
                     assert f"moe_ssd_source_dispatch mapped={int(read_mode == 'buffered')} " in text
                     assert "batch_fields=1" in text
+                if workspace_cache:
+                    assert "runtime_prefill_workspace_cache action=lend" in text
+                    await client.set_resident_memory_budget(int(status["gpu_0_resident_bytes"]))
+                    for _ in range(20):
+                        status=await client.status()
+                        if status["prefill_workspace_expert_capacity_bytes"]==0:break
+                        await asyncio.sleep(.05)
+                    assert status["prefill_workspace_expert_capacity_bytes"]==0,"memory budget retained the revocable prefill cache"
                 return outputs
             finally:
                 with suppress(Exception):
