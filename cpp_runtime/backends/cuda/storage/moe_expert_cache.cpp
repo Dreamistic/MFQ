@@ -2686,3 +2686,36 @@ void set_moe_expert_cache_profile(
         mfq::MoeCacheProfile profile) {
     cache.set_profile(std::move(profile));
 }
+
+std::vector<int> MoeExpertCache::set_prefill_low_priority_sources(std::vector<int> sources) {
+    finish_pipeline_exchanges();
+    std::vector<int> inactive_layers;
+    for(const auto& source:sources_)
+        if(std::find(sources.begin(),sources.end(),source->id_)!=sources.end())inactive_layers.push_back(source->layer_id_);
+    std::sort(inactive_layers.begin(),inactive_layers.end());
+    inactive_layers.erase(std::unique(inactive_layers.begin(),inactive_layers.end()),inactive_layers.end());
+    auto previous=host_experts_->set_scan_low_priority_sources(sources);
+    for(auto& [signature,arena]:arenas_)arena->book->set_low_priority_sources(sources);
+    prefill_low_priority_layers_=std::move(inactive_layers);
+    return previous;
+}
+
+std::vector<int> MoeExpertCache::prioritize_prefill_layers(int first,int last) {
+    std::vector<int> inactive;
+    for(const auto& source:sources_)
+        if(source->layer_id_<first || source->layer_id_>=last)inactive.push_back(source->id_);
+    return set_prefill_low_priority_sources(std::move(inactive));
+}
+
+MoePrefillLayerPriority::MoePrefillLayerPriority(std::shared_ptr<MoeExpertCache> cache,int first,int last) {
+    if(!cache || !cache->ssd_experts())return;
+    previous_=cache->prioritize_prefill_layers(first,last);cache_=std::move(cache);
+    std::cerr<<"runtime_moe_prefill_priority first_layer="<<first<<" last_layer="<<last<<'\n';
+}
+MoePrefillLayerPriority::~MoePrefillLayerPriority() {
+    try {finish();}catch(...) {}
+}
+void MoePrefillLayerPriority::finish() {
+    if(!cache_)return;
+    cache_->set_prefill_low_priority_sources(std::move(previous_));cache_.reset();
+}

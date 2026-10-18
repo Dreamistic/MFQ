@@ -32,7 +32,7 @@ DeepseekV41CausalLm make_model(CudaExecutionContext& execution) {
     c.index_n_heads=32;c.index_head_dim=128;c.index_topk=16;
     c.candidate_source_layer=2;c.candidate_block_size=8;c.candidate_topk_blocks=8;
     c.compress_ratios={0,2,1,1};c.kv_source_layers={1,2};c.index_source_layers={1,2,3};
-    c.sliding_window=128;c.max_position_embeddings=1024;
+    c.sliding_window=128;c.max_position_embeddings=1024;c.dspark_target_layer_ids={2,3};
     model.metadata.hidden_size=c.hidden;model.metadata.vocab_size=c.vocab;
     model.metadata.num_hidden_layers=c.n_layers;model.metadata.hc_mult=4;
     model.metadata.max_position_embeddings=c.max_position_embeddings;
@@ -96,7 +96,9 @@ void check_exact_short() {
 void check_long_and_cancel() {
     CudaExecutionContext execution;
     auto model=make_model(execution);
-    auto result=deepseek_v41_prefill_hidden(model,ids(257),64);
+    tb::Tensor raw;
+    auto result=deepseek_v41_prefill_hidden(model,ids(257),64,{},&raw);
+    require(raw.sizes()==tb::IntArrayRef({1,128,2*64}),"CED DSpark target tail geometry changed");
     require(result.size(1)==128,"CED did not limit Decoder replay to the local window");
     require(std::isfinite(result.to(tb::kFloat32).abs().max().item<double>()),"CED output is not finite");
     check_positions(model,257);
@@ -111,7 +113,7 @@ void check_long_and_cancel() {
 int main() try {
     int devices=0;
     if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
-    check_exact_short();check_long_and_cancel();
+    check_exact_short();check_long_and_cancel();run_dspark_self_check();
     std::cout<<"DeepSeek-V4.1 CED numerical/cache tests passed\n";return 0;
 } catch(const std::exception& error) {
     std::cerr<<error.what()<<'\n';return 1;

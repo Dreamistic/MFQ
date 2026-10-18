@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "storage/moe_expert_cache.h"
 #include <cstring>
 
 namespace mfq::cuda {
@@ -39,7 +40,7 @@ HashBatch append_hash_tail(const HashBatch& previous, const HashBatch& current, 
 }
 
 Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
-                                   int64_t compute_chunk, const std::function<bool()>& stopped) {
+                                   int64_t compute_chunk, const std::function<bool()>& stopped, Tensor* raw_hidden) {
     auto scope = model.execution_scope();
     ids = model.device_ids(std::move(ids));
     const auto batch = ids.size(0), tokens = ids.size(1);
@@ -53,6 +54,8 @@ Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
     const auto split = config.causal_encoder_layers;
     MFQ_RUNTIME_CHECK(split > 0 && split < model.num_hidden_layers(), "invalid CED encoder boundary");
     compute_chunk = std::min<int64_t>(compute_chunk, 8192);
+    std::optional<MoePrefillLayerPriority> priority;
+    if(tokens > config.sliding_window)priority.emplace(model.execution->moe_expert_cache,0,static_cast<int>(split));
     Tensor tail_hidden, tail_pre, tail_ids;
     HashBatch tail_hashes;
     const auto cancelled = [&] {
@@ -71,7 +74,7 @@ Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
         ops.cache_positions = ops.position_range(model.cache_pos, count);
         ops.pos = ops.full_positions = ops.cache_positions;
         auto hidden = ops.prepare_hidden(batch, count);
-        model.adapter_begin_forward(false);
+        model.adapter_begin_forward(raw_hidden != nullptr);
         for (int64_t layer = 0; layer < split; ++layer) {
             if (cancelled()) return {};
             hidden = ops.layer(model.blocks.at(layer), std::move(hidden));
@@ -96,6 +99,7 @@ Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
                                        static_cast<int>(config.sliding_window));
         model.cache_pos += count;
     }
+    if(priority)priority->finish();
     const auto replay_tokens = tail_ids.size(1), replay_begin = end - replay_tokens;
     const bool truncated_local = replay_begin > begin;
     model.cache_pos = replay_begin;
@@ -123,6 +127,7 @@ Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
     model.cache_pos = end;
     std::cerr << "runtime_deepseek_v41_ced_prefill tokens=" << tokens << " encoder_layers=" << split
               << " decoder_tokens=" << replay_tokens << " compute_chunk=" << compute_chunk << '\n';
+    ops.raw_hidden = raw_hidden;
     return ops.finish(std::move(tail_hidden), batch, replay_tokens);
 }
 } // namespace mfq::cuda

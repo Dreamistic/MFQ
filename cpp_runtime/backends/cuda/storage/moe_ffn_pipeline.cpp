@@ -1386,7 +1386,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(cache_->pipeline_prefill_layer_overlap_) {
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(stream_,cache_->pipeline_prefill_layer_gate_up_ready_[layer.slot],0));
             const auto next=std::next(cache_->pipeline_prefill_layers_.find(layer.layer_id));
-            if(next!=cache_->pipeline_prefill_layers_.end() && (next->first<0)==(layer.layer_id<0))
+            if(next!=cache_->pipeline_prefill_layers_.end() && (next->first<0)==(layer.layer_id<0) &&
+                cache_->prefill_layer_active(next->first))
                 submit_prefill_layer_copy(execution,next->first,layer.slot^1,true);
         }
         ++cache_->stats_.pipeline_serves;

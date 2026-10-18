@@ -201,7 +201,9 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         require_execution(reused_tokens == 0 || !mtp.blockwise_drafting(),
             "blockwise MTP session restore is unsupported");
         if (mtp.blockwise_drafting()) {
-            mtp.append_target_context(raw, 0);
+            if constexpr (requires { mtp.seed_target_context(raw, ops.size(input_ids, 1)); })
+                mtp.seed_target_context(raw, ops.size(input_ids, 1));
+            else mtp.append_target_context(raw, 0);
         }
 
         if (mtp.teacher_forced_prompt_prime() && !stream_prompt_history) {

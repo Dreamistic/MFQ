@@ -241,6 +241,15 @@ struct DeepseekV41Dspark final : MtpModule {
         return static_cast<int>(config.dspark_block_size);
     }
 
+    void seed_target_context(Tensor hidden, std::int64_t tokens) override {
+        MFQ_RUNTIME_CHECK(position == 0 && hidden.dim() == 3 && hidden.size(1) > 0 &&
+            tokens >= hidden.size(1) && tokens <= maximum_context &&
+            hidden.size(1) >= std::min(tokens, config.sliding_window),
+            "invalid DeepSeek-V4.1 DSpark prompt tail");
+        position = tokens - hidden.size(1);
+        append_target_context(std::move(hidden), position);
+    }
+
     void append_target_context(Tensor target_hidden, std::int64_t start_position) override {
         const auto target_width =
             config.hidden * static_cast<std::int64_t>(config.dspark_target_layer_ids.size());
@@ -252,6 +261,7 @@ struct DeepseekV41Dspark final : MtpModule {
                           "invalid DeepSeek-V4.1 DSpark context append");
         const auto tokens = target_hidden.size(1);
         const auto retained = std::min(tokens, config.sliding_window);
+        target_hidden = target_hidden.narrow(1, tokens - retained, retained).contiguous();
         auto positions =
             mfq_tensor_backend::arange(start_position + tokens - retained, start_position + tokens,
                                        mfq_tensor_backend::TensorOptions()
@@ -276,13 +286,10 @@ struct DeepseekV41Dspark final : MtpModule {
                                               stages[index]->key_value_norm, config.rms_eps);
                 key_value = rotate_token_major_tail(
                     key_value,
-                    mfq_tensor_backend::arange(start_position, start_position + tokens,
+                    mfq_tensor_backend::arange(start_position + tokens - retained, start_position + tokens,
                                                positions.options()),
                     stages[index]->rope);
                 key_value = deepseek_v41_mxfp8_e4m3_sim_cuda(key_value.contiguous());
-                if (retained != tokens) {
-                    key_value = key_value.narrow(1, tokens - retained, retained).contiguous();
-                }
                 return key_value;
             },
             [&](size_t index, Tensor key_value) { rings[index].index_copy_(1, slots, key_value); });
@@ -427,6 +434,44 @@ std::unique_ptr<::MtpModule> load_dspark_if_present(CudaExecutionContext &execut
 }
 
 void run_dspark_self_check() {
+    // Seeding only the final window must address the same absolute RoPE and
+    // ring slots as a complete target history.
+    CudaExecutionContext execution;
+    DeepseekV41Dspark predictor;
+    predictor.execution = &execution;
+    predictor.config.hidden = 32;
+    predictor.config.head_dim = 512;
+    predictor.config.sliding_window = 128;
+    predictor.config.dspark_target_layer_ids = {2, 3};
+    predictor.maximum_context = 1024;
+    const auto options = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
+                            .dtype(mfq_tensor_backend::kFloat32);
+    const auto projection = [&](int rows, int columns) {
+        QuantLinear weight;
+        weight.kind = QuantLinearKind::Dense;
+        weight.dense = (mfq_tensor_backend::randn({rows, columns}, options) / std::sqrt(double(columns)))
+                           .to(mfq_tensor_backend::kFloat16).contiguous();
+        return weight;
+    };
+    predictor.main_projection = projection(32, 64);
+    predictor.main_norm = mfq_tensor_backend::ones({32}, options);
+    auto stage = std::make_unique<Block>();
+    stage->key_value = projection(512, 32);
+    stage->key_value_norm = mfq_tensor_backend::ones({512}, options);
+    stage->rope = Dsv4RopeTable(1024, 10000., 0);
+    predictor.stages.push_back(std::move(stage));
+    auto history = mfq_tensor_backend::randn({1, 257, 64}, options).to(mfq_tensor_backend::kFloat16);
+    predictor.reset();
+    predictor.append_target_context(history, 0);
+    auto expected_ring = predictor.rings.front().clone();
+    predictor.reset();
+    predictor.seed_target_context(history.narrow(1, 129, 128).contiguous(), 257);
+    MFQ_RUNTIME_CHECK(predictor.cache_position() == 257 && predictor.rings.front().equal(expected_ring),
+                      "DeepSeek-V4.1 DSpark bounded prompt seed changed context");
+    predictor.append_target_context(history.narrow(1, 0, 1).contiguous(), 257);
+    MFQ_RUNTIME_CHECK(predictor.cache_position() == 258,
+                      "DeepSeek-V4.1 DSpark append after bounded seed lost position");
+
     auto plan =
         dspark_full_attention_plan(1, 2, 33, mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA));
     auto indices = plan.first.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt32).contiguous();

@@ -32,6 +32,11 @@ public:
     PrefillCopySubmission finish_prefill_copy(int slot);
     void finish_prefill_copies();
     std::shared_ptr<mfq::cuda::KvExpertLoan> kv_expert_loan_;
+    std::vector<int> set_prefill_low_priority_sources(std::vector<int>);
+    std::vector<int> prioritize_prefill_layers(int first,int last);
+    bool prefill_layer_active(int layer) const {
+        return !std::binary_search(prefill_low_priority_layers_.begin(),prefill_low_priority_layers_.end(),layer);
+    }
     void prepare_direct_transfer_cache();
     void release_direct_transfer_cache();
     std::size_t begin_prefill_loan(std::size_t workspace_bytes);
@@ -1599,6 +1604,7 @@ private:
     size_t next_stage_ = 0;
     std::unordered_map<std::string, std::unique_ptr<MoeGpuArena>> arenas_;
     std::vector<std::shared_ptr<MoeCachedSource>> sources_;
+    std::vector<int> prefill_low_priority_layers_;
     std::optional<mfq::MoeCacheProfile> profile_;
     std::vector<mfq::MoeProfileCandidate> prewarm_selected_;
     MoeCacheStats stats_;

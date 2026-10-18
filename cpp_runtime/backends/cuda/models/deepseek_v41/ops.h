@@ -557,6 +557,9 @@ struct Block final : ::Block {
         const auto tokens = input.size(1);
         const auto pool_length = shared->compressed_length;
         Tensor candidates;
+        // Restrict scoring only when the candidate budget excludes some KV.
+        // An all-inclusive list adds scattered loads without reducing work.
+        const bool restricted = pool_length > config.candidate_topk_blocks * config.candidate_block_size;
         return mfq::models::deepseek_v41::hierarchical_index(
             ratio, index_source(), layer, config.candidate_source_layer, pool_length,
             [&] { return empty_topk(batch, tokens, input.device()); },
@@ -580,7 +583,7 @@ struct Block final : ::Block {
                                    .to(mfq_tensor_backend::kFloat16)
                                    .contiguous();
                 auto keys = shared->index_k.narrow(1, 0, pool_length).contiguous();
-                if (layer > config.candidate_source_layer) {
+                if (layer > config.candidate_source_layer && restricted) {
                     MFQ_RUNTIME_CHECK(shared->candidate_blocks.defined(),
                                       "DeepSeek-V4.1 hierarchical indexer has no candidates");
                     candidates = candidate_positions(shared->candidate_blocks,
@@ -595,11 +598,12 @@ struct Block final : ::Block {
                 });
             },
             [&](Tensor scores) {
-                shared->candidate_blocks = candidate_blocks_from_scores(
+                if (restricted) shared->candidate_blocks = candidate_blocks_from_scores(
                     scores, ratio, position, config.candidate_topk_blocks,
                     config.candidate_block_size);
             },
             [&](Tensor scores) {
+                if (!restricted) return select_topk(scores, config.index_topk, pool_length);
                 MFQ_RUNTIME_CHECK(candidates.defined(), "DeepSeek-V4.1 candidate scores are unavailable");
                 return select_topk(scores, config.index_topk, pool_length, candidates);
             },
@@ -848,7 +852,7 @@ extern template struct CudaSessionCodec<DeepseekV41Model>;
 
 mfq_tensor_backend::Tensor deepseek_v41_prefill_hidden(
     DeepseekV41CausalLm& model, mfq_tensor_backend::Tensor ids, std::int64_t compute_chunk,
-    const std::function<bool()>& stopped = {});
+    const std::function<bool()>& stopped = {}, mfq_tensor_backend::Tensor* raw_hidden = nullptr);
 
 } // namespace mfq::cuda
 

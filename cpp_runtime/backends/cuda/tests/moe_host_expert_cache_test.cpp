@@ -35,6 +35,25 @@ void wait_coalesced(const MoeHostExpertCache& cache,std::promise<void>& release)
 
 int main() try {
     {
+        MoeHostExpertCache cache(192);cache.enable_reuse_priority();
+        cache.acquire(key(0,0),64,[]{return weight(64,1);});
+        cache.acquire(key(0,1),64,[]{return weight(64,2);});
+        cache.find(key(0,1)); // A reused Decoder remains a valid phase victim.
+        auto held=cache.acquire(key(1,1),64,[]{return weight(64,3);});
+        auto previous=cache.set_scan_low_priority_sources({1});
+        check(previous.empty(),"unexpected initial prefill priority");
+        bytes_equal(cache.acquire_scan(key(1,0),64,[]{return weight(64,4);}),4);
+        check(cache.contains(key(0,0)) && !cache.contains(key(0,1)) && cache.contains(key(1,1)),
+              "prefill priority ignored inactive layers or invalidated a live lease");
+        int loads=0;
+        check(!cache.acquire_scan(key(2,1),64,[&]{++loads;return weight(64,5);}) && !loads,
+              "inactive-layer scan evicted active Encoder experts");
+        cache.set_scan_low_priority_sources(std::move(previous));
+        check(!cache.acquire_scan(key(2,0),64,[&]{++loads;return weight(64,5);}) && !loads,
+              "normal prefill scan retained phase eviction permission");
+        check(cache.stats().managed_bytes==192,"phase priority exceeded the RAM budget");
+    }
+    {
         MoeHostExpertCache cache(256);cache.enable_reuse_priority();
         auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(
             std::vector<mfq::MoeCacheKey>{key(0),key(1)},true);

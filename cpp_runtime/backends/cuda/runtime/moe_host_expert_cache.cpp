@@ -92,6 +92,9 @@ struct MoeHostExpertCache::Impl {
     std::condition_variable exchange_complete;
     std::size_t exchange_placeholders=0;
     MoeHostExpertCacheStats counters;
+    std::vector<int> scan_low_priority_sources;
+    std::vector<mfq::MoeCacheKey> scan_victims;
+    std::size_t scan_victim_cursor=0;
     bool preserve=false,reuse_learning=true;
     bool speculative_learning=false;
     std::uint64_t learning_epoch=0;
@@ -196,6 +199,22 @@ struct MoeHostExpertCache::Impl {
         if(counters.reuse_promotions!=before && ++counters.device_reuse_promotions==1)
             std::fprintf(stderr,"moe_ram_gpu_reuse_dispatch scope=first_promotion enabled=1\n");
     }
+    bool make_scan_room(mfq::MoeCacheKey incoming,std::size_t bytes) {
+        if(!bytes || bytes>budget)return false;
+        if(ledger->managed.load()<=budget-bytes)return true;
+        if(preserve || std::binary_search(scan_low_priority_sources.begin(),
+                                          scan_low_priority_sources.end(),incoming.source))return false;
+        // This bounded snapshot is built once at the phase boundary, rather
+        // than scanning all cached experts for every prefill miss.
+        while(ledger->managed.load()>budget-bytes && scan_victim_cursor<scan_victims.size()) {
+            const auto key=scan_victims[scan_victim_cursor++];
+            const auto found=entries.find(key);
+            if(found==entries.end() || exchanging.contains(key) || found->second.value.use_count()!=1)continue;
+            remember_eviction(key,found->second);
+            remove(found);++counters.evictions;
+        }
+        return ledger->managed.load()<=budget-bytes;
+    }
     bool make_room(std::size_t bytes,bool prediction=false) {
         if (!bytes || bytes>budget) return false;
         refresh_device_hints();
@@ -278,6 +297,22 @@ void MoeHostExpertCache::enable_reuse_priority() {
 }
 void MoeHostExpertCache::set_reuse_learning(bool enabled) {
     std::lock_guard lock(impl_->mutex);impl_->reuse_learning=enabled;
+}
+std::vector<int> MoeHostExpertCache::set_scan_low_priority_sources(std::vector<int> sources) {
+    std::sort(sources.begin(),sources.end());
+    sources.erase(std::unique(sources.begin(),sources.end()),sources.end());
+    auto& state=*impl_;std::lock_guard lock(state.mutex);
+    std::vector<mfq::MoeCacheKey> victims;
+    if(!sources.empty()) {
+        victims.reserve(state.entries.size());
+        for(auto* queue:{&state.lru,&state.reused})
+            for(auto it=queue->rbegin();it!=queue->rend();++it)
+                if(std::binary_search(sources.begin(),sources.end(),it->source))victims.push_back(*it);
+    }
+    auto previous=std::move(state.scan_low_priority_sources);
+    state.scan_low_priority_sources=std::move(sources);
+    state.scan_victims=std::move(victims);state.scan_victim_cursor=0;
+    return previous;
 }
 void MoeHostExpertCache::begin_speculative_learning() {
     auto& state=*impl_;std::lock_guard lock(state.mutex);
@@ -391,7 +426,7 @@ MoeHostExpertCache::Lease MoeHostExpertCache::load(mfq::MoeCacheKey key,std::siz
                 return flight->value;
             }
         }
-        if(scan && (bytes>state.budget || state.ledger->managed.load()>state.budget-bytes))return {};
+        if(scan && !state.make_scan_room(key,bytes))return {};
         ++state.counters.misses;
         // Predictions may replace idle probation entries, never the reused
         // hot set. If those entries are leased, keep a bounded transient.

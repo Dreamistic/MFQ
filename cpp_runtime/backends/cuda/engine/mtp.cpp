@@ -329,6 +329,14 @@ template <class Model> struct CudaMtpOps {
         return {std::move(hidden),std::move(raw),timer.elapsed_ms()};
       }
     }
+    if constexpr(std::is_same_v<Model,mfq::cuda::DeepseekV41CausalLm>) {
+      if(!transformed_prompt) {
+        auto hidden=mfq::cuda::deepseek_v41_prefill_hidden(model,ids,prefill_compute_chunk,
+            [&] {return output && output->stopped();},&raw);
+        finish_prefill();
+        return {std::move(hidden),std::move(raw),timer.elapsed_ms()};
+      }
+    }
     MoePrefillWorkspaceLoan workspace(model.execution->moe_expert_cache);
     const bool host_history=host_prompt_history(chunk.count);
     bool borrowed=false;
@@ -754,6 +762,9 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
     if(reused_tokens==0 && (!prepared || !prepared->transformed()) &&
         mfq::cuda::qwen4_layer_major_prefill_eligible(model,request.prompt.size()))
       logical_chunk=request.prompt.size();
+  }
+  if constexpr(std::is_same_v<Model,mfq::cuda::DeepseekV41CausalLm>) {
+    if(!prepared || !prepared->transformed())logical_chunk=request.prompt.size();
   }
   return mfq::engine::speculative_sequence(
       CudaMtpOps<Model>{model, mtp, prepared, prefill_chunk_size, &output}, request, output,

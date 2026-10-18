@@ -41,6 +41,19 @@ private:
     std::shared_ptr<MoeExpertCache> cache_;
     bool active_=false;
 };
+// A phase can prefer experts from [first,last). Scope exit restores normal
+// eviction on success, cancellation and exceptions, without moving weights.
+class MoePrefillLayerPriority {
+public:
+    MoePrefillLayerPriority(std::shared_ptr<MoeExpertCache> cache,int first,int last);
+    ~MoePrefillLayerPriority();
+    void finish();
+    MoePrefillLayerPriority(const MoePrefillLayerPriority&)=delete;
+    MoePrefillLayerPriority& operator=(const MoePrefillLayerPriority&)=delete;
+private:
+    std::shared_ptr<MoeExpertCache> cache_;
+    std::vector<int> previous_;
+};
 std::size_t moe_prefill_transfer_bytes(const std::shared_ptr<MoeExpertCache>& cache,bool predictor=false);
 class MoeQuantRangeSource;
 struct CudaExecutionConfig;
