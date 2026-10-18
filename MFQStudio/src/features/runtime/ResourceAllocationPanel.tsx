@@ -38,10 +38,10 @@ export function ResourceAllocationPanel() {
   const unloading = loaded.filter((item) => item.state === 'unloading').length;
   const pool = memoryPoolUsage(ceiling,
     loaded.map(item => residentWeightsAndBuffers(item.memory, separate)), loaded.map(item => item.memory?.kv_bytes ?? null),
-    separate ? runtime?.device_free_bytes : runtime?.host_memory_available_bytes);
+    separate ? runtime?.device_free_bytes : runtime?.runtime_memory_effective_budget_bytes != null ? undefined : runtime?.host_memory_available_bytes);
   const capacity = pool.capacity;
   const headroom = runtime?.runtime_memory_headroom_bytes;
-  const available = headroom != null ? pool.available != null ? Math.min(headroom, pool.available) : headroom : pool.available;
+  const available = headroom != null ? separate && pool.available != null ? Math.min(headroom, pool.available) : headroom : pool.available;
   const metrics = [
     { label: separate ? tr('总显存常驻预算', 'Total resident VRAM budget') : tr('总常驻内存预算', 'Total resident memory budget'), value: bytes(capacity),
       detail: runtime?.runtime_memory_budget_mode === 'automatic' ? tr('自动 · 当前可用预算', 'Automatic · current usable budget')

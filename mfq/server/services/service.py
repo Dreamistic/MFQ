@@ -197,6 +197,7 @@ class ServiceError(RuntimeError):
 @dataclass(frozen=True)
 class PreparedResponse:
     request: CreateResponseRequest
+    model: str
     begin: BeginResponseResult
     backend_messages: tuple[dict[str, Any], ...]
 
@@ -1607,6 +1608,10 @@ class ServerService:
         request: CreateResponseRequest,
     ) -> PreparedResponse:
         try:
+            session = await asyncio.to_thread(self.store.get_session, session_id)
+            model = request.model or session.model
+            if not model:
+                raise ServiceError(400, "model_required", "Select a model before sending a message")
             history = await asyncio.to_thread(self.store.list_messages, session_id)
             await asyncio.to_thread(
                 self._validate_media_parts,
@@ -1638,6 +1643,7 @@ class ServerService:
                 request.input,
                 ResponseRequestSettings(
                     sampling=request.sampling,
+                    model=model,
                     system_prompt=request.system_prompt,
                     include_reasoning_history=request.include_reasoning_history,
                     input_role=request.input_role,
@@ -1687,6 +1693,7 @@ class ServerService:
             backend_messages = (*backend_messages, backend_input)
         return PreparedResponse(
             request=request,
+            model=model,
             begin=begin,
             backend_messages=tuple(backend_messages),
         )
@@ -1698,7 +1705,7 @@ class ServerService:
         accumulator = _OutputAccumulator()
         try:
             async for delta in self.backend.stream(
-                model=prepared.begin.session.model,
+                model=prepared.model,
                 messages=prepared.backend_messages,
                 sampling=prepared.request.sampling,
                 session_id=prepared.begin.session.id,
@@ -1839,7 +1846,7 @@ class ServerService:
         try:
             async with closing_backend_stream(
                 self.backend.stream(
-                    model=prepared.begin.session.model,
+                    model=prepared.model,
                     messages=prepared.backend_messages,
                     sampling=prepared.request.sampling,
                     session_id=prepared.begin.session.id,
@@ -2019,6 +2026,8 @@ class ServerService:
     @staticmethod
     def _request_fingerprint(request: CreateResponseRequest) -> str:
         value = request.model_dump(mode="json", exclude={"stream"})
+        if request.model is None:
+            value.pop("model", None)
         encoded = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 

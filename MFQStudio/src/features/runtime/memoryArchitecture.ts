@@ -45,6 +45,11 @@ export function residentMemoryCapacity(runtime: RuntimeStatus | null | undefined
     ?? (hasSeparateVram(runtime) ? runtime?.device_memory_total_bytes ?? runtime?.device_total_bytes : runtime?.host_memory_total_bytes);
 }
 
+export function availableResidentMemory(runtime: RuntimeStatus | null | undefined): number | null {
+  const value = runtime?.runtime_memory_headroom_bytes ?? runtime?.host_memory_available_bytes;
+  return value != null && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
 /** Add our existing allocations to live free memory; the ceiling still caps the pool.
  * Other processes and unreported allocations are excluded from the tier budget. */
 export function memoryPoolUsage(capacityBytes: number | null | undefined,

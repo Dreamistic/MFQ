@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
 from mfq.server.state.catalog import DiscoveredModel, ModelArtifactNotFoundError, ModelCatalog
 from mfq.server.runtime.host_memory import (
+    MemoryReleaseCredit,
     automatic_memory_reserve,
     host_memory_snapshot,
     metal_allocation_limit,
@@ -361,6 +362,7 @@ class RuntimePool:
         self._shared_cache_pressure_checked_at = 0.0
         self._host_vm_counters: tuple[int, int] | None = None
         self._host_vm_pressure_until = 0.0
+        self._memory_release_credit = MemoryReleaseCredit()
         self.store = None
         self._instances: dict[UUID, _Runtime] = {}
         self._loading_model_names: set[str] = set()
@@ -3533,7 +3535,10 @@ class RuntimePool:
             return ceiling
         reserve = automatic_memory_reserve(snapshot.total)
         ceiling = min(ceiling, max(1, snapshot.total - reserve))
-        dynamic_ceiling = physical + snapshot.reclaimable(active_ratio=0.0) - reserve
+        own_cpu = cpu + (process_physical_footprint(os.getpid()) or 0)
+        reclaimable = snapshot.reclaimable(active_ratio=0.25, own_cpu_bytes=own_cpu)
+        released = self._memory_release_credit.update(physical, snapshot.reclaimable(active_ratio=0.0))
+        dynamic_ceiling = physical + reclaimable + released - reserve
         return max(1, min(ceiling, dynamic_ceiling))
 
     def _runtime_memory_pressure_locked(

@@ -7,7 +7,7 @@ import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { ModelLoadProgress } from './ModelLoadProgress';
 import { formatNumber } from '../../app/formatters';
 import { ModelPressureBars } from './ModelMemoryPressure';
-import { hasSeparateVram } from '../runtime/memoryArchitecture';
+import { availableResidentMemory, hasSeparateVram } from '../runtime/memoryArchitecture';
 
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
@@ -25,8 +25,8 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
     .sort((a, b) => sort === 'name' ? a.name.localeCompare(b.name) : sort === 'size'
       ? b.total_bytes - a.total_bytes : (Date.parse(b.modified_at) || 0) - (Date.parse(a.modified_at) || 0));
   const filterCount = [status, architecture, format].filter(value => value !== 'all').length;
-  const available = runtime?.runtime_memory_headroom_bytes;
   const separate = hasSeparateVram(runtime);
+  const available = separate ? runtime?.runtime_memory_headroom_bytes : availableResidentMemory(runtime);
   const system = separate ? { physical_memory_bytes: runtime?.host_memory_total_bytes, memory_pools: [
     { kind: 'vram' as const, capacity_bytes: runtime?.device_memory_total_bytes },
     { kind: 'ram' as const, capacity_bytes: runtime?.host_memory_total_bytes },

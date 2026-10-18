@@ -1781,6 +1781,19 @@
             "title": "Input Role",
             "type": "string"
           },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "request_id": {
             "format": "uuid",
             "title": "Request Id",
@@ -1895,8 +1908,9 @@
             "default": "text"
           },
           "model": {
+            "default": "",
+            "deprecated": true,
             "maxLength": 255,
-            "minLength": 1,
             "title": "Model",
             "type": "string"
           },
@@ -1913,9 +1927,6 @@
             "title": "Title"
           }
         },
-        "required": [
-          "model"
-        ],
         "title": "CreateSessionRequest",
         "type": "object"
       },
@@ -6877,6 +6888,19 @@
             ],
             "title": "Input Role",
             "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "response_format": {
             "discriminator": {

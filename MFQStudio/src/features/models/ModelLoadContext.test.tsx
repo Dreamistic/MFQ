@@ -64,6 +64,12 @@ const profile: ModelCacheProfile = { max_context: 131072, fixed_bytes: GiB,
   components: [{ group: 'QSA', name: 'raw_kv', layers: 2, kv_heads: 16, head_dimension: 256,
     bytes_per_row: 32768, tokens_per_row: 1, allocation: 'exact', minimum_rows: 16 }] };
 
+it('shows zero backend headroom even when the OS still reports three GiB available', () => {
+  render(<Form runtime={{ memory_architecture: 'unified', host_memory_available_bytes: 3 * GiB,
+    runtime_memory_headroom_bytes: 0 }} />);
+  expect(screen.getByText(/当前剩余/)).toHaveTextContent('0 GiB');
+});
+
 it('defaults to no model and updates total with context and KV precision without loading a model', async () => {
   const cache = vi.spyOn(modelsApi, 'modelCacheProfile').mockResolvedValue(profile);
   const load = vi.spyOn(modelsApi, 'loadModel');

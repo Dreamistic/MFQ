@@ -6,6 +6,14 @@ it('counts unified memory once even for CUDA', () => {
     gpu_devices: [{ id: '0', name: 'Spark', memory_available_bytes: 48, unified_memory: true }] })).toBe(48);
 });
 
+it('uses the shared backend headroom including zero instead of raw system availability', () => {
+  expect(availableLoadMemory({ memory_architecture: 'unified', host_memory_available_bytes: 3,
+    runtime_memory_headroom_bytes: 0 })).toBe(0);
+  expect(availableLoadMemory({ memory_architecture: 'unified', host_memory_available_bytes: 3,
+    runtime_memory_headroom_bytes: 5 })).toBe(5);
+  expect(availableLoadMemory({ memory_architecture: 'unified', runtime_memory_headroom_bytes: 5 })).toBe(5);
+});
+
 it('uses actual free RAM and the chosen GPU rather than installed capacity or other GPUs', () => {
   const runtime = { memory_architecture: 'discrete' as const, host_memory_available_bytes: 40,
     host_memory_total_bytes: 128, gpu_devices: [
