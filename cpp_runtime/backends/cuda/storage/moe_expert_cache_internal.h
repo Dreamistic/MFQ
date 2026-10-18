@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <future>
+#include <condition_variable>
 
 struct MoeFfnPrefillHostWorkspace;
 struct CudaProfiler;
@@ -364,6 +365,26 @@ public:
     struct SsdPlacementStats {std::size_t experts=0,bytes=0,batches=0,peak=0;};
     void prepare_ssd_placement(MoeCachedSource& source,const std::vector<int32_t>& experts,SsdPlacementStats& stats);
     using SsdExpertRequest=std::pair<MoeQuantRangeSource*,int>;
+    struct SsdExpertReads {
+        std::vector<SsdExpertRequest> requests;
+        std::vector<MoeHostExpertCache::Lease> leases;
+        std::vector<std::size_t> missing;
+        std::future<void> ready;
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::size_t gate_up_requests=0,gate_up_remaining=0;
+        std::exception_ptr failed;
+        ~SsdExpertReads(){if(ready.valid())ready.wait();}
+        void wait(){if(ready.valid())ready.get();}
+        void wait_gate_up() {
+            std::unique_lock lock(mutex);
+            changed.wait(lock,[&]{return !gate_up_remaining || failed;});
+            if(failed)std::rethrow_exception(failed);
+        }
+    };
+    std::unique_ptr<SsdExpertReads> prepare_ssd_expert_reads(std::vector<SsdExpertRequest> requests,bool background=false);
+    void execute_ssd_expert_reads(SsdExpertReads& reads,bool background=false);
+    std::unique_ptr<SsdExpertReads> begin_ssd_expert_reads(std::vector<SsdExpertRequest> requests,std::size_t gate_up_requests);
     std::vector<MoeHostExpertCache::Lease> read_ssd_experts(const std::vector<SsdExpertRequest>& requests,bool background=false);
     struct SsdExpertCopy {MoeQuantRangeSource* source;int expert;std::vector<mfq_tensor_backend::Tensor> fields;};
     void copy_ssd_experts(const std::vector<SsdExpertCopy>& requests);
@@ -644,6 +665,8 @@ public:
                << " pipeline_kv_early_gu_serves=" << stats_.pipeline_kv_early_gu_serves
                << " pipeline_gu_build_overlap_serves=" << stats_.pipeline_gu_build_overlap_serves
                << " pipeline_gu_build_overlap_copies=" << stats_.pipeline_gu_build_overlap_copies
+               << " pipeline_ssd_gu_overlap_serves=" << stats_.pipeline_ssd_gu_overlap_serves
+               << " pipeline_ssd_gu_overlap_bytes=" << stats_.pipeline_ssd_gu_overlap_bytes
                << " pipeline_native_dma_batches=" << stats_.pipeline_native_dma_batches
                << " pipeline_native_dma_copies=" << stats_.pipeline_native_dma_copies
                << " pipeline_native_dma_fallbacks=" << stats_.pipeline_native_dma_fallbacks
@@ -859,6 +882,8 @@ public:
             {"expert_wire_fallback_cells",double(pipeline_wire_fallback_cells_)},
             {"expert_wire_fallback_bytes",double(pipeline_wire_fallback_bytes_)},
             {"expert_gu_build_overlap_serves",double(stats_.pipeline_gu_build_overlap_serves)},
+            {"ssd_gu_io_overlap_serves",double(stats_.pipeline_ssd_gu_overlap_serves)},
+            {"ssd_gu_io_overlap_bytes",double(stats_.pipeline_ssd_gu_overlap_bytes)},
             {"ram_expert_payload_bytes", double(resident)},
             {"ram_expert_optional_backup_bytes",double(host.optional_bytes)},
               {"ram_expert_optional_reclaimed_bytes",double(host.optional_reclaimed_bytes)},

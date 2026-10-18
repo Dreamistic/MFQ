@@ -357,6 +357,34 @@ int main(int argc,char** argv)try {
                 after.at("ssd_ram_read_fast_hits")==before.at("ssd_ram_read_fast_hits")+2 &&
                 after.at("ssd_scheduled_read_jobs")==before.at("ssd_scheduled_read_jobs"),
                 "RAM hits launched SSD worker jobs or lost their shared lease");
+            {
+                auto ready=candidate.cache->begin_ssd_expert_reads({{quant,31},{quant,31}},1);
+                check(!ready->ready.valid(),"RAM-only phase batch launched a coordinator job");
+                ready->wait_gate_up();ready->wait();
+                check(ready->leases[0]==held && ready->leases[1]==held,"phase batch changed a RAM hit's lease");
+            }
+            for(int expert:{45,46})quant->host_cache()->erase(quant->host_key(expert));
+            {
+                auto reads=candidate.cache->begin_ssd_expert_reads({{quant,45},{quant,46}},1);
+                check(reads->ready.valid(),"cold phase batch did not start asynchronous reads");
+                reads->wait_gate_up();check(bool(reads->leases[0]),"GU release preceded its lease publication");
+                reads->wait();check(bool(reads->leases[1]),"Down read lost its lease");
+                for(int i=0;i<2;++i) {
+                    const auto expected=moe_cache_fields(quant->read_expert(45+i));
+                    const auto actual=moe_cache_fields(reads->leases[i]->weights);
+                    for(std::size_t f=0;f<expected.size();++f)check(std::memcmp(actual[f].data_ptr(),expected[f].data_ptr(),expected[f].nbytes())==0,
+                        "asynchronous SSD phase read changed an expert field");
+                }
+            }
+            failed=false;
+            try {
+                auto reads=candidate.cache->begin_ssd_expert_reads({{quant,experts+1},{quant,47}},1);
+                reads->wait_gate_up();reads->wait();
+            }catch(const std::exception&){failed=true;}
+            check(failed,"failed asynchronous SSD GU read did not release its waiter");
+            // Dropping a packet still drains its queued read before freeing
+            // leases and completion state captured by the retained worker.
+            candidate.cache->begin_ssd_expert_reads({{quant,48},{quant,49}},1).reset();
             const auto expected=moe_cache_fields(quant->read_expert(31));
             std::array<std::vector<tb::Tensor>,2> targets;
             std::array<std::future<void>,2> reads;

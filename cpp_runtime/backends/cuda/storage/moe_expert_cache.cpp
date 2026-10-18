@@ -619,34 +619,66 @@ void MoeExpertCache::initialize_ssd_residency() {
     stats_={};
 }
 
-std::vector<MoeHostExpertCache::Lease> MoeExpertCache::read_ssd_experts(
-        const std::vector<SsdExpertRequest>& requests,bool background) {
-    std::vector<MoeHostExpertCache::Lease> leases(requests.size());
-    if(requests.empty())return leases;
-    std::vector<std::size_t> missing;
+std::unique_ptr<MoeExpertCache::SsdExpertReads> MoeExpertCache::prepare_ssd_expert_reads(
+        std::vector<SsdExpertRequest> requests,bool background) {
+    auto reads=std::make_unique<SsdExpertReads>();reads->requests=std::move(requests);
+    reads->leases.resize(reads->requests.size());
     std::uint64_t hits=0;
-    for(std::size_t i=0;i<requests.size();++i) {
-        const auto& [source,expert]=requests[i];
-        if(const auto& cache=source->host_cache())leases[i]=cache->try_find(source->host_key(expert),!background);
-        if(leases[i])++hits;
-        else {if(missing.empty())missing.reserve(requests.size());missing.push_back(i);}
+    for(std::size_t i=0;i<reads->requests.size();++i) {
+        const auto& [source,expert]=reads->requests[i];
+        if(const auto& cache=source->host_cache())reads->leases[i]=cache->try_find(source->host_key(expert),!background);
+        if(reads->leases[i])++hits;
+        else {if(reads->missing.empty())reads->missing.reserve(reads->requests.size());reads->missing.push_back(i);}
     }
     ssd_ram_read_fast_hits_.fetch_add(hits,std::memory_order_relaxed);
-    if(missing.empty())return leases;
+    return reads;
+}
+
+void MoeExpertCache::execute_ssd_expert_reads(SsdExpertReads& reads,bool background) {
+    if(reads.missing.empty())return;
     auto* pool=background?ssd_background_read_pool_.get():ssd_read_pool_.get();
     if(!pool)throw std::logic_error("SSD expert read pool is not initialized");
     // An adaptive batch must not hold the demand executor's dispatch mutex
     // while a predictor is waiting for just its current routed experts.
     const int workers=std::max(1,background?config_.moe_ssd_io_workers/2:config_.moe_ssd_io_workers);
-    ssd_scheduled_read_jobs_.fetch_add(missing.size(),std::memory_order_relaxed);
-    pool->run(0,int64_t(missing.size()),1,workers,
+    ssd_scheduled_read_jobs_.fetch_add(reads.missing.size(),std::memory_order_relaxed);
+    pool->run(0,int64_t(reads.missing.size()),1,workers,
         [&](int64_t begin,int64_t end) {
             for(auto i=begin;i<end;++i) {
-                const auto index=missing[i];
-                leases[index]=requests[index].first->acquire_expert(requests[index].second);
+                const auto index=reads.missing[i];
+                reads.leases[index]=reads.requests[index].first->acquire_expert(reads.requests[index].second);
+                if(index<reads.gate_up_requests) {
+                    {std::lock_guard lock(reads.mutex);--reads.gate_up_remaining;}
+                    reads.changed.notify_one();
+                }
             }
         });
-    return leases;
+}
+
+std::unique_ptr<MoeExpertCache::SsdExpertReads> MoeExpertCache::begin_ssd_expert_reads(
+        std::vector<SsdExpertRequest> requests,std::size_t gate_up_requests) {
+    auto reads=prepare_ssd_expert_reads(std::move(requests));
+    if(gate_up_requests>reads->requests.size())throw std::logic_error("invalid SSD projection read boundary");
+    reads->gate_up_requests=gate_up_requests;
+    for(const auto index:reads->missing)reads->gate_up_remaining+=index<gate_up_requests;
+    if(!reads->missing.empty()) {
+        if(!ssd_prefill_reader_)throw std::logic_error("SSD expert read queue is not initialized");
+        reads->ready=ssd_prefill_reader_->submit([this,pending=reads.get()] {
+            try{execute_ssd_expert_reads(*pending);}
+            catch(...) {
+                {std::lock_guard lock(pending->mutex);pending->failed=std::current_exception();}
+                pending->changed.notify_one();throw;
+            }
+        });
+    }
+    return reads;
+}
+
+std::vector<MoeHostExpertCache::Lease> MoeExpertCache::read_ssd_experts(
+        const std::vector<SsdExpertRequest>& requests,bool background) {
+    auto reads=prepare_ssd_expert_reads(requests,background);
+    execute_ssd_expert_reads(*reads,background);
+    return std::move(reads->leases);
 }
 
 std::future<void> MoeExpertCache::queue_ssd_expert_copies(std::vector<SsdExpertCopy> requests) {

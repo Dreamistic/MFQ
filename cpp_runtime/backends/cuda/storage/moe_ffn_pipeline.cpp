@@ -252,6 +252,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         bool phased_transfer=false;
         bool fused_transfer_copy=false;
         bool host_cache_packet=false;
+        bool ssd_gate_up_submitted=false;
         bool direct_packet=false;
         bool wire_fallback=false;
         bool cached_resident=false;
@@ -2966,7 +2967,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             int64_t copies=1+projection_field_count,wire_bytes=cell.wire_header_bytes+projection_field_bytes;
             const auto* early_gu_option=std::getenv("MFQ_MOE_KV_EARLY_GU");
             const bool early_gu=consume_loan && early_gu_option && early_gu_option[0]=='1' && (!batched || cell.native_dma_mode);
-            bool early_gu_submitted=projection_gu_submitted;
+            bool early_gu_submitted=projection_gu_submitted || cell.ssd_gate_up_submitted;
             if(consume_loan)for(int phase=0;phase<2;++phase) {
             for(const auto* field:loan_copies[phase]) {
                 const auto stage_source=[&]() -> const void* {
@@ -3226,7 +3227,79 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         finish_transfer(cell,true);
         rollback.published=true;
     }
-    void fetch(Cell& cell) {
+    void upload_ssd_gate_up(Cell& cell,const MoeExpertCache::SsdExpertReads& reads) {
+        auto& loan=*cache_->kv_expert_loan_;
+        // Reserve every routed hit before GU allocations can evict a Down
+        // projection omitted from the read batch by the GPU's snapshot.
+        std::vector<mfq::cuda::KvExpertLoan::Key> protected_keys;
+        for(const auto& group:cell.plan.groups)if(group.kind==mfq::MoeDispatchKind::GpuTransfer)
+            for(int p=0;p<3;++p) {
+                const auto& source=*sources_[p];
+                const auto& sizes=source.cohorts_[source.expert_to_cohort_[group.expert]].bytes_per_expert;
+                protected_keys.push_back({source.id_,group.expert,-1});
+                for(std::size_t f=0;f<sizes.size();++f)if(sizes[f]>=int64_t(mfq::cuda::KvExpertLoan::page))
+                    protected_keys.push_back({source.id_,group.expert,int64_t(f)});
+            }
+        loan.protect_packet_fields(protected_keys);
+        const auto begin=reinterpret_cast<uintptr_t>(cache_->pipeline_ram_complement_->data_ptr());
+        const auto capacity=cache_->pipeline_ram_registered_bytes_;
+        const auto alias=[&](const void* pointer,std::size_t bytes)->CUdeviceptr {
+            const auto address=reinterpret_cast<uintptr_t>(pointer);
+            return address>=begin && address-begin<=capacity && bytes<=capacity-(address-begin)
+                ?reinterpret_cast<CUdeviceptr>(cache_->pipeline_ram_alias_)+(address-begin):0;
+        };
+        std::vector<mfq::cuda::DmaCopy> copies;
+        std::size_t bytes=0;
+        for(std::size_t i=0;i<reads.gate_up_requests;++i) {
+            const auto& [quant,expert]=reads.requests[i];
+            const int p=quant==sources_[0]->quant_source_.get()?0:1;
+            const auto& source=*sources_[p];
+            const auto& sizes=source.cohorts_[source.expert_to_cohort_[expert]].bytes_per_expert;
+            std::size_t total=0;for(const auto size:sizes)total=((total+15)&~std::size_t(15))+std::size_t(size);
+            if(loan.find_for_exchange({source.id_,expert,-1},total))continue;
+            const auto& lease=reads.leases[i];
+            const auto fields=moe_cache_field_refs(lease->weights);
+            if(fields.size()!=sizes.size())throw std::logic_error("SSD GU field count changed");
+            bool pinned=true;
+            for(std::size_t f=0;f<sizes.size();++f)if(sizes[f]) {
+                if(tensor_nbytes(fields[f])!=sizes[f])throw std::logic_error("SSD GU field size changed");
+                pinned&=alias(fields[f].data_ptr(),std::size_t(sizes[f]))!=0;
+            }
+            // Pageable fields retain the ordinary bounded staging path. This
+            // early packet never borrows staging bytes subsequently overwritten
+            // by fetch_registered while its DMA is still in flight.
+            if(!pinned)continue;
+            bool hit=false;
+            const auto* cached=loan.pin_projection(source.id_,expert,sizes,cache_->weight_stream_,hit,
+                [&](void* destination,const std::array<std::size_t,8>& offsets) {
+                    cache_->pipeline_dma_leases_.push_back(lease);
+                    for(std::size_t f=0;f<sizes.size();++f)if(sizes[f]) {
+                        copies.push_back({static_cast<uint8_t*>(destination)+offsets[f],fields[f].data_ptr(),std::size_t(sizes[f])});
+                        bytes+=std::size_t(sizes[f]);
+                    }
+                });
+            if(cached && !hit)++cache_->stats_.pipeline_kv_projection_misses;
+        }
+        if(copies.empty())return;
+        if(mfq::cuda::NativeDmaBatch::submit(copies,cache_->weight_stream_,cell.native_dma_mode,alias)) {
+            ++cache_->stats_.pipeline_native_dma_batches;
+            cache_->stats_.pipeline_native_dma_copies+=copies.size();
+        } else for(const auto& copy:copies)MFQ_CUDA_CHECK(cudaMemcpyAsync(
+            copy.destination,copy.source,copy.bytes,cudaMemcpyHostToDevice,cache_->weight_stream_));
+        MFQ_CUDA_CHECK(cudaEventRecord(cache_->transfer_ready_,cache_->weight_stream_));
+        cache_->transfer_ready_recorded_=true;
+        cell.ssd_gate_up_submitted=true;
+        mfq::cuda::check_stream_progress(cache_->weight_stream_);
+        auto& stats=cache_->stats_;
+        stats.ram_pcie_bytes+=bytes;stats.pipeline_direct_ram_bytes+=bytes;
+        stats.pipeline_dma_copies+=copies.size();stats.pipeline_direct_ram_copies+=copies.size();
+        stats.pipeline_window_dma_copies+=copies.size();stats.pipeline_window_dma_bytes+=bytes;
+        stats.pipeline_ssd_gu_overlap_bytes+=bytes;
+        if(++stats.pipeline_ssd_gu_overlap_serves==1)
+            std::fprintf(stderr,"moe_ssd_gu_io_overlap scope=first_upload enabled=1 copies=%zu bytes=%zu\n",copies.size(),bytes);
+    }
+    void fetch(Cell& cell,MoeExpertCache::SsdExpertReads* ssd_reads=nullptr) {
+        cell.ssd_gate_up_submitted=false;
         struct ClearPrefetchKeys {
             std::vector<mfq::MoeCacheKey>& keys;
             ~ClearPrefetchKeys(){keys.clear();}
@@ -3330,6 +3403,20 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             } else MFQ_CUDA_CHECK(cudaStreamWaitEvent(cache_->weight_stream_,cache_->compute_done_,0));
         }
         if(cell.wire.defined() && (cache_->pipeline_ram_registered_bytes_ || cache_->ssd_experts())) {
+            if(ssd_reads) {
+                const auto wait=[&](bool gate_up) {
+                    const auto started=std::chrono::steady_clock::now();
+                    if(gate_up)ssd_reads->wait_gate_up();else ssd_reads->wait();
+                    cache_->stats_.pipeline_ssd_read_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now()-started).count();
+                };
+                if(ssd_reads->ready.valid() && std::any_of(ssd_reads->missing.begin(),ssd_reads->missing.end(),
+                        [&](auto index){return index>=ssd_reads->gate_up_requests;})) {
+                    wait(true);
+                    upload_ssd_gate_up(cell,*ssd_reads);
+                }
+                wait(false);
+            }
             fetch_registered(cell);return;
         }
         auto* packed=cache_->pipeline_host_stage_.data_ptr<uint8_t>();int64_t offset=cell.wire_header_bytes;
@@ -3588,10 +3675,14 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         // Parallel file reads share one immutable lease with CPU work and
         // Gate/Up/Down uploads, including when the LRU budget is exhausted.
         std::vector<MoeHostExpertCache::Lease> ssd_leases;
+        std::unique_ptr<MoeExpertCache::SsdExpertReads> ssd_reads;
+        const auto ssd_read_before=stats.pipeline_ssd_read_ns;
         if(cache_->ssd_experts()) {
             std::vector<MoeExpertCache::SsdExpertRequest> requests;
-            for(const auto& group:cell.plan.groups)if(group.kind!=mfq::MoeDispatchKind::GpuResident)
-                for(int p=0;p<3;++p) {
+            std::size_t gate_up_requests=0;
+            for(int p=0;p<3;++p) {
+                if(p==2)gate_up_requests=requests.size();
+                for(const auto& group:cell.plan.groups)if(group.kind!=mfq::MoeDispatchKind::GpuResident) {
                     if((combined_gate_up_ && p==1) || sources_[p]->quant_source_->gpu_resident(group.expert))continue;
                     if(group.kind==mfq::MoeDispatchKind::GpuTransfer) {
                         if(cell.cached_resident && (cached_expert_fields_->h<mfq::cuda::MfeCachedExpert>()[group.expert].ready_mask&(uint64_t(1)<<p)))continue;
@@ -3603,9 +3694,18 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     }
                     requests.emplace_back(sources_[p]->quant_source_.get(),group.expert);
                 }
-            const auto before=stats.pipeline_ssd_read_ns;
-            time(stats.pipeline_ssd_read_ns,[&]{ssd_leases=cache_->read_ssd_experts(requests);});
-            if(cell.in_window)stats.pipeline_window_ssd_read_ns+=stats.pipeline_ssd_read_ns-before;
+            }
+            const auto* overlap=std::getenv("MFQ_MOE_SSD_GU_IO_OVERLAP");
+            const auto* projection=std::getenv("MFQ_MOE_KV_PROJECTION_CACHE");
+            const auto* lookup=std::getenv("MFQ_MOE_KV_LOOKUP_FIRST");
+            const bool phased_reads=cell.direct_packet && cache_->kv_expert_loan_ &&
+                gate_up_requests && gate_up_requests<requests.size() &&
+                (!overlap || overlap[0]!='0') && (!projection || projection[0]=='1') && (!lookup || lookup[0]=='1') &&
+                std::none_of(cell.plan.groups.begin(),cell.plan.groups.end(),[](const auto& group){return group.kind==mfq::MoeDispatchKind::Cpu;});
+            time(stats.pipeline_ssd_read_ns,[&] {
+                if(phased_reads)ssd_reads=cache_->begin_ssd_expert_reads(std::move(requests),gate_up_requests);
+                else ssd_leases=cache_->read_ssd_experts(requests);
+            });
         }
         const auto transferred=stats.ram_pcie_bytes,fetch_started=stats.pipeline_fetch_ns;
         if(cache_->pipeline_dma_profile_enabled_) {
@@ -3621,8 +3721,13 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         time(stats.pipeline_fetch_ns,[&] {
             if(cache_->pipeline_dma_profile_enabled_ && cell.dma_timing)
                 cell.dma_timing->fetch_started=std::chrono::steady_clock::now();
-            fetch(cell);
+            const auto read_before=stats.pipeline_ssd_read_ns;
+            fetch(cell,ssd_reads.get());
+            // Fetch includes CPU preparation, while file waits keep their
+            // original separate counter even when reads run asynchronously.
+            stats.pipeline_fetch_ns-=stats.pipeline_ssd_read_ns-read_before;
         });
+        if(cell.in_window)stats.pipeline_window_ssd_read_ns+=stats.pipeline_ssd_read_ns-ssd_read_before;
         trace_serve(cell,"cpu");
         if(cache_->pipeline_dma_profile_enabled_ && cell.dma_timing) {
             auto& sample=cell.dma_timing->sample;

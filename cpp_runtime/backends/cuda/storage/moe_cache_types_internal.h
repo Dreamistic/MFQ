@@ -397,6 +397,7 @@ struct MoeCacheStats {
     int64_t pipeline_kv_direct_read_bytes=0,pipeline_kv_direct_read_fields=0;
     int64_t pipeline_kv_early_gu_serves=0;
     int64_t pipeline_gu_build_overlap_serves=0,pipeline_gu_build_overlap_copies=0;
+    int64_t pipeline_ssd_gu_overlap_serves=0,pipeline_ssd_gu_overlap_bytes=0;
     int64_t pipeline_kv_projection_hits=0,pipeline_kv_projection_misses=0,pipeline_kv_projection_fallbacks=0;
     int64_t pipeline_kv_projection_small_hit_bytes=0;
     int64_t pipeline_kv_projection_early_hits=0;
