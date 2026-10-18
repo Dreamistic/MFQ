@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <charconv>
 #include <chrono>
@@ -39,6 +40,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <future>
 #include <list>
 #include <limits>
@@ -59,6 +61,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include <sys/mman.h>
 #include <unistd.h>
 
 namespace mfq::metal {
@@ -71,6 +74,7 @@ using mlx::core::Shape;
 using mlx::core::array;
 
 constexpr int kDescriptorSize = 32;
+std::atomic<std::size_t> uncached_packed_storage_bytes{0};
 
 constexpr int kFamily = 0;
 constexpr int kLocalExpert = 1;
@@ -2482,14 +2486,16 @@ array allocate_packed_array(std::size_t bytes, Dtype dtype) {
     return result;
 }
 
-array allocate_wire_array(std::size_t bytes) {
+array allocate_wire_array(std::size_t bytes, bool account = false) {
     struct Storage {
         std::uint8_t* data = nullptr;
         std::size_t bytes = 0;
+        bool accounted = false;
         mlx::core::allocator::Buffer buffer{nullptr};
         ~Storage() {
             if (buffer.ptr()) mlx::core::allocator::release(buffer);
             detail::MmapAllocator<std::uint8_t>{}.deallocate(data, bytes);
+            if (accounted) uncached_packed_storage_bytes.fetch_sub(bytes, std::memory_order_relaxed);
         }
     };
     const auto layout = detail::packed_storage_layout(bytes);
@@ -2501,6 +2507,10 @@ array allocate_wire_array(std::size_t bytes) {
     storage->data = detail::MmapAllocator<std::uint8_t>{}.allocate(storage->bytes);
     storage->buffer = mlx::core::allocator::make_buffer(storage->data, storage->bytes);
     if (!storage->buffer.ptr()) return allocate_packed_array(bytes, mlx::core::uint8);
+    if (account) {
+        uncached_packed_storage_bytes.fetch_add(storage->bytes, std::memory_order_relaxed);
+        storage->accounted = true;
+    }
     const auto buffer = storage->buffer;
     return array(buffer, shape, mlx::core::uint8,
         [storage = std::move(storage)](mlx::core::allocator::Buffer) {});
@@ -2730,11 +2740,238 @@ void align_packed_stream(
 
 array make_int32_array(
     const std::vector<std::int32_t>& values,
-    Shape shape) {
+    Shape shape,
+    const array* arena = nullptr) {
+    if (values.size() == 1 && values.front() == 0)
+        return mlx::core::reshape(empty_packed_array(mlx::core::int32), std::move(shape));
+    if (arena) {
+        const auto bytes = checked_product(values.size(), sizeof(std::int32_t), "MFE metadata bytes");
+        if (bytes > arena->nbytes()) throw std::out_of_range("MFE metadata arena is too small");
+        auto result = array(std::move(shape), mlx::core::int32, nullptr, {});
+        result.copy_shared_buffer(*arena, result.strides(), result.flags(), values.size());
+        result.set_status(array::Status::available);
+        std::memcpy(result.data<std::int32_t>(), values.data(), bytes);
+        return result;
+    }
     auto result = array(values.begin(), std::move(shape));
     MlxWeightResidency::track(result);
     return result;
 }
+
+constexpr std::size_t kPackedCopyInputs = 24;
+std::atomic<std::size_t> packed_copy_submissions{0};
+std::atomic<std::size_t> indirect_expert_submissions{0};
+std::atomic<std::size_t> packed_pinned_bytes{0}, packed_pin_errors{0};
+std::atomic<std::size_t> pooled_expert_staging{0};
+using PackedCopySpec = std::array<std::uint32_t, 4>;
+
+struct PackedCopyBatch {
+    std::uint32_t first;
+    std::uint32_t count;
+    std::uint32_t source;
+    bool operator==(const PackedCopyBatch&) const = default;
+};
+
+class PackedCopyPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
+public:
+    PackedCopyPrimitive(mlx::core::Stream stream, Shape shape, std::vector<PackedCopyBatch> batches)
+        : UnaryPrimitive(stream), shape_(std::move(shape)), batches_(std::move(batches)) {}
+    std::string preparation_key() const override { return "mfq_mfe_packed_copy_v2"; }
+    void prepare_gpu() override { (void)kernel(); }
+    void eval_cpu(const std::vector<array>&, array&) override {
+        throw std::runtime_error("packed expert copy requires Metal");
+    }
+    void eval_gpu(const std::vector<array>& inputs, array& output) override {
+        if (inputs.size() < 2) throw std::logic_error("packed expert copy has no sources");
+        if (output.nbytes() >= (std::size_t{64} << 10)) {
+            auto storage = allocate_wire_array(output.nbytes(), true);
+            output.copy_shared_buffer(storage, output.strides(), output.flags(), output.size());
+        } else output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(kernel());
+        encoder.set_input_array(inputs.back(), kPackedCopyInputs);
+        encoder.set_output_array(output, kPackedCopyInputs + 1);
+        const auto empty = empty_packed_array(mlx::core::uint8);
+        for (const auto& batch : batches_) {
+            for (std::size_t index = 0; index < kPackedCopyInputs; ++index) {
+                const auto source = batch.source + index;
+                encoder.set_input_array(source < inputs.size() - 1 ? inputs[source] : empty, index);
+            }
+            const std::array<std::uint32_t, 2> geometry{batch.first, batch.source};
+            encoder.set_bytes(geometry, kPackedCopyInputs + 2);
+            encoder.dispatch_threadgroups(MTL::Size(batch.count, 1, 1), MTL::Size(256, 1, 1));
+        }
+        packed_copy_submissions.fetch_add(1, std::memory_order_relaxed);
+    }
+    const char* name() const override { return "PackedCopyPrimitive"; }
+    bool is_equivalent(const mlx::core::Primitive& other) const override {
+        const auto* value = dynamic_cast<const PackedCopyPrimitive*>(&other);
+        return value && value->shape_ == shape_ && value->batches_ == batches_;
+    }
+    std::vector<Shape> output_shapes(const std::vector<array>&) override { return {shape_}; }
+private:
+    MTL::ComputePipelineState* kernel() {
+        auto& device = kernel_device(stream().device);
+        auto* library = device.get_library(preparation_key(), [] {
+            std::ostringstream source;
+            source << "#include <metal_stdlib>\nusing namespace metal;\n"
+                "kernel void mfq_mfe_packed_copy_v2(\n";
+            for (std::size_t index = 0; index < kPackedCopyInputs; ++index)
+                source << "device const uchar* p" << index << " [[buffer(" << index << ")]],\n";
+            source << R"(device const uint4* moves [[buffer(24)]],
+device uchar* output [[buffer(25)]], constant uint* geometry [[buffer(26)]],
+uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
+    const uint4 move = moves[geometry[0] + group.x];
+    const uint bytes = move.w & 0x0fffffffu;
+    if (move.x == 0xffffffffu) {
+        for (uint index = lane; index < bytes; index += 256) output[move.z + index] = 0;
+        return;
+    }
+    device const uchar* input = nullptr;
+    switch (move.x - geometry[1]) {
+)";
+            for (std::size_t index = 0; index < kPackedCopyInputs; ++index)
+                source << "case " << index << ": input = p" << index << "; break;\n";
+            source << R"(default: return;
+    }
+    input += move.y;
+    device uchar* target = output + move.z;
+    const uint alignment = move.y | move.z | (move.w >> 28);
+    if ((alignment & 3u) == 0) {
+        device const uint* words = reinterpret_cast<device const uint*>(input);
+        device uint* destination = reinterpret_cast<device uint*>(target);
+        for (uint index = lane; index < bytes / 4; index += 256) destination[index] = words[index];
+        for (uint index = (bytes & ~3u) + lane; index < bytes; index += 256) target[index] = input[index];
+    } else {
+        for (uint index = lane; index < bytes; index += 256) target[index] = input[index];
+    }
+}
+)";
+            return source.str();
+        });
+        return device.get_kernel(preparation_key(), library);
+    }
+    Shape shape_;
+    std::vector<PackedCopyBatch> batches_;
+};
+
+array packed_expert_copy(std::vector<array> sources,
+    const std::vector<std::vector<PackedCopySpec>>& copies, std::size_t bytes) {
+    if (sources.empty() || bytes == 0 || bytes > std::size_t(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("invalid packed expert copy extent");
+    std::vector<std::uint32_t> moves;
+    std::vector<PackedCopyBatch> batches;
+    for (std::size_t index = 0; index < copies.size(); ++index) {
+        if (copies[index].empty()) continue;
+        batches.push_back({static_cast<std::uint32_t>(moves.size() / 4),
+            static_cast<std::uint32_t>(copies[index].size()),
+            static_cast<std::uint32_t>(index * kPackedCopyInputs)});
+        for (const auto& copy : copies[index]) moves.insert(moves.end(), copy.begin(), copy.end());
+    }
+    if (moves.empty()) throw std::invalid_argument("packed expert copy has no ranges");
+    sources.emplace_back(moves.begin(), Shape{checked_int(moves.size() / 4, "packed copy ranges"), 4});
+    const Shape shape{static_cast<int>(bytes)};
+    return array(shape, mlx::core::uint8,
+        std::make_shared<PackedCopyPrimitive>(mlx::core::default_stream(mlx::core::Device::gpu), shape, std::move(batches)),
+        std::move(sources));
+}
+
+struct PackedExpertArena {
+    array storage;
+    struct Stream {
+        const std::vector<array>* values;
+        std::size_t offset;
+        std::size_t bytes;
+    };
+    std::vector<Stream> streams;
+};
+
+std::optional<PackedExpertArena> pack_expert_streams(std::vector<array> sources,
+    std::span<const std::vector<array>* const> streams) {
+    std::unordered_map<const void*, std::uint32_t> owners;
+    std::unordered_map<std::uintptr_t, std::uint32_t> external;
+    std::vector<array> unique;
+    for (const auto& source : sources) {
+        if (!source.is_available() || !source.flags().row_contiguous)
+            continue;
+        if (owners.emplace(source.data_shared_ptr().get(), static_cast<std::uint32_t>(unique.size())).second) {
+            if (source.dtype() == mlx::core::uint8
+                && source.buffer_size() <= std::size_t(std::numeric_limits<int>::max())) {
+                auto backing = array(Shape{static_cast<int>(source.buffer_size())}, mlx::core::uint8, nullptr, {});
+                backing.copy_shared_buffer(source, backing.strides(), backing.flags(), backing.size(), -source.offset());
+                backing.set_status(array::Status::available);
+                unique.push_back(std::move(backing));
+            } else unique.push_back(source);
+        }
+    }
+    std::vector<std::vector<PackedCopySpec>> copies(std::max<std::size_t>(1,
+        (unique.size() + kPackedCopyInputs - 1) / kPackedCopyInputs));
+    std::vector<PackedExpertArena::Stream> views;
+    std::size_t bytes = 0;
+    constexpr std::size_t tile = std::size_t{64} << 10;
+    for (const auto* values : streams) {
+        if (values->empty()) continue;
+        const auto empty = empty_packed_array(values->front().dtype()).data_shared_ptr();
+        if (std::all_of(values->begin(), values->end(), [&](const auto& value) {
+                return value.data_shared_ptr() == empty;
+            })) continue;
+        bytes = checked_add(bytes, 15, "packed copy alignment") & ~std::size_t{15};
+        const auto first = bytes;
+        for (const auto& value : *values) {
+            if (!value.is_available() || !value.flags().row_contiguous) return std::nullopt;
+            const auto next = checked_add(bytes, value.nbytes(), "packed copy output");
+            if (next > std::size_t(std::numeric_limits<int>::max())) return std::nullopt;
+            const auto found = owners.find(value.data_shared_ptr().get());
+            std::optional<std::pair<std::uint32_t, std::size_t>> range;
+            if (found != owners.end()) {
+                const auto& source = unique[found->second];
+                const auto base = reinterpret_cast<std::uintptr_t>(source.data<std::uint8_t>());
+                const auto address = reinterpret_cast<std::uintptr_t>(value.data<std::uint8_t>());
+                if (address >= base && address - base <= source.nbytes()
+                    && value.nbytes() <= source.nbytes() - (address - base))
+                    range.emplace(found->second, address - base);
+            }
+            if (!range) {
+                const auto* data = value.data<std::uint8_t>();
+                if (value.nbytes() <= 16 && std::all_of(data, data + value.nbytes(), [](auto v) { return v == 0; })) {
+                    copies.front().push_back({std::numeric_limits<std::uint32_t>::max(), 0,
+                        static_cast<std::uint32_t>(bytes), static_cast<std::uint32_t>(value.nbytes())});
+                } else {
+                    const auto address = reinterpret_cast<std::uintptr_t>(data);
+                    const auto found = external.find(address);
+                    if (found != external.end() && unique[found->second].nbytes() >= value.nbytes())
+                        range.emplace(found->second, 0);
+                    else {
+                        const auto index = static_cast<std::uint32_t>(unique.size());
+                        unique.push_back(value);
+                        external[address] = index;
+                        copies.resize((unique.size() + kPackedCopyInputs - 1) / kPackedCopyInputs);
+                        range.emplace(index, 0);
+                    }
+                }
+            }
+            if (range) {
+                const auto alignment = static_cast<std::uint32_t>(
+                    reinterpret_cast<std::uintptr_t>(unique[range->first].data<std::uint8_t>()) & 15u) << 28;
+                for (std::size_t offset = 0; offset < value.nbytes(); offset += tile)
+                    copies[range->first / kPackedCopyInputs].push_back({range->first,
+                        static_cast<std::uint32_t>(range->second + offset),
+                        static_cast<std::uint32_t>(bytes + offset),
+                        static_cast<std::uint32_t>(std::min(tile, value.nbytes() - offset)) | alignment});
+            }
+            bytes = next;
+        }
+        views.push_back({values, first, bytes - first});
+    }
+    if (!bytes) return std::nullopt;
+    if (unique.empty()) unique.push_back(empty_packed_array(mlx::core::uint8));
+    return PackedExpertArena{packed_expert_copy(std::move(unique), copies, bytes), std::move(views)};
+}
+
+struct MfePageResources {
+    NS::SharedPtr<MTL::ResidencySet> residency;
+    std::vector<array> owners;
+};
 
 struct NativeMoeConfig {
     Dtype dtype;
@@ -2764,8 +3001,63 @@ struct NativeMoeConfig {
     int packed_expert_ids = 0;
     bool route_groups = false;
     bool nint_q_dispatch = false;
+    bool indirect_pages = false;
     int workgroups = 0;
+    std::shared_ptr<const MfePageResources> page_resources;
 };
+
+constexpr std::array<std::pair<const char*, const char*>, 21> kExpertStreams{{
+    {"nint_q", "uchar"}, {"nint_sub_scale", "uchar"}, {"nint_sub_min", "uchar"},
+    {"nint_anchor_scale", "float"}, {"nint_anchor_min", "float"},
+    {"q8_q", "int8_t"}, {"q8_scales", "half"},
+    {"vq_indices", "uchar"}, {"vq_state", "uchar"}, {"vq_aux", "uchar"},
+    {"vq_anchors", "float"}, {"vq_codebooks", "int8_t"}, {"vq_scales", "float"},
+    {"vq_state_to_codebank", "uchar"}, {"vq_banks", "uchar"}, {"vq_parameters", "float"},
+    {"vq_residual_codebooks", "float"}, {"vq_residual_first", "short"},
+    {"vq_residual_second", "short"}, {"mx_values", "uchar"}, {"mx_scales", "uchar"}
+}};
+
+bool uses_indirect_expert_pages(std::uint32_t families) {
+    if (families == (1u << kFamilyMxfp4) || mlx_reference_enabled()) return false;
+    if (__builtin_available(macOS 15, *))
+        return mlx::core::metal::device(mlx::core::Device::gpu).mtl_device()->supportsFamily(MTL::GPUFamilyMetal3);
+    return false;
+}
+
+void retain_indirect_resources(mlx::core::metal::CommandEncoder& encoder, std::span<const array> sources) {
+    struct Residency {
+        NS::SharedPtr<MTL::ResidencySet> set;
+        std::unordered_set<const MTL::Buffer*> buffers;
+    };
+    static thread_local std::unordered_map<MTL::CommandBuffer*, std::weak_ptr<Residency>> pending;
+    auto* command = encoder.get_command_buffer();
+    auto state = pending[command].lock();
+    if (!state) {
+        for (auto it = pending.begin(); it != pending.end();)
+            if (it->second.expired()) it = pending.erase(it); else ++it;
+        state = std::make_shared<Residency>();
+        auto descriptor = NS::TransferPtr(MTL::ResidencySetDescriptor::alloc()->init());
+        descriptor->setInitialCapacity(sources.size());
+        NS::Error* error = nullptr;
+        auto& device = mlx::core::metal::device(mlx::core::Device::gpu);
+        state->set = NS::TransferPtr(device.mtl_device()->newResidencySet(descriptor.get(), &error));
+        if (!state->set) throw std::runtime_error(error
+            ? error->localizedDescription()->utf8String() : "expert residency set unavailable");
+        pending[command] = state;
+        command->useResidencySet(state->set.get());
+        command->addCompletedHandler([state](MTL::CommandBuffer*) {});
+    }
+    bool changed = false;
+    for (const auto& source : sources) {
+        auto* buffer = static_cast<const MTL::Buffer*>(source.buffer().ptr());
+        if (state->buffers.insert(buffer).second) {
+            state->set->addAllocation(buffer);
+            encoder.add_temporary(source);
+            changed = true;
+        }
+    }
+    if (changed) state->set->commit();
+}
 
 struct Mxfp4DecodeReduceConfig {
     Dtype dtype;
@@ -2817,6 +3109,7 @@ struct GroupedMmqConfig {
     std::shared_ptr<const std::vector<std::tuple<int, int, int>>> cohort_populations;
     bool use_nax = false;
     bool direct_nax = false;
+    bool indirect_pages = false;
     float swiglu_limit = 0.0f;
 };
 
@@ -2858,23 +3151,22 @@ grouped_mmq_block_builder(bool cohort_ordered) {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         std::vector<std::string> inputs{"indices"};
-        if (ordered) {
-            inputs.emplace_back("expert_order");
-        }
+        if (ordered) inputs.push_back("expert_order");
         std::string source = ordered
             ? "#define MFQ_SCHEDULED_EXPERT(index) expert_order[index]\n"
             : "#define MFQ_SCHEDULED_EXPERT(index) int(index)\n";
         source +=
             R"METAL(
                 const int M = indices_shape[0];
+                const int NUM_EXPERTS = int(threads_per_threadgroup.x);
                 const int MAX_BLOCKS = (M + BM - 1) / BM + NUM_EXPERTS;
                 const uint schedule_index = thread_index_in_threadgroup;
                 const uint expert = uint(
                     MFQ_SCHEDULED_EXPERT(schedule_index));
 
                 threadgroup atomic_int local_count;
-                threadgroup int expert_starts[NUM_EXPERTS];
-                threadgroup int expert_rows[NUM_EXPERTS];
+                threadgroup int expert_starts[1024];
+                threadgroup int expert_rows[1024];
                 threadgroup int use_block_chunks;
                 if constexpr (BLOCK_CHUNK == 0) {
                     if (expert == 0) {
@@ -3086,12 +3378,8 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
     const bool cohort_ordered = experts >= 128
         && route_count > experts * 96;
     const int block_chunk = cohort_ordered ? 2 : 0;
-    std::vector<array> builder_inputs{
-        std::move(sorted_ids),
-    };
-    if (cohort_ordered) {
-        builder_inputs.push_back(expert_order);
-    }
+    std::vector<array> builder_inputs{std::move(sorted_ids)};
+    if (cohort_ordered) builder_inputs.push_back(expert_order);
     auto outputs = grouped_mmq_block_builder(cohort_ordered)(
         std::move(builder_inputs),
         {
@@ -3105,7 +3393,6 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
         {experts, 1, 1},
         {experts, 1, 1},
         {
-            {"NUM_EXPERTS", experts},
             {"BM", block_rows},
             {
                 "BLOCK_CHUNK",
@@ -3178,6 +3465,7 @@ std::string native_moe_kernel_name(
     name << "_pe" << config.packed_expert_ids;
     name << "_rg" << config.route_groups;
     name << "_qd" << config.nint_q_dispatch;
+    if (config.indirect_pages) name << "_page_addresses";
     if (config.route_groups) name << "_pairq";
     name << "_ng";
     append_nint_group_key(name, config.nint_group_sizes);
@@ -3199,10 +3487,17 @@ std::string make_native_moe_source(
         << "#define MFQ_MOE_ROUTE_GROUPS " << config.route_groups << "\n"
         << "#define MFQ_NINT_Q_DISPATCH " << config.nint_q_dispatch << "\n"
         << "#define MFQ_MOE_VQ_LAYOUTS " << config.vq_layouts << "ul\n"
-        << kMoeHeader
-        << "\nkernel void " << kernel_name << "(\n"
+        << kMoeHeader;
+    if (config.indirect_pages) {
+        source << "struct MfqExpertStreams {\n";
+        for (const auto& [name, type] : kExpertStreams)
+            source << "device const " << type << "* " << name << ";\n";
+        source << "};\n";
+    }
+    source << "\nkernel void " << kernel_name << "(\n"
         << "device const int* descriptors [[buffer(0)]],\n"
-        << "device const uchar* nint_q [[buffer(1)]],\n"
+        << (config.indirect_pages ? "device const MfqExpertStreams* expert_streams [[buffer(1)]],\n"
+            : "device const uchar* nint_q [[buffer(1)]],\n")
         << "device const uchar* nint_sub_scale [[buffer(2)]],\n"
         << "device const uchar* nint_sub_min [[buffer(3)]],\n"
         << "device const float* nint_anchor_scale [[buffer(4)]],\n"
@@ -3288,9 +3583,16 @@ std::string make_native_moe_source(
     if (!has_expert_map) {
         source << "device const int* expert_map = expert_ids;\n";
     }
-    source
-        << kMoeSource
-        << "\n}\n";
+    std::string body(kMoeSource);
+    if (config.indirect_pages) {
+        const auto position = body.find("    uint descriptor_base = (\n");
+        if (position == std::string::npos) throw std::logic_error("MFE page binding marker is missing");
+        std::ostringstream bindings;
+        for (const auto& [name, type] : kExpertStreams)
+            bindings << "#define " << name << " expert_streams[uint(expert)]." << name << "\n";
+        body.insert(position, bindings.str());
+    }
+    source << body << "\n}\n";
     return source.str();
 }
 
@@ -3336,7 +3638,8 @@ public:
         array& output) override {
         const int input_count = 26 + static_cast<int>(config_.expert_map_size != 0)
             + static_cast<int>(config_.route_groups);
-        if (inputs.size() != static_cast<std::size_t>(input_count)) {
+        if (inputs.size() < static_cast<std::size_t>(input_count)
+            || (!config_.indirect_pages && inputs.size() != static_cast<std::size_t>(input_count))) {
             throw std::logic_error(
                 "native MFE primitive input count mismatch");
         }
@@ -3348,6 +3651,17 @@ public:
             mlx::core::metal::get_command_encoder(
                 selected_stream);
         encoder.set_compute_pipeline_state(kernel);
+        if (config_.indirect_pages) {
+            if (config_.page_resources) {
+                auto* command = encoder.get_command_buffer();
+                command->useResidencySet(config_.page_resources->residency.get());
+                command->addCompletedHandler([resources = config_.page_resources](MTL::CommandBuffer*) {});
+            } else {
+                for (std::size_t index = input_count; index < inputs.size(); ++index)
+                    encoder.set_input_array(inputs[index], 1);
+                retain_indirect_resources(encoder, std::span(inputs).subspan(input_count));
+            }
+        }
         for (int index = 0; index < input_count; ++index) {
             encoder.set_input_array(
                 inputs[static_cast<std::size_t>(index)],
@@ -3360,6 +3674,7 @@ public:
         encoder.dispatch_threadgroups(
             MTL::Size(config_.workgroups, 1, 1),
             MTL::Size(64, 1, 1));
+        if (config_.indirect_pages) indirect_expert_submissions.fetch_add(1, std::memory_order_relaxed);
     }
 
     const char* name() const override {
@@ -3376,7 +3691,8 @@ public:
             && primitive->config_.variant_stride == config_.variant_stride
             && primitive->config_.experts == config_.experts
             && primitive->config_.expert_map_size == config_.expert_map_size
-            && primitive->config_.workgroups == config_.workgroups;
+            && primitive->config_.workgroups == config_.workgroups
+            && primitive->config_.page_resources == config_.page_resources;
     }
 
     std::vector<Shape> output_shapes(
@@ -4896,11 +5212,13 @@ public:
         for (const int value : {config_.block_rows, config_.tile_columns, config_.projections,
                 config_.input_width, config_.output_width, config_.matrix_output_width,
                 config_.fused_swiglu, config_.has_nepq_residual, config_.family_mask,
-                config_.vq_profile_mask, static_cast<int>(config_.use_nax), static_cast<int>(config_.direct_nax)})
+                config_.vq_profile_mask, static_cast<int>(config_.use_nax), static_cast<int>(config_.direct_nax),
+                static_cast<int>(config_.indirect_pages)})
             key += "_" + std::to_string(value);
         if (config_.nint_group_sizes)
             for (const int group : *config_.nint_group_sizes) key += "_gs" + std::to_string(group);
-        if (compact_blocks()) key += "_compact_blocks";
+        if (compact_blocks()) key += "_compact_blocks_p"
+            + std::to_string(config_.cohort_populations->size());
         return key;
     }
     void prepare_gpu() override {
@@ -4998,6 +5316,7 @@ kernel void mfq_grouped_mfe_partition(
             library_name += "_fm" + std::to_string(family_mask)
                 + "_gs" + std::to_string(group_size);
             if (compact_blocks()) library_name += "_compact";
+            if (config_.indirect_pages) library_name += "_pages";
             if (!config_.use_nax)
                 library_name += "_bm" + std::to_string(config_.block_rows);
             if (config_.use_nax) {
@@ -5016,6 +5335,7 @@ kernel void mfq_grouped_mfe_partition(
                 compile_options,
                 [
                     use_nax = config_.use_nax,
+                    indirect_pages = config_.indirect_pages,
                     vector_vq = selected_vector_vq,
                     vector_jsc_extended = selected_extended,
                     family_mask,
@@ -5102,6 +5422,12 @@ kernel void mfq_grouped_mfe_partition(
                     }
                     source += "using namespace metal;\n";
                     source += "using bfloat16_t = bfloat;\n";
+                    if (indirect_pages) {
+                        source += "#define MFQ_GROUPED_INDIRECT_PAGES 1\nstruct MfqExpertStreams {\n";
+                        for (const auto& [name, type] : kExpertStreams)
+                            source += "device const " + std::string(type) + "* " + name + ";\n";
+                        source += "};\n";
+                    }
                     source += detail::kNintMetadataSource;
                     source += use_nax
                         ? detail::kSteelNaxSource
@@ -5181,7 +5507,8 @@ kernel void mfq_grouped_mfe_partition(
     void eval_gpu(
         const std::vector<array>& inputs,
         array& output) override {
-        if (inputs.size() != 28) {
+        if (inputs.size() < (config_.indirect_pages ? 29u : 28u)
+            || (!config_.indirect_pages && inputs.size() != 28)) {
             throw std::logic_error(
                 "grouped MMQ primitive input count mismatch");
         }
@@ -5191,6 +5518,12 @@ kernel void mfq_grouped_mfe_partition(
         auto& encoder =
             mlx::core::metal::get_command_encoder(
                 selected_stream);
+        if (config_.indirect_pages) {
+            for (std::size_t index = 29; index < inputs.size(); ++index)
+                encoder.set_input_array(inputs[index], 29);
+            retain_indirect_resources(encoder, std::span(inputs).subspan(29));
+            encoder.set_input_array(inputs[28], 29);
+        }
         const auto kernels = prepared_kernels();
         std::optional<array> compact_meta;
         std::optional<array> compact_count;
@@ -5320,6 +5653,7 @@ kernel void mfq_grouped_mfe_partition(
             && primitive->config_.cohort_populations == config_.cohort_populations
             && primitive->config_.use_nax == config_.use_nax
             && primitive->config_.direct_nax == config_.direct_nax
+            && primitive->config_.indirect_pages == config_.indirect_pages
             && primitive->config_.swiglu_limit == config_.swiglu_limit;
     }
 
@@ -6434,6 +6768,9 @@ std::optional<MlxVqWeight> add_vq_pool(
         streams.vq_aux.append(std::move(weight.auxiliary));
     }
     streams.vq_anchors.append(std::move(weight.anchors));
+    streams.vq_codebooks.append(std::span(
+        reinterpret_cast<const std::uint8_t*>(weight.borrowed_codebooks.data()),
+        weight.borrowed_codebooks.size()));
     streams.vq_codebooks.append(std::move(weight.codebooks));
     streams.vq_scales.append(std::move(weight.scales));
     streams.vq_state_to_codebank.append(std::move(weight.state_to_codebank));
@@ -6910,6 +7247,19 @@ struct MfeReadCounters {
     std::size_t bytes = 0, calls = 0;
     double seconds = 0;
 };
+struct MfeReadRange {
+    std::uint64_t source;
+    std::size_t destination;
+    std::size_t bytes;
+};
+using MfeReadPlan = std::vector<MfeReadRange>;
+thread_local MfeReadPlan* current_mfe_plan = nullptr;
+struct MfeReadPlanScope {
+    explicit MfeReadPlanScope(MfeReadPlan* value)
+        : previous(std::exchange(current_mfe_plan, value)) {}
+    ~MfeReadPlanScope() { current_mfe_plan = previous; }
+    MfeReadPlan* previous;
+};
 thread_local MfeReadCounters* current_mfe_reads = nullptr;
 struct MfeReadScope {
     explicit MfeReadScope(MfeReadCounters* value)
@@ -6934,11 +7284,55 @@ void append_record_range(
     std::uint64_t nbytes) {
     const auto begin = target.size();
     target.resize(checked_add(begin, nbytes, "streamed appended range"));
+    if (current_mfe_plan) {
+        if (nbytes) current_mfe_plan->push_back({offset, begin, static_cast<std::size_t>(nbytes)});
+        return;
+    }
     const auto started = current_mfe_reads ? std::chrono::steady_clock::now()
         : std::chrono::steady_clock::time_point{};
     model.read_range_into(name, offset,
         std::as_writable_bytes(std::span<std::uint8_t>(target).subspan(begin)));
     record_mfe_read(nbytes, started);
+}
+
+void read_mfe_batch(const MfqContainer& model, const std::string& name,
+    std::span<MfeReadBytes> blobs, std::span<const MfeReadPlan> plans) {
+    struct Range {
+        std::uint64_t source;
+        std::span<std::uint8_t> target;
+    };
+    std::vector<Range> ranges;
+    for (std::size_t index = 0; index < plans.size(); ++index)
+        for (const auto& range : plans[index]) ranges.push_back({range.source,
+            std::span(blobs[index]).subspan(range.destination, range.bytes)});
+    std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.source < b.source; });
+    constexpr std::size_t max_read = std::size_t{8} << 20;
+    MfeReadBytes scratch;
+    for (std::size_t first = 0; first < ranges.size();) {
+        const auto offset = ranges[first].source;
+        auto end = checked_range_add(offset, ranges[first].target.size(), "MFE batch range");
+        auto last = first + 1;
+        while (last < ranges.size() && ranges[last].source <= end) {
+            const auto next = checked_range_add(ranges[last].source, ranges[last].target.size(), "MFE batch range");
+            if (next - offset > max_read) break;
+            end = std::max(end, next);
+            ++last;
+        }
+        const auto bytes = static_cast<std::size_t>(end - offset);
+        const auto started = std::chrono::steady_clock::now();
+        if (last == first + 1) {
+            model.read_range_into(name, offset, std::as_writable_bytes(ranges[first].target));
+            record_mfe_read(bytes, started);
+        } else {
+            scratch.resize(bytes);
+            model.read_range_into(name, offset, std::as_writable_bytes(std::span(scratch)));
+            record_mfe_read(bytes, started);
+            for (auto index = first; index < last; ++index)
+                std::memcpy(ranges[index].target.data(), scratch.data() + ranges[index].source - offset,
+                    ranges[index].target.size());
+        }
+        first = last;
+    }
 }
 
 template <typename Bytes>
@@ -7105,6 +7499,70 @@ struct MfeStreamProjection {
     std::shared_ptr<const MlxMfeKernelProfile> kernel_profile;
 };
 
+std::size_t streamed_expert_storage_bound(
+    const MfeStreamProjection& projection, const MfeStreamExpertLocation& location) {
+    const auto rows = static_cast<std::size_t>(projection.out_per_expert);
+    const auto packed = [&](std::size_t count, int bits) {
+        return checked_packed_size(count, bits, "streamed expert working storage");
+    };
+    const auto product = [&](std::size_t first, std::size_t second) {
+        return checked_product(first, second, "streamed expert working storage");
+    };
+    const auto add = [](std::size_t first, std::size_t second) {
+        return checked_add(first, second, "streamed expert working storage");
+    };
+    auto bytes = std::visit([&](const auto& layout) -> std::size_t {
+        using Layout = std::decay_t<decltype(layout)>;
+        if constexpr (std::is_same_v<Layout, MfeNintStreamLayout>) {
+            const auto groups = static_cast<std::size_t>(layout.groups);
+            const auto width = product(groups, layout.group_size);
+            auto result = add(layout.header.size(), product(rows, 4));
+            if (layout.adaptive_storage) {
+                result = add(result, add(packed(rows, 2), packed(rows, 3)));
+                for (int index = 0; index < 4; ++index) {
+                    const auto count = layout.k_expert_prefixes[location.local_expert + 1][index]
+                        - layout.k_expert_prefixes[location.local_expert][index];
+                    result = add(result, product(2, packed(product(count, groups),
+                        layout.nominal_sub_bits - 1 + index)));
+                }
+                for (int index = 0; index < 8; ++index) {
+                    const auto count = layout.q_expert_prefixes[location.local_expert + 1][index]
+                        - layout.q_expert_prefixes[location.local_expert][index];
+                    result = add(result, packed(product(count, width), index + 1));
+                }
+            } else {
+                const auto metadata = product(rows, groups);
+                const auto values = product(rows, width);
+                result = add(result, layout.legacy_unpacked
+                    ? add(product(metadata, 2), values)
+                    : add(product(2, packed(metadata, layout.nominal_sub_bits)), packed(values, layout.q_bits)));
+            }
+            // Four uint32 row descriptors and per-row byte/alignment tails.
+            return add(result, product(rows, 32));
+        } else if constexpr (std::is_same_v<Layout, MfeNvqJscStreamLayout>) {
+            auto result = add(layout.prefix_bytes, product(rows, 2));
+            if (layout.group64) result = add(result, product(product(rows, layout.groups), 8));
+            else {
+                result = add(result, packed(product(rows, layout.groups), layout.state_bits));
+                result = add(result, packed(product(rows, layout.vectors), layout.index_bits));
+                result = add(result, packed(product(rows, layout.signs), layout.auxiliary_bits));
+            }
+            // Packed indices/states remain packed; anchors and small lookup
+            // tables may widen. NVQ1-L's built-in 2048x8 table has no wire bytes.
+            return add(add(result, product(rows, 2)), add(
+                std::max<std::size_t>(16384, product(layout.prefix_bytes, 2)), 1024));
+        } else {
+            const auto values = product(rows, layout.bits == 4 ? layout.columns / 2 : layout.columns);
+            const auto scales = layout.bits == 4 ? product(rows, layout.columns / 32)
+                : product((rows + 127) / 128, layout.columns / 128);
+            return add(layout.header.size(), add(values, scales));
+        }
+    }, location.pool->layout);
+    bytes = add(bytes, product(location.pool->runtime_bytes, 2));
+    return add(bytes, sizeof(std::int32_t) * kDescriptorSize + 21 * 15
+        + static_cast<std::size_t>(getpagesize()));
+}
+
 MfeNintStreamLayout parse_streamed_nint_layout(
     const MfqContainer& model,
     const std::string& name,
@@ -7112,12 +7570,13 @@ MfeNintStreamLayout parse_streamed_nint_layout(
     std::uint64_t payload_bytes,
     int expected_rows,
     int expected_columns,
-    int rows_per_expert) {
+    int rows_per_expert,
+    int expected_experts = 0) {
     constexpr std::uint64_t kHeaderBytes = 42;
     if (payload_bytes < kHeaderBytes) {
         throw std::runtime_error("truncated streamed NINT payload: " + name);
     }
-    const auto header = model.read_range(
+    auto header = model.read_range(
         name, payload_offset, kHeaderBytes);
     const int raw_bits = header[0];
     const int nominal_sub_bits = header[1];
@@ -7129,24 +7588,36 @@ MfeNintStreamLayout parse_streamed_nint_layout(
         header, 10, "NINT width");
     const auto dimensions = read_scalar<std::uint32_t>(
         header, 14, "NINT dimensions");
-    const auto shape_rows = read_scalar<std::int64_t>(
-        header, 18, "NINT rows");
+    if (dimensions == 3 && expected_experts > 0) {
+        if (payload_bytes < kHeaderBytes + 8)
+            throw std::runtime_error("truncated streamed NINT expert header: " + name);
+        header = model.read_range(name, payload_offset, kHeaderBytes + 8);
+    } else if (dimensions != 2 || expected_experts > 0) {
+        throw std::runtime_error("unsupported streamed NINT rank: " + name);
+    }
+    const auto shape_offset = dimensions == 3 ? 26u : 18u;
+    const auto shape_rows = read_scalar<std::int64_t>(header, shape_offset, "NINT rows");
     const auto shape_columns = read_scalar<std::int64_t>(
-        header, 26, "NINT columns");
+        header, shape_offset + 8, "NINT columns");
     const auto rows = read_scalar<std::uint32_t>(
-        header, 34, "NINT output size");
+        header, shape_offset + 16, "NINT output size");
     const auto groups = read_scalar<std::uint32_t>(
-        header, 38, "NINT group count");
+        header, shape_offset + 20, "NINT group count");
+    const bool shape_valid = dimensions == 3
+        ? read_scalar<std::int64_t>(header, 18, "NINT experts") == expected_experts
+            && shape_rows == rows_per_expert
+            && std::int64_t(expected_experts) * rows_per_expert == expected_rows
+        : shape_rows == expected_rows;
     const bool adaptive_storage = (raw_bits & 0x80) != 0;
     const int q_bits = raw_bits & 0x7f;
     if (q_bits < 1
         || q_bits > 8 || nominal_sub_bits < 1
         || nominal_sub_bits > 8 || group_size <= 0 || axis != 0
-        || dimensions != 2 || columns != expected_columns
-        || shape_rows != expected_rows || shape_columns != expected_columns
+        || !shape_valid || columns != expected_columns
+        || shape_columns != expected_columns
         || rows != static_cast<std::uint32_t>(expected_rows)
         || groups != static_cast<std::uint32_t>(
-            (expected_columns + group_size - 1) / group_size)) {
+            (expected_columns - 1) / group_size + 1)) {
         throw std::runtime_error(
             "unsupported streamed NINTv2 geometry: " + name);
     }
@@ -7158,9 +7629,14 @@ MfeNintStreamLayout parse_streamed_nint_layout(
     result.q_bits = q_bits;
     result.nominal_sub_bits = nominal_sub_bits;
     result.adaptive_storage = adaptive_storage;
-    result.header = header;
+    result.header.assign(header.begin(), header.begin() + 18);
+    patch_scalar_bytes<std::uint32_t>(result.header, 14, 2, "NINT matrix rank");
+    append_scalar_bytes<std::int64_t>(result.header, expected_rows);
+    append_scalar_bytes<std::int64_t>(result.header, expected_columns);
+    append_scalar_bytes<std::uint32_t>(result.header, rows);
+    append_scalar_bytes<std::uint32_t>(result.header, groups);
     result.payload_offset = payload_offset;
-    result.anchor_scale_offset = payload_offset + kHeaderBytes;
+    result.anchor_scale_offset = payload_offset + header.size();
     result.anchor_min_offset = result.anchor_scale_offset
         + static_cast<std::uint64_t>(expected_rows) * 2;
     std::uint64_t cursor = result.anchor_min_offset
@@ -7855,7 +8331,7 @@ struct MfeGroupTask {
 struct MlxMfeOffloadCache::Impl {
     MfeGroupTask prepare_grouped(const std::string& name,
         const std::vector<std::int32_t>& active_experts,
-        std::span<const std::uint32_t> activation_counts);
+        std::span<const std::uint32_t> activation_counts, bool prefill_scan);
     struct Key {
         std::string name;
         std::int32_t expert = 0;
@@ -7888,20 +8364,25 @@ struct MlxMfeOffloadCache::Impl {
     struct MfeCachedExpert {
         MfeCachedExpert(
             std::int32_t global,
-            MlxMfeWeight value)
+            MlxMfeWeight value,
+            bool temporary = false)
             : expert(global),
               weight(std::move(value)),
-              packed_nbytes(weight.packed_nbytes()) {}
+              packed_nbytes(weight.packed_nbytes()),
+              transient(temporary) {}
 
         std::int32_t expert = 0;
         MlxMfeWeight weight;
         std::size_t packed_nbytes = 0;
+        bool transient = false;
     };
 
     struct MfeCacheValue {
         Key key;
         std::shared_ptr<const MfeCachedExpert> weight;
         std::uint8_t credit = 0;
+        std::shared_ptr<void> pin;
+        bool pin_attempted = false;
     };
 
     struct PreparedProjection {
@@ -7913,6 +8394,11 @@ struct MlxMfeOffloadCache::Impl {
         bool complete = false;
         std::optional<PreparedProjection> result;
         std::vector<std::shared_ptr<const MfeCachedExpert>> pages;
+    };
+
+    struct PinRequest {
+        Key key;
+        std::weak_ptr<const MfeCachedExpert> page;
     };
 
     using MfeProjectionCache = std::unordered_map<
@@ -7935,6 +8421,7 @@ struct MlxMfeOffloadCache::Impl {
             throw std::invalid_argument(
                 "MFE offload expert count cannot be negative");
         }
+        PackedCopyPrimitive(mlx::core::default_stream(mlx::core::Device::gpu), Shape{1}, {}).prepare_gpu();
         resources.bind([this] {
             std::lock_guard lock(mutex);
             std::size_t payload = 0;
@@ -7943,10 +8430,132 @@ struct MlxMfeOffloadCache::Impl {
         });
     }
 
+    ~Impl() {
+        {
+            std::lock_guard lock(pin_mutex);
+            pin_stopping = true;
+            pin_queue.clear();
+        }
+        pin_ready.notify_one();
+        if (pin_worker.joinable()) pin_worker.join();
+    }
+
+    bool enqueue_pin(const Key& key, const std::shared_ptr<const MfeCachedExpert>& page) noexcept {
+        if (page->packed_nbytes < (std::size_t{64} << 10)) return true;
+        try {
+            std::lock_guard lock(pin_mutex);
+            if (pin_queue.size() >= 64 || pin_stopping) return false;
+            if (!pin_worker.joinable()) pin_worker = std::thread([this] { pin_loop(); });
+            pin_queue.push_back({key, page});
+            pin_ready.notify_one();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void pin_loop() {
+        for (;;) {
+            PinRequest request;
+            {
+                std::unique_lock lock(pin_mutex);
+                pin_ready.wait(lock, [&] { return pin_stopping || !pin_queue.empty(); });
+                if (pin_stopping) return;
+                request = std::move(pin_queue.front());
+                pin_queue.pop_front();
+            }
+            std::shared_ptr<const MfeCachedExpert> page;
+            {
+                std::lock_guard lock(mutex);
+                const auto cached = mfe_cache.find(request.key);
+                page = request.page.lock();
+                if (!page || cached == mfe_cache.end() || cached->second->weight != page) continue;
+            }
+            auto pin = page->weight.pin_packed_storage();
+            {
+                std::lock_guard lock(mutex);
+                const auto cached = mfe_cache.find(request.key);
+                if (cached != mfe_cache.end() && cached->second->weight == page)
+                    cached->second->pin = std::move(pin);
+            }
+        }
+    }
+
+    static std::shared_ptr<const MfeStreamProjection> make_projection(
+        int projection_experts, int rows_per_expert, int columns,
+        std::vector<std::optional<MfeStreamExpertLocation>> locations) {
+        auto profile = std::make_shared<MlxMfeKernelProfile>();
+        profile->nint_q_dispatch = true;
+        std::vector<int> group_sizes;
+        std::unordered_set<const MfeStreamPool*> visited;
+        for (const auto& location : locations) {
+            const auto& pool = *location->pool;
+            if (!visited.insert(&pool).second) continue;
+            if (const auto* nint = std::get_if<MfeNintStreamLayout>(&pool.layout)) {
+                profile->family_mask |= 1u << kFamilyNint;
+                group_sizes.push_back(nint->group_size);
+                if (nint->adaptive_storage) {
+                    for (std::size_t first = 0; first < nint->q_selectors.size(); first += rows_per_expert) {
+                        const auto q = nint->q_selectors[first] + 1u;
+                        profile->nint_q_dispatch &= q == 4u || q == 5u || q == 6u || q == 8u;
+                        for (std::size_t row = 1; profile->nint_q_dispatch && row < rows_per_expert; ++row)
+                            profile->nint_q_dispatch &= nint->q_selectors[first + row] == nint->q_selectors[first];
+                    }
+                } else {
+                    profile->nint_q_dispatch &= nint->q_bits == 4 || nint->q_bits == 5
+                        || nint->q_bits == 6 || nint->q_bits == 8;
+                }
+            } else if (const auto* mx = std::get_if<MfeMxStreamLayout>(&pool.layout)) {
+                profile->family_mask |= 1u << (mx->bits == 4 ? kFamilyMxfp4 : kFamilyMxfp8);
+            } else {
+                const auto& vq = std::get<MfeNvqJscStreamLayout>(pool.layout);
+                profile->family_mask |= 1u << kFamilyVq;
+                profile->vq_profile_mask |= 1u << vq.decoder_profile;
+                profile->vq_layouts |= std::uint64_t{1}
+                    << (vq.decoder_profile * 7 + vq.execution_layout);
+                profile->vq_execution_layout |= vq.execution_layout != 0;
+            }
+        }
+        std::sort(group_sizes.begin(), group_sizes.end());
+        group_sizes.erase(std::unique(group_sizes.begin(), group_sizes.end()), group_sizes.end());
+        profile->nint_group_sizes = std::make_shared<const std::vector<int>>(std::move(group_sizes));
+        return std::make_shared<MfeStreamProjection>(MfeStreamProjection{
+            projection_experts, rows_per_expert, columns, std::move(locations), std::move(profile)});
+    }
+
+    std::shared_ptr<const MfeStreamProjection> parse_nint_projection(const std::string& name) {
+        const auto& record = model.record(name);
+        if (record.nbytes < 50)
+            throw std::runtime_error("truncated streamed NINT expert header: " + name);
+        const auto header = model.read_range(name, 0, 50);
+        const auto count = read_scalar<std::int64_t>(header, 18, "NINT expert count");
+        const auto output = read_scalar<std::int64_t>(header, 26, "NINT expert output");
+        const auto input = read_scalar<std::int64_t>(header, 34, "NINT expert input");
+        const auto limit = std::numeric_limits<int>::max();
+        if (read_scalar<std::uint32_t>(header, 14, "NINT rank") != 3
+            || count <= 0 || count > limit || (experts > 0 && count != experts)
+            || output <= 0 || output > limit || input <= 0 || input > limit
+            || count > limit / output)
+            throw std::runtime_error("invalid streamed NINT expert geometry: " + name);
+        auto pool = std::make_shared<MfeStreamPool>();
+        pool->dtype = std::string(mfq::canonical_format_dtype(record.dtype));
+        pool->expert_count = static_cast<int>(count);
+        pool->payload_bytes = record.nbytes;
+        pool->layout = parse_streamed_nint_layout(model, name, 0, record.nbytes,
+            static_cast<int>(count * output), static_cast<int>(input),
+            static_cast<int>(output), static_cast<int>(count));
+        std::vector<std::optional<MfeStreamExpertLocation>> locations(static_cast<std::size_t>(count));
+        for (int expert = 0; expert < count; ++expert)
+            locations[expert] = MfeStreamExpertLocation{pool, expert};
+        return make_projection(static_cast<int>(count), static_cast<int>(output),
+            static_cast<int>(input), std::move(locations));
+    }
+
     std::shared_ptr<const MfeStreamProjection>
     parse_mfe_projection(
         const std::string& name) {
         const auto& record = model.record(name);
+        if (is_nint_dtype(record.dtype)) return parse_nint_projection(name);
         if (record.dtype != "MFE") {
             throw MfeStreamUnsupported(
                 "expert record is not MFE: " + name);
@@ -8133,49 +8742,8 @@ struct MlxMfeOffloadCache::Impl {
                 "streamed MFE pools do not exactly cover the record: "
                 + name);
         }
-        auto profile = std::make_shared<MlxMfeKernelProfile>();
-        profile->nint_q_dispatch = true;
-        std::vector<int> group_sizes;
-        std::unordered_set<const MfeStreamPool*> visited;
-        for (const auto& location : locations) {
-            const auto& pool = *location->pool;
-            if (!visited.insert(&pool).second) continue;
-            if (const auto* nint = std::get_if<MfeNintStreamLayout>(&pool.layout)) {
-                profile->family_mask |= 1u << kFamilyNint;
-                group_sizes.push_back(nint->group_size);
-                if (nint->adaptive_storage) {
-                    for (std::size_t first = 0; first < nint->q_selectors.size(); first += rows_per_expert) {
-                        const auto q = nint->q_selectors[first] + 1u;
-                        profile->nint_q_dispatch &= q == 4u || q == 5u || q == 6u || q == 8u;
-                        for (std::size_t row = 1; profile->nint_q_dispatch && row < rows_per_expert; ++row)
-                            profile->nint_q_dispatch &= nint->q_selectors[first + row] == nint->q_selectors[first];
-                    }
-                } else {
-                    profile->nint_q_dispatch &= nint->q_bits == 4 || nint->q_bits == 5
-                        || nint->q_bits == 6 || nint->q_bits == 8;
-                }
-            } else if (const auto* mx = std::get_if<MfeMxStreamLayout>(&pool.layout)) {
-                profile->family_mask |= 1u << (mx->bits == 4 ? kFamilyMxfp4 : kFamilyMxfp8);
-            } else {
-                const auto& vq = std::get<MfeNvqJscStreamLayout>(pool.layout);
-                profile->family_mask |= 1u << kFamilyVq;
-                profile->vq_profile_mask |= 1u << vq.decoder_profile;
-                profile->vq_layouts |= std::uint64_t{1}
-                    << (vq.decoder_profile * 7 + vq.execution_layout);
-                profile->vq_execution_layout |= vq.execution_layout != 0;
-            }
-        }
-        std::sort(group_sizes.begin(), group_sizes.end());
-        group_sizes.erase(std::unique(group_sizes.begin(), group_sizes.end()), group_sizes.end());
-        profile->nint_group_sizes = std::make_shared<const std::vector<int>>(std::move(group_sizes));
-        return std::make_shared<MfeStreamProjection>(
-            MfeStreamProjection{
-                projection_experts,
-                static_cast<int>(rows_per_expert),
-                static_cast<int>(columns),
-                std::move(locations),
-                std::move(profile),
-            });
+        return make_projection(projection_experts, static_cast<int>(rows_per_expert),
+            static_cast<int>(columns), std::move(locations));
     }
 
     std::shared_ptr<const MfeStreamProjection>
@@ -8194,8 +8762,9 @@ struct MlxMfeOffloadCache::Impl {
         const std::string& name,
         const MfeStreamProjection& projection,
         const MfeStreamExpertLocation& location,
-        MfeReadCounters* reads = nullptr) {
+        MfeReadCounters* reads = nullptr, MfeReadPlan* plan = nullptr) {
         MfeReadScope observation(reads);
+        MfeReadPlanScope planned(plan);
         const auto& runtime = location.pool->runtime;
         MfeReadBytes blob;
         const auto prefix_bytes = std::visit([](const auto& layout) {
@@ -8258,16 +8827,32 @@ struct MlxMfeOffloadCache::Impl {
     std::unordered_map<std::string, PreparedProjection> prepared;
     std::unordered_map<std::string,
         std::vector<std::shared_ptr<const MfeCachedExpert>>> resident_pages;
+    std::unordered_map<std::string, std::shared_ptr<const MlxMfeCachedProjection>> cached_views;
+    std::size_t page_generation = 0;
+    std::unordered_map<std::string, std::uint8_t> route_confidence;
     std::unordered_map<std::string, std::shared_ptr<InFlight>> loading;
     std::condition_variable loaded;
     std::size_t epoch = 0;
     MlxMfeCacheReuseStats stats;
+    std::mutex pin_mutex;
+    std::condition_variable pin_ready;
+    std::deque<PinRequest> pin_queue;
+    bool pin_stopping = false;
+    std::thread pin_worker;
 
     void drop_prepared(const std::string& name) {
         const auto found = prepared.find(name);
         if (found == prepared.end()) return;
         resident_bytes -= found->second.weight.packed_nbytes();
         prepared.erase(found);
+    }
+
+    void drop_cached_view(const std::string& name) {
+        ++page_generation;
+        if (const auto found = cached_views.find(name); found != cached_views.end()) {
+            resident_bytes -= found->second->metadata_bytes;
+            cached_views.erase(found);
+        }
     }
 
     void trim() {
@@ -8280,6 +8865,7 @@ struct MlxMfeOffloadCache::Impl {
                 mfe_lru.splice(mfe_lru.end(), mfe_lru, victim);
                 continue;
             }
+            drop_cached_view(victim->key.name);
             resident_bytes -= victim->weight->packed_nbytes;
             resident_pages.at(victim->key.name)[victim->key.expert].reset();
             ++stats.evictions;
@@ -8339,9 +8925,13 @@ void MlxMfeOffloadCache::prepare_projection(
         projection = impl_->mfe_projection_locked(name);
     }
     preparation->collect([&] {
+        preparation->add(packed_expert_copy({empty_packed_array(mlx::core::uint8)},
+            {{PackedCopySpec{0, 0, 0, 1}}}, 1));
         const auto blob = impl_->load_mfe_expert_blob(
             name, *projection, *projection->experts_by_id.front());
         const auto weight = MlxMfeWeight::from_blob(blob)
+            .with_kernel_profile(projection->kernel_profile);
+        const auto indirect = MlxMfeWeight::concatenate_expert_pages({weight, weight}, projection->kernel_profile)
             .with_kernel_profile(projection->kernel_profile);
         const int routes = preparation->routes();
         for (const int rows : {1, 2, 3, 4, 5, 6, 8}) {
@@ -8353,11 +8943,69 @@ void MlxMfeOffloadCache::prepare_projection(
                 preparation->add(fused_swiglu
                     ? weight.routed_swiglu(input, ids, 0.0f, groups)
                     : weight.routed_matmul(input, ids, groups));
+                preparation->add(fused_swiglu
+                    ? indirect.routed_swiglu(input, ids, 0.0f, groups)
+                    : indirect.routed_matmul(input, ids, groups));
             };
             add(nullptr);
             if (rows > 1 && rows <= 24) {
                 const auto groups = mlx::core::zeros(Shape{rows, routes, 8}, mlx::core::int32);
                 add(&groups);
+            }
+        }
+        const auto maximum_rows = *std::max_element(preparation->row_buckets().begin(),
+            preparation->row_buckets().end());
+        if (maximum_rows < 32 || !indirect.supports_grouped_mmq()
+            || !uses_indirect_expert_pages(projection->kernel_profile->family_mask)) return;
+        for (const int block_rows : {32, 48, 64, 80, 96, 128}) {
+            for (const int rows : {32, maximum_rows}) {
+                const auto ids = mlx::core::zeros(Shape{rows, routes}, mlx::core::int32);
+                const auto order = mlx::core::arange(rows * routes, mlx::core::int32);
+                const auto experts = mlx::core::arange(projection->experts, mlx::core::int32);
+                preparation->add(make_grouped_mmq_plan(ids, order, experts,
+                    projection->experts, block_rows).block_meta);
+            }
+        }
+        const auto& profile = *projection->kernel_profile;
+        std::vector<std::tuple<int, int, int>> cohorts;
+        for (int family = 0; family < 7; ++family) {
+            if (!(profile.family_mask & (1u << family))) continue;
+            if (family == kFamilyNint && profile.nint_group_sizes && !profile.nint_group_sizes->empty()) {
+                for (const int group : *profile.nint_group_sizes) cohorts.emplace_back(1 << family, group, 1);
+            } else cohorts.emplace_back(1 << family, 0, 1);
+        }
+        const int width = fused_swiglu ? projection->out_per_expert / 2 : projection->out_per_expert;
+        for (const bool nax : {false, true}) {
+            if (nax && !mixed_grouped_nax_enabled(checked_int(checked_product(
+                    maximum_rows, routes, "prefill preparation routes"), "prefill preparation routes"))) continue;
+            for (const int block_rows : {32, 48, 64, 80, 96, 128}) {
+                if (!nax && (block_rows == 48 || block_rows == 128)) continue;
+                GroupedMmqConfig config{
+                    .output_shape = Shape{1, width},
+                    .block_rows = block_rows,
+                    .tile_columns = nax ? grouped_mmq_tile_columns(block_rows, width, fused_swiglu) : 64,
+                    .experts = 1,
+                    .output_width = width,
+                    .matrix_output_width = projection->out_per_expert,
+                    .input_width = projection->neuron_len,
+                    .fused_swiglu = static_cast<int>(fused_swiglu),
+                    .family_mask = static_cast<int>(profile.family_mask),
+                    .vq_profile_mask = static_cast<int>(profile.vq_profile_mask),
+                    .nint_group_sizes = profile.nint_group_sizes,
+                    .use_nax = nax,
+                    .indirect_pages = true,
+                };
+                preparation->add(grouped_mmq_dispatch({}, config));
+                if (!nax || fused_swiglu) continue;
+                for (std::size_t count = 2; count <= cohorts.size(); ++count) {
+                    auto passes = std::make_shared<const std::vector<std::tuple<int, int, int>>>(
+                        cohorts.begin(), cohorts.begin() + count);
+                    config.family_mask = 0;
+                    for (const auto& [family, group, population] : *passes) config.family_mask |= family;
+                    config.experts = static_cast<int>(count);
+                    config.cohort_populations = std::move(passes);
+                    preparation->add(grouped_mmq_dispatch({}, config));
+                }
             }
         }
     });
@@ -8480,7 +9128,8 @@ std::optional<std::vector<MlxMfeWeight>> MlxMfeOffloadCache::layer_mfe(
                 return read_record(names[index + 1], std::move(pending));
             });
         }
-        result.push_back(MlxMfeWeight::from_blob(storage));
+        result.push_back(is_nint_dtype(impl_->model.record(names[index]).dtype)
+            ? MlxMfeWeight::from_nint_blob(storage) : MlxMfeWeight::from_blob(storage));
         if (next.valid()) storage = next.get();
     }
     {
@@ -8495,7 +9144,7 @@ std::optional<std::vector<MlxMfeWeight>> MlxMfeOffloadCache::layer_mfe(
 MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     const std::string& name,
     const std::vector<std::int32_t>& active_experts,
-    std::span<const std::uint32_t> activation_counts) {
+    std::span<const std::uint32_t> activation_counts, bool prefill_scan) {
     auto* const impl_ = this;
     if (active_experts.empty())
         throw std::invalid_argument("streamed MFE active expert set cannot be empty");
@@ -8504,26 +9153,36 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     if (std::any_of(activation_counts.begin(), activation_counts.end(),
         [](auto count) { return count == 0; }))
         throw std::invalid_argument("MFE activation counts must be positive");
+    std::optional<MlxResidentBudgetHold> staging;
+    std::vector<std::shared_ptr<const Impl::MfeCachedExpert>> protected_pages;
+    std::optional<std::size_t> admission_epoch;
     if (MlxResidentBudgetScope::enabled()) {
         std::size_t working_bytes = 0;
-        bool missing = false;
         {
             std::lock_guard lock(impl_->mutex);
+            admission_epoch = impl_->epoch;
             const auto projection = impl_->mfe_projection_locked(name);
+            protected_pages.reserve(std::min(active_experts.size(), static_cast<std::size_t>(projection->experts)));
+            const bool indirect_pages = uses_indirect_expert_pages(projection->kernel_profile->family_mask);
+            if (indirect_pages) working_bytes = std::size_t{3} * getpagesize();
             std::unordered_set<std::int32_t> seen;
             for (const auto expert : active_experts) {
                 if (!seen.insert(expert).second) continue;
                 if (expert < 0 || expert >= projection->experts || !projection->experts_by_id[expert])
                     throw std::out_of_range("streamed MFE expert is unavailable");
-                missing |= impl_->mfe_cache.find({name, expert}) == impl_->mfe_cache.end();
-                const auto& pool = projection->experts_by_id[expert]->pool;
-                const auto prefix = std::get_if<MfeNvqJscStreamLayout>(&pool->layout);
-                const auto payload = checked_range_product(projection->out_per_expert, projection->neuron_len, "expert working elements") * 2;
-                working_bytes = checked_add(working_bytes, checked_add(payload,
-                    pool->runtime_bytes + (prefix ? prefix->prefix_bytes : 0) + 256, "expert working payload"), "active expert working set");
+                const auto cached = impl_->mfe_cache.find({name, expert});
+                const bool missing = cached == impl_->mfe_cache.end();
+                if (!missing) protected_pages.push_back(cached->second->weight);
+                const auto bytes = missing
+                    ? streamed_expert_storage_bound(*projection, *projection->experts_by_id[expert])
+                    : indirect_pages ? sizeof(std::int32_t) * (kDescriptorSize + 1)
+                        + 21 * sizeof(std::uint64_t) : cached->second->weight->packed_nbytes;
+                const auto copies = missing ? std::size_t{5} : std::size_t{1};
+                working_bytes = checked_add(working_bytes, checked_product(bytes, copies,
+                    "expert packed staging"), "active expert working set");
             }
         }
-        if (missing) MlxResidentBudgetScope::reserve(checked_add(working_bytes, working_bytes, "expert CPU and GPU staging"));
+        staging.emplace(working_bytes);
     }
     std::unique_lock lock(impl_->mutex);
     std::shared_ptr<Impl::InFlight> completed;
@@ -8566,11 +9225,15 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     impl_->backing_records.emplace(name, impl_->model.record(name).nbytes);
 
     const auto touch = [&](const Impl::Key& key, bool hit) {
+        if (prefill_scan) return;
         const auto cached = impl_->mfe_cache.find(key);
         if (cached == impl_->mfe_cache.end()) return;
         auto& value = *cached->second;
         value.credit = static_cast<std::uint8_t>(std::min<unsigned>(3,
             value.credit + counts.at(key.expert) - (hit ? 0 : 1)));
+        if (hit && value.credit >= 2 && !value.pin_attempted) {
+            value.pin_attempted = impl_->enqueue_pin(key, value.weight);
+        }
         impl_->mfe_lru.splice(impl_->mfe_lru.end(), impl_->mfe_lru, cached->second);
     };
     const auto reuse_packed = [&](const Impl::PreparedProjection& packed)
@@ -8606,6 +9269,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
         std::int32_t expert = 0;
         MfeReadCounters reads;
         double prepare_seconds = 0;
+        std::optional<array> destination;
     };
     std::vector<ActivePage> pages;
     pages.reserve(ordered_keys.size());
@@ -8615,6 +9279,12 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
         const auto cached = impl_->mfe_cache.find(key);
         if (cached != impl_->mfe_cache.end()) {
             pages.push_back({key, cached->second->weight, false});
+            ++impl_->stats.expert_hits;
+            continue;
+        }
+        if (const auto protected_page = std::find_if(protected_pages.begin(), protected_pages.end(),
+                [&](const auto& page) { return page->expert == key.expert; }); protected_page != protected_pages.end()) {
+            pages.push_back({key, *protected_page, false});
             ++impl_->stats.expert_hits;
             continue;
         }
@@ -8634,8 +9304,13 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
 
     std::vector<std::shared_ptr<const Impl::MfeCachedExpert>> bank_pages;
     std::size_t bank_bytes = 0;
+    const bool indirect_pages = uses_indirect_expert_pages(projection->kernel_profile->family_mask);
+    if (!prefill_scan) {
+        auto& confidence = impl_->route_confidence[name];
+        confidence = pending.empty() ? static_cast<std::uint8_t>(std::min<unsigned>(15, confidence + 1)) : 0;
+    }
     const auto resident = impl_->resident_pages.find(name);
-    if (pending.empty() && resident != impl_->resident_pages.end()) {
+    if (!indirect_pages && pending.empty() && resident != impl_->resident_pages.end()) {
         for (const auto& page : resident->second) {
             if (!page) continue;
             bank_pages.push_back(page);
@@ -8643,7 +9318,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
                 "prepared MFE expert bytes");
         }
     }
-    if (pending.empty()) {
+    if (!indirect_pages && pending.empty()) {
         for (const auto& page : pages) {
             if (impl_->mfe_cache.contains(page.key)) continue;
             bank_pages.push_back(page.value);
@@ -8653,7 +9328,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     }
     const auto spare = impl_->cache_limit - std::min(impl_->cache_limit, impl_->resident_bytes);
     bool prepare = pending.empty() && bank_pages.size() > 1 && bank_bytes <= spare;
-    const auto epoch = impl_->epoch;
+    const auto epoch = admission_epoch.value_or(impl_->epoch);
     auto in_flight = std::make_shared<Impl::InFlight>();
     impl_->loading.emplace(name, in_flight);
     struct FinishLoading {
@@ -8674,15 +9349,95 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
         if (prepare) MlxResidentBudgetScope::reserve(bank_bytes);
     }
     if (!prepare) bank_pages.clear();
-    if (!pending.empty()) co_yield MfeGroupWork{pending.size(),
+    std::optional<array> transient_arena;
+    if (prefill_scan && pending.size() > 1 && !mlx_reference_enabled()) {
+        std::vector<std::size_t> offsets{0};
+        for (const auto& request : pending) {
+            const auto bytes = streamed_expert_storage_bound(*projection,
+                *projection->experts_by_id[request.expert]);
+            offsets.push_back(checked_add(checked_add(offsets.back(), bytes,
+                "prefill expert arena"), 15, "prefill expert alignment") & ~std::size_t{15});
+        }
+        if (offsets.back() > spare && offsets.back() <= std::size_t(std::numeric_limits<int>::max())) {
+            transient_arena = offsets.back() >= (std::size_t{64} << 10)
+                ? allocate_wire_array(offsets.back())
+                : allocate_packed_array(offsets.back(), mlx::core::uint8);
+            for (std::size_t index = 0; index < pending.size(); ++index) {
+                auto view = array(Shape{static_cast<int>(offsets[index + 1] - offsets[index])}, mlx::core::uint8, nullptr, {});
+                view.copy_shared_buffer(*transient_arena, view.strides(), view.flags(), view.size(), offsets[index]);
+                view.set_status(array::Status::available);
+                pending[index].destination.emplace(std::move(view));
+            }
+            pooled_expert_staging.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (prefill_scan && pending.size() > 1) {
+        std::vector<std::size_t> read_order(pending.size());
+        std::iota(read_order.begin(), read_order.end(), 0);
+        std::sort(read_order.begin(), read_order.end(), [&](auto a, auto b) {
+            const auto& left = *projection->experts_by_id[pending[a].expert];
+            const auto& right = *projection->experts_by_id[pending[b].expert];
+            return std::tie(left.pool->payload_offset, left.local_expert)
+                < std::tie(right.pool->payload_offset, right.local_expert);
+        });
+        std::vector<std::vector<std::size_t>> batches;
+        std::size_t batch_bytes = 0;
+        for (const auto index : read_order) {
+            const auto& location = *projection->experts_by_id[pending[index].expert];
+            const auto bytes = streamed_expert_storage_bound(*projection, location);
+            const auto* previous = batches.empty() ? nullptr
+                : &*projection->experts_by_id[pending[batches.back().back()].expert];
+            if (!previous || previous->pool != location.pool
+                || previous->local_expert + 1 != location.local_expert
+                || bytes > (std::size_t{8} << 20) - std::min(batch_bytes, std::size_t{8} << 20)) {
+                batches.emplace_back();
+                batch_bytes = 0;
+            }
+            batches.back().push_back(index);
+            batch_bytes += bytes;
+        }
+        co_yield MfeGroupWork{batches.size(),
+            [&](std::int64_t begin, std::int64_t end) {
+                for (auto batch_index = begin; batch_index < end; ++batch_index) {
+                    const auto& batch = batches[batch_index];
+                    const auto started = std::chrono::steady_clock::now();
+                    std::vector<MfeReadBytes> wire;
+                    std::vector<MfeReadPlan> plans(batch.size());
+                    wire.reserve(batch.size());
+                    auto& reads = pending[batch.front()].reads;
+                    for (std::size_t index = 0; index < batch.size(); ++index) {
+                        const auto& location = *projection->experts_by_id[pending[batch[index]].expert];
+                        wire.push_back(impl_->load_mfe_expert_blob(name, *projection, location, &reads,
+                            batch.size() > 1 ? &plans[index] : nullptr));
+                    }
+                    if (batch.size() > 1) {
+                        MfeReadScope observation(&reads);
+                        read_mfe_batch(impl_->model, name, wire, plans);
+                    }
+                    for (std::size_t index = 0; index < batch.size(); ++index) {
+                        auto& request = pending[batch[index]];
+                        const std::array blobs{std::span<const std::uint8_t>(wire[index])};
+                        pages[request.page].value = std::make_shared<Impl::MfeCachedExpert>(
+                            request.expert, request.destination
+                                ? MlxMfeWeight::from_projection_blobs_impl(blobs, false, nullptr, &*request.destination)
+                                : MlxMfeWeight::from_blob(wire[index]), request.destination.has_value());
+                    }
+                    pending[batch.front()].prepare_seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - started).count() - reads.seconds;
+                }
+            }};
+    } else if (!pending.empty()) co_yield MfeGroupWork{pending.size(),
         [&](std::int64_t begin, std::int64_t end) {
             for (auto index = begin; index < end; ++index) {
                 auto& request = pending[index];
                 const auto& location = *projection->experts_by_id[request.expert];
                 const auto started = std::chrono::steady_clock::now();
                 const auto blob = impl_->load_mfe_expert_blob(name, *projection, location, &request.reads);
+                const std::array blobs{std::span<const std::uint8_t>(blob)};
                 pages[request.page].value = std::make_shared<Impl::MfeCachedExpert>(
-                    request.expert, MlxMfeWeight::from_blob(blob));
+                    request.expert, request.destination
+                        ? MlxMfeWeight::from_projection_blobs_impl(blobs, false, nullptr, &*request.destination)
+                        : MlxMfeWeight::from_blob(blob), request.destination.has_value());
                 request.prepare_seconds = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - started).count() - request.reads.seconds;
             }
@@ -8695,6 +9450,9 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
         weights.push_back(page.value->weight);
     }
     std::optional<Impl::PreparedProjection> bank;
+    const auto assemble = [&](const std::vector<MlxMfeWeight>& values) {
+        return MlxMfeWeight::concatenate_expert_pages(values, projection->kernel_profile);
+    };
     if (prepare) {
         std::vector<MlxMfeWeight> bank_weights;
         bank_weights.reserve(bank_pages.size());
@@ -8704,17 +9462,17 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
             bank_weights.push_back(page->weight);
         }
         bank.emplace(Impl::PreparedProjection{
-            MlxMfeWeight::concatenate_experts(bank_weights)
+            assemble(bank_weights)
                 .with_kernel_profile(projection->kernel_profile), std::move(local)});
     }
     auto result = [&] {
-        if (!bank) return MlxMfeWeight::concatenate_experts(weights)
+        if (!bank) return assemble(weights)
             .with_kernel_profile(projection->kernel_profile);
         std::vector<std::int32_t> local;
         for (const auto& key : ordered_keys) local.push_back(bank->local_ids.at(key.expert));
         return bank->weight.select_experts(local);
     }();
-    if (!bank && pages.size() > 1) {
+    if (!bank && pages.size() > 1 && !indirect_pages) {
         std::unordered_map<std::int32_t, std::int32_t> local;
         for (std::size_t index = 0; index < pages.size(); ++index)
             local.emplace(pages[index].key.expert, static_cast<std::int32_t>(index));
@@ -8740,6 +9498,10 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
     impl_->stats.expert_loads += pending.size();
     if (epoch != impl_->epoch) co_return result;
 
+    if (std::any_of(pages.begin(), pages.end(), [&](const auto& page) {
+        return !page.value->transient && !impl_->mfe_cache.contains(page.key);
+    })) impl_->drop_cached_view(name);
+
     impl_->mfe_cache.reserve(checked_add(
         impl_->mfe_cache.size(),
         static_cast<std::size_t>(std::count_if(
@@ -8747,13 +9509,15 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
             [](const auto& page) { return page.staged; })),
         "resident MFE cache entries"));
     for (const auto& page : pages) {
+        if (page.value->transient) continue;
         if (impl_->mfe_cache.contains(page.key)) continue;
         auto& by_id = impl_->resident_pages[name];
         if (by_id.empty()) by_id.resize(projection->experts);
         const auto bytes = checked_add(impl_->resident_bytes,
             page.value->packed_nbytes, "resident MFE expert bytes");
-        impl_->mfe_lru.push_back({page.key, page.value});
-        const auto inserted = std::prev(impl_->mfe_lru.end());
+        const auto inserted = prefill_scan
+            ? impl_->mfe_lru.insert(impl_->mfe_lru.begin(), {page.key, page.value})
+            : impl_->mfe_lru.insert(impl_->mfe_lru.end(), {page.key, page.value});
         try {
             if (!impl_->mfe_cache.emplace(inserted->key, inserted).second)
                 throw std::logic_error("duplicate staged MFE expert cache key");
@@ -8778,15 +9542,15 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
 MlxMfeWeight MlxMfeOffloadCache::grouped_mfe(
     const std::string& name,
     const std::vector<std::int32_t>& active_experts,
-    std::span<const std::uint32_t> activation_counts) {
+    std::span<const std::uint32_t> activation_counts, bool prefill_scan) {
     const std::array<std::string, 1> names{name};
-    return grouped_mfe(names, active_experts, activation_counts).front();
+    return grouped_mfe(names, active_experts, activation_counts, prefill_scan).front();
 }
 
 std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
     std::span<const std::string> names,
     const std::vector<std::int32_t>& active_experts,
-    std::span<const std::uint32_t> activation_counts) {
+    std::span<const std::uint32_t> activation_counts, bool prefill_scan) {
     if (names.empty()) throw std::invalid_argument("streamed MFE projections cannot be empty");
     std::unordered_set<std::string> unique;
     for (const auto& name : names)
@@ -8800,16 +9564,19 @@ std::vector<MlxMfeWeight> MlxMfeOffloadCache::grouped_mfe(
     std::sort(order.begin(), order.end(), [&](auto left, auto right) { return names[left] < names[right]; });
     tasks.reserve(names.size());
     for (const auto index : order) {
-        tasks.push_back(impl_->prepare_grouped(names[index], active_experts, activation_counts));
+        tasks.push_back(impl_->prepare_grouped(names[index], active_experts, activation_counts, prefill_scan));
         tasks.back().resume();
         if (auto& work = tasks.back().handle.promise().work; work) {
             jobs.push_back(&*work);
             offsets.push_back(checked_add(offsets.back(), work->count, "MFE grouped expert tasks"));
         }
     }
+    const auto workers = std::max(1u, std::thread::hardware_concurrency());
+    // Prefill has wide CPU parsing work; small route sets mostly contend on
+    // the allocator's resource/residency lock once the I/O queue is saturated.
     impl_->io_workers.run(0, offsets.back(), 1,
         static_cast<int>(std::min(std::max<std::size_t>(1, offsets.back()),
-            std::size_t(std::max(1u, std::thread::hardware_concurrency())))),
+            std::size_t(prefill_scan ? workers : std::min(8u, workers)))),
         [&](std::int64_t begin, std::int64_t end) {
             while (begin < end) {
                 const auto index = std::upper_bound(offsets.begin(), offsets.end(),
@@ -8873,6 +9640,8 @@ void MlxMfeOffloadCache::discard_record(
     std::lock_guard lock(impl_->mutex);
     ++impl_->epoch;
     impl_->drop_prepared(name);
+    impl_->drop_cached_view(name);
+    impl_->route_confidence.erase(name);
     for (auto item = impl_->mfe_lru.begin();
          item != impl_->mfe_lru.end();) {
         if (item->key.name != name) {
@@ -8892,6 +9661,9 @@ void MlxMfeOffloadCache::clear() {
     std::lock_guard lock(impl_->mutex);
     ++impl_->epoch;
     impl_->prepared.clear();
+    impl_->cached_views.clear();
+    ++impl_->page_generation;
+    impl_->route_confidence.clear();
     impl_->resident_pages.clear();
     impl_->mfe_cache.clear();
     impl_->mfe_lru.clear();
@@ -8901,6 +9673,11 @@ void MlxMfeOffloadCache::clear() {
 
 struct MlxMfeWeight::Impl {
     array descriptors;
+    std::shared_ptr<const MfePageResources> page_resources;
+    std::optional<array> indirect_addresses;
+    std::vector<array> indirect_owners;
+    std::shared_ptr<const std::vector<MlxMfeWeight>> indirect_sources;
+    std::optional<array> packed_arena;
     array nint_q;
     array nint_sub_scale;
     array nint_sub_min;
@@ -9437,10 +10214,20 @@ MlxMfeWeight MlxMfeWeight::from_nint_blob(
     return from_projection_blobs_impl(blobs, true);
 }
 
+MlxMfeWeight MlxMfeWeight::from_nint_blob(const array& blob) {
+    if (blob.dtype() != mlx::core::uint8 || !blob.flags().row_contiguous)
+        throw std::invalid_argument("NINT wire storage must be contiguous bytes");
+    auto storage = blob;
+    storage.eval();
+    const std::array blobs{std::span<const std::uint8_t>(storage.data<std::uint8_t>(), storage.nbytes())};
+    return from_projection_blobs_impl(blobs, true, &storage);
+}
+
 MlxMfeWeight MlxMfeWeight::from_projection_blobs_impl(
     std::span<const std::span<const std::uint8_t>> blobs,
     bool nint_tensor,
-    const array* storage) {
+    const array* storage,
+    const array* destination) {
     if (blobs.empty()) {
         throw std::invalid_argument("at least one MFE projection is required");
     }
@@ -9705,11 +10492,16 @@ MlxMfeWeight MlxMfeWeight::from_projection_blobs_impl(
         descriptor_rows,
         kDescriptorSize,
     };
-    std::optional<array> arena;
+    std::optional<array> arena = destination ? std::optional<array>(*destination) : std::nullopt;
     const auto stream_bytes = streams.size();
-    if (expert_count == 1 && !reference && stream_bytes > 0 && stream_bytes <= (std::size_t{8} << 20))
-        arena = allocate_packed_array(stream_bytes + 21 * 15, mlx::core::uint8);
-    std::size_t arena_offset = 0;
+    const auto descriptor_bytes = checked_product(descriptors.size(), sizeof(std::int32_t), "MFE descriptor bytes");
+    if (destination && (expert_count != 1 || reference || destination->dtype() != mlx::core::uint8
+        || !destination->is_available() || !destination->flags().row_contiguous
+        || destination->nbytes() < stream_bytes + 21 * 15 + descriptor_bytes + 15))
+        throw std::invalid_argument("MFE expert staging arena is too small or incompatible");
+    if (!destination && expert_count == 1 && !reference && stream_bytes > 0 && stream_bytes <= (std::size_t{8} << 20))
+        arena = allocate_packed_array(stream_bytes + 21 * 15 + descriptor_bytes + 15, mlx::core::uint8);
+    std::size_t arena_offset = arena ? descriptor_bytes : 0;
     const auto materialize = [&](PackedStream stream, Dtype dtype) {
         arena_offset = (arena_offset + 15) & ~std::size_t{15};
         const auto begin = arena_offset;
@@ -9719,7 +10511,7 @@ MlxMfeWeight MlxMfeWeight::from_projection_blobs_impl(
     auto impl = std::make_shared<Impl>(
         make_int32_array(
             descriptors,
-            descriptor_shape),
+            descriptor_shape, arena ? &*arena : nullptr),
         materialize(
             std::move(streams.nint_q),
             mlx::core::uint8),
@@ -9790,6 +10582,7 @@ MlxMfeWeight MlxMfeWeight::from_projection_blobs_impl(
         output_width,
         input_width,
         projection_count);
+    impl->packed_arena = arena;
     impl->reference_cohorts =
         std::move(reference_cohorts);
     impl->mxfp4_sq_cohorts =
@@ -9948,6 +10741,13 @@ MlxMfeWeight MlxMfeWeight::from_mxfp4_slots(
 
 MlxMfeWeight MlxMfeWeight::concatenate_projections(
     const std::vector<MlxMfeWeight>& weights) {
+    if (std::any_of(weights.begin(), weights.end(), [](const auto& weight) { return weight.impl_->indirect_sources != nullptr; })) {
+        std::vector<MlxMfeWeight> packed;
+        for (const auto& weight : weights)
+            packed.push_back(weight.impl_->indirect_sources
+                ? concatenate_experts(*weight.impl_->indirect_sources).with_kernel_profile(weight.impl_->kernel_profile) : weight);
+        return concatenate_projections(packed);
+    }
     if (weights.empty()) {
         throw std::invalid_argument(
             "at least one MFE projection is required");
@@ -10479,6 +11279,7 @@ MlxMfeWeight MlxMfeWeight::concatenate_experts(
         }
     }
 
+    if (weights.size() == 1) return weights.front();
     const int expert_count = checked_int(
         weights.size(),
         "resident expert count");
@@ -10744,9 +11545,68 @@ MlxMfeWeight MlxMfeWeight::concatenate_experts(
         }
     }
 
-    const auto concatenate_or_empty = [](
-        std::vector<array> values,
+    const std::array<const std::vector<array>*, 21> stream_arrays{&nint_q_arrays, &nint_sub_scale_arrays, &nint_sub_min_arrays,
+        &nint_anchor_scale_arrays, &nint_anchor_min_arrays, &q8_q_arrays, &q8_scale_arrays,
+        &vq_indices_arrays, &vq_state_arrays, &vq_aux_arrays, &vq_anchor_arrays,
+        &vq_codebook_arrays, &vq_scale_arrays, &vq_state_bank_arrays, &vq_bank_arrays,
+        &vq_parameter_arrays, &vq_residual_codebook_arrays, &vq_residual_first_arrays,
+        &vq_residual_second_arrays, &mx_value_arrays, &mx_scale_arrays};
+    std::vector<array> sources;
+    for (const auto& weight : weights) {
+        if (weight.impl_->packed_arena) sources.push_back(*weight.impl_->packed_arena);
+    }
+    const auto execution_arena = pack_expert_streams(std::move(sources), stream_arrays);
+    const auto host_stream_bytes = [](const std::vector<array>& values) {
+        if (values.size() < 2) return std::size_t{0};
+        const auto dtype = values.front().dtype();
+        const auto empty = empty_packed_array(dtype).data_shared_ptr();
+        bool all_empty = true;
+        std::size_t bytes = 0;
+        for (const auto& value : values) {
+            if (value.dtype() != dtype || !value.flags().row_contiguous || !value.is_available())
+                return std::size_t{0};
+            bytes = checked_add(bytes, value.nbytes(), "expert metadata bytes");
+            if (bytes > (std::size_t{128} << 10)) return std::size_t{0};
+            all_empty &= value.data_shared_ptr() == empty;
+        }
+        return all_empty ? std::size_t{0} : bytes;
+    };
+    std::size_t metadata_bytes = 0;
+    std::vector<std::pair<const std::vector<array>*, std::size_t>> metadata_streams;
+    for (const auto* values : stream_arrays) {
+        if (execution_arena) break;
+        const auto bytes = host_stream_bytes(*values);
+        if (!bytes) continue;
+        metadata_streams.emplace_back(values, bytes);
+        metadata_bytes = checked_add(metadata_bytes, bytes, "expert metadata arena");
+    }
+    const auto descriptor_bytes = checked_product(descriptors.size(), sizeof(std::int32_t), "expert descriptors");
+    std::optional<array> metadata_arena;
+    if (metadata_bytes)
+        metadata_arena = allocate_packed_array(metadata_bytes + descriptor_bytes + 22 * 15, mlx::core::uint8);
+    std::size_t metadata_offset = descriptor_bytes;
+    const auto concatenate_or_empty = [&](
+        std::vector<array>&& values,
         Dtype dtype) {
+        if (execution_arena) {
+            const auto found = std::find_if(execution_arena->streams.begin(), execution_arena->streams.end(),
+                [&](const auto& entry) { return entry.values == &values; });
+            if (found == execution_arena->streams.end()) return empty_packed_array(dtype);
+            return mlx::core::view(mlx::core::slice(execution_arena->storage,
+                {static_cast<int>(found->offset)}, {static_cast<int>(found->offset + found->bytes)}), dtype);
+        }
+        if (metadata_arena) {
+            const auto found = std::find_if(metadata_streams.begin(), metadata_streams.end(),
+                [&](const auto& entry) { return entry.first == &values; });
+            if (found != metadata_streams.end()) {
+                PackedStream stream;
+                for (auto& value : values) stream.append(std::move(value));
+                metadata_offset = (metadata_offset + 15) & ~std::size_t{15};
+                const auto begin = metadata_offset;
+                metadata_offset += found->second;
+                return std::move(stream).materialize(dtype, &*metadata_arena, begin);
+            }
+        }
         return values.empty()
             ? make_raw_array(
                   std::vector<std::uint8_t>{},
@@ -10756,7 +11616,7 @@ MlxMfeWeight MlxMfeWeight::concatenate_experts(
     auto impl = std::make_shared<Impl>(
         make_int32_array(
             descriptors,
-            Shape{expert_count, kDescriptorSize}),
+            Shape{expert_count, kDescriptorSize}, metadata_arena ? &*metadata_arena : nullptr),
         concatenate_or_empty(std::move(nint_q_arrays), mlx::core::uint8),
         concatenate_or_empty(
             std::move(nint_sub_scale_arrays), mlx::core::uint8),
@@ -10798,12 +11658,79 @@ MlxMfeWeight MlxMfeWeight::concatenate_experts(
         first.out_per_expert,
         first.neuron_len,
         1);
+    impl->has_generic_cohorts = std::all_of(weights.begin(), weights.end(),
+        [](const auto& weight) { return weight.impl_->has_generic_cohorts; });
+    if (execution_arena) impl->packed_arena = execution_arena->storage;
     impl->automatic_mxfp4_nax_prefill = std::all_of(
         weights.begin(),
         weights.end(),
         [](const MlxMfeWeight& weight) {
             return weight.impl_->automatic_mxfp4_nax_prefill;
         });
+    return MlxMfeWeight(std::move(impl));
+}
+
+MlxMfeWeight MlxMfeWeight::concatenate_expert_pages(const std::vector<MlxMfeWeight>& weights,
+    std::shared_ptr<const MlxMfeKernelProfile> profile) {
+    if (weights.empty() || mlx_reference_enabled()) return concatenate_experts(weights);
+    const auto streams = [](const Impl& value) {
+        return std::array<const array*, 21>{&value.nint_q, &value.nint_sub_scale, &value.nint_sub_min,
+            &value.nint_anchor_scale, &value.nint_anchor_min, &value.q8_q, &value.q8_scales,
+            &value.vq_indices, &value.vq_state, &value.vq_aux, &value.vq_anchors,
+            &value.vq_codebooks, &value.vq_scales, &value.vq_state_to_codebank, &value.vq_banks,
+            &value.vq_parameters, &value.vq_residual_codebooks, &value.vq_residual_first,
+            &value.vq_residual_second, &value.mx_values, &value.mx_scales};
+    };
+    const auto& first = *weights.front().impl_;
+    std::uint32_t families = 0;
+    for (const auto& weight : weights) {
+        const auto& value = *weight.impl_;
+        if (!value.native_primitive || value.projections != 1 || value.experts != 1
+            || value.out_per_expert != first.out_per_expert || value.neuron_len != first.neuron_len
+            || !value.reference_cohorts.empty() || !value.mxfp4_sq_cohorts.empty()
+            || !value.fp8_sq_cohorts.empty() || value.standalone_owner || value.indirect_sources)
+            return concatenate_experts(weights);
+        for (const auto* stream : streams(value))
+            if (!stream->is_available() || !stream->flags().row_contiguous) return concatenate_experts(weights);
+        families |= value.family_mask;
+    }
+    if (!uses_indirect_expert_pages(profile ? profile->family_mask : families)) return concatenate_experts(weights);
+    std::vector<std::int32_t> descriptors;
+    std::vector<std::uint64_t> addresses;
+    std::vector<array> owners;
+    std::unordered_set<const MTL::Buffer*> buffers;
+    std::vector<RotationSpec> rotations;
+    std::size_t bytes = 0;
+    for (const auto& weight : weights) {
+        const auto& value = *weight.impl_;
+        const auto begin = descriptors.size();
+        descriptors.insert(descriptors.end(), value.descriptor_values.begin(), value.descriptor_values.end());
+        const int variant = descriptors[begin + kVqRotationVariant];
+        if (variant) descriptors[begin + kVqRotationVariant] = rotation_variant(value.rotations.at(variant - 1), rotations);
+        for (const auto* stream : streams(value)) {
+            auto* buffer = static_cast<const MTL::Buffer*>(stream->buffer().ptr());
+            addresses.push_back(buffer->gpuAddress() + stream->offset());
+            if (buffers.insert(buffer).second) owners.push_back(*stream);
+        }
+        bytes = checked_add(bytes, weight.packed_nbytes(), "indirect expert bytes");
+    }
+    const int experts = checked_int(weights.size(), "indirect expert count");
+    auto impl = std::make_shared<Impl>(make_int32_array(descriptors, Shape{experts, kDescriptorSize}),
+        first.nint_q, first.nint_sub_scale, first.nint_sub_min, first.nint_anchor_scale, first.nint_anchor_min,
+        first.q8_q, first.q8_scales, first.vq_indices, first.vq_state, first.vq_aux, first.vq_anchors,
+        first.vq_codebooks, first.vq_scales, first.vq_state_to_codebank, first.vq_banks, first.vq_parameters,
+        first.vq_residual_codebooks, first.vq_residual_first, first.vq_residual_second,
+        first.mx_values, first.mx_scales, std::move(rotations), std::move(descriptors),
+        experts, first.out_per_expert, first.neuron_len, 1);
+    impl->indirect_addresses.emplace(addresses.begin(), Shape{experts, 21}, mlx::core::uint64);
+    impl->mxfp4_slot_ids.reset();
+    impl->mxfp4_slot_ids_sorted = false;
+    impl->indirect_owners = std::move(owners);
+    impl->indirect_sources = std::make_shared<const std::vector<MlxMfeWeight>>(weights);
+    impl->has_generic_cohorts = true;
+    impl->kernel_profile = std::move(profile);
+    impl->packed_bytes = checked_add(bytes, checked_add(impl->descriptors.nbytes(),
+        impl->indirect_addresses->nbytes(), "indirect expert metadata"), "indirect expert storage");
     return MlxMfeWeight(std::move(impl));
 }
 
@@ -10825,6 +11752,11 @@ MlxMfeWeight MlxMfeWeight::select_experts(
         values.insert(values.end(), first, first + kDescriptorSize);
     }
     if (identity) return *this;
+    if (impl_->indirect_sources) {
+        std::vector<MlxMfeWeight> pages;
+        for (const auto expert : experts) pages.push_back(impl_->indirect_sources->at(expert));
+        return concatenate_expert_pages(pages, impl_->kernel_profile);
+    }
     auto descriptors = make_int32_array(values,
         Shape{checked_int(experts.size(), "MFE view experts"), kDescriptorSize});
     auto impl = std::make_shared<Impl>(std::move(descriptors),
@@ -10838,15 +11770,136 @@ MlxMfeWeight MlxMfeWeight::select_experts(
         checked_int(experts.size(), "MFE view experts"), impl_->out_per_expert,
         impl_->neuron_len, 1);
     impl->automatic_mxfp4_nax_prefill = impl_->automatic_mxfp4_nax_prefill;
+    impl->packed_arena = impl_->packed_arena;
+    impl->has_generic_cohorts = impl_->has_generic_cohorts;
     impl->kernel_profile = impl_->kernel_profile;
     return MlxMfeWeight(std::move(impl));
 }
 
 MlxMfeWeight MlxMfeWeight::with_kernel_profile(
     std::shared_ptr<const MlxMfeKernelProfile> profile) const {
+    if (impl_->kernel_profile == profile) return *this;
     auto impl = std::make_shared<Impl>(*impl_);
     impl->kernel_profile = std::move(profile);
     return MlxMfeWeight(std::move(impl));
+}
+
+MlxMfeWeight MlxMfeWeight::with_prepared_page_resources() const {
+    if (!impl_->indirect_addresses || impl_->page_resources) return *this;
+    auto resources = std::make_shared<MfePageResources>();
+    resources->owners = impl_->indirect_owners;
+    auto descriptor = NS::TransferPtr(MTL::ResidencySetDescriptor::alloc()->init());
+    descriptor->setInitialCapacity(resources->owners.size());
+    NS::Error* error = nullptr;
+    auto& device = mlx::core::metal::device(mlx::core::Device::gpu);
+    resources->residency = NS::TransferPtr(device.mtl_device()->newResidencySet(descriptor.get(), &error));
+    if (!resources->residency) throw std::runtime_error(error
+        ? error->localizedDescription()->utf8String() : "expert residency set unavailable");
+    for (const auto& owner : resources->owners) {
+        if (!owner.is_available()) throw std::logic_error("prepared expert page is not ready");
+        resources->residency->addAllocation(static_cast<const MTL::Buffer*>(owner.buffer().ptr()));
+    }
+    resources->residency->commit();
+    auto impl = std::make_shared<Impl>(*impl_);
+    impl->page_resources = std::move(resources);
+    return MlxMfeWeight(std::move(impl));
+}
+
+std::shared_ptr<const MlxMfeCachedProjection> MlxMfeOffloadCache::cached_projection(const std::string& name) {
+    std::unique_lock lock(impl_->mutex);
+    const auto confidence = impl_->route_confidence.find(name);
+    if (confidence == impl_->route_confidence.end() || confidence->second < 8) return {};
+    if (const auto cached = impl_->cached_views.find(name); cached != impl_->cached_views.end()) return cached->second;
+    const auto projection = impl_->mfe_projection_locked(name);
+    const auto resident = impl_->resident_pages.find(name);
+    if (resident == impl_->resident_pages.end() || !uses_indirect_expert_pages(projection->kernel_profile->family_mask)) return {};
+    const auto count = std::count_if(resident->second.begin(), resident->second.end(), [](const auto& page) { return bool(page); });
+    if (!count) return {};
+    const auto estimate = checked_add(std::size_t{3} * getpagesize(), checked_product(count,
+        sizeof(std::int32_t) * (kDescriptorSize + 2) + 21 * sizeof(std::uint64_t), "cached expert metadata"),
+        "cached expert metadata");
+    lock.unlock();
+    if (!MlxResidentBudgetScope::permits_optional(estimate)) return {};
+    MlxResidentBudgetScope::reserve(estimate);
+    lock.lock();
+    if (const auto cached = impl_->cached_views.find(name); cached != impl_->cached_views.end()) return cached->second;
+    const auto current = impl_->resident_pages.find(name);
+    if (current == impl_->resident_pages.end()) return {};
+    const auto epoch = impl_->epoch;
+    const auto generation = impl_->page_generation;
+    std::vector<MlxMfeWeight> pages;
+    std::vector<std::int32_t> map(projection->experts, -1);
+    for (std::size_t expert = 0; expert < current->second.size(); ++expert) if (const auto& page = current->second[expert]) {
+        map[expert] = static_cast<std::int32_t>(pages.size());
+        pages.push_back(page->weight);
+    }
+    if (pages.empty()) return {};
+    lock.unlock();
+    auto weight = MlxMfeWeight::concatenate_expert_pages(pages, projection->kernel_profile).with_prepared_page_resources();
+    if (!weight.impl_->page_resources) return {};
+    array expert_map(map.begin(), Shape{projection->experts}, mlx::core::int32);
+    const auto metadata = weight.impl_->descriptors.nbytes() + weight.impl_->indirect_addresses->nbytes()
+        + (weight.impl_->expert_order ? weight.impl_->expert_order->nbytes() : 0) + expert_map.nbytes();
+    auto view = std::make_shared<const MlxMfeCachedProjection>(MlxMfeCachedProjection{
+        std::move(weight), std::move(expert_map), std::move(map), name, metadata});
+    lock.lock();
+    if (epoch == impl_->epoch && generation == impl_->page_generation && metadata <= impl_->cache_limit) {
+        if (const auto cached = impl_->cached_views.find(name); cached != impl_->cached_views.end()) return cached->second;
+        const auto bytes = checked_add(impl_->resident_bytes, metadata, "cached expert metadata");
+        impl_->cached_views.emplace(name, view);
+        impl_->resident_bytes = bytes;
+        impl_->trim();
+    }
+    return view;
+}
+
+bool MlxMfeOffloadCache::resolve_cached_projections(std::span<const std::shared_ptr<const MlxMfeCachedProjection>> views,
+    std::span<const std::int32_t> experts) {
+    if (experts.empty() || views.empty()) throw std::invalid_argument("cached expert routes cannot be empty");
+    std::unordered_map<std::int32_t, unsigned> counts;
+    std::vector<std::int32_t> ordered;
+    counts.reserve(experts.size());
+    ordered.reserve(experts.size());
+    for (const auto expert : experts) {
+        const auto [found, inserted] = counts.try_emplace(expert, 0);
+        if (inserted) ordered.push_back(expert);
+        auto& count = found->second;
+        count = std::min(3u, count + 1);
+    }
+    std::vector<bool> hits(views.size(), true);
+    for (std::size_t index = 0; index < views.size(); ++index) {
+        if (!views[index]) throw std::invalid_argument("cached projection is missing");
+        for (const auto expert : ordered) {
+            if (expert < 0 || static_cast<std::size_t>(expert) >= views[index]->host_expert_map.size())
+                throw std::out_of_range("cached expert route is out of range");
+            hits[index] = hits[index] && views[index]->host_expert_map[expert] >= 0;
+        }
+    }
+    std::lock_guard lock(impl_->mutex);
+    if (std::any_of(hits.begin(), hits.end(), [](bool hit) { return !hit; })) {
+        for (std::size_t index = 0; index < views.size(); ++index) if (!hits[index]) {
+            impl_->route_confidence[views[index]->name] = 0;
+        }
+        ++impl_->stats.cached_route_misses;
+        return false;
+    }
+    ++impl_->stats.cached_route_hits;
+    for (const auto& view : views) {
+        auto& confidence = impl_->route_confidence[view->name];
+        confidence = static_cast<std::uint8_t>(std::min<unsigned>(15, confidence + 1));
+        impl_->stats.expert_hits += counts.size();
+        for (const auto expert : ordered) {
+            const auto count = counts.at(expert);
+            const Impl::Key key{view->name, expert};
+            const auto cached = impl_->mfe_cache.find(key);
+            if (cached == impl_->mfe_cache.end()) continue;
+            auto& value = *cached->second;
+            value.credit = static_cast<std::uint8_t>(std::min<unsigned>(3, value.credit + count));
+            if (value.credit >= 2 && !value.pin_attempted) value.pin_attempted = impl_->enqueue_pin(key, value.weight);
+            impl_->mfe_lru.splice(impl_->mfe_lru.end(), impl_->mfe_lru, cached->second);
+        }
+    }
+    return true;
 }
 
 MlxMfeWeight MlxMfeWeight::with_automatic_mxfp4_nax_prefill(
@@ -11099,6 +12152,7 @@ array MlxMfeWeight::routed_swiglu_pair(
             -1));
     };
     const bool native_pair =
+        !impl_->indirect_sources && !up.impl_->indirect_sources &&
         impl_->native_primitive
         && up.impl_->native_primitive
         && impl_->family_mask
@@ -11203,7 +12257,7 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
     const array* route_groups,
     const array* router_logits) const {
     const auto supported_impl = [](const Impl& impl, int projections) {
-        return impl.native_primitive &&
+        return impl.native_primitive && !impl.indirect_sources &&
             impl.projections == projections &&
             impl.rotations.empty() &&
             impl.reference_cohorts.empty() &&
@@ -11409,6 +12463,7 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
 
 bool MlxMfeWeight::supports_fused_routed_reduce() const noexcept {
     return mxfp4_decode_down_reduce_enabled()
+        && !impl_->indirect_sources
         && !mlx_reference_enabled()
         && impl_->native_primitive
         && impl_->family_mask == (std::uint32_t{1} << kFamilyMxfp4)
@@ -12208,6 +13263,11 @@ array MlxMfeWeight::routed_matmul_sorted(
     }
     kernel_inputs.push_back(selected_plan.block_meta);
     kernel_inputs.push_back(selected_plan.block_count);
+    if (impl_->indirect_addresses) {
+        kernel_inputs.push_back(*impl_->indirect_addresses);
+        kernel_inputs.insert(kernel_inputs.end(), impl_->indirect_owners.begin(), impl_->indirect_owners.end());
+    }
+    const auto compilation = impl_->compilation_profile();
     return grouped_mmq_dispatch(
         std::move(kernel_inputs),
         GroupedMmqConfig{
@@ -12239,12 +13299,12 @@ array MlxMfeWeight::routed_matmul_sorted(
             .has_nepq_residual = static_cast<int>(
                 impl_->has_nepq_residual),
             .family_mask = static_cast<int>(impl_->family_mask),
-            .vq_profile_mask = static_cast<int>(
-                impl_->vq_profile_mask),
+            .vq_profile_mask = static_cast<int>(compilation.vq_profile_mask),
             .nint_group_sizes = impl_->nint_group_sizes,
             .cohort_populations = impl_->cohort_populations,
             .use_nax = use_grouped_nax,
             .direct_nax = use_direct_nax,
+            .indirect_pages = impl_->indirect_addresses.has_value(),
             .swiglu_limit = swiglu_limit,
         });
 }
@@ -12257,6 +13317,9 @@ array MlxMfeWeight::routed_matmul_impl(
     const array* expert_map,
     bool packed_expert_ids,
     const array* route_groups) const {
+    if (impl_->indirect_sources && mlx_reference_enabled())
+        return concatenate_experts(*impl_->indirect_sources).with_kernel_profile(impl_->kernel_profile)
+            .routed_matmul_impl(input, expert_ids, fused_swiglu, swiglu_limit, expert_map, packed_expert_ids, route_groups);
     if (impl_->projections > 1 && !impl_->projection_views.empty() &&
         std::any_of(
             impl_->projection_views.begin(),
@@ -12654,6 +13717,10 @@ array MlxMfeWeight::routed_matmul_impl(
                 fused_swiglu));
         kernel_inputs.push_back(plan.block_meta);
         kernel_inputs.push_back(plan.block_count);
+        if (impl_->indirect_addresses) {
+            kernel_inputs.push_back(*impl_->indirect_addresses);
+            kernel_inputs.insert(kernel_inputs.end(), impl_->indirect_owners.begin(), impl_->indirect_owners.end());
+        }
         auto sorted_outputs = grouped_mmq_dispatch(
             std::move(kernel_inputs),
             GroupedMmqConfig{
@@ -12684,12 +13751,12 @@ array MlxMfeWeight::routed_matmul_impl(
                 .has_nepq_residual = static_cast<int>(
                     impl_->has_nepq_residual),
                 .family_mask = static_cast<int>(impl_->family_mask),
-                .vq_profile_mask = static_cast<int>(
-                    impl_->vq_profile_mask),
+                .vq_profile_mask = static_cast<int>(compilation.vq_profile_mask),
                 .nint_group_sizes = impl_->nint_group_sizes,
                 .cohort_populations = impl_->cohort_populations,
                 .use_nax = use_grouped_nax,
                 .direct_nax = use_direct_nax,
+                .indirect_pages = impl_->indirect_addresses.has_value(),
                 .swiglu_limit = swiglu_limit,
             });
         auto inverse_order = moe_inverse_permutation(route_order);
@@ -12716,6 +13783,11 @@ array MlxMfeWeight::routed_matmul_impl(
             kernel_inputs.push_back(map);
         }
         if (route_groups != nullptr) kernel_inputs.push_back(*route_groups);
+        if (impl_->indirect_addresses) {
+            kernel_inputs[1] = *impl_->indirect_addresses;
+            if (!impl_->page_resources)
+                kernel_inputs.insert(kernel_inputs.end(), impl_->indirect_owners.begin(), impl_->indirect_owners.end());
+        }
         return merge_standalone(native_moe_dispatch(
             std::move(kernel_inputs),
             NativeMoeConfig{
@@ -12750,7 +13822,9 @@ array MlxMfeWeight::routed_matmul_impl(
                 .packed_expert_ids = static_cast<int>(packed_expert_ids),
                 .route_groups = route_groups != nullptr,
                 .nint_q_dispatch = compilation.nint_q_dispatch,
+                .indirect_pages = impl_->indirect_addresses.has_value(),
                 .workgroups = static_cast<int>(workgroups),
+                .page_resources = impl_->page_resources,
             }));
     }
     const auto grid = checked_product(
@@ -12973,6 +14047,60 @@ int MlxMfeWeight::neuron_len() const noexcept {
 
 int MlxMfeWeight::projections() const noexcept {
     return impl_->projections;
+}
+
+std::size_t MlxMfeWeight::packed_copy_count() noexcept {
+    return packed_copy_submissions.load(std::memory_order_relaxed);
+}
+
+std::size_t MlxMfeWeight::indirect_dispatch_count() noexcept {
+    return indirect_expert_submissions.load(std::memory_order_relaxed);
+}
+std::size_t MlxMfeWeight::uncached_packed_bytes() noexcept {
+    return uncached_packed_storage_bytes.load(std::memory_order_relaxed);
+}
+
+std::size_t MlxMfeWeight::pinned_packed_bytes() noexcept {
+    return packed_pinned_bytes.load(std::memory_order_relaxed);
+}
+
+std::size_t MlxMfeWeight::packed_pin_failures() noexcept {
+    return packed_pin_errors.load(std::memory_order_relaxed);
+}
+
+std::size_t MlxMfeWeight::pooled_staging_count() noexcept {
+    return pooled_expert_staging.load(std::memory_order_relaxed);
+}
+
+std::shared_ptr<void> MlxMfeWeight::pin_packed_storage() const noexcept {
+    struct Pin {
+        explicit Pin(array value) : storage(std::move(value)) {}
+        ~Pin() {
+            if (!bytes) return;
+            munlock(storage.data<std::uint8_t>(), bytes);
+            packed_pinned_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        }
+        array storage;
+        std::size_t bytes = 0;
+    };
+    try {
+        if (!impl_->packed_arena || !impl_->packed_arena->is_available()
+            || impl_->packed_arena->nbytes() < (std::size_t{64} << 10)) return {};
+        const auto* data = impl_->packed_arena->data<std::uint8_t>();
+        if (reinterpret_cast<std::uintptr_t>(data) % getpagesize()) return {};
+        auto pin = std::make_shared<Pin>(*impl_->packed_arena);
+        const auto bytes = pin->storage.buffer_size();
+        if (mlock(data, bytes) != 0) {
+            packed_pin_errors.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
+        pin->bytes = bytes;
+        packed_pinned_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        return pin;
+    } catch (...) {
+        packed_pin_errors.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
 }
 
 std::size_t MlxMfeWeight::packed_nbytes() const noexcept {
