@@ -381,9 +381,10 @@ def _run(args: argparse.Namespace) -> int:
         port=args.port if args.port is not None else saved_service_port(listener_settings),
         log_level=args.log_level,
         access_log=args.access_log,
+        timeout_graceful_shutdown=5 if args.exit_on_stdin_close else None,
     ), listener_settings, anthropic_port=(
         args.anthropic_port if args.anthropic_port is not None else saved_service_port(listener_settings, "anthropic")
-    )).run()
+    ), parent_input=getattr(sys.stdin, "buffer", sys.stdin) if args.exit_on_stdin_close else None).run()
     return 0
 
 
@@ -397,6 +398,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     parser.add_argument("--model", type=Path, help="optional MFQ model to load at startup")
+    parser.add_argument("--exit-on-stdin-close", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--running-executable",
         type=Path,

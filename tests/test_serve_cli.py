@@ -602,3 +602,20 @@ def test_serve_starts_without_loading_an_initial_model(
     assert (data_dir / "server.sqlite3").is_file()
     assert (data_dir / "media").is_dir()
     assert (data_dir / "models").is_dir()
+
+
+def test_app_lifecycle_is_opt_in_and_has_bounded_request_shutdown(tmp_path: Path, monkeypatch) -> None:
+    import io
+    executable = tmp_path / "mfq-decode-metal"
+    executable.write_bytes(b"runtime")
+    reader = io.BytesIO()
+    monkeypatch.setattr("sys.stdin", reader)
+    servers = []
+    monkeypatch.setattr("mfq.server.api.listener.RuntimeServer.run", lambda server: servers.append(server))
+    for owned in (False, True):
+        args = _build_parser().parse_args(["serve", "--no-web-ui", "--running-executable", str(executable),
+            "--data-dir", str(tmp_path / str(owned)), *(["--exit-on-stdin-close"] if owned else [])])
+        assert _run(args) == 0
+        server = servers[-1]
+        assert server.parent_input is (reader if owned else None)
+        assert server.config.timeout_graceful_shutdown == (5 if owned else None)

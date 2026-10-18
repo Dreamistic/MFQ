@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
@@ -76,6 +76,23 @@ struct SelectedModelDirectory {
 #[derive(Default)]
 struct StudioState {
     start_lock: Mutex<()>,
+    server_input: std::sync::Mutex<Option<(u32, ChildStdin)>>,
+}
+
+impl StudioState {
+    fn own_server(&self, child: &mut Child) -> Result<(), String> {
+        let input = child.stdin.take().ok_or("MFQ Server lifecycle pipe is unavailable")?;
+        *self.server_input.lock().map_err(|error| error.to_string())? = Some((child.id(), input));
+        Ok(())
+    }
+
+    fn release_server(&self, pid: u32) {
+        if let Ok(mut input) = self.server_input.lock() {
+            if input.as_ref().is_some_and(|(owner, _)| *owner == pid) {
+                input.take();
+            }
+        }
+    }
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -238,9 +255,8 @@ fn configure_detached(command: &mut Command) {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     #[cfg(unix)]
     {
@@ -377,6 +393,7 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
     }
     command
         .arg("serve")
+        .arg("--exit-on-stdin-close")
         .arg("--no-access-log")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -410,7 +427,7 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
         command.env("MFQ_AVFOUNDATION_VIDEO_LIBRARY", video_library);
     }
     command
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .current_dir(&data_dir);
@@ -418,21 +435,29 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start MFQ Server: {error}"))?;
-    fs::write(data_dir.join(PID_FILE), format!("{}\n", child.id()))
-        .map_err(|error| error.to_string())?;
+    let state = app.state::<StudioState>();
+    state.own_server(&mut child)?;
+    let result = async {
+        fs::write(data_dir.join(PID_FILE), format!("{}\n", child.id()))
+            .map_err(|error| error.to_string())?;
 
-    for _ in 0..3600 {
-        if is_mfq_server(&client, &service_url).await {
-            return status_for(app, config).await;
+        for _ in 0..3600 {
+            if is_mfq_server(&client, &service_url).await {
+                return status_for(app, config).await;
+            }
+            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                return Err(startup_failure(&log_path, log_offset,
+                    &format!("MFQ Server could not start ({status}).")));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            return Err(startup_failure(&log_path, log_offset,
-                &format!("MFQ Server could not start ({status}).")));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        Err(startup_failure(&log_path, log_offset,
+            "MFQ Server did not become ready within 30 minutes."))
+    }.await;
+    if result.is_err() {
+        state.release_server(child.id());
     }
-    Err(startup_failure(&log_path, log_offset,
-        "MFQ Server did not become ready within 30 minutes."))
+    result
 }
 
 #[tauri::command]
@@ -659,6 +684,53 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn pipe_child() -> Child {
+        Command::new("/bin/cat").stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pipe_child(child: &mut Child) {
+        for _ in 0..100 {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("owned server did not receive lifecycle EOF");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_studio_closes_only_its_owned_server_pipe() {
+        let mut owned = pipe_child();
+        let mut external = pipe_child();
+        let state = StudioState::default();
+        state.own_server(&mut owned).unwrap();
+        assert!(owned.stdin.is_none());
+        assert!(owned.try_wait().unwrap().is_none());
+        drop(state);
+        wait_for_pipe_child(&mut owned);
+        assert!(external.try_wait().unwrap().is_none());
+        drop(external.stdin.take());
+        wait_for_pipe_child(&mut external);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_cleanup_does_not_close_a_different_owned_server() {
+        let mut owned = pipe_child();
+        let state = StudioState::default();
+        state.own_server(&mut owned).unwrap();
+        state.release_server(owned.id().wrapping_add(1));
+        assert!(owned.try_wait().unwrap().is_none());
+        state.release_server(owned.id());
+        wait_for_pipe_child(&mut owned);
+    }
 
     fn startup_test_dir() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
