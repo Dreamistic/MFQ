@@ -1,4 +1,5 @@
 import asyncio
+import os
 import socket
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,79 @@ from mfq.server.api import create_app
 from mfq.server.api.auth import required_scope
 from mfq.server.api.listener import RuntimeServer, saved_service_port
 from mfq.server.state.storage import SessionStore
+
+
+def test_app_pipe_eof_gracefully_closes_both_api_listeners() -> None:
+    async def run():
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "rb", buffering=0)
+        writer = os.fdopen(write_fd, "wb", buffering=0)
+        service = SimpleNamespace(start=AsyncMock(), aclose=AsyncMock())
+        server = RuntimeServer(uvicorn.Config(create_app(service), host="127.0.0.1", port=0,
+            log_level="error"), anthropic_port=0, parent_input=reader)
+        task = asyncio.create_task(server.serve())
+        try:
+            for _ in range(200):
+                if server.started:
+                    break
+                await asyncio.sleep(.01)
+            assert server.started
+            ports = [server.config.port, server.anthropic_port]
+            async with httpx.AsyncClient(trust_env=False) as client:
+                for port in ports:
+                    assert (await client.get(f"http://127.0.0.1:{port}/health")).status_code == 200
+            writer.write(b"owner still alive")
+            await asyncio.sleep(.05)
+            assert not task.done()
+            writer.close()
+            await asyncio.wait_for(task, 5)
+            service.aclose.assert_awaited_once()
+            for port in ports:
+                with socket.socket() as probe:
+                    probe.settimeout(.2)
+                    assert probe.connect_ex(("127.0.0.1", port)) != 0
+        finally:
+            writer.close()
+            server.should_exit = True
+            await asyncio.wait_for(task, 5)
+            reader.close()
+    asyncio.run(run())
+
+
+def test_cli_server_without_app_pipe_keeps_running() -> None:
+    async def run():
+        service = SimpleNamespace(start=AsyncMock(), aclose=AsyncMock())
+        server = RuntimeServer(uvicorn.Config(create_app(service), host="127.0.0.1", port=0, log_level="error"))
+        task = asyncio.create_task(server.serve())
+        try:
+            for _ in range(200):
+                if server.started:
+                    break
+                await asyncio.sleep(.01)
+            assert server.started
+            assert server.parent_input is None
+            await asyncio.sleep(.1)
+            assert not task.done()
+            service.aclose.assert_not_awaited()
+        finally:
+            server.should_exit = True
+            await asyncio.wait_for(task, 5)
+        service.aclose.assert_awaited_once()
+    asyncio.run(run())
+
+
+def test_app_already_closed_during_server_startup() -> None:
+    async def run():
+        import io
+        service = SimpleNamespace(start=AsyncMock(), aclose=AsyncMock())
+        server = RuntimeServer(uvicorn.Config(create_app(service), host="127.0.0.1", port=0,
+            log_level="error"), anthropic_port=0, parent_input=io.BytesIO())
+        await asyncio.wait_for(server.serve(), 5)
+        assert server.should_exit
+        service.aclose.assert_awaited_once()
+        for listener in server.servers:
+            assert not listener.is_serving()
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("protocol", ["openai", "anthropic"])

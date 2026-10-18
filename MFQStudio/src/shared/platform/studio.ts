@@ -14,6 +14,15 @@ export interface StudioStatus {
   service_url: string;
   reachable: boolean;
   managed_pid: number | null;
+  connection?: 'managed' | 'external' | 'confirmation_required' | 'incompatible' | 'offline';
+  server?: {
+    version: string;
+    instance_id: string;
+    workspace_id: string;
+    pid: number;
+    launch_mode: 'studio' | 'cli';
+  } | null;
+  connection_error?: string | null;
 }
 
 /** GitHub Release 中与当前平台严格匹配的可安装资产。 */
@@ -116,6 +125,12 @@ export async function startLocalStudio(): Promise<StudioStatus> {
   const tauri = internals();
   if (!tauri) throw new Error('MFQ Studio runtime is unavailable');
   return tauri.invoke<StudioStatus>('studio_start_local');
+}
+
+export async function connectExistingStudio(instanceId: string, workspaceId: string): Promise<StudioStatus> {
+  const tauri = internals();
+  if (!tauri) throw new Error('MFQ Studio runtime is unavailable');
+  return tauri.invoke<StudioStatus>('studio_connect_existing', { instanceId, workspaceId });
 }
 
 /** 打开桌面原生模型目录选择器，取消时返回 null。 */

@@ -25,6 +25,15 @@ it('preserves diagnostic codes for unexpected failures', () => {
   expect(errorMessage(new Error('unexpected problem'))).toBe('unexpected problem');
 });
 
+it('preserves native desktop string and message-object rejections', () => {
+  const message = 'The Anthropic API port 8091 is already in use.';
+  expect(errorMessage(message)).toBe(message);
+  expect(errorMessage({ message })).toBe(message);
+  for (const value of [null, undefined, '', '  ', {}, { message: 1 }]) {
+    expect(errorMessage(value)).toBe('Unknown error');
+  }
+});
+
 it('explains automatic KV capacity failure with the requested SSD alternative', () => {
   expect(errorMessage(apiError('kv_memory_insufficient'), (zh) => zh)).toBe(
     '可用显存和内存不足，请选择自动（启用SSD KV），这可能会拖慢长上下文时的速度并造成磁盘占用，或者降低上下文长度。');

@@ -32,6 +32,7 @@ from mfq.server.api.routes.sessions import router as session_router
 from mfq.server.api.static import SPAStaticFiles
 from mfq.server.protocol.models import ErrorDetail, ErrorResponse
 from mfq.server.services.service import ServerService, ServiceError
+from mfq.server.instance import server_identity as make_server_identity
 
 
 def create_app(
@@ -41,6 +42,7 @@ def create_app(
     api_key: str = "",
     api_keys: ApiKeyManager | None = None,
     auth_settings_path: str | Path | None = None,
+    server_identity: dict[str, str | int] | None = None,
 ) -> FastAPI:
     """Create an executable app, or a route-only contract app when service is omitted."""
 
@@ -62,27 +64,17 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.service = service
+    app.state.server_identity = server_identity if server_identity is not None else make_server_identity()
     app.state.api_key = api_key
     app.state.api_keys = api_keys
     app.state.auth_policy = AuthenticationPolicy(api_key or (api_keys.root_key if api_keys else ""),
         enabled=api_keys is not None, path=Path(auth_settings_path) if auth_settings_path is not None else None)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[
-            "tauri://localhost",
-            "http://tauri.localhost",
-            "https://tauri.localhost",
-            "http://127.0.0.1:5173",
-            "http://localhost:5173",
-            "http://127.0.0.1:5174",
-            "http://localhost:5174",
-        ],
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Accept", "Authorization", "Content-Type", "X-Content-SHA256", "X-Api-Key", "Anthropic-Version", "Anthropic-Beta"],
-    )
-
     @app.middleware("http")
     async def protect_and_harden(request: Request, call_next: Any) -> Response:
+        expected_instance = request.headers.get("x-mfq-instance-id")
+        if expected_instance and expected_instance != app.state.server_identity["instance_id"]:
+            detail = ErrorDetail(code="server_instance_changed", message="The server instance changed. Reconnect and confirm the new server.")
+            return JSONResponse(status_code=409, content=ErrorResponse(error=detail).model_dump(mode="json"))
         policy = app.state.auth_policy
         if policy.enabled and request.method != "OPTIONS" and request.url.path.startswith(("/api/", "/v1")):
             authorization = request.headers.get("authorization", "")
@@ -125,6 +117,21 @@ def create_app(
             "script-src 'self'; font-src 'self' data:"
         )
         return response
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+            "http://127.0.0.1:5174",
+            "http://localhost:5174",
+        ],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Accept", "Authorization", "Content-Type", "X-Content-SHA256", "X-Api-Key", "Anthropic-Version", "Anthropic-Beta", "X-MFQ-Instance-ID"],
+    )
 
     @app.exception_handler(ServiceError)
     async def handle_service_error(request: Request, error: ServiceError) -> JSONResponse:

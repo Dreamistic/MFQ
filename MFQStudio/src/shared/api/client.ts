@@ -19,7 +19,9 @@ export class ApiError extends Error {
 
 let apiBaseUrl = '';
 let apiToken = '';
+let apiServerInstance = '';
 const authenticationListeners = new Set<() => void>();
+const instanceChangeListeners = new Set<() => void>();
 const BROWSER_SERVICE_KEY = 'mfq.studio.service-url';
 let browserUrlOverride: string | undefined;
 
@@ -28,9 +30,20 @@ export function onAuthenticationRequired(listener: () => void): () => void {
   return () => { authenticationListeners.delete(listener); };
 }
 
+export function onServerInstanceChanged(listener: () => void): () => void {
+  instanceChangeListeners.add(listener);
+  return () => { instanceChangeListeners.delete(listener); };
+}
+
+export function setApiServerInstance(value: string): void {
+  apiServerInstance = value;
+}
+
 export async function verifyApiToken(token: string, signal?: AbortSignal): Promise<void> {
+  const headers = new Headers({ Authorization: `Bearer ${token.trim()}` });
+  if (apiServerInstance) headers.set('X-MFQ-Instance-ID', apiServerInstance);
   const response = await fetch(apiUrl('/api/v1/runtime/instances'), {
-    headers: new Headers({ Authorization: `Bearer ${token.trim()}` }),
+    headers,
     cache: 'no-store',
     signal,
   });
@@ -85,6 +98,7 @@ export function runtimeRealtimeUrl(): string {
   const base = apiBaseUrl || window.location.origin;
   const url = new URL('/api/v1/runtime/realtime?mode=audio', base);
   if (apiToken) url.searchParams.set('access_token', apiToken);
+  if (apiServerInstance) url.searchParams.set('server_instance', apiServerInstance);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   return url.toString();
 }
@@ -109,6 +123,7 @@ export async function errorFromResponse(response: Response): Promise<ApiError> {
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const endpoint = apiBaseUrl;
   const token = apiToken;
+  const instance = apiServerInstance;
   const headers = authorizedHeaders(init?.headers);
   if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
   const response = await fetch(apiUrl(path), {
@@ -117,6 +132,9 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const error = await errorFromResponse(response);
+    if (error.code === 'server_instance_changed' && endpoint === apiBaseUrl && instance === apiServerInstance && !init?.signal?.aborted) {
+      instanceChangeListeners.forEach((listener) => listener());
+    }
     if (error.status === 401 && endpoint === apiBaseUrl && token === apiToken && !init?.signal?.aborted) {
       authenticationListeners.forEach((listener) => listener());
     }
@@ -129,5 +147,6 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export function authorizedHeaders(headers?: HeadersInit): Headers {
   const result = new Headers(headers);
   if (apiToken) result.set('Authorization', `Bearer ${apiToken}`);
+  if (apiServerInstance) result.set('X-MFQ-Instance-ID', apiServerInstance);
   return result;
 }

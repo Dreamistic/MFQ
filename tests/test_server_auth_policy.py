@@ -71,3 +71,26 @@ def test_authentication_changes_fail_closed(tmp_path: Path) -> None:
             assert (await client.get("/api/v1/auth/policy", headers=headers)).status_code == 200
             assert not app.state.auth_policy.matches("example-new-key")
     asyncio.run(run())
+
+
+def test_desktop_can_read_authentication_failures_without_relaxing_cors() -> None:
+    async def run() -> None:
+        app = create_app(api_key="example-desktop-key")
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            for origin in ("tauri://localhost", "http://tauri.localhost", "https://tauri.localhost", "http://127.0.0.1:5174"):
+                headers = {"Origin": origin}
+                denied = await client.get("/api/v1/auth/policy", headers=headers)
+                assert denied.status_code == 401
+                assert denied.headers["access-control-allow-origin"] == origin
+                assert denied.json()["error"]["code"] == "unauthorized"
+                assert denied.headers["www-authenticate"] == "Bearer"
+                invalid = await client.get("/api/v1/auth/policy", headers={**headers, "Authorization": "Bearer incorrect"})
+                assert invalid.status_code == 401
+                assert invalid.headers["access-control-allow-origin"] == origin
+                allowed = await client.get("/api/v1/auth/policy", headers={**headers, "Authorization": "Bearer example-desktop-key"})
+                assert allowed.status_code == 200
+                assert allowed.headers["access-control-allow-origin"] == origin
+            denied = await client.get("/api/v1/auth/policy", headers={"Origin": "https://untrusted.example"})
+            assert denied.status_code == 401
+            assert "access-control-allow-origin" not in denied.headers
+    asyncio.run(run())
