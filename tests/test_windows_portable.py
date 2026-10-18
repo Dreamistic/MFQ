@@ -3,7 +3,12 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
 import zipfile
 
 import pytest
@@ -19,6 +24,10 @@ def project(tmp_path):
     root = tmp_path / "source tree"
     tauri = root / "MFQStudio/src-tauri"
     tauri.mkdir(parents=True)
+    (tauri / "icons").mkdir()
+    shutil.copyfile(Path(__file__).parents[1] / "MFQStudio/src-tauri/icons/icon.ico", tauri / "icons/icon.ico")
+    (root / "packaging").mkdir()
+    shutil.copyfile(Path(__file__).parents[1] / "packaging/windows_standalone.nsi", root / "packaging/windows_standalone.nsi")
     (tauri / "tauri.conf.json").write_text(json.dumps({"version": "0.4.0"}))
     (tauri / "tauri.release-windows.conf.json").write_text(json.dumps({"bundle": {
         "resources": {
@@ -78,3 +87,58 @@ def test_unsafe_or_conflicting_resource_destination_is_rejected(tmp_path, destin
     config.write_text(json.dumps(value))
     with pytest.raises(ValueError):
         module.payload(root, root / "build/mfq-studio.exe")
+
+
+@pytest.mark.skipif(sys.platform != "win32" or not os.environ.get("MFQ_TEST_NSIS"), reason="Windows NSIS execution")
+def test_single_executable_extracts_reuses_and_repairs_its_cache(tmp_path):
+    root = project(tmp_path)
+    executable = module.build_executable(root, root / "build/mfq-studio.exe", tmp_path / "output", Path(os.environ["MFQ_TEST_NSIS"]))
+    with zipfile.ZipFile(executable.parent / "MFQ Studio_0.4.0_x64-portable.zip") as package:
+        assert package.namelist() == ["MFQ Studio.exe"]
+        assert package.read("MFQ Studio.exe") == executable.read_bytes()
+    cache = tmp_path / "runtime cache"
+    environment = dict(os.environ, MFQ_STUDIO_RUNTIME_CACHE=str(cache))
+    arguments = [str(executable), "/EXTRACT_ONLY"]
+    subprocess.run(arguments, check=True, timeout=30, env=environment)
+    directory, = cache.glob("0.4.0-*")
+    native = directory / "mfq-runtime.exe"
+    assert native.read_bytes() == b"mfq-runtime-x86_64-pc-windows-msvc.exe"
+    assert (directory / "mfq-cli/_internal/python.dll").is_file()
+    sentinel = directory / "cache-hit-check"
+    sentinel.touch()
+    timestamp = native.stat().st_mtime_ns
+    subprocess.run(arguments, check=True, timeout=30, env=environment)
+    assert sentinel.exists() and native.stat().st_mtime_ns == timestamp
+    (directory / "mfq-cli/mfq-cli.exe").unlink()
+    subprocess.run(arguments, check=True, timeout=30, env=environment)
+    assert (directory / "mfq-cli/mfq-cli.exe").is_file()
+    assert not sentinel.exists()
+    children = [subprocess.Popen(arguments, env=environment) for _ in range(3)]
+    assert [child.wait(timeout=30) for child in children] == [0, 0, 0]
+
+
+@pytest.mark.skipif(sys.platform != "win32" or not os.environ.get("MFQ_TEST_STANDALONE_APP"), reason="Windows launcher fixture")
+def test_single_executable_launches_the_app_and_waits_for_an_update_parent(tmp_path):
+    root = project(tmp_path)
+    shutil.copyfile(os.environ["MFQ_TEST_STANDALONE_APP"], root / "build/mfq-studio.exe")
+    executable = module.build_executable(root, root / "build/mfq-studio.exe", tmp_path / "output", Path(os.environ["MFQ_TEST_NSIS"]))
+    cache, log = tmp_path / "runtime cache", tmp_path / "launched.txt"
+    environment = dict(os.environ, MFQ_STUDIO_RUNTIME_CACHE=str(cache), MFQ_TEST_LAUNCH_LOG=str(log))
+    parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1)"])
+    try:
+        launcher = subprocess.Popen([str(executable), f"/WAITPID={parent.pid}"], env=environment)
+        time.sleep(.1)
+        assert not log.exists()
+        parent.wait(timeout=10)
+        assert launcher.wait(timeout=15) == 0
+        deadline = time.monotonic() + 10
+        while not log.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        original, actual, directory = log.read_text(encoding="utf-16le").splitlines()
+        assert Path(original) == executable
+        assert Path(actual).parent.parent == cache
+        assert Path(directory) == Path(actual).parent
+    finally:
+        if parent.poll() is None:
+            parent.terminate()
+            parent.wait(timeout=5)

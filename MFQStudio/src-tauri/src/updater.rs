@@ -158,6 +158,8 @@ fn update_root(app: &AppHandle) -> Result<PathBuf, String> {
         .app_local_data_dir()
         .map_err(|error| error.to_string())?
         .join("updates");
+    #[cfg(target_os = "windows")]
+    let root = if standalone_launcher().is_some() { root.join("standalone") } else { root };
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     Ok(root)
 }
@@ -224,6 +226,19 @@ fn compare_versions(left: &str, right: &str) -> Ordering {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn standalone_launcher() -> Option<PathBuf> {
+    std::env::var_os("MFQ_STUDIO_LAUNCHER").map(PathBuf::from).filter(|path|
+        path.is_absolute() && path.extension().is_some_and(|value| value.eq_ignore_ascii_case("exe")))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_asset_name(name: &str, standalone: bool) -> bool {
+    let name = name.to_ascii_lowercase();
+    if standalone { name.ends_with("_x64.exe") }
+    else { name.ends_with("_x64-setup.exe") }
+}
+
 fn asset_for_platform(release: &GitHubRelease) -> Option<&GitHubAsset> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     return release.assets.iter().find(|asset| {
@@ -232,8 +247,7 @@ fn asset_for_platform(release: &GitHubRelease) -> Option<&GitHubAsset> {
     });
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     return release.assets.iter().find(|asset| {
-        let name = asset.name.to_ascii_lowercase();
-        name.ends_with(".exe") && name.contains("x64")
+        windows_asset_name(&asset.name, standalone_launcher().is_some())
     });
     #[allow(unreachable_code)]
     None
@@ -438,9 +452,8 @@ fn cached_installable(directory: &Path) -> Option<PathBuf> {
             .flatten()
             .map(|item| item.path())
             .find(|path| {
-                path.extension()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|value| value.eq_ignore_ascii_case("exe"))
+                path.is_file() && path.file_name().and_then(|value| value.to_str())
+                    .is_some_and(|name| windows_asset_name(name, standalone_launcher().is_some()))
             });
     }
     #[allow(unreachable_code)]
@@ -1099,6 +1112,13 @@ pub async fn studio_update_install(
             let installer = cached_installable(&root.join("versions").join(version))
                 .ok_or_else(|| "selected version has not been downloaded".to_string())?;
             server_app.state::<crate::StudioState>().stop_owned_server()?;
+            if let Some(launcher) = standalone_launcher() {
+                replace_standalone(&installer, &launcher)?;
+                return Command::new(launcher)
+                    .arg(format!("/WAITPID={}", std::process::id()))
+                    .spawn().map(|_| ())
+                    .map_err(|error| format!("could not start the updated application: {error}"));
+            }
             Command::new(installer)
                 .spawn()
                 .map(|_| ())
@@ -1111,6 +1131,15 @@ pub async fn studio_update_install(
     }
     #[allow(unreachable_code)]
     Err("application updates are not available on this platform".into())
+}
+
+#[cfg(target_os = "windows")]
+fn replace_standalone(source: &Path, target: &Path) -> Result<(), String> {
+    let parent = target.parent().ok_or("standalone executable has no parent directory")?;
+    let temporary = parent.join(format!(".mfq-update-{}.exe", std::process::id()));
+    let result = fs::copy(source, &temporary).and_then(|_| fs::rename(&temporary, target));
+    if result.is_err() { let _ = fs::remove_file(temporary); }
+    result.map_err(|error| format!("could not replace the standalone application: {error}"))
 }
 
 #[tauri::command]
@@ -1143,6 +1172,33 @@ pub async fn studio_update_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_updates_keep_installed_and_standalone_packages_separate() {
+        let installer = "MFQ.Studio_0.4.0_x64-setup.exe";
+        let standalone = "MFQ.Studio_0.4.0_x64.exe";
+        assert!(windows_asset_name(installer, false));
+        assert!(!windows_asset_name(installer, true));
+        assert!(windows_asset_name(standalone, true));
+        assert!(!windows_asset_name(standalone, false));
+        assert!(!windows_asset_name("MFQ.Studio_0.4.0_x64-portable.zip", true));
+        assert!(!windows_asset_name("MFQ.Studio_0.4.0_arm64.exe", true));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn standalone_update_replaces_the_original_file_and_preserves_it_on_copy_failure() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("download.exe");
+        let target = directory.0.join("MFQ Studio.exe");
+        fs::write(&source, b"new package").unwrap();
+        fs::write(&target, b"old package").unwrap();
+        replace_standalone(&source, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new package");
+        assert!(replace_standalone(&directory.0.join("missing.exe"), &target).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"new package");
+        assert!(!directory.0.join(format!(".mfq-update-{}.exe", std::process::id())).exists());
+    }
 
     struct TestDirectory(PathBuf);
 

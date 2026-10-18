@@ -1,4 +1,4 @@
-# Build the Windows x64 MFQ Studio installer, portable ZIP, and CUDA sidecar.
+# Build the Windows x64 MFQ Studio installer, single-file app, and CUDA sidecar.
 #
 # The release Python environment is isolated from development environments. It
 # contains only the base dependencies needed by `mfq serve`; training,
@@ -621,6 +621,10 @@ function Build-PortableArchive {
         Resolve-BuildPath $env:CARGO_TARGET_DIR $Context.StudioDirectory
     }
     $executable = Join-Path $cargoTargetDirectory "$($Context.TargetTriple)\release\mfq-studio.exe"
+    $makensis = Join-Path $cargoTargetDirectory ".tauri\NSIS\makensis.exe"
+    if (-not (Test-Path -LiteralPath $makensis -PathType Leaf)) {
+        $makensis = Require-Command "makensis"
+    }
     Assert-ReleasePaths $Context @(
         $executable, $Context.SidecarDirectory, $Context.ResourceDirectory,
         $Context.WindowsRuntimeDirectory, (Join-Path $Context.StudioDirectory "dist")
@@ -628,7 +632,8 @@ function Build-PortableArchive {
     Invoke-Checked $Context.Python @(
         (Join-Path $Context.ScriptDirectory "build_portable_windows.py"),
         "--studio-executable", $executable,
-        "--output-directory", $Context.OutputDirectory
+        "--output-directory", $Context.OutputDirectory,
+        "--makensis", $makensis
     )
 }
 
