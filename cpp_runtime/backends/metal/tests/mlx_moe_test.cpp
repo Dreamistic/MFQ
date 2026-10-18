@@ -7089,7 +7089,7 @@ void test_streamed_mixed_mfe_residency() {
 }
 
 void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt = false, bool nint_predictor = false,
-    bool gdn_block = false) {
+    bool gdn_block = false, bool qsa_group = false) {
     constexpr int hidden = 96, intermediate = 48, experts = 4;
     std::string config = R"JSON({"model_type":"qwen4_exp_text","vocab_size":32,"hidden_size":96,
         "num_hidden_layers":1,"max_position_embeddings":128,"num_attention_heads":6,
@@ -7107,6 +7107,10 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
         parsed["num_hidden_layers"] = 3;
         parsed["full_attention_interval"] = 4;
         parsed["layer_types"] = {"linear_attention", "linear_attention", "linear_attention"};
+        if (qsa_group) {
+            parsed["full_attention_interval"] = 2;
+            parsed["layer_types"][1] = "full_attention";
+        }
         parsed["linear_num_key_heads"] = 1;
         parsed["linear_num_value_heads"] = 1;
         parsed["linear_key_head_dim"] = 128;
@@ -7178,6 +7182,7 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
                 tensor, {}}})});
     }
     if (gdn_block) {
+        const auto attention_records = records;
         std::erase_if(records, [](const auto& record) {
             return record.name.starts_with("model.block.0.attention.") &&
                 !record.name.starts_with("model.block.0.attention.mhc.");
@@ -7188,6 +7193,14 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
                 records.push_back({"model.block." + std::to_string(layer) + "." + record.name.substr(14),
                     record.dtype, record.payload});
         for (int layer = 0; layer < 3; ++layer) {
+            if (qsa_group && layer == 1) {
+                for (const auto& record : attention_records)
+                    if (record.name.starts_with("model.block.0.attention.") &&
+                        !record.name.starts_with("model.block.0.attention.mhc."))
+                        records.push_back({"model.block.1." + record.name.substr(14),
+                            record.dtype, record.payload});
+                continue;
+            }
             const auto root = "model.block." + std::to_string(layer) + ".linear_attention";
             dense(root + ".qkv.weight", {384, hidden});
             dense(root + ".gate.weight", {128, hidden});
@@ -7498,6 +7511,13 @@ void test_qwen4_online_expert_offload(bool mtp, bool prepare = false, bool ttt =
         for (std::size_t index = 0; index < result.size(); ++index)
             require_close(result[index], oracle[index], 1e-3f);
         require(paged.cache_position() == 32, "GDN route grouping advanced state twice");
+        if (qsa_group) {
+            const auto checkpoint = paged.capture_text_session_state(std::vector<std::int64_t>(32, 1));
+            require(checkpoint.layers[1].position == 32 && checkpoint.layers[1].kv &&
+                    checkpoint.layers[1].kv->position == 32 && checkpoint.layers[1].pooled_keys &&
+                    checkpoint.layers[1].pooled_keys->shape(1) == 16,
+                "QSA route grouping advanced KV or pooled index keys twice");
+        }
     }
     if (mtp) {
         mfq::metal::MlxSamplingParams sampling;
@@ -9196,6 +9216,7 @@ int main(int argc, char** argv) {
             test_qwen4_online_expert_offload(true);
             test_qwen4_online_expert_offload(true, false, false, true);
             test_qwen4_online_expert_offload(false, false, false, false, true);
+            test_qwen4_online_expert_offload(false, false, false, false, true, true);
             test_streamed_mixed_mfe_residency();
             test_streamed_vq_wire_views();
             test_streamed_nvq1_residency();
