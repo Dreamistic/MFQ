@@ -1936,16 +1936,16 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
                 MFQ_RUNTIME_CHECK((group_threads==128 && up_mode==24) || group_threads==256 || group_threads==512,"GR Up grouped threads must be 256 or 512");
                 const int launch_threads=up_mode>=9?(count==4?std::min(group_threads,256):group_threads):threads;
                 const int columns_per_block=(launch_threads/32)*(up_mode==11 || up_mode==12 || up_mode==13 || up_mode==14 || up_mode==15 || up_mode==17 || up_mode==18 || up_mode==19 || up_mode==20 || up_mode==21 || up_mode==22 || up_mode==23?2:up_mode==24 || up_mode==9 || up_mode==10?4:1);
-                gated_residual_up_kernel<fixed,fixed?4:0,decltype(width)::value,count,decltype(shared_metadata)::value,up_mode><<<dim3(unsigned((hidden+columns_per_block-1)/columns_per_block),unsigned((rows+count-1)/count)),unsigned(launch_threads),up_mode==7 || up_mode==8 || up_mode==10 || up_mode==12 || up_mode==15 || up_mode==16 || up_mode==17 || up_mode==18 || up_mode==19 || up_mode==20 || up_mode==21 || up_mode==22 || up_mode==23 || up_mode==24?0:unsigned(count*down.out*sizeof(float)),mfq_current_cuda_stream()>>>(
+                gated_residual_up_kernel<fixed,fixed?4:0,std::decay_t<decltype(width)>::value,count,decltype(shared_metadata)::value,up_mode><<<dim3(unsigned((hidden+columns_per_block-1)/columns_per_block),unsigned((rows+count-1)/count)),unsigned(launch_threads),up_mode==7 || up_mode==8 || up_mode==10 || up_mode==12 || up_mode==15 || up_mode==16 || up_mode==17 || up_mode==18 || up_mode==19 || up_mode==20 || up_mode==21 || up_mode==22 || up_mode==23 || up_mode==24?0:unsigned(count*down.out*sizeof(float)),mfq_current_cuda_stream()>>>(
                     d,u,i,normalized.data_ptr(),parts.data_ptr<float>(),mixed.data_ptr(),next_injection.data_ptr(),hidden,int(streams),half,ds,is,dense_projection.defined()?dense_projection.data_ptr<float>():nullptr,rows,prepared_up,
                     up_group_coefficients.defined() && !packed_up_metadata?reinterpret_cast<const float2*>(up_group_coefficients.data_ptr<float>()):nullptr,
                     packed_up_metadata?reinterpret_cast<const int4*>(up_group_coefficients.data_ptr<int32_t>()):nullptr,
                     packed_up_metadata?reinterpret_cast<const uint16_t*>(up_group_coefficients.data_ptr<int32_t>()+up.out*4):nullptr);
                 if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(mfq_current_cuda_stream(),up_mode==24?"gr_up_mix_direct_s16_four_outputs":up_mode==23?"gr_up_mix_direct_s16_stats_vector24":up_mode==22?"gr_up_mix_direct_s16_stats_preload4":up_mode==21?"gr_up_mix_direct_s16_stats":up_mode==20?"gr_up_mix_direct_s16_preload4":up_mode==19?"gr_up_mix_direct_s16":up_mode==18?"gr_up_mix_uniform16_records":up_mode==17?"gr_up_mix_uniform16_coefficients":up_mode==16?"gr_up_mix_uniform16_prepared_warp":up_mode==15?"gr_up_mix_uniform16_prepared":up_mode==14?"gr_up_mix_uniform16_preload":up_mode==13?"gr_up_mix_uniform16_half_groups":up_mode==11 || up_mode==12?"gr_up_mix_int24_half_groups":up_mode==9 || up_mode==10?"gr_up_mix_int24_groups":up_mode==8?"gr_up_mix_int24_prepared_global":up_mode==7?"gr_up_mix_int24_prepared":up_mode==6?"gr_up_mix_int24_stream":up_mode==5?"gr_up_mix_int24_reuse":up_mode==3?"gr_up_mix_int24_chunks":up_mode?"gr_up_mix_uniform16":"gr_up_mix",
-                    reinterpret_cast<const void*>(gated_residual_up_kernel<fixed,fixed?4:0,decltype(width)::value,count,decltype(shared_metadata)::value,decltype(integer_up)::value>),
+                    reinterpret_cast<const void*>(gated_residual_up_kernel<fixed,fixed?4:0,std::decay_t<decltype(width)>::value,count,decltype(shared_metadata)::value,decltype(integer_up)::value>),
                     "M="+std::to_string(rows)+" half="+std::to_string(half)+" capacity="+std::to_string(count));
                 };
-                if constexpr(fixed==48 && decltype(width)::value==320 && decltype(shared_metadata)::value==0) {
+                if constexpr(fixed==48 && std::decay_t<decltype(width)>::value==320 && decltype(shared_metadata)::value==0) {
                     const auto* integer_up=std::getenv("MFQ_GR_UP_INT_DOT");
                     const bool verified_geometry=hidden==2560 && down.neuron_len==10240 && down.out==320;
                     const auto* uniform_up=std::getenv("MFQ_GR_UP_UNIFORM16");
@@ -1990,7 +1990,7 @@ std::vector<mfq_tensor_backend::Tensor> gated_residual_two_stage_cuda(
                     else launch_integer(std::false_type{});
                 }else launch_integer(std::false_type{});
                 };
-                if constexpr(fixed>0 && decltype(width)::value==320) {
+                if constexpr(fixed>0 && std::decay_t<decltype(width)>::value==320) {
                     if(up_metadata==2)launch_metadata(std::integral_constant<int,2>{});
                     else if(up_metadata==1)launch_metadata(std::integral_constant<int,1>{});
                     else launch_metadata(std::integral_constant<int,0>{});

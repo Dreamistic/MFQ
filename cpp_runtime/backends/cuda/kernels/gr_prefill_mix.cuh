@@ -203,7 +203,7 @@ mfq_tensor_backend::Tensor gr_prefill_fused_mix(const NintWeight& weight,
         if constexpr(swizzle)invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::false_type{},std::false_type{},std::integral_constant<int,4>{});
         else {
             const auto* option=std::getenv("MFQ_GR_PREFILL_FUSED_MIX");
-            const int requested_mode=option?std::atoi(option):(std::is_same_v<Input,__half>?12:10);
+            const int requested_mode=option?std::atoi(option):(std::is_same<Input,__half>::value?12:10);
             const int mode=requested_mode==10 || requested_mode==12?6:requested_mode;
             if(mode==8)invoke(std::integral_constant<int,128>{},std::integral_constant<int,32>{},std::false_type{},std::true_type{},std::true_type{},std::integral_constant<int,2>{});
             else if(mode==7)invoke(std::integral_constant<int,256>{},std::integral_constant<int,32>{},std::false_type{},std::true_type{},std::true_type{},std::integral_constant<int,4>{});

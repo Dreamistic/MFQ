@@ -282,12 +282,15 @@ bool nint_launch_fixed_decode(NintWholeArgs args,int group_size,int uniform_bits
             args.groups<=32 && args.activation_rows<=6 &&
             ((group_size==24 && uniform_bits==6) || (group_size==28 && uniform_bits==5))) {
         const auto launch=[&](auto rows) {
+            using RowCount=decltype(rows);
             const auto geometry=[&](auto gs,auto bits) {
+                using GroupSize=decltype(gs);
+                using BitWidth=decltype(bits);
                 const auto offset=[&](auto narrow) {
-                    nint_fixed_small_kernel<decltype(gs)::value,decltype(bits)::value,decltype(rows)::value,decltype(narrow)::value><<<
+                    nint_fixed_small_kernel<GroupSize::value,BitWidth::value,RowCount::value,decltype(narrow)::value><<<
                         (args.rows+3)/4,dim3(32,4),0,stream>>>(args);
                     if(mfq::cuda::dispatch_trace::enabled())mfq::cuda::dispatch_trace::record(stream,"nint_fixed_small_groups",
-                        reinterpret_cast<const void*>(nint_fixed_small_kernel<decltype(gs)::value,decltype(bits)::value,decltype(rows)::value,decltype(narrow)::value>),
+                        reinterpret_cast<const void*>(nint_fixed_small_kernel<GroupSize::value,BitWidth::value,RowCount::value,decltype(narrow)::value>),
                         "M="+std::to_string(args.activation_rows)+" N="+std::to_string(args.rows)+" gs="+std::to_string(group_size)+" groups="+std::to_string(args.groups));
                 };
                 if(args.bytes<(uint64_t(1)<<29))offset(std::true_type{});else offset(std::false_type{});
@@ -337,55 +340,60 @@ bool nint_launch_fixed_decode(NintWholeArgs args,int group_size,int uniform_bits
         args.groups==256 && args.activation_rows<=2;
     const bool output_narrow=(output_narrow_setting?output_narrow_setting[0]=='1':narrow_output_default) && args.bytes<(uint64_t(1)<<29);
     const auto launch=[&](auto rows) {
+        // Keep outer tag parameters out of nested lambda captures on GCC 11.
+        using RowCount=decltype(rows);
         const auto details=tracing?"M="+std::to_string(args.activation_rows)+" N="+std::to_string(args.rows)+
             " gs="+std::to_string(group_size)+" groups="+std::to_string(args.groups)+
-            " capacity="+std::to_string(decltype(rows)::value)+
-            " exact="+std::to_string(exact_rows && args.activation_rows==decltype(rows)::value)+
+            " capacity="+std::to_string(RowCount::value)+
+            " exact="+std::to_string(exact_rows && args.activation_rows==RowCount::value)+
             " output_narrow="+std::to_string(output && output_narrow):std::string{};
         const auto launch_exact=[&](auto shape) {
         constexpr bool Exact=decltype(shape)::value;
         const auto launch_sum=[&](auto sums) {
+            using Sums=decltype(sums);
             if(output) {
                 const auto launch_output=[&](auto gs,auto bits) {
+                    using GroupSize=decltype(gs);
+                    using BitWidth=decltype(bits);
                 const auto launch_offset=[&](auto narrow) {
                 constexpr bool Narrow=decltype(narrow)::value;
                 const auto launch_proof=[&](auto proof) {
                 const auto* dual_setting=std::getenv("MFQ_NINT_OUTPUT_DUAL_GROUP");
                 if(dual_setting && dual_setting[0]=='1' && args.rows%2==0 && args.activation_rows<=6) {
-                    nint_fixed_dual_group_output_kernel<decltype(gs)::value,decltype(bits)::value,decltype(rows)::value,decltype(sums)::value,Exact,Narrow><<<
+                    nint_fixed_dual_group_output_kernel<GroupSize::value,BitWidth::value,RowCount::value,Sums::value,Exact,Narrow><<<
                         args.rows/2,dim3(32,4),0,stream>>>(args);
                     if(tracing)mfq::cuda::dispatch_trace::record(stream,"nint_fixed_dual_group_output",
-                        reinterpret_cast<const void*>(nint_fixed_dual_group_output_kernel<decltype(gs)::value,decltype(bits)::value,decltype(rows)::value,decltype(sums)::value,Exact,Narrow>),details);
+                        reinterpret_cast<const void*>(nint_fixed_dual_group_output_kernel<GroupSize::value,BitWidth::value,RowCount::value,Sums::value,Exact,Narrow>),details);
                     return;
                 }
                 if(one_warp) {
-                    if constexpr(decltype(rows)::value==1) {
+                    if constexpr(RowCount::value==1) {
                         const auto* setting=std::getenv("MFQ_NINT_FIXED_LONG_GROUPS");
-                        constexpr int FixedGroups=decltype(gs)::value==24?256:220;
+                        constexpr int FixedGroups=GroupSize::value==24?256:220;
                         if(setting && setting[0]=='1' && args.groups==FixedGroups && args.rows==2560 &&
-                                (decltype(gs)::value==24 || decltype(bits)::value==5)) {
-                            nint_fixed_one_warp_output_kernel<decltype(gs)::value,decltype(bits)::value,1,decltype(sums)::value,Exact,Narrow,FixedGroups><<<
+                                (GroupSize::value==24 || BitWidth::value==5)) {
+                            nint_fixed_one_warp_output_kernel<GroupSize::value,BitWidth::value,1,Sums::value,Exact,Narrow,FixedGroups><<<
                                 (args.rows+3)/4,dim3(32,4),0,stream>>>(args);
                             if(tracing)mfq::cuda::dispatch_trace::record(stream,"nint_fixed_long_groups",
-                                reinterpret_cast<const void*>(nint_fixed_one_warp_output_kernel<decltype(gs)::value,decltype(bits)::value,1,decltype(sums)::value,Exact,Narrow,FixedGroups>),details);
+                                reinterpret_cast<const void*>(nint_fixed_one_warp_output_kernel<GroupSize::value,BitWidth::value,1,Sums::value,Exact,Narrow,FixedGroups>),details);
                             return;
                         }
                     }
-                    nint_fixed_one_warp_output_kernel<decltype(gs)::value,decltype(bits)::value,decltype(rows)::value,decltype(sums)::value,Exact,Narrow,0,decltype(proof)::value><<<
+                    nint_fixed_one_warp_output_kernel<GroupSize::value,BitWidth::value,RowCount::value,Sums::value,Exact,Narrow,0,decltype(proof)::value><<<
                         (args.rows+3)/4,dim3(32,4),0,stream>>>(args);
                     if(tracing)mfq::cuda::dispatch_trace::record(stream,decltype(proof)::value?"nint_fixed_one_warp_output_bounds":"nint_fixed_one_warp_output",
-                        reinterpret_cast<const void*>(nint_fixed_one_warp_output_kernel<decltype(gs)::value,decltype(bits)::value,decltype(rows)::value,decltype(sums)::value,Exact,Narrow,0,decltype(proof)::value>),details);
+                        reinterpret_cast<const void*>(nint_fixed_one_warp_output_kernel<GroupSize::value,BitWidth::value,RowCount::value,Sums::value,Exact,Narrow,0,decltype(proof)::value>),details);
                     return;
                 }
                 if(two_warps) {
-                    nint_fixed_two_warp_output_kernel<decltype(gs)::value,decltype(bits)::value,decltype(rows)::value,decltype(sums)::value,Exact,Narrow,decltype(proof)::value><<<args.rows/2,dim3(32,4),0,stream>>>(args);
+                    nint_fixed_two_warp_output_kernel<GroupSize::value,BitWidth::value,RowCount::value,Sums::value,Exact,Narrow,decltype(proof)::value><<<args.rows/2,dim3(32,4),0,stream>>>(args);
                     if(tracing)mfq::cuda::dispatch_trace::record(stream,decltype(proof)::value?"nint_fixed_two_warp_output_bounds":uniform_bits==5?"nint_fixed5_two_warp_output":"nint_fixed6_two_warp_output",
-                        reinterpret_cast<const void*>(nint_fixed_two_warp_output_kernel<decltype(gs)::value,decltype(bits)::value,decltype(rows)::value,decltype(sums)::value,Exact,Narrow,decltype(proof)::value>),details);
+                        reinterpret_cast<const void*>(nint_fixed_two_warp_output_kernel<GroupSize::value,BitWidth::value,RowCount::value,Sums::value,Exact,Narrow,decltype(proof)::value>),details);
                     return;
                 }
-                nint_fixed_output_kernel<decltype(gs)::value,decltype(bits)::value,decltype(rows)::value,decltype(sums)::value,Exact,Narrow,decltype(proof)::value><<<args.rows,dim3(32,4),0,stream>>>(args);
+                nint_fixed_output_kernel<GroupSize::value,BitWidth::value,RowCount::value,Sums::value,Exact,Narrow,decltype(proof)::value><<<args.rows,dim3(32,4),0,stream>>>(args);
                 if(tracing)mfq::cuda::dispatch_trace::record(stream,decltype(proof)::value?"nint_fixed_output_bounds":uniform_bits==5?"nint_fixed5_long_output":"nint_fixed6_output",
-                    reinterpret_cast<const void*>(nint_fixed_output_kernel<decltype(gs)::value,decltype(bits)::value,decltype(rows)::value,decltype(sums)::value,Exact,Narrow,decltype(proof)::value>),details);
+                    reinterpret_cast<const void*>(nint_fixed_output_kernel<GroupSize::value,BitWidth::value,RowCount::value,Sums::value,Exact,Narrow,decltype(proof)::value>),details);
                 };
                 const auto* row_bounds=std::getenv("MFQ_NINT_ROW_BOUNDS");
                 const bool proof_selected=row_bounds?row_bounds[0]!='0':args.activation_rows<=6 && args.activation_rows!=3;
@@ -409,18 +417,19 @@ bool nint_launch_fixed_decode(NintWholeArgs args,int group_size,int uniform_bits
                 const auto* row_pairs=std::getenv("MFQ_NINT_ROW_PAIRS");
                 if constexpr(!Interleaved) {
                     if(args.rows%2==0 && row_pairs && row_pairs[0]=='1') {
-                        nint_fixed_five_kernel<decltype(rows)::value,decltype(sums)::value,2,false,Narrow,Exact><<<args.rows/2,dim3(32,6),0,stream>>>(args);
+                        nint_fixed_five_kernel<RowCount::value,Sums::value,2,false,Narrow,Exact><<<args.rows/2,dim3(32,6),0,stream>>>(args);
                         if(tracing)mfq::cuda::dispatch_trace::record(stream,"nint_fixed5_row_pairs",
-                            reinterpret_cast<const void*>(nint_fixed_five_kernel<decltype(rows)::value,decltype(sums)::value,2,false,Narrow,Exact>),details);
+                            reinterpret_cast<const void*>(nint_fixed_five_kernel<RowCount::value,Sums::value,2,false,Narrow,Exact>),details);
                         return;
                     }
                 }
                 if(warp_rows?warp_rows[0]=='1':args.activation_rows<=6) {
                     const auto launch_groups=[&](auto fixed_groups) {
+                        using FixedGroups=decltype(fixed_groups);
                         const auto launch_bounds=[&](auto proof) {
-                            nint_fixed_five_warp_rows_kernel<decltype(rows)::value,decltype(sums)::value,Interleaved,Narrow,Exact,decltype(fixed_groups)::value,decltype(proof)::value><<<(args.rows+3)/4,dim3(32,4),0,stream>>>(args);
-                            if(tracing)mfq::cuda::dispatch_trace::record(stream,decltype(proof)::value?"nint_fixed5_warp_rows_bounds":decltype(fixed_groups)::value?"nint_fixed5_warp_rows_92":Narrow?"nint_fixed5_warp_rows_narrow":Interleaved?"nint_fixed5_warp_rows_interleaved":"nint_fixed5_warp_rows",
-                                reinterpret_cast<const void*>(nint_fixed_five_warp_rows_kernel<decltype(rows)::value,decltype(sums)::value,Interleaved,Narrow,Exact,decltype(fixed_groups)::value,decltype(proof)::value>),details);
+                            nint_fixed_five_warp_rows_kernel<RowCount::value,Sums::value,Interleaved,Narrow,Exact,FixedGroups::value,decltype(proof)::value><<<(args.rows+3)/4,dim3(32,4),0,stream>>>(args);
+                            if(tracing)mfq::cuda::dispatch_trace::record(stream,decltype(proof)::value?"nint_fixed5_warp_rows_bounds":FixedGroups::value?"nint_fixed5_warp_rows_92":Narrow?"nint_fixed5_warp_rows_narrow":Interleaved?"nint_fixed5_warp_rows_interleaved":"nint_fixed5_warp_rows",
+                                reinterpret_cast<const void*>(nint_fixed_five_warp_rows_kernel<RowCount::value,Sums::value,Interleaved,Narrow,Exact,FixedGroups::value,decltype(proof)::value>),details);
                         };
                         const auto* row_bounds=std::getenv("MFQ_NINT_ROW_BOUNDS");
                         if(row_bounds?row_bounds[0]!='0':args.activation_rows<=6)launch_bounds(std::true_type{});
@@ -428,9 +437,9 @@ bool nint_launch_fixed_decode(NintWholeArgs args,int group_size,int uniform_bits
                     };
                     if(fixed_92)launch_groups(std::true_type{});else launch_groups(std::false_type{});
                 }else {
-                    nint_fixed_five_kernel<decltype(rows)::value,decltype(sums)::value,1,Interleaved,Narrow,Exact><<<args.rows,dim3(32,3),0,stream>>>(args);
+                    nint_fixed_five_kernel<RowCount::value,Sums::value,1,Interleaved,Narrow,Exact><<<args.rows,dim3(32,3),0,stream>>>(args);
                     if(tracing)mfq::cuda::dispatch_trace::record(stream,Narrow?(Interleaved?"nint_fixed5_interleaved_narrow":"nint_fixed5_narrow"):Interleaved?"nint_fixed5_interleaved":"nint_fixed5",
-                        reinterpret_cast<const void*>(nint_fixed_five_kernel<decltype(rows)::value,decltype(sums)::value,1,Interleaved,Narrow,Exact>),details);
+                        reinterpret_cast<const void*>(nint_fixed_five_kernel<RowCount::value,Sums::value,1,Interleaved,Narrow,Exact>),details);
                 }
                 };
                 if(narrow_offsets)launch_offset(std::true_type{});else launch_offset(std::false_type{});
@@ -440,7 +449,7 @@ bool nint_launch_fixed_decode(NintWholeArgs args,int group_size,int uniform_bits
         if(cached_sums)launch_sum(std::true_type{});else launch_sum(std::false_type{});
         };
         // Forced padded capacity must retain guards, including M5/M6 -> 8.
-        if(exact_rows && args.activation_rows==decltype(rows)::value)launch_exact(std::true_type{});
+        if(exact_rows && args.activation_rows==RowCount::value)launch_exact(std::true_type{});
         else launch_exact(std::false_type{});
     };
     const auto* exact=std::getenv("MFQ_NINT_EXACT_BATCH");
