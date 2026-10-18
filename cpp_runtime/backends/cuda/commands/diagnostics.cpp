@@ -1103,7 +1103,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             if (stop_ids.empty()) std::cerr << "warning: no model EOS token IDs; generation is limited only by --gen\n";
         }
         const auto status=generate_diagnostic_tokens(
-            execution, model, ids, gen, profile, t0, t1,decode_inputs,stop_ids);
+            execution, model, ids, gen, profile, t0, t1,decode_inputs,stop_ids,!router_lookahead_audit.empty());
         if(!status && !router_lookahead_audit.empty()) {
             if constexpr (std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
                 qwen4_finish_router_lookahead_audit(model,router_lookahead_audit);

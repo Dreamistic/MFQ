@@ -70,6 +70,7 @@ std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
     bool* initialized=nullptr,const mfq_tensor_backend::Tensor& host_ids={},
     mfq_tensor_backend::Tensor* logits=nullptr,std::vector<int32_t>* greedy_tokens=nullptr,bool compact_sampling=true);
 void qwen4_report_decode_graph(const Qwen4CausalLm&,std::ostream&);
+std::vector<std::pair<std::string,double>> qwen4_decode_graph_profile_metrics(const Qwen4CausalLm&,const MtpModule*);
 mfq_tensor_backend::Tensor qwen4_decode_graph_compact_topk(const Qwen4CausalLm&);
 void qwen4_release_decode_graphs(Qwen4CausalLm&,MtpModule*);
 void qwen4_warmup_decode_graphs(Qwen4CausalLm&,MtpModule*,int maximum_draft_depth=3);

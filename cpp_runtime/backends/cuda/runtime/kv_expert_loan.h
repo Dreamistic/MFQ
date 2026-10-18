@@ -28,7 +28,24 @@ class KvExpertLoan {
         int fields=0;std::size_t logical_bytes=0;
     };
 public:
+    void set_reuse_learning(bool enabled) {
+        std::lock_guard lock(mutex_);reuse_learning_=enabled;
+    }
     using Key=std::array<int64_t,3>; // source, expert, field
+    struct ReuseStats {uint64_t promotions=0,protected_hits=0,probation_evictions=0;std::size_t protected_pages=0;bool enabled=false;};
+    void set_reuse_priority(bool enabled) {
+        std::lock_guard<std::mutex> lock(mutex_);if(reuse_priority_==enabled)return;
+        reuse_priority_=enabled;reuse_pages_=0;reuse_heads_={};reuse_tails_={};
+        for(auto* entries:{&lru_,&retired_})for(auto& entry:*entries) {
+            entry.reused=false;entry.reuse_linked=false;entry.reuse_prev=entry.reuse_next=nullptr;
+            if(entry.published)notify_projection(entry,true,true);
+        }
+        if(enabled)rebuild_reuse_queues();
+    }
+    ReuseStats reuse_stats() const {
+        std::lock_guard<std::mutex> lock(mutex_);auto result=reuse_stats_;result.protected_pages=reuse_pages_;
+        result.enabled=reuse_priority_;return result;
+    }
     class ExchangeReadGuard {
         friend class KvExpertLoan;
         KvExpertLoan* owner_;
@@ -115,6 +132,7 @@ public:
         if(copy_stream_)MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
         MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
         r=Region{};
+        update_bounds();
     }
     void ensure(int64_t tokens) {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -162,14 +180,16 @@ public:
     }
     using ProjectionFill=std::function<void(void*,const std::array<std::size_t,8>&)>;
     using ProjectionObserver=std::function<void(int64_t,const void*,const std::array<std::size_t,8>&)>;
-    void observe_projections(int64_t source,ProjectionObserver observer,std::shared_ptr<void> owner={}) {
+    // RAM eviction may use only repeatedly consumed GPU images. One-use
+    // transfer pages are too short-lived to replace a protected RAM image.
+    void observe_projections(int64_t source,ProjectionObserver observer,std::shared_ptr<void> owner={},bool reuse_only=false) {
         if(!observer)throw std::invalid_argument("empty KV projection observer");
         std::lock_guard<std::mutex> lock(mutex_);
         for(const auto& entry:lru_)if(entry.key[0]==source && entry.projection && entry.published)
-            observer(entry.key[1],pointer(entry),entry.projection->offsets);
+            observer(entry.key[1],!reuse_only || entry.reused?pointer(entry):nullptr,entry.projection->offsets);
         auto& observers=observers_[source];
         std::erase_if(observers,[](const auto& value){return value.managed && value.owner.expired();});
-        observers.push_back({std::move(observer),owner,bool(owner)});
+        observers.push_back({std::move(observer),owner,bool(owner),reuse_only});
     }
     // Route publication has fenced the previous readers. Check complete hits
     // before acquiring RAM expert slices or reserving transfer-stage slots.
@@ -186,6 +206,7 @@ public:
         if(it->retired)pending_publications_.push_back(it->key);
         note_access(*it,it->retired);
         lru_.splice(lru_.begin(),it->retired?retired_:lru_,it);it->retired=false;it->packet=packet_;
+        if(reuse_priority_)reuse_touch(*it);
         offsets=it->projection->offsets;logical_bytes=it->projection->logical_bytes;hits_+=logical_bytes;
         return pointer(*it);
     }
@@ -209,12 +230,24 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         for(int f=-1;f<fields;++f)if(auto found=entries_.find({source,expert,f});found!=entries_.end()) {
             auto it=found->second;if(it->retired)continue;
+            set_reused(*it,false);
+            reuse_unlink(*it);
             if(it->published){notify_projection(*it,false);it->published=false;}
             it->retired=true;retired_.splice(retired_.end(),lru_,it);
         }
     }
     // Residency exchange holds the completed window and joins before the next
     // packet/KV growth. It may reuse these bytes until that exchange finishes.
+    bool contains_projection(int64_t source,int64_t expert,const std::vector<int64_t>& sizes) const {
+        std::lock_guard lock(mutex_);
+        const auto found=entries_.find({source,expert,-1});
+        if(found==entries_.end() || !found->second->projection)return false;
+        const auto& layout=*found->second->projection;
+        if(sizes.size()!=std::size_t(layout.fields))return false;
+        for(std::size_t f=0;f<sizes.size();++f)
+            if(sizes[f]<0 || std::size_t(sizes[f])!=layout.bytes[f])return false;
+        return true;
+    }
     const void* find_for_exchange(const Key& key,std::size_t bytes,ExchangeReadGuard* guard=nullptr) const {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto retain=[&](Entry& entry) {
@@ -280,13 +313,20 @@ private:
     }
     struct Region {mfq_tensor_backend::Tensor owner;int64_t capacity=0,ratio=1,manual_live=-1;std::size_t row_bytes=0,begin=0,end=0,largest_free=0;bool prefix=false,external=false;std::map<std::size_t,std::size_t> free;};
     struct Entry {Key key;std::size_t region,first,pages,bytes;uint64_t packet=0;bool retired=false,published=false;
-        uint64_t order=0,prior_order=0,epoch=0;uint32_t used_rows=0;
+        uint64_t order=0,prior_order=0,epoch=0;uint32_t used_rows=0;bool reused=false,reuse_eligible=false,reuse_linked=false;
+        Entry* reuse_prev=nullptr;Entry* reuse_next=nullptr;
         std::unique_ptr<ProjectionLayout> projection;std::size_t exchange_pins=0;};
     void disable_speculative() {
         speculative_rows_=0;speculative_keys_.clear();packet_sources_={};packet_masks_.clear();++speculative_stats_.disabled;
     }
     void note_access(Entry& entry,bool fresh=false) {
-        if(!speculative_rows_)return;
+        if(!reuse_learning_)return;
+        const bool reused=!fresh && entry.packet!=packet_;
+        if(reuse_priority_ && entry.reused)++reuse_stats_.protected_hits;
+        if(!speculative_rows_) {
+            if(reuse_priority_ && reused){set_reused(entry,true);trim_reused(&entry);}
+            return;
+        }
         const auto expert=entry.key[1];
         const auto mask=expert>=0 && std::size_t(expert)<packet_masks_.size() &&
             std::find(packet_sources_.begin(),packet_sources_.end(),entry.key[0])!=packet_sources_.end()?
@@ -296,9 +336,10 @@ private:
                 try {speculative_keys_.push_back(entry.key);}
                 catch(const std::bad_alloc&){disable_speculative();return;}
                 entry.epoch=speculative_epoch_;entry.prior_order=fresh?0:entry.order;entry.used_rows=0;
+                entry.reuse_eligible=reused;
             }
             entry.used_rows|=mask;
-        }
+        }else if(reuse_priority_ && reused){set_reused(entry,true);trim_reused(&entry);}
         entry.order=++access_order_;
     }
     void finish_speculative(int rows,bool cancelled) {
@@ -307,7 +348,10 @@ private:
         for(const auto& key:speculative_keys_)if(auto found=entries_.find(key);found!=entries_.end()) {
             auto& entry=*found->second;if(entry.epoch!=speculative_epoch_)continue;
             entry.epoch=0;
-            if(entry.used_rows&accepted) {++speculative_stats_.kept;continue;}
+            if(entry.used_rows&accepted) {
+                if(reuse_priority_ && entry.reuse_eligible)set_reused(entry,true);
+                ++speculative_stats_.kept;continue;
+            }
             entry.order=entry.prior_order;reordered=true;
             if(entry.prior_order)++hits;else ++insertions;
         }
@@ -315,6 +359,7 @@ private:
         // become cold. Do not free, unpublish or move any payload here: a later
         // ordinary packet boundary remains the sole eviction/read fence.
         if(reordered)lru_.sort([](const Entry& a,const Entry& b){return a.order>b.order;});
+        if(reuse_priority_){rebuild_reuse_queues();trim_reused();}
         ++speculative_stats_.windows;speculative_stats_.reverted_hits+=hits;
         speculative_stats_.cold_insertions+=insertions;speculative_stats_.cancels+=cancelled;
         if(reordered && !speculative_reported_) {
@@ -347,6 +392,7 @@ private:
             if(it->retired && it->projection)pending_publications_.push_back(it->key);
             note_access(*it,it->retired);
             lru_.splice(lru_.begin(),it->retired?retired_:lru_,it);it->retired=false;
+            if(reuse_priority_)reuse_touch(*it);
             it->packet=packet_;hit=true;hits_+=projection?projection->logical_bytes:bytes;
             return pointer(*it);
         }
@@ -356,10 +402,15 @@ private:
         if(room.first==regions_.size() && exchange_freezes_)return nullptr;
         while(room.first==regions_.size()) {
             auto candidate=lru_.end();
-            for(auto it=lru_.end();it!=lru_.begin();) {
+            if(reuse_priority_) {
+                for(int queue=0;queue<2 && candidate==lru_.end();++queue)
+                    for(auto* entry=reuse_tails_[queue];entry;entry=entry->reuse_prev)
+                        if(entry->packet!=packet_ && !entry->exchange_pins){candidate=entries_.at(entry->key);break;}
+            }else for(auto it=lru_.end();it!=lru_.begin();) {
                 --it;if(it->packet!=packet_ && !it->exchange_pins){candidate=it;break;}
             }
             if(candidate==lru_.end())break;
+            if(reuse_priority_ && !candidate->reused)++reuse_stats_.probation_evictions;
             erase(candidate);room=find(pages);
         }
         if(room.first==regions_.size())return nullptr;
@@ -383,6 +434,7 @@ private:
         }
         note_access(entry,true);
         lru_.push_front(std::move(entry));entries_[key]=lru_.begin();bytes_+=bytes;copy_stream_=stream;
+        if(reuse_priority_)reuse_touch(lru_.front());
         if(projection)pending_publications_.push_back(key);
         return cache;
     }
@@ -413,7 +465,53 @@ private:
             }
             r.largest_free=0;for(const auto& [begin,size]:r.free)r.largest_free=std::max(r.largest_free,size);
         }
+        reuse_capacity_pages_=0;
+        for(const auto& r:regions_)if(r.end>r.begin)reuse_capacity_pages_+=r.end-r.begin;
+        if(reuse_priority_)trim_reused();
         return changed;
+    }
+    void set_reused(Entry& entry,bool value) {
+        if(entry.reused==value)return;
+        reuse_unlink(entry);
+        entry.reused=value;
+        if(entry.published)notify_projection(entry,true,true);
+        if(value){reuse_pages_+=entry.pages;++reuse_stats_.promotions;}
+        else reuse_pages_-=entry.pages;
+        if(reuse_priority_ && !entry.retired)reuse_touch(entry);
+    }
+    void reuse_unlink(Entry& entry) {
+        if(!entry.reuse_linked)return;
+        const int queue=entry.reused?1:0;
+        if(entry.reuse_prev)entry.reuse_prev->reuse_next=entry.reuse_next;
+        else reuse_heads_[queue]=entry.reuse_next;
+        if(entry.reuse_next)entry.reuse_next->reuse_prev=entry.reuse_prev;
+        else reuse_tails_[queue]=entry.reuse_prev;
+        entry.reuse_prev=entry.reuse_next=nullptr;entry.reuse_linked=false;
+    }
+    void reuse_touch(Entry& entry) {
+        reuse_unlink(entry);const int queue=entry.reused?1:0;
+        entry.reuse_next=reuse_heads_[queue];
+        if(entry.reuse_next)entry.reuse_next->reuse_prev=&entry;
+        else reuse_tails_[queue]=&entry;
+        reuse_heads_[queue]=&entry;entry.reuse_linked=true;
+    }
+    void rebuild_reuse_queues() {
+        reuse_heads_={};reuse_tails_={};
+        for(auto it=lru_.rbegin();it!=lru_.rend();++it) {
+            it->reuse_linked=false;it->reuse_prev=it->reuse_next=nullptr;reuse_touch(*it);
+        }
+    }
+    void trim_reused(Entry* recent=nullptr) {
+        // Keep a probationary quarter for new routes. Repeated experts survive
+        // long one-use scans without reserving VRAM for any particular source.
+        const auto limit=reuse_capacity_pages_-reuse_capacity_pages_/4;
+        while(reuse_pages_>limit) {
+            auto* entry=reuse_tails_[1];
+            if(entry && entry==recent)entry=entry->reuse_prev;
+            if(!entry)break;
+            set_reused(*entry,false);
+        }
+        if(reuse_pages_>limit && recent)set_reused(*recent,false);
     }
     void revoke() {
         bool revoked=false;
@@ -432,17 +530,19 @@ private:
         return {regions_.size(),0};
     }
     void* pointer(const Entry& e) const {return static_cast<uint8_t*>(regions_[e.region].owner.data_ptr())+e.first*page;}
-    void notify_projection(const Entry& entry,bool valid) {
+    void notify_projection(const Entry& entry,bool valid,bool reuse_change=false) {
         if(!entry.projection)return;
         if(auto found=observers_.find(entry.key[0]);found!=observers_.end()) {
             std::erase_if(found->second,[](const auto& value){return value.managed && value.owner.expired();});
-            for(const auto& observer:found->second)
-                observer.callback(entry.key[1],valid?pointer(entry):nullptr,entry.projection->offsets);
+            for(const auto& observer:found->second)if(!reuse_change || observer.reuse_only)
+                observer.callback(entry.key[1],valid && (!observer.reuse_only || entry.reused)?pointer(entry):nullptr,entry.projection->offsets);
         }
     }
     void erase(std::list<Entry>::iterator it) {
         if(it->exchange_pins)throw std::logic_error("reclaiming a pinned KV exchange source");
         if(it->published)notify_projection(*it,false);
+        set_reused(*it,false);
+        reuse_unlink(*it);
         auto& r=regions_[it->region];
         auto begin=std::max(it->first,r.begin),end=std::min(it->first+it->pages,r.end);
         if(begin<end) {
@@ -461,7 +561,7 @@ private:
     std::vector<Region> regions_;
     std::list<Entry> lru_,retired_;
     std::unordered_map<Key,std::list<Entry>::iterator,KeyHash> entries_;
-    struct Observer {ProjectionObserver callback;std::weak_ptr<void> owner;bool managed=false;};
+    struct Observer {ProjectionObserver callback;std::weak_ptr<void> owner;bool managed=false,reuse_only=false;};
     std::unordered_map<int64_t,std::vector<Observer>> observers_;
     std::vector<Key> pending_publications_;
     uint64_t packet_=1;
@@ -470,6 +570,10 @@ private:
     std::vector<uint32_t> packet_masks_;
     std::vector<Key> speculative_keys_;
     SpeculativeStats speculative_stats_;
+    bool reuse_priority_=false,reuse_learning_=true;
+    std::array<Entry*,2> reuse_heads_{},reuse_tails_{};
+    std::size_t reuse_pages_=0,reuse_capacity_pages_=0;
+    ReuseStats reuse_stats_;
     bool speculative_reported_=false;
     std::size_t bytes_=0,hits_=0,retired_bytes_=0;
     double lookup_us_=0;

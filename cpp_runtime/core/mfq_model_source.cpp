@@ -1,10 +1,16 @@
 #include "mfq/mfq_model_source.h"
 #include "mfq/async_range_reader.h"
+#include "mfq/mapped_read_profile.h"
+#include "mfq/mapped_prefetch_scope.h"
+#include "mfq/mapped_tensor_pages.h"
 
 #include "mfq_format_compat.h"
 #include "mfq_legacy_tensor_names.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cctype>
 #include <cstring>
 #include <cstdio>
@@ -42,11 +48,16 @@ constexpr std::uint64_t kMaxStringBytes = std::uint64_t{64} << 20;
 constexpr std::uint32_t kMaxMetadataEntries = std::uint32_t{1} << 16;
 constexpr std::uint32_t kMaxRecordEntries = std::uint32_t{1} << 20;
 constexpr std::string_view kAssetPrefix = "__mfq_asset__/";
+std::array<std::atomic<std::uint64_t>,5> mapped_read_totals{};
+using MappedClock=std::chrono::steady_clock;
+thread_local bool mapped_prefetch_context=false;
 
 class MappedTensorRange {
     void* view_=nullptr;
     std::size_t mapped_bytes_=0,prefix_=0;
     std::uint64_t bytes_=0;
+    bool profile_=false;
+    int prefetch_override_=-1;
 #ifdef _WIN32
     HANDLE file_=INVALID_HANDLE_VALUE,mapping_=nullptr;
 #else
@@ -64,6 +75,10 @@ class MappedTensorRange {
     }
 public:
     explicit MappedTensorRange(const MfqStoredRecord& record):bytes_(record.tensor.nbytes) {
+        const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");
+        profile_=profile && profile[0]=='1';
+        const auto* prefetch=std::getenv("MFQ_MAPPED_BATCH_PREFETCH");
+        if(prefetch)prefetch_override_=prefetch[0]!='0';
         if(!bytes_)return;
         try {
             std::uint64_t granularity=0,file_bytes=0;
@@ -104,11 +119,28 @@ public:
     ~MappedTensorRange(){close();}
     MappedTensorRange(const MappedTensorRange&)=delete;
     MappedTensorRange& operator=(const MappedTensorRange&)=delete;
+    bool release_pages() const noexcept {
+        if(!view_ || !mapped_bytes_)return false;
+#ifdef _WIN32
+        // Unlocked file pages become reclaimable even when the API reports
+        // ERROR_NOT_LOCKED. The read-only view and its file stay open.
+        (void)VirtualUnlock(view_,mapped_bytes_);
+#else
+        (void)::madvise(view_,mapped_bytes_,MADV_DONTNEED);
+#endif
+        return true;
+    }
     void read(std::uint64_t offset,std::byte* destination,std::size_t size)const {
         if(offset>bytes_ || size>bytes_-offset)throw std::out_of_range("mapped tensor row range is out of bounds");
         if(!size)return;
         if(!destination)throw std::invalid_argument("mapped tensor destination is null");
+        const auto started=profile_?MappedClock::now():MappedClock::time_point{};
         std::memcpy(destination,static_cast<const std::byte*>(view_)+prefix_+static_cast<std::size_t>(offset),size);
+        if(profile_) {
+            mapped_read_totals[1].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(MappedClock::now()-started).count(),std::memory_order_relaxed);
+            mapped_read_totals[2].fetch_add(size,std::memory_order_relaxed);
+            mapped_read_totals[3].fetch_add(1,std::memory_order_relaxed);
+        }
     }
     void read_batch(const std::vector<ReadSpan>& spans)const {
         // Check the complete batch before touching any destination. A failed
@@ -119,10 +151,12 @@ public:
             if(span.size && !span.destination)
                 throw std::invalid_argument("mapped tensor batch destination is null");
         }
-#ifdef _WIN32
         // Like Strata's PLE prefetch, submit the independent pages together.
         // NINT stores q, sub-scale/min and neuron anchors in separate streams;
         // sequential mapped reads otherwise fault those five streams in turn.
+        const auto started=profile_?MappedClock::now():MappedClock::time_point{};
+        if(prefetch_override_<0?mapped_prefetch_context:prefetch_override_!=0) {
+#ifdef _WIN32
         std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
         ranges.reserve(std::min<std::size_t>(spans.size(),4096));
         const auto prefetch=[&] {
@@ -134,10 +168,30 @@ public:
             if(ranges.size()==4096)prefetch();
         }
         prefetch();
+#else
+        const auto page=std::size_t(::sysconf(_SC_PAGESIZE));
+        if(page && page!=std::size_t(-1))for(const auto& span:spans)if(span.size) {
+            const auto address=reinterpret_cast<std::uintptr_t>(view_)+prefix_+std::size_t(span.offset);
+            const auto begin=address/page*page,end=(address+span.size+page-1)/page*page;
+            (void)::madvise(reinterpret_cast<void*>(begin),end-begin,MADV_WILLNEED);
+        }
 #endif
+        }
+        if(profile_) {
+            mapped_read_totals[0].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(MappedClock::now()-started).count(),std::memory_order_relaxed);
+            mapped_read_totals[4].fetch_add(1,std::memory_order_relaxed);
+        }
         for(const auto& span:spans)if(span.size)read(span.offset,span.destination,span.size);
     }
 };
+
+std::mutex mapped_ranges_mutex;
+std::vector<std::weak_ptr<MappedTensorRange>> mapped_ranges;
+std::shared_ptr<MappedTensorRange> map_tensor_range(const MfqStoredRecord& record) {
+    auto range=std::make_shared<MappedTensorRange>(record);
+    std::lock_guard lock(mapped_ranges_mutex);mapped_ranges.push_back(range);
+    return range;
+}
 
 std::filesystem::path stable_path(const std::filesystem::path& path) {
     std::error_code error;
@@ -441,6 +495,27 @@ struct MfqModelSource::Impl {
     std::unordered_map<std::string, std::size_t> tensors_by_name;
 };
 
+std::array<std::uint64_t,5> mapped_tensor_read_profile() {
+    std::array<std::uint64_t,5> result{};
+    for(std::size_t i=0;i<result.size();++i)result[i]=mapped_read_totals[i].load(std::memory_order_relaxed);
+    return result;
+}
+
+std::size_t release_mapped_tensor_pages() {
+    std::lock_guard lock(mapped_ranges_mutex);
+    std::size_t views=0;
+    for(auto item=mapped_ranges.begin();item!=mapped_ranges.end();) {
+        if(const auto range=item->lock()) {views+=range->release_pages();++item;}
+        else item=mapped_ranges.erase(item);
+    }
+    return views;
+}
+
+MappedPrefetchScope::MappedPrefetchScope(bool enabled):previous_(mapped_prefetch_context) {
+    mapped_prefetch_context=enabled;
+}
+MappedPrefetchScope::~MappedPrefetchScope(){mapped_prefetch_context=previous_;}
+
 MfqModelSource::MfqModelSource(std::filesystem::path requested, FileReadMode mode)
     : impl_(std::make_unique<Impl>()) {
     impl_->read_mode = mode;
@@ -692,7 +767,7 @@ ModelSource::TensorReader MfqModelSource::mapped_tensor_reader(std::string_view 
     }
     if(found==impl_->records_by_name.end() || impl_->records[found->second].asset)
         throw std::runtime_error("mapped model tensor not found: "+std::string(name));
-    auto range=std::make_shared<MappedTensorRange>(impl_->records[found->second]);
+    auto range=map_tensor_range(impl_->records[found->second]);
     return [range](std::uint64_t offset,std::byte* destination,std::size_t size){range->read(offset,destination,size);};
 }
 
@@ -707,7 +782,7 @@ ModelSource::TensorBatchReader MfqModelSource::mapped_tensor_batch_reader(std::s
     }
     if(found==impl_->records_by_name.end() || impl_->records[found->second].asset)
         throw std::runtime_error("mapped model tensor not found: "+std::string(name));
-    auto range=std::make_shared<MappedTensorRange>(impl_->records[found->second]);
+    auto range=map_tensor_range(impl_->records[found->second]);
     return [range](const std::vector<ReadSpan>& spans){range->read_batch(spans);};
 }
 ModelSource::TensorBatchReader MfqModelSource::tensor_batch_reader(std::string_view name) const {
@@ -745,6 +820,7 @@ FileReadStats MfqModelSource::file_read_stats() const noexcept {
         result.logical_bytes += value.logical_bytes; result.physical_bytes += value.physical_bytes;
         result.errors += value.errors; result.staging_bytes += value.staging_bytes;
         result.staging_peak_bytes += value.staging_peak_bytes; result.read_nanoseconds += value.read_nanoseconds;
+        result.staging_cached_bytes+=value.staging_cached_bytes;result.staging_allocations+=value.staging_allocations;
     }
     {
         std::lock_guard lock(impl_->pipeline_reader_mutex);
@@ -753,6 +829,7 @@ FileReadStats MfqModelSource::file_read_stats() const noexcept {
             result.physical_bytes+=value.physical_bytes;result.errors+=value.errors;
             result.staging_bytes+=value.staging_bytes;result.staging_peak_bytes+=value.staging_peak_bytes;
             result.read_nanoseconds+=value.read_nanoseconds;
+            result.staging_cached_bytes+=value.staging_cached_bytes;result.staging_allocations+=value.staging_allocations;
         }
     }
     return result;

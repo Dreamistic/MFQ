@@ -57,6 +57,8 @@ public:
     std::size_t segments() const {return barriers_.size()+1;}
     bool valid() const { const auto* graph=graphs_.find(0,1);return graph && graph->valid() && !recording_segments_; }
     static DecodeWindow* recording() noexcept;
+    bool prediction_enabled() const noexcept {return prediction_enabled_;}
+    void set_prediction_enabled(bool enabled) noexcept {prediction_enabled_=enabled;}
 private:
     cudaStream_t stream_;
     GraphRegistry graphs_;
@@ -69,6 +71,7 @@ private:
     int profile_layer_=-1;
     bool layer_profile_;
     bool independent_sequences_;
+    bool prediction_enabled_=true;
     std::string profile_role_="unknown";
     int profile_rows_=1;
     std::map<int,std::string> profile_kinds_;

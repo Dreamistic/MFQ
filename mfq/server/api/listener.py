@@ -78,6 +78,8 @@ class RuntimeServer(uvicorn.Server):
                 listener.listen(config.backlog)
                 listeners.append(listener)
             await super().startup(listeners)
+            if self.should_exit:
+                raise SystemExit(3)
         except BaseException:
             for listener in owned_sockets:
                 listener.close()

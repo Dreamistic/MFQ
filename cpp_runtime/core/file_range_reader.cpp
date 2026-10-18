@@ -5,9 +5,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -23,6 +26,10 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <linux/aio_abi.h>
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace mfq {
@@ -43,13 +50,88 @@ struct FileRangeReader::Impl {
     std::size_t alignment = 1;
     std::uint64_t size = 0;
     mutable std::atomic<std::uint64_t> calls{0}, logical{0}, physical{0}, errors{0}, staging{0}, peak{0}, nanos{0};
+    mutable std::atomic<std::uint64_t> cached_staging{0},staging_allocations{0};
 #if defined(_WIN32)
     HANDLE handle = INVALID_HANDLE_VALUE;
-    ~Impl() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
 #else
     int handle = -1;
-    ~Impl() { if (handle >= 0) ::close(handle); }
 #endif
+    struct Slab {void* data=nullptr;std::size_t bytes=0;std::uint64_t order=0;};
+    mutable std::mutex slabs_mutex;
+    mutable std::array<Slab,16> slabs{};
+    mutable std::uint64_t slab_order=0;
+    static void free_staging(void* data) noexcept {
+#if defined(_WIN32)
+        _aligned_free(data);
+#else
+        std::free(data);
+#endif
+    }
+    ~Impl() {
+        for(const auto& slab:slabs)if(slab.data)free_staging(slab.data);
+#if defined(_WIN32)
+        if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+#else
+        if (handle >= 0) ::close(handle);
+#endif
+    }
+    Slab borrow_staging(std::size_t bytes) const {
+        Slab result;
+        {
+            std::lock_guard lock(slabs_mutex);
+            auto best=slabs.end();
+            for(auto it=slabs.begin();it!=slabs.end();++it)
+                if(it->data && it->bytes>=bytes && it->bytes-bytes<=std::max<std::size_t>(bytes,65536) &&
+                        (best==slabs.end() || it->bytes<best->bytes))best=it;
+            if(best!=slabs.end()) {
+                result=*best;*best={};
+                cached_staging.fetch_sub(result.bytes,std::memory_order_relaxed);
+            }
+        }
+        if(result.data) {
+            static std::atomic<bool> reported{false};
+            if(!reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
+                std::fprintf(stderr,"model_direct_staging_pool scope=first_reuse enabled=1 max_idle_bytes=8388608 bytes=%zu\n",result.bytes);
+        }
+        if(!result.data) {
+            // Sector-aligned size classes reuse ordinary expert images across
+            // nearby formats, without rounding small metadata up to 64 KiB.
+            const auto granule=std::max<std::size_t>(alignment,65536);
+            if(bytes>=granule && bytes<=(4u<<20))bytes=(bytes+granule-1)/granule*granule;
+            void* data=nullptr;
+#if defined(_WIN32)
+            data=_aligned_malloc(bytes,std::max(alignment,sizeof(void*)));
+#else
+            if(::posix_memalign(&data,std::max(alignment,sizeof(void*)),bytes))data=nullptr;
+#endif
+            result={data,bytes};
+            if(!result.data)throw std::bad_alloc();
+            staging_allocations.fetch_add(1,std::memory_order_relaxed);
+        }
+        acquire(result.bytes);return result;
+    }
+    void return_staging(Slab slab) const noexcept {
+        bool retained=false;
+        if(slab.bytes<=(4u<<20)) {
+            std::lock_guard lock(slabs_mutex);
+            auto idle=cached_staging.load(std::memory_order_relaxed);
+            for(;;) {
+                auto free=slabs.end(),oldest=slabs.end();
+                for(auto it=slabs.begin();it!=slabs.end();++it) {
+                    if(!it->data)free=it;
+                    else if(oldest==slabs.end() || it->order<oldest->order)oldest=it;
+                }
+                if(free!=slabs.end() && slab.bytes<=(8u<<20)-idle) {
+                    slab.order=++slab_order;*free=slab;idle+=slab.bytes;retained=true;break;
+                }
+                if(oldest==slabs.end())break;
+                idle-=oldest->bytes;free_staging(oldest->data);*oldest={};
+            }
+            cached_staging.store(idle,std::memory_order_relaxed);
+        }
+        staging.fetch_sub(slab.bytes,std::memory_order_relaxed);
+        if(!retained)free_staging(slab.data);
+    }
     explicit Impl(FileReadMode value) : mode(value) {}
     void acquire(std::size_t bytes) const {
         const auto current = staging.fetch_add(bytes, std::memory_order_relaxed) + bytes;
@@ -160,23 +242,12 @@ void FileRangeReader::read(std::uint64_t offset, std::byte* destination, std::si
                 std::size_t bytes = 0;
                 Buffer(const Impl& value, std::size_t count, bool allocate) : owner(value) {
                     if (!allocate) return;
-#if defined(_WIN32)
-                    data = _aligned_malloc(count, owner.alignment);
-#else
-                    if (::posix_memalign(&data, std::max(owner.alignment, sizeof(void*)), count)) data = nullptr;
-#endif
-                    if (!data) throw std::bad_alloc();
-                    bytes = count;
-                    owner.acquire(bytes);
+                    const auto slab=owner.borrow_staging(count);
+                    data=slab.data;bytes=slab.bytes;
                 }
                 ~Buffer() {
                     if (!data) return;
-#if defined(_WIN32)
-                    _aligned_free(data);
-#else
-                    std::free(data);
-#endif
-                    owner.staging.fetch_sub(bytes, std::memory_order_relaxed);
+                    owner.return_staging({data,bytes});
                 }
             } buffer(*impl_, transfer_bytes, bounce);
             const auto actual = impl_->transfer(aligned_offset, bounce ? buffer.data : destination, transfer_bytes);
@@ -198,8 +269,55 @@ void FileRangeReader::read(std::uint64_t offset, std::byte* destination, std::si
 FileReadStats FileRangeReader::stats() const noexcept {
     const auto& p = *impl_;
     return {p.mode, 1, p.calls.load(), p.logical.load(), p.physical.load(), p.errors.load(),
-            p.staging.load(), p.peak.load(), p.nanos.load()};
+            p.staging.load(), p.peak.load(), p.nanos.load(),p.cached_staging.load(),p.staging_allocations.load()};
 }
+
+#if defined(__linux__)
+namespace {
+// Each SSD worker owns its kernel queue. A shared userspace dispatch mutex
+// would serialize independent experts, even with several outer read workers.
+struct LinuxAioContext {
+    aio_context_t context=0;
+    LinuxAioContext(){if(::syscall(SYS_io_setup,64,&context)<0)context=0;}
+    void reset() noexcept {
+        if(context){while(::syscall(SYS_io_destroy,context)<0 && errno==EINTR){}context=0;}
+    }
+    ~LinuxAioContext(){reset();}
+    bool read(std::array<iocb*,64>& requests,std::size_t count,
+              std::array<std::int64_t,64>& results) {
+        if(!context)return false;
+        std::size_t submitted=0,completed=0;int failure=0;
+        while(submitted<count) {
+            const auto n=::syscall(SYS_io_submit,context,count-submitted,requests.data()+submitted);
+            if(n<0 && errno==EINTR)continue;
+            if(n<=0){failure=n<0?errno:EIO;break;}
+            submitted+=std::size_t(n);
+        }
+        // Drain partial submissions, including a later submission failure,
+        // before any destination or iocb can be released or reused.
+        while(completed<submitted) {
+            std::array<io_event,64> events{};
+            const auto n=::syscall(SYS_io_getevents,context,1,submitted-completed,events.data(),nullptr);
+            if(n<0 && errno==EINTR)continue;
+            if(n<=0) {
+                const auto error=n<0?errno:EIO;reset();
+                throw std::system_error(error,std::generic_category(),"complete Linux model-file batch");
+            }
+            for(long i=0;i<n;++i)results.at(events[i].data)=events[i].res;
+            completed+=std::size_t(n);
+        }
+        // Filesystems without native AIO still use the same O_DIRECT fd.
+        // They run on the caller's existing SSD worker, without a global pool.
+        if(!submitted && (failure==EINVAL || failure==EOPNOTSUPP || failure==ENOSYS))return false;
+        if(failure)throw std::system_error(failure,std::generic_category(),"submit Linux model-file batch");
+        static std::atomic<bool> reported{false};
+        if(!reported.exchange(true,std::memory_order_relaxed))
+            std::fprintf(stderr,"model_linux_aio_batch enabled=1 max_requests=64\n");
+        return true;
+    }
+};
+}
+#endif
 
 void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
     for (const auto& span : spans) {
@@ -275,12 +393,38 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
             std::chrono::steady_clock::now()-started).count(),std::memory_order_relaxed);
         return;
     }
+    struct DirectEvents {
+        std::array<HANDLE,64> handles{};
+        ~DirectEvents(){for(auto handle:handles)if(handle)CloseHandle(handle);}
+        HANDLE at(std::size_t i) {
+            if(!handles[i])handles[i]=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+            if(!handles[i])throw std::system_error(GetLastError(),std::system_category(),"create direct batch event");
+            return handles[i];
+        }
+    };
+    static thread_local DirectEvents events;
+    struct BatchStorage {
+        const Impl& owner;
+        void* data=nullptr;
+        std::size_t capacity=0;
+        explicit BatchStorage(const Impl& value):owner(value) {}
+        void release() {
+            if(!data)return;
+            owner.return_staging({data,capacity});data=nullptr;capacity=0;
+        }
+        void ensure(std::size_t bytes) {
+            if(bytes<=capacity)return;
+            // Every preceding wave was drained before the arena can grow.
+            release();const auto slab=owner.borrow_staging(bytes);data=slab.data;capacity=slab.bytes;
+        }
+        ~BatchStorage(){release();}
+    };
     struct Request {
         const Impl& owner;
         OVERLAPPED native{};
         void* storage = nullptr;
         std::byte* destination = nullptr;
-        std::size_t prefix = 0, bytes = 0, allocation = 0;
+        std::size_t prefix = 0, bytes = 0, allocation = 0, storage_offset = 0;
         bool submitted = false, finished = false;
         explicit Request(const Impl& value) : owner(value) {}
         ~Request() {
@@ -288,64 +432,76 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
                 DWORD ignored = 0;
                 GetOverlappedResult(owner.handle, &native, &ignored, TRUE);
             }
-            if (native.hEvent) CloseHandle(native.hEvent);
-            if (storage) {
-                _aligned_free(storage);
-                owner.staging.fetch_sub(allocation, std::memory_order_relaxed);
-            }
         }
     };
     const auto started = std::chrono::steady_clock::now();
-    std::vector<std::unique_ptr<Request>> requests;
+    // Destruction drains requests before releasing their common I/O target.
+    BatchStorage storage(*impl_);
+    std::array<std::optional<Request>,64> requests;
+    std::size_t count=0;
     try {
         const auto alignment = impl_->alignment;
         const auto limit = std::size_t(std::numeric_limits<DWORD>::max()) / alignment * alignment;
-        for (const auto& span : spans) {
-            std::size_t copied = 0;
-            while (copied < span.size) {
-                const auto offset = span.offset + copied;
+        std::size_t span_index = 0, span_offset = 0;
+        while (span_index < spans.size()) {
+            std::size_t batch_bytes=0;
+            // Large PLE gathers can contain thousands of row ranges. Bound
+            // aligned staging and outstanding IRPs, reusing the same events
+            // after each fully drained batch.
+            while (count < requests.size() && span_index < spans.size()) {
+                const auto& span = spans[span_index];
+                if (span_offset == span.size) { ++span_index; span_offset = 0; continue; }
+                const auto offset = span.offset + span_offset;
                 const auto base = offset / alignment * alignment;
-                auto request = std::make_unique<Request>(*impl_);
+                auto* request=&requests[count].emplace(*impl_);
                 request->prefix = static_cast<std::size_t>(offset - base);
-                request->bytes = std::min(span.size - copied, limit - request->prefix);
+                request->bytes = std::min(span.size - span_offset, limit - request->prefix);
                 const auto required = request->prefix + request->bytes;
                 request->allocation = required + (alignment - required % alignment) % alignment;
-                request->destination = span.destination + copied;
-                request->storage = _aligned_malloc(request->allocation, std::max(alignment, sizeof(void*)));
-                if (!request->storage) throw std::bad_alloc();
-                impl_->acquire(request->allocation);
+                request->destination = span.destination + span_offset;
+                if(request->allocation>SIZE_MAX-batch_bytes)throw std::overflow_error("direct read staging size overflow");
+                request->storage_offset=batch_bytes;batch_bytes+=request->allocation;
                 request->native.Offset = static_cast<DWORD>(base);
                 request->native.OffsetHigh = static_cast<DWORD>(base >> 32);
-                request->native.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-                if (!request->native.hEvent)
-                    throw std::system_error(GetLastError(), std::system_category(), "create batch-read event");
-                copied += request->bytes;
-                requests.push_back(std::move(request));
+                request->native.hEvent = events.at(count);
+                span_offset += request->bytes;
+                ++count;
             }
-        }
-        // Keep every IO request outstanding before waiting for completion.
-        for (auto& request : requests) {
-            impl_->calls.fetch_add(1, std::memory_order_relaxed);
-            const auto ok = ReadFile(impl_->handle, request->storage,
-                static_cast<DWORD>(request->allocation), nullptr, &request->native);
-            const auto error = ok ? ERROR_SUCCESS : GetLastError();
-            if (!ok && error != ERROR_IO_PENDING)
-                throw std::system_error(error, std::system_category(), "submit batch read");
-            request->submitted = true;
-        }
-        for (auto& request : requests) {
-            DWORD actual = 0;
-            const auto ok = GetOverlappedResult(impl_->handle, &request->native, &actual, TRUE);
-            request->finished = true;
-            if (!ok) throw std::system_error(GetLastError(), std::system_category(), "complete batch read");
-            impl_->physical.fetch_add(actual, std::memory_order_relaxed);
-            if (actual < request->prefix + request->bytes)
-                throw std::runtime_error("model file truncated during batch read");
-        }
-        for (auto& request : requests) {
-            std::memcpy(request->destination,
-                static_cast<std::byte*>(request->storage) + request->prefix, request->bytes);
-            impl_->logical.fetch_add(request->bytes, std::memory_order_relaxed);
+            storage.ensure(batch_bytes);
+            static std::atomic<bool> reported{false};
+            if(count>1 && !reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
+                std::fprintf(stderr,"model_direct_staging_batch enabled=1 requests=%zu bytes=%zu arena_allocations=1\n",count,batch_bytes);
+            // Keep every IO request in this bounded batch outstanding before
+            // waiting for completion. Ordinary expert field batches fit here.
+            for (std::size_t i=0;i<count;++i) {
+                auto& request=requests[i];
+                request->storage=static_cast<std::byte*>(storage.data)+request->storage_offset;
+                impl_->calls.fetch_add(1, std::memory_order_relaxed);
+                const auto ok = ReadFile(impl_->handle, request->storage,
+                    static_cast<DWORD>(request->allocation), nullptr, &request->native);
+                const auto error = ok ? ERROR_SUCCESS : GetLastError();
+                if (!ok && error != ERROR_IO_PENDING)
+                    throw std::system_error(error, std::system_category(), "submit batch read");
+                request->submitted = true;
+            }
+            for (std::size_t i=0;i<count;++i) {
+                auto& request=requests[i];
+                DWORD actual = 0;
+                const auto ok = GetOverlappedResult(impl_->handle, &request->native, &actual, TRUE);
+                request->finished = true;
+                if (!ok) throw std::system_error(GetLastError(), std::system_category(), "complete batch read");
+                impl_->physical.fetch_add(actual, std::memory_order_relaxed);
+                if (actual < request->prefix + request->bytes)
+                    throw std::runtime_error("model file truncated during batch read");
+            }
+            for (std::size_t i=0;i<count;++i) {
+                auto& request=requests[i];
+                std::memcpy(request->destination,
+                    static_cast<std::byte*>(request->storage) + request->prefix, request->bytes);
+                impl_->logical.fetch_add(request->bytes, std::memory_order_relaxed);
+            }
+            for(std::size_t i=0;i<count;++i)requests[i].reset();
+            count=0;
         }
     } catch (...) {
         impl_->errors.fetch_add(1, std::memory_order_relaxed);
@@ -353,16 +509,73 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
     }
     impl_->nanos.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - started).count(), std::memory_order_relaxed);
-#else
-    static HostParallelPool io_workers;
-    const auto threads = std::max(1u, std::thread::hardware_concurrency());
-    io_workers.run(0, static_cast<std::int64_t>(spans.size()), 1, threads,
-        [&](std::int64_t first, std::int64_t last) {
-            for (auto index = first; index < last; ++index) {
-                const auto& span = spans[static_cast<std::size_t>(index)];
-                read(span.offset, span.destination, span.size);
+#elif defined(__linux__)
+    if(impl_->mode==FileReadMode::Buffered) {
+        for(const auto& span:spans)read(span.offset,span.destination,span.size);
+        return;
+    }
+    static thread_local LinuxAioContext queue;
+    const auto started=std::chrono::steady_clock::now();
+    struct Storage {
+        const Impl& owner;Impl::Slab slab{};
+        explicit Storage(const Impl& value):owner(value){}
+        ~Storage(){if(slab.data)owner.return_staging(slab);}
+        void ensure(std::size_t bytes) {
+            if(bytes<=slab.bytes)return;
+            if(slab.data){owner.return_staging(slab);slab={};}
+            slab=owner.borrow_staging(bytes);
+        }
+    } storage(*impl_);
+    struct Part {std::uint64_t offset;std::size_t prefix,bytes,allocation,staging;std::byte* destination;};
+    std::size_t index=0,consumed=0;
+    try {
+        while(index<spans.size()) {
+            std::array<Part,64> parts{};std::size_t count=0,bytes=0;
+            const auto alignment=impl_->alignment;
+            const auto wave_limit=std::max<std::size_t>(8u<<20,alignment);
+            while(count<parts.size() && index<spans.size()) {
+                const auto& span=spans[index];
+                if(consumed==span.size){++index;consumed=0;continue;}
+                const auto offset=span.offset+consumed,base=offset/alignment*alignment;
+                const auto prefix=std::size_t(offset-base);
+                const auto copy=std::min(span.size-consumed,wave_limit-prefix);
+                const auto allocation=(prefix+copy+alignment-1)/alignment*alignment;
+                if(count && allocation>wave_limit-bytes)break;
+                parts[count++]={base,prefix,copy,allocation,bytes,span.destination+consumed};
+                bytes+=allocation;consumed+=copy;
             }
-        });
+            if(!count)continue;
+            storage.ensure(bytes);
+            std::array<iocb,64> native{};std::array<iocb*,64> requests{};
+            std::array<std::int64_t,64> results{};
+            for(std::size_t i=0;i<count;++i) {
+                const auto& part=parts[i];auto& request=native[i];requests[i]=&request;
+                request.aio_data=i;request.aio_lio_opcode=IOCB_CMD_PREAD;request.aio_fildes=impl_->handle;
+                request.aio_buf=reinterpret_cast<std::uintptr_t>(static_cast<std::byte*>(storage.slab.data)+part.staging);
+                request.aio_nbytes=part.allocation;request.aio_offset=part.offset;
+            }
+            if(!queue.read(requests,count,results)) {
+                for(std::size_t i=0;i<count;++i)results[i]=impl_->transfer(parts[i].offset,
+                    static_cast<std::byte*>(storage.slab.data)+parts[i].staging,parts[i].allocation);
+            }
+            impl_->calls.fetch_add(count,std::memory_order_relaxed);
+            for(std::size_t i=0;i<count;++i) {
+                if(results[i]<0)throw std::system_error(int(-results[i]),std::generic_category(),"Linux model-file range read");
+                impl_->physical.fetch_add(results[i],std::memory_order_relaxed);
+                if(std::size_t(results[i])<parts[i].prefix+parts[i].bytes)
+                    throw std::runtime_error("model file was truncated during Linux batch read");
+            }
+            for(std::size_t i=0;i<count;++i) {
+                const auto& part=parts[i];
+                std::memcpy(part.destination,static_cast<std::byte*>(storage.slab.data)+part.staging+part.prefix,part.bytes);
+                impl_->logical.fetch_add(part.bytes,std::memory_order_relaxed);
+            }
+        }
+    }catch(...){impl_->errors.fetch_add(1,std::memory_order_relaxed);throw;}
+    impl_->nanos.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now()-started).count(),std::memory_order_relaxed);
+#else
+    for(const auto& span:spans)read(span.offset,span.destination,span.size);
 #endif
 }
 

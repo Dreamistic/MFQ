@@ -264,10 +264,16 @@ void DecodeWindow::capture(const std::function<void()>& body,const std::function
         release_warm_outputs();
         tasks_.clear();barriers_.clear();
         checkpoint("warmup");
-        {int device=0;MFQ_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
-            GraphWarmupScope warmup(default_context(device),stream_);body();}
-        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));restore();
-        release_warm_outputs();
+        // Some first-use operator outputs remain cached after the first pass.
+        // Warm their steady allocation lifetimes before forbidding new storage
+        // in capture, including a previously unused output projection.
+        for(int pass=0;pass<2;++pass) {
+            {int device=0;MFQ_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
+                GraphWarmupScope warmup(default_context(device),stream_);body();}
+            MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_));restore();
+            release_warm_outputs();
+            if(!pass){tasks_.clear();barriers_.clear();}
+        }
         const auto warm_tasks=tasks_.size(),warm_barriers=barriers_.size();tasks_.clear();barriers_.clear();
         checkpoint("record");
         try {
