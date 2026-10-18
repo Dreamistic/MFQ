@@ -2556,7 +2556,19 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         }
         return bytes;
     }
-    void fetch_registered(Cell& cell) {
+    MoeHostExpertCache::Lease prepared_expert(const MoeExpertCache::SsdExpertReads* reads,int projection,int expert) const {
+        auto* source=sources_[projection]->quant_source_.get();
+        if(reads)for(std::size_t i=0;i<reads->requests.size();++i)
+            if(reads->requests[i].first==source && reads->requests[i].second==expert) {
+                if(!reads->leases[i])throw std::logic_error("SSD expert consumer preceded its read completion");
+                static std::atomic<bool> reported{false};
+                if(!reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
+                    std::fprintf(stderr,"moe_ssd_prepared_image_dispatch scope=first_consumer enabled=1\n");
+                return reads->leases[i];
+            }
+        return source->acquire_expert(expert);
+    }
+    void fetch_registered(Cell& cell,const MoeExpertCache::SsdExpertReads* reads=nullptr) {
         using Field=TransferScratch::Field;
         auto& scratch=cell.transfer_scratch;scratch.clear();
         // Source owners remain in pipeline_dma_leases_ through the existing
@@ -2640,7 +2652,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     }
                     ++cache_->stats_.pipeline_transfer_cache_misses;
                 }
-                auto lease=source.quant_source_->acquire_expert(e);
+                // The routed read already owns this immutable image. Looking
+                // it up again would mark a freshly loaded expert as reused by
+                // 2Q and unnecessarily enter the shared RAM-cache mutex.
+                auto lease=prepared_expert(reads,projection,e);
                 const auto values=moe_cache_field_refs(lease->weights);
                 if(values.size()!=cohort.bytes_per_expert.size())throw std::logic_error("MFQ RAM field count changed");
                 for(std::size_t f=0;f<values.size();++f) {
@@ -3484,7 +3499,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 }
                 wait(false);
             }
-            fetch_registered(cell);return;
+            fetch_registered(cell,ssd_reads);return;
         }
         auto* packed=cache_->pipeline_host_stage_.data_ptr<uint8_t>();int64_t offset=cell.wire_header_bytes;
         struct Copy {void* dst;const void* src;int64_t bytes;std::size_t pitch=0,rows=1;};
@@ -3513,7 +3528,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 // Split experts use resident GPU fields directly and upload
                 // only their missing RAM projections.
                 if(hot_slot>=0)continue;
-                auto lease=source.quant_source_->acquire_expert(e);
+                auto lease=prepared_expert(ssd_reads,projection,e);
                 auto fields=moe_cache_fields(lease->weights);
                 staged[c].push_back({slot,e,std::move(lease),std::move(fields)});
             }
@@ -3588,7 +3603,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         } else for(const auto& copy:copies)copy_transfer(cell,copy.dst,copy.src,static_cast<std::size_t>(copy.bytes),copy.pitch,copy.rows);
         finish_transfer(cell,!copies.empty() || cell.wire.defined());
     }
-    void cpu(Cell& cell) {
+    void cpu(Cell& cell,const MoeExpertCache::SsdExpertReads* reads=nullptr) {
         using Clock=std::chrono::steady_clock;
         const auto ns=[](Clock::time_point begin,Clock::time_point end) {
             return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count());
@@ -3603,7 +3618,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         cell.jobs.clear();int offset=0;
         for(const auto& group:cell.plan.groups)if(group.kind==mfq::MoeDispatchKind::Cpu) {
             CpuJob job;job.expert=group.expert;job.offset=offset;job.count=static_cast<int>(group.positions.size());
-            for(int i=0;i<3;++i){job.leases[i]=combined_gate_up_ && i==1?job.leases[0]:sources_[i]->quant_source_->acquire_expert(group.expert);job.rows[i]=rows_plan(job.leases[i]->weights,combined_gate_up_ && i==1);}
+            for(int i=0;i<3;++i){job.leases[i]=combined_gate_up_ && i==1?job.leases[0]:prepared_expert(reads,i,group.expert);job.rows[i]=rows_plan(job.leases[i]->weights,combined_gate_up_ && i==1);}
             offset+=job.count;cell.jobs.push_back(std::move(job));
         }
         cache_->record_hybrid(static_cast<int>(cell.jobs.size()),static_cast<int>(cell.plan.groups.size()-cell.jobs.size()));
@@ -3741,7 +3756,6 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         // The demand plan already deduplicates the window's token routes.
         // Parallel file reads share one immutable lease with CPU work and
         // Gate/Up/Down uploads, including when the LRU budget is exhausted.
-        std::vector<MoeHostExpertCache::Lease> ssd_leases;
         std::unique_ptr<MoeExpertCache::SsdExpertReads> ssd_reads;
         const auto ssd_read_before=stats.pipeline_ssd_read_ns;
         if(cache_->ssd_experts()) {
@@ -3771,7 +3785,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 std::none_of(cell.plan.groups.begin(),cell.plan.groups.end(),[](const auto& group){return group.kind==mfq::MoeDispatchKind::Cpu;});
             time(stats.pipeline_ssd_read_ns,[&] {
                 if(phased_reads)ssd_reads=cache_->begin_ssd_expert_reads(std::move(requests),gate_up_requests);
-                else ssd_leases=cache_->read_ssd_experts(requests);
+                else {
+                    ssd_reads=cache_->prepare_ssd_expert_reads(std::move(requests));
+                    cache_->execute_ssd_expert_reads(*ssd_reads);
+                }
             });
         }
         const auto transferred=stats.ram_pcie_bytes,fetch_started=stats.pipeline_fetch_ns;
@@ -3814,7 +3831,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             if(found==cell.plan.groups.end() || found->kind==mfq::MoeDispatchKind::Cpu)
                 throw std::logic_error("background CPU calibration changed production dispatch");
             std::array<MoeHostExpertCache::Lease,3> leases;
-            for(int p=0;p<3;++p)leases[p]=sources_[p]->quant_source_->acquire_expert(found->expert);
+            for(int p=0;p<3;++p)leases[p]=prepared_expert(ssd_reads.get(),p,found->expert);
             std::vector<float> input(found->positions.size()*width_);
             for(size_t row=0;row<found->positions.size();++row)
                 std::memcpy(input.data()+row*width_,cell.x.h<float>()+
@@ -3825,7 +3842,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 width_,ff_,int(found->positions.size()),double(preparation_ns),combined_gate_up_);
             cache_->pipeline_cpu_calibration_.start(std::move(work));
         }
-        time(stats.pipeline_cpu_ns,[&]{cpu(cell);});
+        time(stats.pipeline_cpu_ns,[&]{cpu(cell,ssd_reads.get());});
         trace_serve(cell,"complete");
         if(work){
             const auto elapsed=stats.pipeline_cpu_ns-cpu_started;

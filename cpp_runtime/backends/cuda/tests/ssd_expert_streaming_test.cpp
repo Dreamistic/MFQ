@@ -456,6 +456,28 @@ int main(int argc,char** argv)try {
                     "SSD CPU fields differ from resident RAM fields");
             }
         }
+        if(std::string(format)=="phase-wide") {
+            const auto suspended=candidate.cache->suspend_residency(true);
+            auto input=tb::full({1,width},.015,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+            auto ids=tb::full({1,2},51,input.options().dtype(tb::kInt32));
+            auto weights=tb::full({1,2},.5,input.options().dtype(tb::kFloat32));
+            const auto expected=reference.forward(reference.execution,input,ids,weights).cpu().clone();
+            release_moe_decode_buffers(reference.cache);
+            ids.fill_(0);
+            candidate.forward(candidate.execution,input,ids,weights);
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));
+            for(const auto& source:candidate.sources) {
+                check(!source->gpu_resident(51),"one-use RAM priority fixture unexpectedly selected a primary expert");
+                source->host_cache()->erase(source->host_key(51));
+            }
+            ids.fill_(51);
+            const auto before=candidate.sources[0]->host_cache()->stats().reuse_promotions;
+            check_output(candidate.forward(candidate.execution,input,ids,weights),expected);
+            check(candidate.sources[0]->host_cache()->stats().reuse_promotions==before,
+                "one SSD demand promoted its fresh RAM image as a second use");
+            candidate.cache->suspend_residency(suspended);
+            release_moe_decode_buffers(reference.cache);release_moe_decode_buffers(candidate.cache);
+        }
         for(const int rows:{1,2,3,4,5,6,8,32,1024,143,1,1024})for(const bool graph:{false,true}) {
             if(graph && rows>32)continue;
             std::cerr<<"ssd_case format="<<format<<" rows="<<rows<<" graph="<<graph<<'\n';
