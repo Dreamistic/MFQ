@@ -61,6 +61,7 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma,ram_p
     assert "SSD expert streaming cases=243 PASS" in result.stdout
     if native_dma == "1" and pcie_fraction == 1 and ram_pin_bytes == "0":
         assert "moe_ssd_gu_io_overlap scope=first_upload enabled=1" in result.stderr
+        assert "moe_ssd_gu_compute_overlap scope=first_ready enabled=1" in result.stderr
     if os.name == "nt" and read_mode == "direct":
         assert "model_direct_staging_batch enabled=1" in result.stderr
 

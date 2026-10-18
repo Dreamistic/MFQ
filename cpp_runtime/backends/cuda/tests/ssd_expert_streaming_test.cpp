@@ -153,7 +153,7 @@ struct Run {
         }
         const bool mixed=path.stem()=="mixed";
         const bool phase_wide=path.stem()=="phase-wide";
-        c.moe_host_cache_bytes=prefix.empty()?(streaming?(phase_wide?1<<20:mixed?512*1024:32768):64*1024*1024):(streaming?32*1024*1024:4LL*1024*1024*1024);
+        c.moe_host_cache_bytes=prefix.empty()?(streaming?(phase_wide?4<<20:mixed?512*1024:32768):(phase_wide?64:8)*1024*1024):(streaming?32*1024*1024:4LL*1024*1024*1024);
         // CPU/GPU arithmetic parity needs the same placement in both runs.
         // The GPU-only variant separately exercises adaptive exchanges.
         c.moe_residency_adapt=streaming && !hybrid;c.moe_residency_warm=streaming && !hybrid;c.moe_residency_projection_heat=true;
@@ -337,6 +337,7 @@ int main(int argc,char** argv)try {
     int cases=0;
     if(argc==2)check_ssd_predictor_overlap(argv[1]);
     for(const char* format:{"nint","nvq2j","nvq3j","nvq2j-l","nvq2j-xl","nvq3j-l","nint-combined","mixed","phase-wide"}) {
+        if(const auto* selected=std::getenv("MFQ_SSD_EXPERT_TEST_FORMAT");selected && std::string(selected)!=format)continue;
         if(argc==3 && std::string(format)!="nint")continue;
         const bool combined=std::string(format)=="nint-combined";
         const auto path=argc==3?std::filesystem::path(argv[1]):std::filesystem::path(argv[1])/(std::string(combined?"nint":format)+".mfq");
@@ -467,7 +468,8 @@ int main(int argc,char** argv)try {
                 std::vector<float> input(rows*width);
                 for(std::size_t i=0;i<input.size();++i)input[i]=(prefix.empty()?.001f:.1f)*std::sin(float(i+step*17)*.027f);
                 std::vector<int32_t> routes(rows*2);
-                for(int i=0;i<rows*2;++i)routes[i]=rows>32?(i+step*19)%experts:(31+(i%2)+(step==2?11:0))%experts;
+                for(int i=0;i<rows*2;++i)routes[i]=rows>32?(i+step*19)%experts:
+                    (31+(i%2)+(step==2?11:0)+(graph && std::string(format)=="phase-wide"?rows*2:0))%experts;
                 x.copy_(tb::tensor(input).reshape({rows,width}).to(tb::kFloat16).to(tb::kCUDA));
                 ids.copy_(tb::tensor(routes).reshape({rows,2}).to(tb::kCUDA));
             };

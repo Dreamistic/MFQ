@@ -191,8 +191,10 @@ __global__ void copy_mapped(const uint64_t* header,const uint32_t* cancelled) {
     }
 }
 __global__ void await_plan_snapshot(const uint32_t* ready,const uint32_t* host_abort,uint32_t* device_abort,
-        const uint64_t* table,uint64_t* snapshot,uint64_t capacity) {
+        const uint64_t* table,uint64_t* snapshot,uint64_t capacity,
+        const uint64_t* host_descriptors,uint64_t* device_descriptors,uint64_t descriptor_capacity) {
     __shared__ uint64_t count;
+    __shared__ uint64_t descriptor_words;
     __shared__ uint32_t abort;
     if(!threadIdx.x) {
         while(!*reinterpret_cast<const volatile uint32_t*>(ready) &&
@@ -203,11 +205,19 @@ __global__ void await_plan_snapshot(const uint32_t* ready,const uint32_t* host_a
         const bool empty_packet=count==~uint64_t(0);
         if(empty_packet)count=0;
         abort|=count>capacity;
+        descriptor_words=abort || !host_descriptors?0:table[2];
+        abort|=descriptor_words>descriptor_capacity;
         *device_abort=abort;snapshot[0]=abort?0:count;snapshot[1]=abort?0:table[1];
         snapshot[2]=abort?1u:empty_packet?2u:0u;snapshot[3]=!abort && empty_packet;
     }
     __syncthreads();if(abort)return;
     for(uint64_t word=threadIdx.x;word<count*4;word+=blockDim.x)snapshot[4+word]=table[4+word];
+    // This wait follows GU arithmetic and hidden quantization. Replacing the
+    // views here cannot race their reads, and Down sees its final addresses
+    // only after the host's independent Down-ready publication.
+    for(uint64_t vector=threadIdx.x;vector<descriptor_words/2;vector+=blockDim.x)
+        reinterpret_cast<uint4*>(device_descriptors)[vector]=reinterpret_cast<const uint4*>(host_descriptors)[vector];
+    if(!threadIdx.x && (descriptor_words&1))device_descriptors[descriptor_words-1]=host_descriptors[descriptor_words-1];
 }
 __global__ void scatter_wire(const std::uint8_t* wire,const std::uint32_t* cancelled,int phase) {
     scatter_wire_body(wire,cancelled,phase);
@@ -403,9 +413,11 @@ void moe_scatter_wire_and_loan_phase(const void* wire,const void* loan,uint64_t 
         static_cast<const uint64_t*>(loan),capacity,cancelled,phase);
 }
 void wait_mapped_plan_snapshot(const uint32_t* ready,const uint32_t* host_abort,uint32_t* device_abort,
-        const void* table,void* snapshot,uint64_t capacity,cudaStream_t stream) {
+        const void* table,void* snapshot,uint64_t capacity,cudaStream_t stream,
+        const void* host_descriptors,void* device_descriptors,uint64_t descriptor_capacity) {
     await_plan_snapshot<<<1,capacity<=256?32:128,0,stream>>>(ready,host_abort,device_abort,static_cast<const uint64_t*>(table),
-        static_cast<uint64_t*>(snapshot),capacity);
+        static_cast<uint64_t*>(snapshot),capacity,static_cast<const uint64_t*>(host_descriptors),
+        static_cast<uint64_t*>(device_descriptors),descriptor_capacity);
 }
 void moe_scatter_wire(const void* wire,const std::uint32_t* cancelled,int blocks,int threads,cudaStream_t stream) {
     scatter_wire<<<blocks,threads,0,stream>>>(static_cast<const std::uint8_t*>(wire),cancelled,0);

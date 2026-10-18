@@ -667,6 +667,7 @@ public:
                << " pipeline_gu_build_overlap_copies=" << stats_.pipeline_gu_build_overlap_copies
                << " pipeline_ssd_gu_overlap_serves=" << stats_.pipeline_ssd_gu_overlap_serves
                << " pipeline_ssd_gu_overlap_bytes=" << stats_.pipeline_ssd_gu_overlap_bytes
+               << " pipeline_ssd_gu_compute_serves=" << stats_.pipeline_ssd_gu_compute_serves
                << " pipeline_native_dma_batches=" << stats_.pipeline_native_dma_batches
                << " pipeline_native_dma_copies=" << stats_.pipeline_native_dma_copies
                << " pipeline_native_dma_fallbacks=" << stats_.pipeline_native_dma_fallbacks
@@ -884,6 +885,9 @@ public:
             {"expert_gu_build_overlap_serves",double(stats_.pipeline_gu_build_overlap_serves)},
             {"ssd_gu_io_overlap_serves",double(stats_.pipeline_ssd_gu_overlap_serves)},
             {"ssd_gu_io_overlap_bytes",double(stats_.pipeline_ssd_gu_overlap_bytes)},
+            {"ssd_gu_compute_overlap_serves",double(stats_.pipeline_ssd_gu_compute_serves)},
+            {"ssd_gate_up_read_wait_ms",double(stats_.pipeline_ssd_gate_up_wait_ns)/1e6},
+            {"ssd_down_read_wait_ms",double(stats_.pipeline_ssd_down_wait_ns)/1e6},
             {"ram_expert_payload_bytes", double(resident)},
             {"ram_expert_optional_backup_bytes",double(host.optional_bytes)},
               {"ram_expert_optional_reclaimed_bytes",double(host.optional_reclaimed_bytes)},
