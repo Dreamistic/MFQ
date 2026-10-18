@@ -36,6 +36,35 @@ void wait_coalesced(const MoeHostExpertCache& cache,std::promise<void>& release)
 int main() try {
     {
         MoeHostExpertCache cache(192);cache.enable_reuse_priority();
+        auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(
+            std::vector<mfq::MoeCacheKey>{key(1)},true);
+        cache.set_device_cache_hints(hints);
+        for(int e:{0,1,2})cache.acquire(key(e),64,[e]{return weight(64,e+1);});
+        // Only the GPU consumed this expert again. Its RAM backup must
+        // survive pressure and remain useful when borrowed VRAM is revoked.
+        hints->publish(0,true);
+        cache.acquire(key(3),64,[]{return weight(64,4);});
+        check(cache.contains(key(1)) && !cache.contains(key(0)),"GPU-only reuse lost its RAM backup");
+        hints->publish(0,false);
+        cache.acquire(key(4),64,[]{return weight(64,5);});
+        check(cache.contains(key(1)) && !cache.contains(key(2)),"GPU revocation discarded a confirmed hot backup");
+        check(cache.stats().device_reuse_promotions==1,"confirmed GPU reuse did not reach the RAM policy");
+        bytes_equal(cache.find(key(1)),2);
+    }
+    {
+        MoeHostExpertCache cache(192);cache.enable_reuse_priority();
+        auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(
+            std::vector<mfq::MoeCacheKey>{key(1)},true);
+        cache.set_device_cache_hints(hints);cache.set_reuse_learning(false);
+        for(int e:{0,1,2})cache.acquire(key(e),64,[e]{return weight(64,e+1);});
+        hints->publish(0,true);cache.acquire(key(3),64,[]{return weight(64,4);});
+        check(!cache.stats().device_reuse_promotions,"synthetic GPU reuse changed RAM cache priority");
+        cache.set_reuse_learning(true);
+        cache.acquire(key(1),64,[]{return weight(64,2);});
+        check(cache.stats().device_reuse_promotions==1,"new RAM backup ignored existing confirmed GPU reuse");
+    }
+    {
+        MoeHostExpertCache cache(192);cache.enable_reuse_priority();
         for(int e:{0,1,2})cache.acquire(key(e),64,[e]{return weight(64,e+1);});
         cache.begin_speculative_learning();
         bytes_equal(cache.find(key(1)),2);bytes_equal(cache.find(key(1)),2);bytes_equal(cache.find(key(0)),1);

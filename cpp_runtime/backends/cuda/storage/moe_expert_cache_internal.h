@@ -543,6 +543,7 @@ public:
                << " host_cache_evictions=" << host.evictions
                << " host_device_duplicate_evictions=" << host.device_duplicate_evictions
                << " host_device_duplicate_evicted_bytes=" << host.device_duplicate_evicted_bytes
+               << " host_device_reuse_promotions=" << host.device_reuse_promotions
                << " host_speculative_windows=" << host.speculative_windows
                << " host_speculative_accepted_keys=" << host.speculative_accepted_keys
                << " host_cache_promotions=" << host.promotions
@@ -880,6 +881,7 @@ public:
             {"ram_expert_cache_evictions",double(host.evictions)},
             {"ram_expert_device_duplicate_evictions",double(host.device_duplicate_evictions)},
             {"ram_expert_device_duplicate_evicted_bytes",double(host.device_duplicate_evicted_bytes)},
+            {"ram_expert_device_reuse_promotions",double(host.device_reuse_promotions)},
             {"ram_expert_speculative_windows",double(host.speculative_windows)},
             {"ram_expert_speculative_accepted_keys",double(host.speculative_accepted_keys)},
             {"ram_expert_speculative_cancels",double(host.speculative_cancels)},

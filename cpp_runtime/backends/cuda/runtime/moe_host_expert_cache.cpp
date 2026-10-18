@@ -41,12 +41,14 @@ struct MoeHostExpertCache::DeviceCacheHints::Impl {
     std::vector<mfq::MoeCacheKey> keys;
     std::vector<std::uint8_t> flags;
     std::vector<std::size_t> pending;
-    explicit Impl(std::vector<mfq::MoeCacheKey> value):keys(std::move(value)),flags(keys.size()) {
+    const bool confirmed_reuse;
+    explicit Impl(std::vector<mfq::MoeCacheKey> value,bool reuse)
+        :keys(std::move(value)),flags(keys.size()),confirmed_reuse(reuse) {
         pending.reserve(keys.size());
     }
 };
-MoeHostExpertCache::DeviceCacheHints::DeviceCacheHints(std::vector<mfq::MoeCacheKey> keys)
-    :impl_(std::make_unique<Impl>(std::move(keys))) {}
+MoeHostExpertCache::DeviceCacheHints::DeviceCacheHints(std::vector<mfq::MoeCacheKey> keys,bool confirmed_reuse)
+    :impl_(std::make_unique<Impl>(std::move(keys),confirmed_reuse)) {}
 MoeHostExpertCache::DeviceCacheHints::~DeviceCacheHints()=default;
 void MoeHostExpertCache::DeviceCacheHints::publish(std::size_t index,bool resident) {
     auto& state=*impl_;std::lock_guard lock(state.mutex);
@@ -116,8 +118,10 @@ struct MoeHostExpertCache::Impl {
         for(const auto index:hints.pending) {
             const auto key=hints.keys[index];const bool resident=hints.flags[index]&1;
             if(resident)device_cached.insert(key);else device_cached.erase(key);
-            if(!exchanging.contains(key))if(auto found=entries.find(key);found!=entries.end())
+            if(!exchanging.contains(key))if(auto found=entries.find(key);found!=entries.end()) {
                 device_duplicate(found->second,resident);
+                if(resident)learn_device_reuse(key,found->second);
+            }
             hints.flags[index]&=1;
         }
         hints.pending.clear();
@@ -151,6 +155,16 @@ struct MoeHostExpertCache::Impl {
             lru.splice(lru.begin(),reused,old.position);
             device_duplicate(old,device_cached.contains(*old.position));
         }
+    }
+    void learn_device_reuse(mfq::MoeCacheKey key,Entry& entry) {
+        if(!counters.reuse_priority || entry.reused || !device_hints || !device_hints->impl_->confirmed_reuse)return;
+        // Repeated GPU hits must not leave a hot expert's revocable RAM
+        // backup permanently classified as a one-use image. Warmup and
+        // uncommitted speculation retain the normal learning exclusions.
+        const auto before=counters.reuse_promotions;
+        touch(key,entry);
+        if(counters.reuse_promotions!=before && ++counters.device_reuse_promotions==1)
+            std::fprintf(stderr,"moe_ram_gpu_reuse_dispatch scope=first_promotion enabled=1\n");
     }
     bool make_room(std::size_t bytes) {
         if (!bytes || bytes>budget) return false;
@@ -206,6 +220,7 @@ struct MoeHostExpertCache::Impl {
         catch (...) { lru.pop_front(); throw; }
         counters.resident_bytes+=value->bytes;
         if(key.source<0)counters.optional_bytes+=value->bytes;
+        if(device_cached.contains(key))learn_device_reuse(key,entries.at(key));
     }
 };
 

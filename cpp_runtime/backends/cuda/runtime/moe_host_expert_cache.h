@@ -31,6 +31,7 @@ struct MoeHostExpertCacheStats {
     std::uint64_t reuse_promotions=0;
     std::uint64_t scan_admissions=0,scan_admitted_bytes=0;
     std::uint64_t device_duplicate_evictions=0,device_duplicate_evicted_bytes=0;
+    std::uint64_t device_reuse_promotions=0;
     std::uint64_t speculative_windows=0,speculative_accepted_keys=0,speculative_cancels=0;
 };
 
@@ -79,7 +80,9 @@ public:
     // cache. Each registered key has one bounded, coalesced pending update.
     class DeviceCacheHints {
     public:
-        explicit DeviceCacheHints(std::vector<mfq::MoeCacheKey> keys);
+        // Reuse-only GPU observers also confirm reuse of an existing RAM
+        // backup, even when GPU hits never read that backup directly.
+        explicit DeviceCacheHints(std::vector<mfq::MoeCacheKey> keys,bool confirmed_reuse=false);
         ~DeviceCacheHints();
         void publish(std::size_t index,bool resident);
     private:

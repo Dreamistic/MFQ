@@ -2451,7 +2451,7 @@ void MoeExpertCache::bind_host_device_cache_hints() {
         sources.emplace_back(source->id_,keys.size());
         for(int e=0;e<source->n_experts();++e)keys.push_back(source->quant_source_->host_key(e));
     }
-    auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(std::move(keys));
+    auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(std::move(keys),true);
     host_experts_->set_device_cache_hints(hints);
     for(const auto [source,offset]:sources)kv_expert_loan_->observe_projections(source,
         [weak=std::weak_ptr(hints),offset](int64_t expert,const void* base,const std::array<std::size_t,8>&) {
