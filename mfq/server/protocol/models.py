@@ -942,6 +942,18 @@ class ModelArtifactList(ProtocolModel):
     data: list[ModelArtifactResource]
 
 
+class ModelDeletionPlan(ProtocolModel):
+    model_id: str
+    name: str
+    files: list[str]
+    total_bytes: int = Field(ge=0)
+    token: str = Field(pattern=SHA256_PATTERN)
+
+
+class DeleteModelRequest(ProtocolModel):
+    token: str = Field(pattern=SHA256_PATTERN)
+
+
 class ModelDirectoryEntry(ProtocolModel):
     id: str = Field(pattern=r"^[0-9a-f]{32}$")
     name: str = Field(min_length=1, max_length=512)

@@ -30,6 +30,7 @@ from mfq.server.state.catalog import (
     ModelRegistrationError,
 )
 from mfq.server.services.checkpoint_analysis import analyze_checkpoint
+from mfq.server.services.model_deletion import ModelDeletionError, delete_model_files, model_deletion_plan
 from mfq.server.services.model_memory import checkpoint_cache_profile
 from mfq.server.services.documents import DocumentExtractionError, extract_document
 from mfq.server.services.desktop import FileManagerUnavailableError, open_directory
@@ -94,6 +95,7 @@ from mfq.server.protocol.models import (
     ModelArtifactList,
     ModelCacheProfile,
     ModelDirectoryList,
+    ModelDeletionPlan,
     ModelLoadRequest,
     RuntimeMemoryPolicy,
     RuntimeInferencePolicy,
@@ -1059,6 +1061,50 @@ class ServerService:
             raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
         directory = artifact.path if artifact.resource.format == "hf" else artifact.path.parent
         return await self.model_directories(path=str(directory))
+
+    async def model_deletion_plan(self, model_id: str) -> ModelDeletionPlan:
+        if self.catalog is None:
+            raise ServiceError(501, "model_catalog_unavailable", "model catalog is unavailable")
+        try:
+            artifact = await self.catalog.get(model_id, refresh=True)
+            return await asyncio.to_thread(model_deletion_plan, artifact)
+        except ModelArtifactNotFoundError as error:
+            raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
+        except ModelDeletionError as error:
+            raise ServiceError(409, str(error), "Model files cannot be safely deleted") from error
+        except (OSError, ValueError) as error:
+            raise ServiceError(409, "model_delete_changed", "Model files changed; refresh the list and try again") from error
+
+    async def delete_model_artifact(self, model_id: str, token: str) -> dict[str, int]:
+        if self.catalog is None or not hasattr(self.runtime_manager, "model_deletion_guard"):
+            raise ServiceError(501, "model_delete_unavailable", "Model deletion requires a managed runtime")
+        try:
+            async with self._download_job_lock:
+                artifact = await self.catalog.get(model_id, refresh=True)
+                if self.tool_handlers is not None:
+                    for job in await asyncio.to_thread(self.store.active_download_jobs):
+                        _, destination = await asyncio.to_thread(self.tool_handlers.download_request, job.kind, job.payload)
+                        if artifact.path.resolve().is_relative_to(destination.resolve()):
+                            raise ServiceError(409, "model_delete_downloading", "Wait for the model download to finish or cancel it first")
+                async with self.runtime_manager.model_deletion_guard(artifact):
+                    deletion = asyncio.create_task(asyncio.to_thread(delete_model_files, artifact, token))
+                    try:
+                        result = await asyncio.shield(deletion)
+                    except asyncio.CancelledError:
+                        await deletion
+                        raise
+                    finally:
+                        await self.catalog.invalidate()
+                        await self.catalog.list(refresh=True)
+                return result
+        except ModelArtifactNotFoundError as error:
+            raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
+        except ModelDeletionError as error:
+            raise ServiceError(409, str(error), "Model files changed or cannot be safely deleted") from error
+        except BackendError as error:
+            raise ServiceError(error.status_code or 409, error.code, str(error)) from error
+        except OSError as error:
+            raise ServiceError(409, "model_delete_failed", "Could not delete all model files; check permissions and refresh the list") from error
 
     async def model_cache_profile(self, model_id: str, *, include_recurrent: bool = False) -> ModelCacheProfile | None:
         if self.catalog is None:

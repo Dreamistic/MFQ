@@ -3,9 +3,25 @@ import { expect, it, vi } from 'vitest';
 import type { ModelArtifact } from '../../shared/api/types';
 import type { useModelCatalog } from './useModelCatalog';
 import { LocalCheckpoints } from './LocalCheckpoints';
+import userEvent from '@testing-library/user-event';
 
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
 vi.mock('./ModelLoadProgress', () => ({ ModelLoadProgress: () => null }));
+
+it('opens deletion confirmation by ID and prevents deleting loaded models', async () => {
+  const artifact = { id: 'a', name: 'Model', architecture: 'qwen35', format: 'mfq', shard_count: 1,
+    total_bytes: 100, tensor_count: 1, record_count: 1, dtypes: [], complete: true, loadable: true, modified_at: '' } as ModelArtifact;
+  const prepareModelDeletion = vi.fn();
+  const catalog = { runtime: null, artifacts: [artifact], filteredArtifacts: [artifact], instances: [], busy: false,
+    modelFilter: '', setModelFilter: vi.fn(), unloadInstance: vi.fn(), loadArtifact: vi.fn(),
+    chooseModelDirectory: vi.fn(), openModelFiles: vi.fn(), prepareModelDeletion } as unknown as ReturnType<typeof useModelCatalog>;
+  const view = render(<LocalCheckpoints catalog={catalog} />);
+  await userEvent.click(screen.getByRole('button', { name: 'Delete model: Model' }));
+  expect(prepareModelDeletion).toHaveBeenCalledExactlyOnceWith('a');
+  catalog.runtime = { model: 'Model' };
+  view.rerender(<LocalCheckpoints catalog={catalog} />);
+  expect(screen.getByRole('button', { name: 'Delete model: Model' })).toBeDisabled();
+});
 
 it('uses one combined MoE pressure bar without capacity details, matching the download page', () => {
   const GiB = 2 ** 30;

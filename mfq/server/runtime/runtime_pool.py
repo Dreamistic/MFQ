@@ -366,6 +366,7 @@ class RuntimePool:
         self.store = None
         self._instances: dict[UUID, _Runtime] = {}
         self._loading_model_names: set[str] = set()
+        self._deleting_model_paths: set[Path] = set()
         self._load_events: dict[str, asyncio.Event] = {}
         self._load_errors: dict[str, ErrorDetail] = {}
         self._load_failures: dict[str, _CachedLoadFailure] = {}
@@ -554,6 +555,9 @@ class RuntimePool:
             raise _job_error(
                 "model_artifact_not_found", f"model artifact was not found: {error}"
             ) from error
+        async with self._lock:
+            if artifact.path.resolve() in self._deleting_model_paths:
+                raise _job_error("model_delete_busy", "Model files are being deleted; retry after deletion finishes")
         if not artifact.resource.loadable:
             raise _job_error(
                 (
@@ -705,6 +709,8 @@ class RuntimePool:
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
+            if artifact.path.resolve() in self._deleting_model_paths:
+                raise _job_error("model_delete_busy", "Model files are being deleted; retry after deletion finishes")
             existing = next(
                 (
                     item
@@ -2063,6 +2069,23 @@ class RuntimePool:
                 for name in requested.model_fields_set
             }
         )
+
+    @asynccontextmanager
+    async def model_deletion_guard(self, artifact: DiscoveredModel) -> AsyncIterator[None]:
+        path = artifact.path.resolve()
+        async with self._lock:
+            if path in self._deleting_model_paths or artifact.resource.name in self._loading_model_names or any(
+                (item.artifact.path.resolve() == path or item.artifact.resource.name == artifact.resource.name)
+                and item.state != RuntimeInstanceState.FAILED
+                for item in self._instances.values()
+            ):
+                raise BackendError("model_delete_busy", "Unload the model and wait for loading to finish before deleting it", status_code=409)
+            self._deleting_model_paths.add(path)
+        try:
+            yield
+        finally:
+            async with self._lock:
+                self._deleting_model_paths.discard(path)
 
     async def fork_session(self, source_session_id: UUID, target_session_id: UUID) -> bool:
         async with self._lock:
