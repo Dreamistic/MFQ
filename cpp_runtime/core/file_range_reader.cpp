@@ -5,9 +5,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -285,12 +287,31 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
         }
     };
     static thread_local DirectEvents events;
+    struct BatchStorage {
+        const Impl& owner;
+        void* data=nullptr;
+        std::size_t capacity=0;
+        explicit BatchStorage(const Impl& value):owner(value) {}
+        void release() {
+            if(!data)return;
+            _aligned_free(data);data=nullptr;
+            owner.staging.fetch_sub(capacity,std::memory_order_relaxed);capacity=0;
+        }
+        void ensure(std::size_t bytes) {
+            if(bytes<=capacity)return;
+            // Every preceding wave was drained before the arena can grow.
+            release();data=_aligned_malloc(bytes,std::max(owner.alignment,sizeof(void*)));
+            if(!data)throw std::bad_alloc();
+            capacity=bytes;owner.acquire(capacity);
+        }
+        ~BatchStorage(){release();}
+    };
     struct Request {
         const Impl& owner;
         OVERLAPPED native{};
         void* storage = nullptr;
         std::byte* destination = nullptr;
-        std::size_t prefix = 0, bytes = 0, allocation = 0;
+        std::size_t prefix = 0, bytes = 0, allocation = 0, storage_offset = 0;
         bool submitted = false, finished = false;
         explicit Request(const Impl& value) : owner(value) {}
         ~Request() {
@@ -298,46 +319,50 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
                 DWORD ignored = 0;
                 GetOverlappedResult(owner.handle, &native, &ignored, TRUE);
             }
-            if (storage) {
-                _aligned_free(storage);
-                owner.staging.fetch_sub(allocation, std::memory_order_relaxed);
-            }
         }
     };
     const auto started = std::chrono::steady_clock::now();
-    std::vector<std::unique_ptr<Request>> requests;
-    requests.reserve(events.handles.size());
+    // Destruction drains requests before releasing their common I/O target.
+    BatchStorage storage(*impl_);
+    std::array<std::optional<Request>,64> requests;
+    std::size_t count=0;
     try {
         const auto alignment = impl_->alignment;
         const auto limit = std::size_t(std::numeric_limits<DWORD>::max()) / alignment * alignment;
         std::size_t span_index = 0, span_offset = 0;
         while (span_index < spans.size()) {
+            std::size_t batch_bytes=0;
             // Large PLE gathers can contain thousands of row ranges. Bound
             // aligned staging and outstanding IRPs, reusing the same events
             // after each fully drained batch.
-            while (requests.size() < events.handles.size() && span_index < spans.size()) {
+            while (count < requests.size() && span_index < spans.size()) {
                 const auto& span = spans[span_index];
                 if (span_offset == span.size) { ++span_index; span_offset = 0; continue; }
                 const auto offset = span.offset + span_offset;
                 const auto base = offset / alignment * alignment;
-                auto request = std::make_unique<Request>(*impl_);
+                auto* request=&requests[count].emplace(*impl_);
                 request->prefix = static_cast<std::size_t>(offset - base);
                 request->bytes = std::min(span.size - span_offset, limit - request->prefix);
                 const auto required = request->prefix + request->bytes;
                 request->allocation = required + (alignment - required % alignment) % alignment;
                 request->destination = span.destination + span_offset;
-                request->storage = _aligned_malloc(request->allocation, std::max(alignment, sizeof(void*)));
-                if (!request->storage) throw std::bad_alloc();
-                impl_->acquire(request->allocation);
+                if(request->allocation>SIZE_MAX-batch_bytes)throw std::overflow_error("direct read staging size overflow");
+                request->storage_offset=batch_bytes;batch_bytes+=request->allocation;
                 request->native.Offset = static_cast<DWORD>(base);
                 request->native.OffsetHigh = static_cast<DWORD>(base >> 32);
-                request->native.hEvent = events.at(requests.size());
+                request->native.hEvent = events.at(count);
                 span_offset += request->bytes;
-                requests.push_back(std::move(request));
+                ++count;
             }
+            storage.ensure(batch_bytes);
+            static std::atomic<bool> reported{false};
+            if(count>1 && !reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
+                std::fprintf(stderr,"model_direct_staging_batch enabled=1 requests=%zu bytes=%zu arena_allocations=1\n",count,batch_bytes);
             // Keep every IO request in this bounded batch outstanding before
             // waiting for completion. Ordinary expert field batches fit here.
-            for (auto& request : requests) {
+            for (std::size_t i=0;i<count;++i) {
+                auto& request=requests[i];
+                request->storage=static_cast<std::byte*>(storage.data)+request->storage_offset;
                 impl_->calls.fetch_add(1, std::memory_order_relaxed);
                 const auto ok = ReadFile(impl_->handle, request->storage,
                     static_cast<DWORD>(request->allocation), nullptr, &request->native);
@@ -346,7 +371,8 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
                     throw std::system_error(error, std::system_category(), "submit batch read");
                 request->submitted = true;
             }
-            for (auto& request : requests) {
+            for (std::size_t i=0;i<count;++i) {
+                auto& request=requests[i];
                 DWORD actual = 0;
                 const auto ok = GetOverlappedResult(impl_->handle, &request->native, &actual, TRUE);
                 request->finished = true;
@@ -355,12 +381,14 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
                 if (actual < request->prefix + request->bytes)
                     throw std::runtime_error("model file truncated during batch read");
             }
-            for (auto& request : requests) {
+            for (std::size_t i=0;i<count;++i) {
+                auto& request=requests[i];
                 std::memcpy(request->destination,
                     static_cast<std::byte*>(request->storage) + request->prefix, request->bytes);
                 impl_->logical.fetch_add(request->bytes, std::memory_order_relaxed);
             }
-            requests.clear();
+            for(std::size_t i=0;i<count;++i)requests[i].reset();
+            count=0;
         }
     } catch (...) {
         impl_->errors.fetch_add(1, std::memory_order_relaxed);

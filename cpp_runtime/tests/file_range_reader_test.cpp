@@ -121,6 +121,30 @@ int main() {
                         "direct row batches allocated unbounded aligned staging");
 #endif
             }
+            {
+                mfq::FileRangeReader growing(path,mode);
+                std::vector<std::vector<std::byte>> output;
+                std::vector<mfq::ReadSpan> spans;
+                std::size_t logical=0;
+                for(std::size_t i=0;i<192;++i) {
+                    const std::size_t bytes=i<64?31:(i<128?8193:7);
+                    const auto offset=(i*997)%(expected.size()-bytes+1);
+                    output.emplace_back(bytes+2,std::byte{0x5a});
+                    spans.push_back({offset,output.back().data()+1,bytes});logical+=bytes;
+                }
+                growing.read_batch(spans);
+                for(std::size_t i=0;i<spans.size();++i) {
+                    require(output[i].front()==std::byte{0x5a} && output[i].back()==std::byte{0x5a},"growing batch arena overwrote guards");
+                    require(std::equal(output[i].begin()+1,output[i].end()-1,expected.begin()+spans[i].offset),
+                        "growing or reusing a batch arena changed bytes");
+                }
+                const auto stats=growing.stats();
+                require(!stats.staging_bytes && !stats.errors && stats.logical_bytes==logical,"growing batch staging accounting differs");
+#ifdef _WIN32
+                if(mode==mfq::FileReadMode::Direct)
+                    require(stats.staging_peak_bytes<=64*(8193+2*growing.alignment()),"growing batch retained more than one wave");
+#endif
+            }
             auto reader=std::make_shared<mfq::AsyncRangeReader>(path,mode);
             std::vector<std::future<void>> jobs;
             for(int client=0;client<4;++client)jobs.push_back(std::async(std::launch::async,[&,reader,client] {

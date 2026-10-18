@@ -134,7 +134,8 @@ void check_reused_expert_pages() {
 std::shared_ptr<MoeQuantRangeSource> source(const std::filesystem::path& path,const std::string& name="linear.weight") {
     auto model=mfq::open_model_source(path.string());auto read=model->tensor_reader(name);
     auto store=std::make_shared<mfq::MfeQuantExpertStore>(require_tensor(*model,name).nbytes,
-        [read](std::size_t offset,uint8_t* dst,std::size_t n){read(offset,reinterpret_cast<std::byte*>(dst),n);});
+        [read](std::size_t offset,uint8_t* dst,std::size_t n){read(offset,reinterpret_cast<std::byte*>(dst),n);},
+        model->tensor_batch_reader(name));
     return std::make_shared<MoeQuantRangeSource>(std::move(store));
 }
 struct Run {

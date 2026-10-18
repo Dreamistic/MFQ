@@ -53,6 +53,8 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma,ram_p
     result = subprocess.run([executable, str(tmp_path)], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "SSD expert streaming cases=216 PASS" in result.stdout
+    if os.name == "nt" and read_mode == "direct":
+        assert "model_direct_staging_batch enabled=1" in result.stderr
 
 
 @pytest.mark.parametrize("wide,grouped", [(False, True), (True, True), (True, False)])
