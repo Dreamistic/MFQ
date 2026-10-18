@@ -66,21 +66,6 @@ def create_app(
     app.state.api_keys = api_keys
     app.state.auth_policy = AuthenticationPolicy(api_key or (api_keys.root_key if api_keys else ""),
         enabled=api_keys is not None, path=Path(auth_settings_path) if auth_settings_path is not None else None)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[
-            "tauri://localhost",
-            "http://tauri.localhost",
-            "https://tauri.localhost",
-            "http://127.0.0.1:5173",
-            "http://localhost:5173",
-            "http://127.0.0.1:5174",
-            "http://localhost:5174",
-        ],
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Accept", "Authorization", "Content-Type", "X-Content-SHA256", "X-Api-Key", "Anthropic-Version", "Anthropic-Beta"],
-    )
-
     @app.middleware("http")
     async def protect_and_harden(request: Request, call_next: Any) -> Response:
         policy = app.state.auth_policy
@@ -125,6 +110,21 @@ def create_app(
             "script-src 'self'; font-src 'self' data:"
         )
         return response
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+            "http://127.0.0.1:5174",
+            "http://localhost:5174",
+        ],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Accept", "Authorization", "Content-Type", "X-Content-SHA256", "X-Api-Key", "Anthropic-Version", "Anthropic-Beta"],
+    )
 
     @app.exception_handler(ServiceError)
     async def handle_service_error(request: Request, error: ServiceError) -> JSONResponse:

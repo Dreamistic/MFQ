@@ -195,7 +195,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         await startLocalStudio();
         status = await studioStatus();
       }
-      const token = status ? await studioCredential() : getApiToken();
+      const token = status ? await studioCredential().catch(() => '') : getApiToken();
       if (!mounted.current || version !== initializationVersion.current) return false;
       setApiBaseUrl(status?.service_url ?? browserServiceUrl());
       setApiToken(token);

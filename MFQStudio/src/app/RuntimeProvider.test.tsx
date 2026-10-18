@@ -3,8 +3,9 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runtimeApi } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
+import { ApiError } from '../shared/api/client';
 import type { JobEventResource, JobResource, RuntimeStatus, RuntimeInstance } from '../shared/api/types';
-import { studioStatus } from '../studio';
+import { startLocalStudio, studioCredential, studioStatus } from '../studio';
 import { useJobStore } from '../stores/jobStore';
 import { RuntimeProvider, useRuntime } from './RuntimeProvider';
 
@@ -51,6 +52,7 @@ describe('RuntimeProvider 故障状态', () => {
     useJobStore.getState().setJobs([]);
     vi.restoreAllMocks();
     vi.mocked(studioStatus).mockResolvedValue(null);
+    vi.mocked(studioCredential).mockResolvedValue('');
     vi.spyOn(runtimeApi, 'runtimeInstances').mockResolvedValue([]);
     vi.spyOn(jobsApi, 'jobs').mockResolvedValue([]);
     vi.spyOn(runtimeApi, 'runtimeStatus').mockResolvedValue({ runtime_state: 'idle' } as RuntimeStatus);
@@ -66,6 +68,51 @@ describe('RuntimeProvider 故障状态', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
     await waitFor(() => expect(screen.getByTestId('ready').textContent).toBe('true'));
     expect(screen.getByTestId('refresh-error').textContent).toBe('');
+  });
+
+  it('shows the native startup rejection instead of Unknown error', async () => {
+    vi.mocked(studioStatus).mockResolvedValue({ config: { mode: 'local', remote_url: 'http://127.0.0.1:8090', local_service_port: 8090 },
+      service_url: 'http://127.0.0.1:8090', reachable: false, managed_pid: null });
+    vi.mocked(startLocalStudio).mockRejectedValueOnce('The Anthropic API port 8091 is already in use.');
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(screen.getByTestId('connection-error')).toHaveTextContent('Anthropic API port 8091'));
+    expect(screen.getByTestId('ready')).toHaveTextContent('false');
+  });
+
+  it('opens an unauthenticated workspace when the desktop credential vault is unavailable', async () => {
+    vi.mocked(studioStatus).mockResolvedValue({ config: { mode: 'local', remote_url: 'http://127.0.0.1:8090', local_service_port: 8090 },
+      service_url: 'http://127.0.0.1:8090', reachable: true, managed_pid: null });
+    vi.mocked(studioCredential).mockRejectedValueOnce('credential vault unavailable');
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
+    expect(screen.getByTestId('connection-error')).toHaveTextContent('');
+  });
+
+  it('recovers from a native startup failure without restarting the desktop app', async () => {
+    const offline = { config: { mode: 'local' as const, remote_url: 'http://127.0.0.1:8090', local_service_port: 8090 },
+      service_url: 'http://127.0.0.1:8090', reachable: false, managed_pid: null };
+    const online = { ...offline, reachable: true, managed_pid: 1234 };
+    vi.mocked(studioStatus).mockResolvedValueOnce(offline).mockResolvedValueOnce(offline).mockResolvedValueOnce(online);
+    vi.mocked(startLocalStudio).mockRejectedValueOnce('The Anthropic API port 8091 is already in use.').mockResolvedValueOnce(online);
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(screen.getByTestId('connection-error')).toHaveTextContent('Anthropic API port 8091'));
+    const calls = vi.mocked(startLocalStudio).mock.calls.length;
+    fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
+    await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
+    expect(screen.getByTestId('connection-error')).toHaveTextContent('');
+    expect(startLocalStudio).toHaveBeenCalledTimes(calls + 1);
+  });
+
+  it('still requires API authentication when the desktop credential vault is unavailable', async () => {
+    vi.mocked(studioStatus).mockResolvedValue({ config: { mode: 'local', remote_url: 'http://127.0.0.1:8090', local_service_port: 8090 },
+      service_url: 'http://127.0.0.1:8090', reachable: true, managed_pid: null });
+    vi.mocked(studioCredential).mockRejectedValueOnce('credential vault unavailable');
+    vi.mocked(runtimeApi.runtimeInstances).mockRejectedValueOnce(new ApiError(401, {
+      error: { code: 'unauthorized', message: 'invalid API credential', retryable: false, details: {} },
+    }));
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(capturedRuntime.authenticationRequired).toBe(true));
+    expect(screen.getByTestId('ready')).toHaveTextContent('false');
   });
 
   it('点击立即请求 ctx 重载并持有状态直到服务完成', async () => {

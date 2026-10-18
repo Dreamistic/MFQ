@@ -6,6 +6,7 @@ mod windows_icon;
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -139,6 +140,61 @@ fn service_url(config: &StudioConfig) -> String {
 
 fn read_pid(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn is_loopback_service(base_url: &str) -> bool {
+    let Ok(url) = Url::parse(base_url) else { return false; };
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn server_client(base_url: &str, timeout: Duration) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if is_loopback_service(base_url) {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(|error| error.to_string())
+}
+
+fn check_local_ports(data_dir: &Path, openai_port: u16) -> Result<(), String> {
+    let anthropic_port = fs::read(data_dir.join("listener.json")).ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.get("anthropic_port").and_then(|port| port.as_u64()))
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(8091);
+    if openai_port == anthropic_port {
+        return Err(format!("OpenAI and Anthropic cannot share port {openai_port}. Choose different API ports."));
+    }
+    for (protocol, port) in [("OpenAI", openai_port), ("Anthropic", anthropic_port)] {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::AddrInUse => format!("The {protocol} API port {port} is already in use. Close the other service or choose a different port."),
+                std::io::ErrorKind::PermissionDenied => format!("Permission denied for the {protocol} API port {port}. Choose a different port."),
+                _ => format!("Could not use the {protocol} API port {port}: {error}"),
+            })?;
+    }
+    Ok(())
+}
+
+fn startup_failure(log_path: &Path, offset: u64, summary: &str) -> String {
+    let detail = (|| -> std::io::Result<String> {
+        let mut log = File::open(log_path)?;
+        let end = log.metadata()?.len();
+        log.seek(SeekFrom::Start(offset.max(end.saturating_sub(8192))))?;
+        let mut bytes = Vec::new();
+        log.take(8192).read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+    })().unwrap_or_default();
+    if detail.is_empty() {
+        format!("{summary}\nServer log: {}", log_path.display())
+    } else {
+        format!("{summary}\n\n{detail}\n\nServer log: {}", log_path.display())
+    }
 }
 
 async fn is_mfq_server(client: &reqwest::Client, base_url: &str) -> bool {
@@ -287,10 +343,7 @@ fn packaged_framework(name: &str) -> Option<PathBuf> {
 
 async fn status_for(app: &AppHandle, config: StudioConfig) -> Result<StudioStatus, String> {
     let service_url = service_url(&config);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = server_client(&service_url, Duration::from_secs(2))?;
     let reachable = is_mfq_server(&client, &service_url).await;
     let managed_pid = match config.mode {
         RuntimeMode::Local if reachable => read_pid(&app_data_dir(app)?.join(PID_FILE)),
@@ -306,17 +359,17 @@ async fn status_for(app: &AppHandle, config: StudioConfig) -> Result<StudioStatu
 
 async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStatus, String> {
     let service_url = local_service_url(&config);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = server_client(&service_url, Duration::from_millis(500))?;
     if is_mfq_server(&client, &service_url).await {
         return status_for(app, config).await;
     }
 
     let data_dir = app_data_dir(app)?;
+    check_local_ports(&data_dir, config.local_service_port)?;
     let (program, python_module) = mfq_program(app)?;
-    let stdout = open_log(&data_dir.join(LOG_FILE))?;
+    let log_path = data_dir.join(LOG_FILE);
+    let stdout = open_log(&log_path)?;
+    let log_offset = stdout.metadata().map_err(|error| error.to_string())?.len();
     let stderr = stdout.try_clone().map_err(|error| error.to_string())?;
     let mut command = Command::new(program);
     if python_module {
@@ -373,15 +426,13 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
             return status_for(app, config).await;
         }
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            return Err(format!(
-                "MFQ Server exited during startup with {status}; see {LOG_FILE}"
-            ));
+            return Err(startup_failure(&log_path, log_offset,
+                &format!("MFQ Server could not start ({status}).")));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    Err(format!(
-        "MFQ Server did not become ready within 30 minutes; see {LOG_FILE}"
-    ))
+    Err(startup_failure(&log_path, log_offset,
+        "MFQ Server did not become ready within 30 minutes."))
 }
 
 #[tauri::command]
@@ -401,11 +452,8 @@ async fn studio_configure(
     if matches!(config.mode, RuntimeMode::Local)
         && previous.local_service_port != config.local_service_port
     {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|error| error.to_string())?;
         let previous_url = local_service_url(&previous);
+        let client = server_client(&previous_url, Duration::from_secs(10))?;
         if is_mfq_server(&client, &previous_url).await {
             let token = studio_credential_get()?;
             let request = client.put(format!("{previous_url}/api/v1/runtime/listener"))
@@ -457,10 +505,7 @@ async fn studio_select_model_directory(
         .path()
         .to_str()
         .ok_or_else(|| "selected model directory is not valid UTF-8".to_string())?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = server_client(&local_service_url(&config), Duration::from_secs(300))?;
     let token = studio_credential_get()?;
     let request = client
         .post(format!(
@@ -614,6 +659,96 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn startup_test_dir() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("mfq-startup-test-{}-{nonce}-{sequence}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn only_loopback_server_connections_bypass_proxies() {
+        for url in ["http://localhost:8090", "https://LOCALHOST:8090", "http://127.0.0.1:8090", "http://127.0.0.2:8090", "http://[::1]:8090"] {
+            assert!(is_loopback_service(url), "{url}");
+        }
+        for url in ["https://example.com", "http://localhost.example.com", "http://192.168.1.2:8090", "http://[::2]:8090", "not a URL"] {
+            assert!(!is_loopback_service(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn startup_failure_reports_only_this_launch_and_bounds_log_output() {
+        let directory = startup_test_dir();
+        let path = directory.join(LOG_FILE);
+        let previous = "previous-launch-private-text\n";
+        fs::write(&path, format!("{previous}new launch: library not found\n")).unwrap();
+        let error = startup_failure(&path, previous.len() as u64, "Server exited.");
+        assert!(error.contains("Server exited."));
+        assert!(error.contains("library not found"));
+        assert!(!error.contains("previous-launch-private-text"));
+        fs::write(&path, format!("{}\nlast error", "x".repeat(20000))).unwrap();
+        let error = startup_failure(&path, 0, "Server exited.");
+        assert!(error.contains("last error"));
+        assert!(error.len() < 8500);
+        assert!(startup_failure(&path, 30000, "Server exited.").contains("Server log:"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn startup_failure_keeps_the_summary_when_the_log_is_missing() {
+        let directory = startup_test_dir();
+        let error = startup_failure(&directory.join(LOG_FILE), 0, "Server exited.");
+        assert!(error.starts_with("Server exited.\nServer log:"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn startup_failure_after_log_rotation_does_not_expose_the_previous_log() {
+        use std::io::Write;
+        let directory = startup_test_dir();
+        let path = directory.join(LOG_FILE);
+        fs::write(&path, "previous-launch-private-text").unwrap();
+        OpenOptions::new().write(true).open(&path).unwrap().set_len(LOG_ROTATE_BYTES).unwrap();
+        let mut log = open_log(&path).unwrap();
+        let offset = log.metadata().unwrap().len();
+        assert_eq!(offset, 0);
+        writeln!(log, "current launch error").unwrap();
+        drop(log);
+        let error = startup_failure(&path, offset, "Server exited.");
+        assert!(error.contains("current launch error"));
+        assert!(!error.contains("previous-launch-private-text"));
+        assert_eq!(path.with_extension("log.1").metadata().unwrap().len(), LOG_ROTATE_BYTES);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn startup_rejects_shared_api_ports_without_spawning_a_server() {
+        let directory = startup_test_dir();
+        fs::write(directory.join("listener.json"), r#"{"anthropic_port":19290}"#).unwrap();
+        let error = check_local_ports(&directory, 19290).unwrap_err();
+        assert!(error.contains("cannot share port 19290"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn startup_identifies_the_occupied_api_port() {
+        let directory = startup_test_dir();
+        let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let available = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let available_port = available.local_addr().unwrap().port();
+        drop(available);
+        fs::write(directory.join("listener.json"), format!(r#"{{"anthropic_port":{occupied_port}}}"#)).unwrap();
+        let error = check_local_ports(&directory, available_port).unwrap_err();
+        assert!(error.contains(&format!("Anthropic API port {occupied_port} is already in use")));
+        fs::write(directory.join("listener.json"), format!(r#"{{"anthropic_port":{available_port}}}"#)).unwrap();
+        let error = check_local_ports(&directory, occupied_port).unwrap_err();
+        assert!(error.contains(&format!("OpenAI API port {occupied_port} is already in use")));
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
