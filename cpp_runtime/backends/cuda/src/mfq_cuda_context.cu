@@ -730,6 +730,24 @@ std::size_t Context::available_memory() const {
     DeviceGuard guard(device_);
     std::size_t free=0,total=0;
     MFQ_NATIVE_CUDA_CHECK(cudaMemGetInfo(&free,&total));
+#ifdef _WIN32
+    // CUDA may allocate beyond WDDM's current local-memory budget and let the
+    // driver page live weights through system RAM. Price revocable caches and
+    // new workspace against physical residency, before that silent slowdown.
+    if(allocation_budget_->adapter) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+        if(SUCCEEDED(allocation_budget_->adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&memory))) {
+            const auto available=memory.Budget>memory.CurrentUsage?std::size_t(memory.Budget-memory.CurrentUsage):0;
+            if(available<free) {
+                static std::atomic<bool> reported{false};
+                if(std::getenv("MFQ_PROFILE_SSD_EXPERTS") && !reported.exchange(true,std::memory_order_relaxed))
+                    std::fprintf(stderr,"cuda_residency_budget scope=first_limit cuda_free_bytes=%zu budget_bytes=%llu usage_bytes=%llu available_bytes=%zu\n",
+                        free,static_cast<unsigned long long>(memory.Budget),static_cast<unsigned long long>(memory.CurrentUsage),available);
+                free=available;
+            }
+        }
+    }
+#endif
     const auto budget=memory_stats();
     if(budget.limit) {
         const auto used=resident_memory_usage();
