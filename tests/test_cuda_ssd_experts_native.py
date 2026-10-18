@@ -66,9 +66,13 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma,ram_p
         assert "model_direct_staging_batch enabled=1" in result.stderr
 
 
-@pytest.mark.parametrize("wide,grouped", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("wide,grouped,router_prefetch", [
+    (False, True, False), (True, True, False), (True, False, False),
+    pytest.param(True, True, True, id="router-prefetch"),
+    pytest.param(True, True, None, id="router-auto"),
+])
 @pytest.mark.parametrize("read_mode,preload_requested", [("buffered",False),("direct",False),("direct",True)])
-def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode,preload_requested):
+def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,router_prefetch,read_mode,preload_requested):
     from mfq.server.runtime.client import StdioRuntimeClient
     from tests.test_cuda_flash_next_runtime import mtp_fixture, write_qwen_fixture
     from tests.test_native_nint_ple import _worker_tokenizer
@@ -111,9 +115,11 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode,p
             MFQ_MOE_PRELOAD_ALL=str(int(not ssd or preload_requested)), MFQ_MOE_ASSERT_RESIDENT=str(int(not ssd)), MFQ_MOE_NVQ_DENSE="0",
             MFQ_MOE_HOST_CACHE_BYTES=str((1 << 19 if wide else 4096) if ssd else 1 << 28), MFQ_MOE_RAM_PCIE="1", MFQ_MOE_RAM_PCIE_FRACTION="1",
             MFQ_MOE_RESIDENCY_WARM="1", MFQ_MOE_RESIDENCY_PROJECTION_HEAT="1", MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER="1",
+            MFQ_MOE_ROUTER_LOOKAHEAD=str(int(router_prefetch is True and ssd)),
             MFQ_MOE_PREFILL_LAYER="0", MFQ_RUNTIME_DISABLE_PREFIX_CACHE="1",
             MFQ_KV_TURBOQUANT_BITS="0", MFQ_CUDA_WORKSPACE_RESERVE_GIB="0.01")
         if workspace_cache:env["MFQ_CUDA_WORKSPACE_RESERVE_GIB"]="1.5"
+        if router_prefetch is None and ssd:env.pop("MFQ_MOE_ROUTER_LOOKAHEAD")
         env.pop("MFQ_MOE_PREFILL_GROUPS", None)
         if not grouped:
             env["MFQ_MOE_PREFILL_GROUPS"] = "0"
@@ -154,6 +160,10 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode,p
                 if ssd:
                     assert status["ssd_expert_bytes_read"] > 0 and status["ram_expert_cache_evictions"] > 0
                     assert bool(status.get("ssd_mapped_read_calls", 0)) == (read_mode == "buffered")
+                    if router_prefetch or router_prefetch is None:
+                        assert status["ssd_router_prefetch_jobs"] > 0
+                        assert status["ssd_router_prefetch_bytes"] > 0
+                        assert status["ssd_router_prefetch_used_jobs"] > 0
                 text = (tmp_path / f"worker-{ssd}.log").read_text(errors="replace")
                 captures = [line for line in text.splitlines() if "runtime_qwen4_graph_capture role=" in line]
                 assert captures

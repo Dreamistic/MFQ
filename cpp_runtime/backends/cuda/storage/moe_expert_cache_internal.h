@@ -107,6 +107,8 @@ public:
     }
 
     ~MoeExpertCache() {
+        ssd_prediction_reader_.reset();
+        ssd_prediction_reads_.reset();ssd_previous_prediction_.reset();
         ssd_prefill_reader_.reset();
         try{finish_prefill_copies();}catch(const std::exception& error) {
             std::cerr<<"runtime_prefill_copy destructor_error="<<error.what()<<'\n';
@@ -384,8 +386,36 @@ public:
             if(failed)std::rethrow_exception(failed);
         }
     };
-    std::unique_ptr<SsdExpertReads> prepare_ssd_expert_reads(std::vector<SsdExpertRequest> requests,bool background=false);
+    std::unique_ptr<SsdExpertReads> prepare_ssd_expert_reads(std::vector<SsdExpertRequest> requests,bool background=false,bool prediction=false);
     void execute_ssd_expert_reads(SsdExpertReads& reads,bool background=false);
+    void execute_ssd_expert_reads(SsdExpertReads& reads,mfq::HostParallelPool& pool,int workers,bool touch=true);
+    void queue_ssd_prediction(std::vector<SsdExpertRequest> requests);
+    void observe_ssd_prediction_demand(const std::vector<SsdExpertRequest>& requests);
+    void observe_ssd_read_wait(std::uint64_t ns) {
+        if(!pipeline_reuse_learning_)return;
+        ssd_prediction_wait_ns_=(ssd_prediction_wait_ns_*15+ns)/16;
+        // Extra router work costs tens of microseconds per layer. Enable it
+        // for sustained disk waits, and stop once RAM covers the hot routes.
+        // Hysteresis avoids switching for individual fast/slow layers.
+        const bool enabled=ssd_prediction_auto_?ssd_prediction_wait_ns_>=25000:ssd_prediction_wait_ns_>=50000;
+        bool selected=enabled;
+        if(ssd_prediction_cooldown_){--ssd_prediction_cooldown_;selected=false;}
+        const bool sample=++ssd_prediction_observations_%48==0;
+        if(selected && (!ssd_prediction_auto_ || sample)) {
+            const auto host=host_experts_->stats();
+            const auto started=host.prediction_started_jobs-ssd_prediction_probe_started_;
+            const auto used=host.prediction_used_jobs-ssd_prediction_probe_used_;
+            if(ssd_prediction_auto_ && started>=64 && used*4<started) {
+                selected=false;ssd_prediction_cooldown_=48*64;++ssd_prediction_quality_rejections_;
+            }
+            if(!ssd_prediction_auto_ || started>=64) {
+                ssd_prediction_probe_started_=host.prediction_started_jobs;
+                ssd_prediction_probe_used_=host.prediction_used_jobs;
+            }
+        }
+        if(selected!=ssd_prediction_auto_){ssd_prediction_auto_=selected;++ssd_prediction_switches_;}
+    }
+    bool ssd_router_prefetch() const noexcept {return ssd_prediction_auto_;}
     std::unique_ptr<SsdExpertReads> begin_ssd_expert_reads(std::vector<SsdExpertRequest> requests,std::size_t gate_up_requests);
     std::vector<MoeHostExpertCache::Lease> read_ssd_experts(const std::vector<SsdExpertRequest>& requests,bool background=false);
     struct SsdExpertCopy {MoeQuantRangeSource* source;int expert;std::vector<mfq_tensor_backend::Tensor> fields;};
@@ -885,6 +915,8 @@ public:
             {"ram_expert_speculative_windows",double(host.speculative_windows)},
             {"ram_expert_speculative_accepted_keys",double(host.speculative_accepted_keys)},
             {"ram_expert_speculative_cancels",double(host.speculative_cancels)},
+            {"ram_expert_ghost_entries",double(host.ghost_entries)},
+            {"ram_expert_ghost_promotions",double(host.ghost_promotions)},
             {"ram_expert_enabled", resident > 0 ? 1.0 : 0.0},
             {"resident_expert_cache_bytes",double(gpu_weights+(kv_expert_loan_?kv_expert_loan_->bytes():0))},
             {"expert_decode_transfer_bytes",double(transfer_bytes)},
@@ -902,6 +934,23 @@ public:
             {"ssd_gu_compute_overlap_serves",double(stats_.pipeline_ssd_gu_compute_serves)},
             {"ssd_gate_up_read_wait_ms",double(stats_.pipeline_ssd_gate_up_wait_ns)/1e6},
             {"ssd_down_read_wait_ms",double(stats_.pipeline_ssd_down_wait_ns)/1e6},
+            {"ssd_router_prefetch_batches",double(ssd_prediction_batches_)},
+            {"ssd_router_prefetch_jobs",double(ssd_prediction_jobs_)},
+            {"ssd_router_prefetch_bytes",double(ssd_prediction_bytes_)},
+            {"ssd_router_prefetch_used_jobs",double(host.prediction_used_jobs)},
+            {"ssd_router_prefetch_used_bytes",double(host.prediction_used_bytes)},
+            {"ssd_router_prefetch_started_jobs",double(host.prediction_started_jobs)},
+            {"ssd_router_prefetch_started_bytes",double(host.prediction_started_bytes)},
+            {"ssd_router_prefetch_matched_jobs",double(ssd_prediction_matched_)},
+            {"ssd_router_prefetch_ready_jobs",double(ssd_prediction_ready_)},
+            {"ssd_router_predicted_routes",double(ssd_predicted_routes_)},
+            {"ssd_router_prediction_hits",double(ssd_prediction_hits_)},
+            {"ssd_router_prefetch_busy_skips",double(ssd_prediction_busy_skips_)},
+            {"ssd_router_prefetch_io_wait_us",double(ssd_prediction_wait_ns_)/1000},
+            {"ssd_router_prefetch_suggested",double(ssd_prediction_auto_)},
+            {"ssd_router_prefetch_switches",double(ssd_prediction_switches_)},
+            {"ssd_router_prefetch_quality_rejections",double(ssd_prediction_quality_rejections_)},
+            {"ssd_router_prefetch_cooldown_layers",double(ssd_prediction_cooldown_)},
             {"ram_expert_payload_bytes", double(resident)},
             {"ram_expert_optional_backup_bytes",double(host.optional_bytes)},
               {"ram_expert_optional_reclaimed_bytes",double(host.optional_reclaimed_bytes)},
@@ -1071,6 +1120,16 @@ private:
     std::unique_ptr<mfq::HostParallelPool> ssd_read_pool_;
     std::unique_ptr<mfq::HostParallelPool> ssd_background_read_pool_;
     std::shared_ptr<MoeSsdPrefillReader> ssd_prefill_reader_;
+    std::unique_ptr<mfq::HostParallelPool> ssd_prediction_pool_;
+    std::shared_ptr<MoeSsdPrefillReader> ssd_prediction_reader_;
+    std::unique_ptr<SsdExpertReads> ssd_prediction_reads_,ssd_previous_prediction_;
+    std::uint64_t ssd_prediction_batches_=0,ssd_prediction_jobs_=0,ssd_prediction_bytes_=0,ssd_prediction_busy_skips_=0;
+    std::uint64_t ssd_prediction_wait_ns_=0,ssd_prediction_switches_=0;
+    std::uint64_t ssd_predicted_routes_=0,ssd_prediction_hits_=0;
+    std::uint64_t ssd_prediction_matched_=0,ssd_prediction_ready_=0;
+    std::uint64_t ssd_prediction_observations_=0,ssd_prediction_cooldown_=0,ssd_prediction_quality_rejections_=0;
+    std::uint64_t ssd_prediction_probe_started_=0,ssd_prediction_probe_used_=0;
+    bool ssd_prediction_auto_=false;
     std::atomic<std::uint64_t> ssd_ram_read_fast_hits_{0},ssd_scheduled_read_jobs_{0};
     bool pipeline_residency_suspended_=false;
     bool pipeline_reuse_learning_=true;

@@ -33,6 +33,10 @@ struct MoeHostExpertCacheStats {
     std::uint64_t device_duplicate_evictions=0,device_duplicate_evicted_bytes=0;
     std::uint64_t device_reuse_promotions=0;
     std::uint64_t speculative_windows=0,speculative_accepted_keys=0,speculative_cancels=0;
+    std::uint64_t prediction_used_jobs=0,prediction_used_bytes=0;
+    std::uint64_t prediction_started_jobs=0,prediction_started_bytes=0;
+    std::size_t ghost_entries=0,ghost_bytes=0;
+    std::uint64_t ghost_promotions=0;
 };
 
 // Engine-wide, byte-bounded LRU for immutable CPU expert fields. CPU leases
@@ -48,7 +52,9 @@ public:
     ~MoeHostExpertCache();
     MoeHostExpertCache(const MoeHostExpertCache&)=delete;
     MoeHostExpertCache& operator=(const MoeHostExpertCache&)=delete;
-    Lease acquire(mfq::MoeCacheKey key,std::size_t bytes,const Load& load,bool retain=true);
+    // An unconfirmed prediction (touch=false) cannot evict reused images.
+    // A later demand can admit that same payload without reading it again.
+    Lease acquire(mfq::MoeCacheKey key,std::size_t bytes,const Load& load,bool retain=true,bool touch=true);
     // A prefill scan may fill unused capacity, without evicting existing
     // experts or promoting scan hits. Returns empty without loading if full.
     Lease acquire_scan(mfq::MoeCacheKey key,std::size_t bytes,const Load& load);
@@ -64,7 +70,7 @@ public:
     Lease find(mfq::MoeCacheKey key,bool touch=true);
     // A dispatch preflight must not wait for another key's RAM publication.
     // Busy keys remain eligible for the normal parallel acquisition path.
-    Lease try_find(mfq::MoeCacheKey key,bool touch=true);
+    Lease try_find(mfq::MoeCacheKey key,bool touch=true,bool consume=true);
     MoeHostExpertCacheStats stats() const;
     // A streaming scan must not evict repeatedly consumed decoded images.
     void enable_reuse_priority();
@@ -112,7 +118,7 @@ public:
                         const std::function<void()>& publish = {},
                         const std::function<void()>& prepare = {},bool independent_readers=false);
 private:
-    Lease load(mfq::MoeCacheKey key,std::size_t bytes,const Load& loader,bool retain,bool scan);
+    Lease load(mfq::MoeCacheKey key,std::size_t bytes,const Load& loader,bool retain,bool scan,bool touch);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

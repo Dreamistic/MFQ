@@ -26,6 +26,8 @@ struct MoeHostExpertReservation {
     std::shared_ptr<Ledger> ledger;
     std::size_t bytes;
     bool managed;
+    bool demand_admission=false;
+    bool unconsumed_prediction=false;
     MoeHostExpertReservation(std::shared_ptr<Ledger> value,std::size_t size,bool retained)
         :ledger(std::move(value)),bytes(size),managed(retained) {
         if (managed) charge(ledger->managed,ledger->managed_peak,bytes);
@@ -63,6 +65,7 @@ struct MoeHostExpertCache::Impl {
         Lease value;std::list<mfq::MoeCacheKey>::iterator position;bool reused=false;
         Entry *device_prev=nullptr,*device_next=nullptr;bool device_duplicate=false;
         std::uint64_t birth_epoch=0;
+        bool ghost_eligible=true;
     };
     struct Flight {
         bool ready=false;
@@ -77,6 +80,10 @@ struct MoeHostExpertCache::Impl {
     std::list<mfq::MoeCacheKey> lru;
     std::list<mfq::MoeCacheKey> reused;
     std::unordered_map<mfq::MoeCacheKey,Entry,mfq::MoeCacheKeyHash> entries;
+    struct Ghost {std::size_t bytes;std::list<mfq::MoeCacheKey>::iterator position;};
+    std::list<mfq::MoeCacheKey> ghost_lru;
+    std::unordered_map<mfq::MoeCacheKey,Ghost,mfq::MoeCacheKeyHash> ghosts;
+    std::size_t ghost_bytes=0;
     std::unordered_map<mfq::MoeCacheKey,std::shared_ptr<Flight>,mfq::MoeCacheKeyHash> flights;
     // Bypassed payloads still have an active consumer. Reuse that immutable
     // lease even when the RAM budget cannot retain it in the LRU.
@@ -93,6 +100,27 @@ struct MoeHostExpertCache::Impl {
     Entry *device_head=nullptr,*device_tail=nullptr;
 
     explicit Impl(std::size_t bytes):budget(bytes) {}
+    void forget_ghost(mfq::MoeCacheKey key) {
+        const auto found=ghosts.find(key);if(found==ghosts.end())return;
+        ghost_bytes-=found->second.bytes;ghost_lru.erase(found->second.position);ghosts.erase(found);
+    }
+    void remember_eviction(mfq::MoeCacheKey key,const Entry& entry) {
+        // GPU duplicates and unconsumed predictions are not evidence that a
+        // unique RAM expert will be needed again. Remember only probation
+        // payloads actually acquired by a consumer, without keeping data.
+        if(key.source<0 || entry.reused || !entry.ghost_eligible || device_cached.contains(key) ||
+                entry.value->reservation->unconsumed_prediction)return;
+        forget_ghost(key);ghost_lru.push_front(key);
+        try {ghosts.emplace(key,Ghost{entry.value->bytes,ghost_lru.begin()});}
+        catch(...) {ghost_lru.pop_front();throw;}
+        ghost_bytes+=entry.value->bytes;
+        while(ghost_bytes>budget || ghosts.size()>65536)forget_ghost(ghost_lru.back());
+    }
+    void demand(const Lease& value) {
+        if(!value->reservation->unconsumed_prediction)return;
+        value->reservation->unconsumed_prediction=false;
+        ++counters.prediction_used_jobs;counters.prediction_used_bytes+=value->bytes;
+    }
     void wait_exchange(std::unique_lock<std::mutex>& lock,mfq::MoeCacheKey key) {
         if(exchanging.contains(key))exchange_complete.wait(lock,[&]{return !exchanging.contains(key);});
     }
@@ -136,6 +164,8 @@ struct MoeHostExpertCache::Impl {
     }
     void touch(mfq::MoeCacheKey key,Entry& entry) {
         if(!reuse_learning || speculative_learning)return;
+        entry.ghost_eligible=true;
+        if(ghosts.contains(key)){forget_ghost(key);++counters.ghost_promotions;}
         if(entry.device_duplicate){device_duplicate(entry,false);device_duplicate(entry,true);}
         if(!counters.reuse_priority || key.source<0) {
             lru.splice(lru.begin(),lru,entry.position);return;
@@ -166,7 +196,7 @@ struct MoeHostExpertCache::Impl {
         if(counters.reuse_promotions!=before && ++counters.device_reuse_promotions==1)
             std::fprintf(stderr,"moe_ram_gpu_reuse_dispatch scope=first_promotion enabled=1\n");
     }
-    bool make_room(std::size_t bytes) {
+    bool make_room(std::size_t bytes,bool prediction=false) {
         if (!bytes || bytes>budget) return false;
         refresh_device_hints();
         // Keep the ordinary two-queue policy among unique RAM images. A
@@ -184,6 +214,7 @@ struct MoeHostExpertCache::Impl {
         }
         if(ledger->managed.load()<=budget-bytes)return true;
         for(auto* queue:{&lru,&reused}) {
+          if(prediction && queue==&reused)break;
           auto candidate=queue->end();
           while (ledger->managed.load()>budget-bytes && candidate!=queue->begin()) {
             --candidate;
@@ -196,6 +227,7 @@ struct MoeHostExpertCache::Impl {
             // Externally held payloads stay charged even after removal. Keep
             // their lookup entry rather than evicting useful pinned data.
             if (found->second.value.use_count()!=1) continue;
+            remember_eviction(*candidate,found->second);
             device_duplicate(found->second,false);
             candidate=queue->erase(candidate);
             counters.resident_bytes-=found->second.value->bytes;
@@ -215,12 +247,27 @@ struct MoeHostExpertCache::Impl {
             if (!inserted)
                 throw std::logic_error("duplicate host expert publication");
             found->second.birth_epoch=speculative_learning?learning_epoch:0;
+            found->second.ghost_eligible=reuse_learning && !speculative_learning;
             device_duplicate(found->second,device_cached.contains(key));
         }
         catch (...) { lru.pop_front(); throw; }
         counters.resident_bytes+=value->bytes;
         if(key.source<0)counters.optional_bytes+=value->bytes;
         if(device_cached.contains(key))learn_device_reuse(key,entries.at(key));
+    }
+    void admit_prediction(mfq::MoeCacheKey key,const Lease& value) {
+        if(const auto found=entries.find(key);found!=entries.end()) {
+            touch(key,found->second);return;
+        }
+        auto& reservation=*value->reservation;
+        if(!reservation.demand_admission || !make_room(value->bytes))return;
+        // The prediction already owns the immutable payload. Admit its first
+        // confirmed use without another read or a second allocation.
+        publish(key,value);
+        charge(ledger->managed,ledger->managed_peak,value->bytes);
+        ledger->transient.fetch_sub(value->bytes);
+        reservation.managed=true;reservation.demand_admission=false;
+        transient.erase(key);
     }
 };
 
@@ -252,11 +299,12 @@ void MoeHostExpertCache::commit_speculative_learning(const std::vector<mfq::MoeC
     for(const auto key:accepted)if(!state.exchanging.contains(key)) {
         const auto found=state.entries.find(key);if(found==state.entries.end())continue;
         auto& entry=found->second;
-        if(entry.birth_epoch!=state.learning_epoch)state.touch(key,entry);
+        if(entry.birth_epoch!=state.learning_epoch || state.ghosts.contains(key))state.touch(key,entry);
         else {
             // A newly loaded image has one confirmed use, even when several
             // speculative rows selected it. It remains on probation.
             state.lru.splice(state.lru.begin(),state.lru,entry.position);
+            entry.ghost_eligible=true;
             if(entry.device_duplicate){state.device_duplicate(entry,false);state.device_duplicate(entry,true);}
         }
     }
@@ -276,16 +324,18 @@ MoeHostExpertCache::Lease MoeHostExpertCache::find(mfq::MoeCacheKey key,bool tou
     std::unique_lock lock(impl_->mutex);impl_->wait_exchange(lock,key);
     const auto found=impl_->entries.find(key);
     if(found==impl_->entries.end())return {};
+    impl_->demand(found->second.value);
     if(touch)impl_->touch(key,found->second);
     ++impl_->counters.hits;
     return found->second.value;
 }
 
-MoeHostExpertCache::Lease MoeHostExpertCache::try_find(mfq::MoeCacheKey key,bool touch) {
+MoeHostExpertCache::Lease MoeHostExpertCache::try_find(mfq::MoeCacheKey key,bool touch,bool consume) {
     std::unique_lock lock(impl_->mutex,std::try_to_lock);
     if(!lock.owns_lock() || impl_->exchanging.contains(key))return {};
     const auto found=impl_->entries.find(key);
     if(found==impl_->entries.end())return {};
+    if(consume)impl_->demand(found->second.value);
     if(touch)impl_->touch(key,found->second);
     ++impl_->counters.hits;
     return found->second.value;
@@ -297,17 +347,17 @@ void MoeHostExpertCache::preserve_resident_experts() {
 }
 
 MoeHostExpertCache::Lease MoeHostExpertCache::acquire(mfq::MoeCacheKey key,std::size_t bytes,
-        const Load& load,bool retain) {
-    return this->load(key,bytes,load,retain,false);
+        const Load& load,bool retain,bool touch) {
+    return this->load(key,bytes,load,retain,false,touch);
 }
 
 MoeHostExpertCache::Lease MoeHostExpertCache::acquire_scan(mfq::MoeCacheKey key,std::size_t bytes,
         const Load& load) {
-    return this->load(key,bytes,load,true,true);
+    return this->load(key,bytes,load,true,true,false);
 }
 
 MoeHostExpertCache::Lease MoeHostExpertCache::load(mfq::MoeCacheKey key,std::size_t bytes,
-        const Load& load,bool retain,bool scan) {
+        const Load& load,bool retain,bool scan,bool touch) {
     if (!load || !bytes) throw std::invalid_argument("host expert needs a loader and exact byte size");
     auto& state=*impl_;
     std::shared_ptr<Impl::Flight> flight;
@@ -319,12 +369,16 @@ MoeHostExpertCache::Lease MoeHostExpertCache::load(mfq::MoeCacheKey key,std::siz
         if (retain) {
             const auto hit=state.entries.find(key);
             if (hit!=state.entries.end()) {
-                if(!scan)state.touch(key,hit->second);
+                if(touch){state.demand(hit->second.value);state.touch(key,hit->second);}
                 ++state.counters.hits;
                 return hit->second.value;
             }
             if(const auto active=state.transient.find(key);active!=state.transient.end()) {
-                if(auto value=active->second.lock()) {++state.counters.coalesced;return value;}
+                if(auto value=active->second.lock()) {
+                    ++state.counters.coalesced;
+                    if(touch && !scan){state.demand(value);state.admit_prediction(key,value);}
+                    return value;
+                }
                 state.transient.erase(active);
             }
             const auto pending=state.flights.find(key);
@@ -333,14 +387,22 @@ MoeHostExpertCache::Lease MoeHostExpertCache::load(mfq::MoeCacheKey key,std::siz
                 ++state.counters.coalesced;
                 flight->condition.wait(lock,[&] { return flight->ready; });
                 if (flight->error) std::rethrow_exception(flight->error);
+                if(touch && !scan){state.demand(flight->value);state.admit_prediction(key,flight->value);}
                 return flight->value;
             }
         }
         if(scan && (bytes>state.budget || state.ledger->managed.load()>state.budget-bytes))return {};
         ++state.counters.misses;
-        managed=retain && (scan || state.make_room(bytes));
+        // Predictions may replace idle probation entries, never the reused
+        // hot set. If those entries are leased, keep a bounded transient.
+        managed=retain && (scan || state.make_room(bytes,!touch));
         if (!managed) ++state.counters.bypasses;
         reservation=std::make_shared<MoeHostExpertReservation>(state.ledger,bytes,managed);
+        reservation->demand_admission=retain && !scan && !touch && !managed;
+        reservation->unconsumed_prediction=retain && !scan && !touch;
+        if(reservation->unconsumed_prediction) {
+            ++state.counters.prediction_started_jobs;state.counters.prediction_started_bytes+=bytes;
+        }
         if (retain) {
             flight=std::make_shared<Impl::Flight>();
             state.flights.emplace(key,flight);
@@ -354,9 +416,13 @@ MoeHostExpertCache::Lease MoeHostExpertCache::load(mfq::MoeCacheKey key,std::siz
         std::lock_guard lock(state.mutex);
         if (managed && (!flight || flight->retain)) {
             state.publish(key,value);
+            if(touch && !scan && state.ghosts.contains(key))state.touch(key,state.entries.at(key));
             if(scan){++state.counters.scan_admissions;state.counters.scan_admitted_bytes+=bytes;}
         }
-        else if(retain) state.transient.insert_or_assign(key,value);
+        else if(retain) {
+            if(flight && !flight->retain)value->reservation->demand_admission=false;
+            state.transient.insert_or_assign(key,value);
+        }
         if (flight) {
             flight->value=value;
             flight->ready=true;
@@ -577,5 +643,6 @@ MoeHostExpertCacheStats MoeHostExpertCache::stats() const {
     result.managed_peak_bytes=state.ledger->managed_peak.load();
     result.transient_bytes=state.ledger->transient.load();
     result.transient_peak_bytes=state.ledger->transient_peak.load();
+    result.ghost_entries=state.ghosts.size();result.ghost_bytes=state.ghost_bytes;
     return result;
 }

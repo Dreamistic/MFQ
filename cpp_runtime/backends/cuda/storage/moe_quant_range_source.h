@@ -26,7 +26,7 @@ public:
     bool expert_disk_sealed() const { return disk_sealed_.load(); }
     void bind_host_cache(std::shared_ptr<MoeHostExpertCache> cache,int source_id);
     void bind_pinned_arena(std::shared_ptr<MoePinnedExpertArena> arena) {pinned_arena_=std::move(arena);}
-    MoeHostExpertCache::Lease acquire_expert(int expert) const;
+    MoeHostExpertCache::Lease acquire_expert(int expert,bool touch=true) const;
     bool demote_expert(int expert,const MoeHostExpertCache::Load& copy);
     void mark_gpu_resident(int expert,bool resident);
     // Cache transactions already publish/remove the corresponding RAM entry.

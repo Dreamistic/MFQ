@@ -409,14 +409,14 @@ bool MoeQuantRangeSource::gpu_resident(int expert) const {
     return gpu_resident_[expert].load();
 }
 
-MoeHostExpertCache::Lease MoeQuantRangeSource::acquire_expert(int expert) const {
+MoeHostExpertCache::Lease MoeQuantRangeSource::acquire_expert(int expert,bool touch) const {
     const auto bytes=expert_field_bytes(expert);
     if (host_cache_) return host_cache_->acquire(host_key(expert),bytes,[this,expert] {
         auto pool=read_expert(expert);
         if (expert_fields_bytes(pool)!=expert_field_bytes(expert))
             throw std::runtime_error("decoded expert exceeded registered RAM layout");
         return pool;
-    },!gpu_resident(expert));
+    },!gpu_resident(expert),touch);
     auto value=std::make_shared<MoeHostExpert>();
     value->weights=read_expert(expert);
     value->bytes=bytes;

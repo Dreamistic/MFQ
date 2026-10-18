@@ -228,7 +228,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             for(auto& phase:loan_copies)phase.clear();
         }
     };
+    struct PredictionCell;
     struct Cell {
+        std::shared_ptr<PredictionCell> router_hint;
         TransferScratch transfer_scratch;
         int tokens,routes,entries;
         int calibration_expert=-1;
@@ -312,6 +314,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     std::map<const void*,std::shared_ptr<WindowRoutes>> window_routes_;
     struct PredictionCell {
         Mapped flags{128};
+        int routes=0;
         tb::Tensor aborted=tb::zeros({1},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt32));
         PredictionCell(){publish(flags.h<uint32_t>()+4);publish(flags.h<uint32_t>()+8);}
     };
@@ -1635,7 +1638,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             (!packet_option || packet_option[0]!='0') &&
             (!host_packet_option || host_packet_option[0]=='1') &&
             (!fused_copy_option || fused_copy_option[0]!='0') &&
-            !mfq::cuda::runtime_options::router_lookahead() && !cache_->pipeline_prefetch_host_stage_.defined();
+            (!mfq::cuda::runtime_options::router_lookahead() || cache_->ssd_experts()) && !cache_->pipeline_prefetch_host_stage_.defined();
         if(cell.wire_fallback)cache_->prepare_direct_transfer_cache();
         if(cell.transfer_cache)for(int p=0;p<3;++p)for(auto& cohort:sources_[p]->cohorts_) {
             // Share one capacity across M=9..32; changing concurrency must not
@@ -1973,7 +1976,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             if(input_view)cell.fused->bind_window_inputs(input,ids,*weights_view);
             else cell.fused->use_staged_inputs();
         }
-        if(auto* window=mfq::cuda::DecodeWindow::recording()) {
+        // SSD predictions only populate host leases. Demand transfer owns its
+        // normal completion flags; no speculative GPU wire is consumed.
+        if(auto* window=mfq::cuda::DecodeWindow::recording();window && !cache_->ssd_experts()) {
             const auto found=prediction_cells_.find(window);
             if(found!=prediction_cells_.end()) {
                 auto& prediction=*found->second;
@@ -3752,6 +3757,15 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         time(stats.pipeline_route_wait_ns,[&]{wait_publication(cell);});
         trace_serve(cell,"plan");
         time(stats.pipeline_plan_ns,[&]{plan(cell);});
+        if(cell.router_hint && cell.tokens==1) {
+            const auto& hint=*cell.router_hint;
+            for(int i=0;i<hint.routes;++i) {
+                const int predicted=hint.flags.h<int32_t>()[16+i];
+                ++cache_->ssd_predicted_routes_;
+                if(std::any_of(cell.plan.groups.begin(),cell.plan.groups.end(),
+                        [predicted](const auto& group){return group.expert==predicted;}))++cache_->ssd_prediction_hits_;
+            }
+        }
         trace_serve(cell,"fetch");
         // The demand plan already deduplicates the window's token routes.
         // Parallel file reads share one immutable lease with CPU work and
@@ -3776,6 +3790,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     requests.emplace_back(sources_[p]->quant_source_.get(),group.expert);
                 }
             }
+            if(cell.in_window && cell.tokens==1)cache_->observe_ssd_prediction_demand(requests);
             const auto* overlap=std::getenv("MFQ_MOE_SSD_GU_IO_OVERLAP");
             const auto* projection=std::getenv("MFQ_MOE_KV_PROJECTION_CACHE");
             const auto* lookup=std::getenv("MFQ_MOE_KV_LOOKUP_FIRST");
@@ -3866,6 +3881,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             stats.pipeline_window_plan_ns+=stats.pipeline_plan_ns-plan_started;
             stats.pipeline_window_fetch_ns+=stats.pipeline_fetch_ns-fetch_before;
             stats.pipeline_window_cpu_ns+=stats.pipeline_cpu_ns-cpu_before;
+            if(cache_->ssd_experts() && cell.tokens==1 && sources_[0]->layer_id_>=0)
+                cache_->observe_ssd_read_wait(stats.pipeline_ssd_read_ns-ssd_read_before);
         }
     }
     void observe_gpu(Cell& cell) {
@@ -4021,9 +4038,38 @@ public:
         rollback.committed=true;
     }
     mfq::cuda::DecodeWindow::Task prediction(const tb::Tensor& ids) {
-        if(!mfq::cuda::DecodeWindow::recording() || ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<1 || ids.size(1)>2 ||
-            ids.scalar_type()!=tb::kInt32 || !ids.is_cuda() || !cache_->pipeline_transfer_cache_ || cache_->pipeline_mapped_copy_)
+        if(!mfq::cuda::DecodeWindow::recording() || ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<1 ||
+            ids.size(1)>(cache_->ssd_experts()?4:2) ||
+            ids.scalar_type()!=tb::kInt32 || !ids.is_cuda() ||
+            (!cache_->ssd_experts() && (!cache_->pipeline_transfer_cache_ || cache_->pipeline_mapped_copy_)))
             throw std::invalid_argument("MFQ prefetch requires a single decode row, DMA and transfer caching");
+        if(cache_->ssd_experts()) {
+            const auto* window=mfq::cuda::DecodeWindow::recording();
+            auto& entry=prediction_cells_[window];if(!entry)entry=std::make_shared<PredictionCell>();
+            auto prediction=entry;auto* mapped=&prediction->flags;const int count=int(ids.numel());
+            prediction->routes=count;
+            mfq::cuda::moe_publish_routes(nullptr,ids.data_ptr<int32_t>(),nullptr,mapped->d<int32_t>()+16,
+                mapped->d<uint32_t>(),0,count,mfq_current_cuda_stream());
+            auto owner=shared_from_this();const auto stream=mfq_current_cuda_stream();
+            return {prediction.get(),[prediction]{std::memset(prediction->flags.host,0,prediction->flags.bytes);},
+                [owner,prediction,mapped,count,stream] {
+                    mfq::cuda::wait_route_publication(mapped->h<uint32_t>(),stream);
+                    std::vector<MoeExpertCache::SsdExpertRequest> requests;
+                    // Complete Gate/Up images before Down: their computation
+                    // can overlap the remaining disk reads in the next layer.
+                    for(int p=0;p<3;++p)for(int i=0;i<count;++i) {
+                        const int expert=mapped->h<int32_t>()[16+i];
+                        if(expert<0 || expert>=owner->experts_)throw std::out_of_range("SSD predicted expert is out of range");
+                        const auto mask=owner->cached_expert_fields_?
+                            owner->cached_expert_fields_->h<mfq::cuda::MfeCachedExpert>()[expert].ready_mask:uint64_t(0);
+                        if((owner->combined_gate_up_ && p==1) || (mask&(uint64_t(1)<<p)))continue;
+                        auto* source=owner->sources_[p]->quant_source_.get();
+                        if(!source->gpu_resident(expert))requests.emplace_back(source,expert);
+                    }
+                    owner->cache_->queue_ssd_prediction(std::move(requests));
+                },{},[prediction]{publish(prediction->flags.h<uint32_t>()+8);publish(prediction->flags.h<uint32_t>()+4);},
+                [owner,window]{owner->prediction_cells_.erase(window);}};
+        }
         constexpr int64_t capacity=16*1024*1024;
         if(!cache_->pipeline_prefetch_host_stage_.defined()) {
             cache_->pipeline_prefetch_wire_gpu_=tb::empty({capacity},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
@@ -4135,6 +4181,8 @@ public:
             initialize(*cell,execution,window!=nullptr);
         }
         if(window) {
+            if(cache_->ssd_experts())if(const auto found=prediction_cells_.find(window);found!=prediction_cells_.end())
+                cell->router_hint=found->second;
             auto* captured=cell.get();
             const bool independent=window->independent_sequences();
             std::shared_ptr<WindowRoutes> grouped;

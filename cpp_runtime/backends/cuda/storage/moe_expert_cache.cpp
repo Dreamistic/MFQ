@@ -621,13 +621,13 @@ void MoeExpertCache::initialize_ssd_residency() {
 }
 
 std::unique_ptr<MoeExpertCache::SsdExpertReads> MoeExpertCache::prepare_ssd_expert_reads(
-        std::vector<SsdExpertRequest> requests,bool background) {
+        std::vector<SsdExpertRequest> requests,bool background,bool prediction) {
     auto reads=std::make_unique<SsdExpertReads>();reads->requests=std::move(requests);
     reads->leases.resize(reads->requests.size());
     std::uint64_t hits=0;
     for(std::size_t i=0;i<reads->requests.size();++i) {
         const auto& [source,expert]=reads->requests[i];
-        if(const auto& cache=source->host_cache())reads->leases[i]=cache->try_find(source->host_key(expert),!background);
+        if(const auto& cache=source->host_cache())reads->leases[i]=cache->try_find(source->host_key(expert),!background,!prediction);
         if(reads->leases[i])++hits;
         else {if(reads->missing.empty())reads->missing.reserve(reads->requests.size());reads->missing.push_back(i);}
     }
@@ -642,18 +642,79 @@ void MoeExpertCache::execute_ssd_expert_reads(SsdExpertReads& reads,bool backgro
     // An adaptive batch must not hold the demand executor's dispatch mutex
     // while a predictor is waiting for just its current routed experts.
     const int workers=std::max(1,background?config_.moe_ssd_io_workers/2:config_.moe_ssd_io_workers);
+    execute_ssd_expert_reads(reads,*pool,workers);
+}
+
+void MoeExpertCache::execute_ssd_expert_reads(SsdExpertReads& reads,mfq::HostParallelPool& pool,int workers,bool touch) {
+    if(reads.missing.empty())return;
     ssd_scheduled_read_jobs_.fetch_add(reads.missing.size(),std::memory_order_relaxed);
-    pool->run(0,int64_t(reads.missing.size()),1,workers,
+    pool.run(0,int64_t(reads.missing.size()),1,workers,
         [&](int64_t begin,int64_t end) {
             for(auto i=begin;i<end;++i) {
                 const auto index=reads.missing[i];
-                reads.leases[index]=reads.requests[index].first->acquire_expert(reads.requests[index].second);
+                reads.leases[index]=reads.requests[index].first->acquire_expert(reads.requests[index].second,touch);
                 if(index<reads.gate_up_requests) {
                     {std::lock_guard lock(reads.mutex);--reads.gate_up_remaining;}
                     reads.changed.notify_one();
                 }
             }
         });
+}
+
+void MoeExpertCache::observe_ssd_prediction_demand(const std::vector<SsdExpertRequest>& requests) {
+    for(const auto& request:requests)for(const auto* batch:{ssd_previous_prediction_.get(),ssd_prediction_reads_.get()}) {
+        if(!batch)continue;
+        if(std::none_of(batch->missing.begin(),batch->missing.end(),
+                [&](std::size_t i){return batch->requests[i]==request;}))continue;
+        ++ssd_prediction_matched_;
+        if(batch->ready.valid() && batch->ready.wait_for(std::chrono::seconds(0))==std::future_status::ready)
+            ++ssd_prediction_ready_;
+        break;
+    }
+}
+
+void MoeExpertCache::queue_ssd_prediction(std::vector<SsdExpertRequest> requests) {
+    if(ssd_previous_prediction_) {
+        if(ssd_previous_prediction_->ready.valid() &&
+                ssd_previous_prediction_->ready.wait_for(std::chrono::seconds(0))!=std::future_status::ready) {
+            ++ssd_prediction_busy_skips_;return;
+        }
+        ssd_previous_prediction_->wait();ssd_previous_prediction_.reset();
+    }
+    // Keep the batch for this layer alive until its demand has acquired the
+    // leases, while allowing the next batch to queue before it finishes.
+    // At most two batches can own payloads or pending disk work.
+    ssd_previous_prediction_=std::move(ssd_prediction_reads_);
+    if(requests.empty())return;
+    auto reads=prepare_ssd_expert_reads(std::move(requests),true,true);
+    // Prediction may inspect more routes already covered by GPU/RAM, but a
+    // single-layer overlap cannot hide four complete expert disk reads.
+    // Select at most two actual RAM misses, in Gate/Up priority order.
+    std::vector<int> selected;
+    for(const auto i:reads->missing) {
+        const int expert=reads->requests[i].second;
+        if(std::find(selected.begin(),selected.end(),expert)==selected.end() && selected.size()<2)
+            selected.push_back(expert);
+    }
+    const auto selected_expert=[&](std::size_t i) {
+        return std::find(selected.begin(),selected.end(),reads->requests[i].second)!=selected.end();
+    };
+    std::erase_if(reads->missing,[&](std::size_t i){return !selected_expert(i);});
+    for(std::size_t i=0;i<reads->leases.size();++i)if(!selected_expert(i))reads->leases[i].reset();
+    if(reads->missing.empty())return;
+    if(!ssd_prediction_reader_)ssd_prediction_reader_=std::make_shared<MoeSsdPrefillReader>();
+    if(!ssd_prediction_pool_)ssd_prediction_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
+    std::uint64_t bytes=0;
+    for(const auto i:reads->missing)bytes+=reads->requests[i].first->expert_field_bytes(reads->requests[i].second);
+    ssd_prediction_jobs_+=reads->missing.size();ssd_prediction_bytes_+=bytes;
+    auto* pending=reads.get();
+    reads->ready=ssd_prediction_reader_->submit([this,pending] {
+        execute_ssd_expert_reads(*pending,*ssd_prediction_pool_,std::min(4,config_.moe_ssd_io_workers),false);
+    });
+    ssd_prediction_reads_=std::move(reads);
+    if(++ssd_prediction_batches_==1)std::fprintf(stderr,
+        "moe_ssd_router_prefetch scope=first_batch enabled=1 jobs=%zu bytes=%llu bounded_batches=2\n",
+        pending->missing.size(),static_cast<unsigned long long>(bytes));
 }
 
 std::unique_ptr<MoeExpertCache::SsdExpertReads> MoeExpertCache::begin_ssd_expert_reads(
@@ -2289,6 +2350,9 @@ bool moe_expert_cache_layer_prefill_ready(const std::shared_ptr<MoeExpertCache>&
 }
 bool moe_expert_cache_ssd_experts(const std::shared_ptr<MoeExpertCache>& cache) {
     return cache && cache->ssd_experts();
+}
+bool moe_expert_cache_ssd_router_prefetch(const std::shared_ptr<MoeExpertCache>& cache) {
+    return cache && cache->ssd_experts() && cache->ssd_router_prefetch();
 }
 std::size_t moe_expert_cache_budget_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
     return cache ? std::size_t(cache->budget_bytes()) : 0;

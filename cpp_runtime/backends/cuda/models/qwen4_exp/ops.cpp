@@ -717,20 +717,24 @@ struct Qwen4Block final : Block {
             [&](Tensor branch,const auto& mix){auto result=ffn_gr.pre_after(execution,branch,mix,marker("ffn_mhc_"));mark("ffn_pre_end");return result;},
             [&](Tensor branch) {
                 DecodeWindow::Task prediction{};
-                if(next_prefetch && branch.numel()==config.hidden) {
+                if(next_prefetch && branch.numel()==config.hidden && DecodeWindow::recording()->prediction_enabled()) {
                     const auto routing=config.routing();
                     auto logits=next_router(execution,branch.reshape({1,config.hidden}).to(tb::kFloat16)).to(tb::kFloat32).contiguous();
-                    auto selected=moe_topk_cuda(logits,2,
+                    const int prediction_count=std::min<int64_t>(logits.size(-1),
+                        moe_expert_cache_ssd_experts(execution.moe_expert_cache)?4:2);
+                    auto selected=moe_topk_cuda(logits,prediction_count,
                         routing.activation==mfq::models::RouterActivation::sigmoid,
                         routing.activation==mfq::models::RouterActivation::sqrt_softplus,
                         routing.normalize,routing.delayed_softmax,mfq_nullopt,1e-20,routing.scale);
                     prediction=next_prefetch(selected[0].to(tb::kInt32).contiguous());
                 }
                 if(router_audit)router_audit->input(layer,branch);
+                const bool early_prediction=prediction.identity && moe_expert_cache_ssd_experts(execution.moe_expert_cache);
+                if(early_prediction)DecodeWindow::recording()->enroll(std::move(prediction));
                 auto result=ffn(execution,branch);
                 // Reserve current-layer readers before selecting speculative
                 // slots. The route export itself precedes current FFN math.
-                if(prediction.identity)DecodeWindow::recording()->enroll(std::move(prediction));
+                if(prediction.identity && !early_prediction)DecodeWindow::recording()->enroll(std::move(prediction));
                 return result;
             },
             [&](Tensor branch,const auto& mix){
@@ -1222,13 +1226,14 @@ struct Qwen4DecodeGraph {
     struct Cell {
         mfq_tensor_backend::Tensor ids,positions,cache_positions,host_ids,output,raw_hidden,logits,greedy_host,compact_host;
         qwen4_exp::MtpCompactControl compact_control;
-        bool used_in_request=false;
+        unsigned used_kinds=0;
         std::vector<std::unique_ptr<PleStage>> ple;
         std::vector<qwen4_exp::RecurrentGraphCheckpoint> checkpoints;
         DecodeWindow window;
         Cell(int tokens,int hidden,const std::vector<std::unique_ptr<Block>>& blocks,cudaStream_t stream,int confirmed,
-                std::vector<qwen4_exp::RecurrentGraphCheckpoint>& shared_checkpoints)
+                std::vector<qwen4_exp::RecurrentGraphCheckpoint>& shared_checkpoints,bool prediction)
             :window(stream,mfq::cuda::runtime_options::layer_timings()) {
+            window.set_prediction_enabled(prediction);
             namespace tb=mfq_tensor_backend;
             const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64);
             ids=tb::zeros({1,tokens},options);positions=tb::zeros({tokens},options);cache_positions=tb::zeros({tokens},options);
@@ -1264,7 +1269,7 @@ struct Qwen4DecodeGraph {
         }
     };
     MfqCudaStream stream,ple_stream;
-    std::map<std::tuple<int,int,int>,std::unique_ptr<Cell>> cells;
+    std::map<std::tuple<int,int,int,bool>,std::unique_ptr<Cell>> cells;
     // Verification widths execute serially and commit/rollback before the next
     // window. Their snapshots can share stable allocations across graph shapes.
     std::vector<qwen4_exp::RecurrentGraphCheckpoint> shared_checkpoints;
@@ -1275,7 +1280,8 @@ struct Qwen4DecodeGraph {
     bool failed=false;
     mfq_tensor_backend::Tensor last_compact;
     explicit Qwen4DecodeGraph(Qwen4CausalLm& model):stream(mfq_get_current_cuda_stream()),ple_stream(mfq_get_stream_from_pool()) {
-        const bool enabled=model.router_lookahead.value_or(mfq::cuda::runtime_options::router_lookahead());
+        const bool enabled=model.router_lookahead.value_or(mfq::cuda::runtime_options::router_lookahead_override().value_or(
+            moe_expert_cache_ssd_experts(model.execution->moe_expert_cache)));
         for(std::size_t i=0;i<model.blocks.size();++i) {
             auto& current=static_cast<qwen4_exp::Qwen4Block&>(*model.blocks[i]);
             blocks.push_back(&current);
@@ -1308,6 +1314,11 @@ struct Qwen4DecodeGraph {
         last_compact={};
         if(stream.stream()!=mfq_current_cuda_stream())throw std::runtime_error("MFQ model window changed execution stream");
         const int tokens=static_cast<int>(ids.size(1));
+        // These consumers use the same single-row backbone. Keep its hidden
+        // state, logits and selected token in one graph instead of reserving
+        // a complete set of layer buffers for each output representation.
+        const int result_kind=kind;
+        if(tokens==1 && kind>=1 && kind<=4)kind=4;
         release_moe_prefill_buffers(model.execution->moe_expert_cache);
         const auto required=model.cache_pos+tokens;
         MFQ_RUNTIME_CHECK(required<=model.max_position_embeddings(),"Qwen4 graph exceeds context capacity");
@@ -1330,14 +1341,17 @@ struct Qwen4DecodeGraph {
                 std::cerr<<"runtime_qwen4_graph_capacity position="<<model.cache_pos
                     <<" required="<<required<<" planned="<<planned<<" capacity="<<kv_capacity<<'\n';
         }
-        auto& owner=cells[{tokens,kind,confirmed}];
-        if(!owner)owner=std::make_unique<Cell>(tokens,model.config.hidden,model.blocks,stream.stream(),confirmed,shared_checkpoints);
+        const bool prediction=tokens==1 && model.router_lookahead.value_or(
+            mfq::cuda::runtime_options::router_lookahead_override().value_or(
+                moe_expert_cache_ssd_router_prefetch(model.execution->moe_expert_cache)));
+        auto& owner=cells[{tokens,kind,confirmed,prediction}];
+        if(!owner)owner=std::make_unique<Cell>(tokens,model.config.hidden,model.blocks,stream.stream(),confirmed,shared_checkpoints,prediction);
         owner->window.set_profile_geometry(raw_hidden?"mtp_target":"target_decode",tokens);
         auto& cell=*owner;
         if(kind==4 && tokens>1)cell.compact_control.set(compact_sampling,"target",tokens);
         // A retained graph's first replay can still pay cold transfer/cache
         // costs after prefill. Exclude that replay from steady MTP policy data.
-        if(initialized)*initialized=!cell.window.valid() || !cell.used_in_request;
+        if(initialized)*initialized=!cell.window.valid() || !(cell.used_kinds&(1u<<result_kind));
         if(host_ids.defined()) {
             MFQ_RUNTIME_CHECK(!host_ids.is_cuda() && host_ids.scalar_type()==tb::kInt64 &&
                 host_ids.sizes()==ids.sizes(),"Qwen4 graph host token geometry changed");
@@ -1461,7 +1475,7 @@ struct Qwen4DecodeGraph {
                     <<" confirmed="<<confirmed<<" segments="<<cell.window.segments()<<" count="<<model.decode_graph_captures
                     <<" ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-capture_started).count()<<'\n';
             }
-            cell.window.run();cell.used_in_request=true;
+            cell.window.run();cell.used_kinds|=1u<<result_kind;
             if(confirmed) {
                 // Captured copies save the confirmed prefix. Bind their owned
                 // storage only after replay, so generic commit/rollback keeps
@@ -1492,6 +1506,8 @@ struct Qwen4DecodeGraph {
                 const auto* first=cell.greedy_host.data_ptr<int64_t>();
                 greedy_tokens->assign(first,first+tokens);
             }
+            if(tokens==1 && result_kind==1)return cell.logits.reshape({1,-1});
+            if(tokens==1 && result_kind==2)return cell.greedy_host;
             return cell.output;
         } catch(...) {failed=true;throw;}
     }
@@ -1516,6 +1532,7 @@ void qwen4_report_decode_graph(const Qwen4CausalLm& model,std::ostream& output) 
     for(const auto& [key,cell]:model.graph_registry->cells)
         for(const auto& phase:cell->window.gpu_phases())if(phase.samples)
             output<<"mtp_graph_phase tokens="<<std::get<0>(key)<<" confirmed="<<std::get<2>(key)
+                <<" prediction="<<std::get<3>(key)
                 <<" layer="<<phase.layer<<" from="<<phase.from<<" to="<<phase.to
                 <<" samples="<<phase.samples<<" total_ns="<<phase.total_ns<<'\n';
 }
@@ -1526,9 +1543,11 @@ std::vector<std::pair<std::string,double>> qwen4_decode_graph_profile_metrics(
     if(!mfq::cuda::runtime_options::layer_timings())return result;
     const auto append=[&](const auto& cells,const char* role,const char* attribute,const char* state) {
         for(const auto& [key,cell]:cells) {
-            const auto prefix=std::string("cuda_graph_profile_")+role+"_rows_"+
+            auto prefix=std::string("cuda_graph_profile_")+role+"_rows_"+
                 std::to_string(std::get<0>(key))+"_"+attribute+"_"+std::to_string(std::get<1>(key))+
                 "_"+state+"_"+std::to_string(std::get<2>(key))+"_";
+            if constexpr(std::tuple_size_v<std::remove_cvref_t<decltype(key)>> == 4)
+                prefix+="prediction_"+std::to_string(std::get<3>(key))+"_";
             struct Sample {int64_t total_ns=0,max_ns=0;uint64_t samples=0;};
             std::map<std::string,Sample> phases;
             uint64_t windows=0;
@@ -1743,6 +1762,16 @@ void qwen4_warmup_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp,int maximum_
     }
     (void)qwen4_decode_graph_logits(model,ids.narrow(1,0,1),2);
     (void)qwen4_decode_graph_logits(model,ids.narrow(1,0,1),1);
+    if(moe_expert_cache_ssd_experts(model.execution->moe_expert_cache) &&
+            !model.router_lookahead.has_value() && !runtime_options::router_lookahead_override().has_value()) {
+        struct Restore {
+            Qwen4CausalLm& model;std::optional<bool> previous;
+            ~Restore(){model.router_lookahead=previous;}
+        } restore{model,model.router_lookahead};
+        model.router_lookahead=true;
+        if(model.cache_pos+4>=model.max_position_embeddings())model.reset(1);
+        (void)qwen4_decode_graph_logits(model,ids.narrow(1,0,1),1);
+    }
     model.reset(1);
     MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
     std::cerr<<"runtime_qwen4_graph_warmup target_captures="<<model.decode_graph_captures
@@ -2375,7 +2404,7 @@ void Qwen4Model::adapter_reset(int64_t new_batch) {
     const bool retain=reuse_decode_graphs && new_batch==1 && graph_registry && graph_registry->reusable();
     if(graph_registry)for(auto* block:graph_registry->blocks)block->retain_graph_storage=retain;
     if(!retain)graph_registry.reset();
-    else for(auto& [key,cell]:graph_registry->cells)cell->used_in_request=false;
+    else for(auto& [key,cell]:graph_registry->cells)cell->used_kinds=0;
     positions = mfq_tensor_backend::Tensor();
     batch = new_batch;
 }

@@ -57,6 +57,7 @@ bool moe_expert_cache_finalized(
     const std::shared_ptr<MoeExpertCache>& cache);
 bool moe_expert_cache_layer_prefill_ready(const std::shared_ptr<MoeExpertCache>& cache);
 bool moe_expert_cache_ssd_experts(const std::shared_ptr<MoeExpertCache>& cache);
+bool moe_expert_cache_ssd_router_prefetch(const std::shared_ptr<MoeExpertCache>& cache);
 std::vector<std::pair<std::string, double>> moe_expert_memory_metrics(
     const std::shared_ptr<MoeExpertCache>& cache);
 void finalize_moe_expert_cache(

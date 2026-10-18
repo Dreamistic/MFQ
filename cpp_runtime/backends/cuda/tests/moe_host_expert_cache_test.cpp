@@ -35,6 +35,103 @@ void wait_coalesced(const MoeHostExpertCache& cache,std::promise<void>& release)
 
 int main() try {
     {
+        MoeHostExpertCache cache(256);cache.enable_reuse_priority();
+        auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(
+            std::vector<mfq::MoeCacheKey>{key(0),key(1)},true);
+        cache.set_device_cache_hints(hints);
+        for(int e=0;e<4;++e)cache.acquire(key(e),64,[e]{return weight(64,e+1);});
+        hints->publish(0,true);hints->publish(1,true);
+        for(int e:{4,5,2,3,6})cache.acquire(key(e),64,[e]{return weight(64,e+1);});
+        check(cache.contains(key(2)) && cache.contains(key(3)) && !cache.contains(key(0)),
+            "repeatedly evicted unique experts could not displace a GPU-only RAM backup");
+        check(cache.stats().ghost_promotions==2 && cache.stats().managed_bytes==256 &&
+            cache.stats().ghost_bytes<=256,"ghost reuse changed the payload budget or counted the wrong histories");
+    }
+    for(bool accepted:{false,true}) {
+        MoeHostExpertCache cache(192);cache.enable_reuse_priority();
+        for(int e=0;e<4;++e)cache.acquire(key(e),64,[e]{return weight(64,e+1);});
+        check(!cache.contains(key(0)),"ghost fixture did not evict its first expert");
+        cache.begin_speculative_learning();cache.acquire(key(0),64,[]{return weight(64,1);});
+        check(!cache.stats().ghost_promotions,"uncommitted verification trained ghost reuse");
+        if(accepted)cache.commit_speculative_learning({key(0)});else cache.discard_speculative_learning();
+        check(cache.stats().ghost_promotions==unsigned(accepted),"ghost reuse did not follow the accepted prefix");
+    }
+    {
+        MoeHostExpertCache cache(128);cache.enable_reuse_priority();
+        cache.begin_speculative_learning();cache.acquire(key(0),64,[]{return weight(64,1);});
+        cache.discard_speculative_learning();
+        cache.acquire(key(1),64,[]{return weight(64,2);});cache.acquire(key(2),64,[]{return weight(64,3);});
+        cache.acquire(key(0),64,[]{return weight(64,1);});
+        check(!cache.stats().ghost_promotions,"a rejected draft became repeat history after eviction");
+    }
+    {
+        MoeHostExpertCache cache(128);cache.enable_reuse_priority();
+        cache.acquire(key(0),64,[]{return weight(64,1);});cache.acquire(key(1),64,[]{return weight(64,2);});
+        auto first=cache.find(key(0),false),second=cache.find(key(1),false);
+        auto prediction=cache.acquire(key(2),64,[]{return weight(64,3);},true,false);
+        check(cache.contains(key(0)) && cache.contains(key(1)) && !cache.contains(key(2)),
+            "prediction evicted a useful RAM image before demand");
+        check(cache.stats().managed_bytes==128 && cache.stats().transient_bytes==64 && !cache.stats().evictions,
+            "unconfirmed prediction was not charged as a bounded transient");
+        first.reset();second.reset();
+        auto demand=cache.acquire(key(2),64,[]{throw std::runtime_error("prediction was reread");return weight(64,0);});
+        check(demand==prediction && cache.contains(key(2)) && !cache.contains(key(0)),
+            "confirmed demand did not admit the existing prediction");
+        check(cache.stats().managed_bytes==128 && !cache.stats().transient_bytes && !cache.stats().reuse_promotions,
+            "prediction admission duplicated charges or counted two confirmed uses");
+        cache.find(key(2));
+        check(cache.stats().prediction_used_jobs==1 && cache.stats().prediction_used_bytes==64,
+            "prediction consumption was not counted exactly once");
+        check(cache.stats().prediction_started_jobs==1 && cache.stats().prediction_started_bytes==64,
+            "prediction start counted a later demand acquisition as another disk read");
+        bytes_equal(demand,3);
+    }
+    {
+        MoeHostExpertCache cache(64);auto held=cache.acquire(key(0),64,[]{return weight(64,1);});
+        std::promise<void> entered,release;auto released=release.get_future().share();
+        auto prediction=std::async(std::launch::async,[&] {
+            return cache.acquire(key(1),64,[&] {entered.set_value();released.wait();return weight(64,2);},true,false);
+        });
+        entered.get_future().wait();
+        held.reset();
+        auto demand=std::async(std::launch::async,[&] {
+            return cache.acquire(key(1),64,[]{throw std::runtime_error("coalesced prediction reread");return weight(64,0);});
+        });
+        wait_coalesced(cache,release);
+        auto predicted=prediction.get(),confirmed=demand.get();
+        check(predicted==confirmed && cache.contains(key(1)) && !cache.contains(key(0)),
+            "in-flight demand did not admit the prediction after publication");
+        check(cache.stats().managed_bytes==64 && !cache.stats().transient_bytes,
+            "in-flight prediction admission changed the byte budget");
+        bytes_equal(confirmed,2);
+    }
+    {
+        MoeHostExpertCache cache(192);cache.enable_reuse_priority();
+        for(int e=0;e<3;++e)cache.acquire(key(e),64,[e]{return weight(64,e+1);});
+        cache.find(key(0));cache.find(key(1));
+        auto prediction=cache.acquire(key(3),64,[]{return weight(64,4);},true,false);
+        check(cache.contains(key(0)) && cache.contains(key(1)) && !cache.contains(key(2)) && cache.contains(key(3)),
+            "prediction did not restrict eviction to the probation queue");
+        cache.try_find(key(3),false,false);
+        check(!cache.stats().prediction_used_jobs,"a prediction probe counted as actual consumption");
+        cache.try_find(key(3),false);
+        check(cache.stats().prediction_used_jobs==1 && cache.stats().reuse_promotions==2,
+            "non-learning GPU acquisition did not consume the prediction independently of reuse learning");
+        auto transient=cache.acquire(key(4),64,[]{return weight(64,5);},true,false);
+        check(cache.contains(key(0)) && cache.contains(key(1)) && !cache.contains(key(4)) &&
+            cache.stats().managed_bytes==192 && cache.stats().transient_bytes==64,
+            "prediction evicted confirmed reuse while probation was leased");
+        bytes_equal(prediction,4);bytes_equal(transient,5);
+    }
+    {
+        MoeHostExpertCache cache(128);cache.enable_reuse_priority();
+        cache.acquire(key(0),64,[]{return weight(64,1);});cache.acquire(key(1),64,[]{return weight(64,2);});
+        for(int i=0;i<3;++i)bytes_equal(cache.acquire(key(0),64,[]{throw std::runtime_error("prefetch reread");return weight(64,0);},true,false),1);
+        check(!cache.stats().reuse_promotions,"a background acquisition trained RAM reuse priority");
+        cache.acquire(key(2),64,[]{return weight(64,3);});
+        check(!cache.contains(key(0)) && cache.contains(key(1)),"a speculative prefetch changed confirmed RAM recency");
+    }
+    {
         MoeHostExpertCache cache(192);cache.enable_reuse_priority();
         auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(
             std::vector<mfq::MoeCacheKey>{key(1)},true);
