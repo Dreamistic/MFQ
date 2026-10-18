@@ -254,7 +254,7 @@ struct MoeResidencyManager::Impl {
     std::atomic<std::uint64_t> candidate_projections{0},planned_projections{0},committed_projections{0},projection_memory_rejections{0};
     std::atomic<std::uint64_t> staging_budget_skips{0};
     std::atomic<std::uint64_t> ssd_load_requests{0},ssd_load_bytes{0};
-    std::atomic<std::uint64_t> ssd_gpu_image_bytes{0},ssd_gpu_images{0},ssd_gpu_image_ns{0};
+    std::atomic<std::uint64_t> ssd_gpu_image_bytes{0},ssd_gpu_images{0},ssd_gpu_image_ns{0},ssd_gpu_image_copies{0};
     std::atomic<std::uint64_t> plan_ns{0},decode_plan_ns{0};
     std::uint64_t last_plan_ns=0,last_staging_budget_skips=0;
     std::atomic<std::uint64_t> prepare_ns{0},join_ns{0},dma_wait_ns{0},map_ns{0},host_exchange_ns{0},apply_ns{0};
@@ -1052,15 +1052,27 @@ void MoeResidencyManager::prepare() {
                         ~RetireImage(){if(stream)(void)cudaStreamSynchronize(stream);}
                     } retire{s.stream};
                     const auto target=moe_cache_field_refs(image);
-                    for(std::size_t f=0;f<target.size();++f)if(cohort.bytes_per_expert[f])
-                        MFQ_CUDA_CHECK(cudaMemcpyAsync(target[f].data_ptr(),fields[f],std::size_t(cohort.bytes_per_expert[f]),
-                            cudaMemcpyDeviceToHost,s.stream));
+                    std::array<mfq::cuda::DmaCopy,8> copies{};std::size_t count=0;
+                    for(std::size_t f=0;f<target.size();++f)if(cohort.bytes_per_expert[f]) {
+                        auto* destination=target[f].data_ptr();const auto bytes=std::size_t(cohort.bytes_per_expert[f]);
+                        if(count) {
+                            auto& previous=copies[count-1];
+                            const auto gap=reinterpret_cast<uintptr_t>(fields[f])-reinterpret_cast<uintptr_t>(previous.source);
+                            if(gap>=previous.bytes && gap-previous.bytes<=15 &&
+                                    reinterpret_cast<uintptr_t>(destination)-reinterpret_cast<uintptr_t>(previous.destination)==gap) {
+                                previous.bytes=gap+bytes;continue;
+                            }
+                        }
+                        copies[count++]={destination,fields[f],bytes};
+                    }
+                    for(std::size_t i=0;i<count;++i)MFQ_CUDA_CHECK(cudaMemcpyAsync(
+                        copies[i].destination,copies[i].source,copies[i].bytes,cudaMemcpyDeviceToHost,s.stream));
                     s.observe("gpu_image",std::size_t(key.second));
                     MFQ_CUDA_CHECK(cudaStreamSynchronize(s.stream));
                     retire.stream=nullptr;
-                    s.ssd_gpu_image_bytes+=bytes;
+                    s.ssd_gpu_image_bytes+=bytes;s.ssd_gpu_image_copies+=count;
                     if(++s.ssd_gpu_images==1)std::fprintf(stderr,
-                        "moe_ssd_gpu_image_dispatch scope=first_image enabled=1 bytes=%zu\n",bytes);
+                        "moe_ssd_gpu_image_dispatch scope=first_image enabled=1 bytes=%zu copies=%zu\n",bytes,count);
                     return image;
                 });
             }
@@ -2004,7 +2016,7 @@ MoeResidencyManager::Stats MoeResidencyManager::stats() const noexcept {
         s.shadow_backup_bytes.load(),s.shadow_backup_fields.load(),s.shadow_index_rebuilds.load(),
         s.shadow_index_matches.load(),s.shadow_index_backup_bytes.load(),s.speculative_heat_routes.load(),
         s.predictor_overlap_rounds.load(),s.predictor_overlap_serves.load(),
-        s.ssd_load_requests.load(),s.ssd_load_bytes.load(),s.ssd_gpu_image_bytes.load(),s.ssd_gpu_images.load(),s.ssd_gpu_image_ns.load()};
+        s.ssd_load_requests.load(),s.ssd_load_bytes.load(),s.ssd_gpu_image_bytes.load(),s.ssd_gpu_images.load(),s.ssd_gpu_image_ns.load(),s.ssd_gpu_image_copies.load()};
 }
 void MoeResidencyManager::trace_rank_summary(std::ostream& out) const {
     const auto& s=*impl_;

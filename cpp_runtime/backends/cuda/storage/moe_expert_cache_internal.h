@@ -906,6 +906,7 @@ public:
             {"residency_ssd_gpu_image_bytes",double(residency.ssd_gpu_image_bytes)},
             {"residency_ssd_gpu_images",double(residency.ssd_gpu_images)},
             {"residency_ssd_gpu_image_ms",double(residency.ssd_gpu_image_ns)/1e6},
+            {"residency_ssd_gpu_image_copies",double(residency.ssd_gpu_image_copies)},
               {"residency_ssd_load_bytes",double(residency.ssd_load_bytes)},
               {"residency_kv_refill_bytes",double(residency.kv_refill_bytes)},
               {"residency_cached_copy_bytes",double(residency.cached_copy_bytes)},

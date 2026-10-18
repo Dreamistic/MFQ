@@ -317,6 +317,8 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
         check(failed==fail_image,"GPU image failure did not propagate");
         if(!fail_image)check(manager.stats().kv_refill_bytes>0,"SSD expert promotion reread an existing GPU cache copy");
         if(wide && !fail_image)check(manager.stats().ssd_gpu_image_bytes>0,"SSD exchange reloaded a complete GPU image from disk");
+        if(wide && !fail_image)check(manager.stats().ssd_gpu_image_copies==manager.stats().ssd_gpu_images,
+            "contiguous GPU expert fields were not copied as one image");
         if(const auto* option=std::getenv("MFQ_MOE_RESIDENCY_NATIVE_DMA");option && option[0]=='1' &&
                 mfq::cuda::NativeDmaBatch::available() && !fail_image)
             check(manager.stats().native_dma_batches>0,"SSD expert exchange bypassed native DMA batching");
