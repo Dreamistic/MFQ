@@ -28,6 +28,9 @@ class KvExpertLoan {
         int fields=0;std::size_t logical_bytes=0;
     };
 public:
+    void set_reuse_learning(bool enabled) {
+        std::lock_guard lock(mutex_);reuse_learning_=enabled;
+    }
     using Key=std::array<int64_t,3>; // source, expert, field
     struct ReuseStats {uint64_t promotions=0,protected_hits=0,probation_evictions=0;std::size_t protected_pages=0;bool enabled=false;};
     void set_reuse_priority(bool enabled) {
@@ -304,6 +307,7 @@ private:
         speculative_rows_=0;speculative_keys_.clear();packet_sources_={};packet_masks_.clear();++speculative_stats_.disabled;
     }
     void note_access(Entry& entry,bool fresh=false) {
+        if(!reuse_learning_)return;
         const bool reused=!fresh && entry.packet!=packet_;
         if(reuse_priority_ && entry.reused)++reuse_stats_.protected_hits;
         if(!speculative_rows_) {
@@ -552,7 +556,7 @@ private:
     std::vector<uint32_t> packet_masks_;
     std::vector<Key> speculative_keys_;
     SpeculativeStats speculative_stats_;
-    bool reuse_priority_=false;
+    bool reuse_priority_=false,reuse_learning_=true;
     std::array<Entry*,2> reuse_heads_{},reuse_tails_{};
     std::size_t reuse_pages_=0,reuse_capacity_pages_=0;
     ReuseStats reuse_stats_;

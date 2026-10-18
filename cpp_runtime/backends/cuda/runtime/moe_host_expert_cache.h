@@ -65,6 +65,7 @@ public:
     MoeHostExpertCacheStats stats() const;
     // A streaming scan must not evict repeatedly consumed decoded images.
     void enable_reuse_priority();
+    void set_reuse_learning(bool enabled);
     // Complete-residency mode cannot evict the last copy of an expert.
     void preserve_resident_experts();
     bool exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey outgoing,

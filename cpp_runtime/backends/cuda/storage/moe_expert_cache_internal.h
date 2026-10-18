@@ -374,6 +374,14 @@ public:
         const bool previous=pipeline_residency_suspended_;
         pipeline_residency_suspended_=suspended;return previous;
     }
+    bool set_reuse_learning(bool enabled) {
+        const auto previous=pipeline_reuse_learning_;
+        pipeline_reuse_learning_=enabled;
+        if(host_experts_)host_experts_->set_reuse_learning(enabled);
+        if(kv_expert_loan_)kv_expert_loan_->set_reuse_learning(enabled);
+        return previous;
+    }
+    bool reuse_learning() const noexcept {return pipeline_reuse_learning_;}
     double ram_pcie_fraction() const noexcept { return ram_pcie_fraction_; }
     void finish_pipeline_exchanges() { if(moe_residency_)moe_residency_->apply_pending(); }
     void prepare_predictor_exchange() { if(moe_residency_)moe_residency_->prepare_predictor(); }
@@ -1015,6 +1023,7 @@ private:
     std::shared_ptr<MoeSsdPrefillReader> ssd_prefill_reader_;
     std::atomic<std::uint64_t> ssd_ram_read_fast_hits_{0},ssd_scheduled_read_jobs_{0};
     bool pipeline_residency_suspended_=false;
+    bool pipeline_reuse_learning_=true;
     CudaExecutionConfig config_;
     double ram_pcie_fraction_=0;
     double pipeline_pcie_gbps_=0;

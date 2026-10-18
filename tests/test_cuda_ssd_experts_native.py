@@ -114,6 +114,8 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode):
                 assert bool(status["ssd_expert_enabled"]) == ssd
                 assert bool(status["ssd_reuse_policy_enabled"]) == ssd
                 assert bool(status["ssd_ram_reuse_policy_enabled"]) == ssd
+                if ssd:
+                    assert status["ssd_ram_reuse_promotions"] == 0, "startup learned synthetic RAM cache priority"
                 startup_captures = (tmp_path / f"worker-{ssd}.log").read_text(errors="replace").count(
                     "runtime_qwen4_graph_capture role=")
                 outputs = []

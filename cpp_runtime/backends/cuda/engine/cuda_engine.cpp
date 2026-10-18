@@ -214,6 +214,12 @@ struct CudaEngineState {
             const auto* warmup=std::getenv("MFQ_QWEN4_WARMUP_MTP");
             if(language.graph_registry && components.mtp &&
                     language.max_position_embeddings()>=48 && (!warmup || warmup[0]!='0')) {
+                struct CacheLearningScope {
+                    std::shared_ptr<MoeExpertCache> cache;bool previous;
+                    explicit CacheLearningScope(std::shared_ptr<MoeExpertCache> value):cache(std::move(value)),
+                        previous(set_moe_reuse_learning(cache,false)) {}
+                    ~CacheLearningScope(){set_moe_reuse_learning(cache,previous);}
+                } learning(execution->moe_expert_cache);
                 auto& predictor=*components.mtp;
                 const auto saved_policy=predictor.policy_state;
                 const auto start=std::chrono::steady_clock::now();

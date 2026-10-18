@@ -59,7 +59,7 @@ struct MoeHostExpertCache::Impl {
     std::condition_variable exchange_complete;
     std::size_t exchange_placeholders=0;
     MoeHostExpertCacheStats counters;
-    bool preserve=false;
+    bool preserve=false,reuse_learning=true;
 
     explicit Impl(std::size_t bytes):budget(bytes) {}
     void wait_exchange(std::unique_lock<std::mutex>& lock,mfq::MoeCacheKey key) {
@@ -73,6 +73,7 @@ struct MoeHostExpertCache::Impl {
         entries.erase(found);
     }
     void touch(mfq::MoeCacheKey key,Entry& entry) {
+        if(!reuse_learning)return;
         if(!counters.reuse_priority || key.source<0) {
             lru.splice(lru.begin(),lru,entry.position);return;
         }
@@ -132,6 +133,9 @@ MoeHostExpertCache::MoeHostExpertCache(std::size_t bytes):impl_(std::make_unique
 MoeHostExpertCache::~MoeHostExpertCache()=default;
 void MoeHostExpertCache::enable_reuse_priority() {
     std::lock_guard lock(impl_->mutex);impl_->counters.reuse_priority=true;
+}
+void MoeHostExpertCache::set_reuse_learning(bool enabled) {
+    std::lock_guard lock(impl_->mutex);impl_->reuse_learning=enabled;
 }
 
 MoeHostExpertCache::Lease MoeHostExpertCache::find(mfq::MoeCacheKey key,bool touch) {

@@ -64,6 +64,12 @@ int main() try {
     for(bool reuse:{false,true}) {
         MoeHostExpertCache cache(512);if(reuse)cache.enable_reuse_priority();
         for(int expert:{0,1})cache.acquire(key(expert),64,[expert]{return weight(64,expert+1);});
+        if(reuse) {
+            cache.set_reuse_learning(false);
+            for(int expert:{0,1})bytes_equal(cache.find(key(expert)),expert+1);
+            check(!cache.stats().reuse_promotions,"synthetic accesses promoted RAM cache entries");
+            cache.set_reuse_learning(true);
+        }
         for(int expert:{0,1})bytes_equal(cache.find(key(expert)),expert+1);
         cache.acquire(key(99),64,[]{return weight(64,3);});
         for(int scan=0;scan<3;++scan)bytes_equal(cache.find(key(99),false),3);

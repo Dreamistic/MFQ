@@ -93,7 +93,13 @@ void check_reused_expert_pages() {
             check(loan.pin_existing_projection(17,expert,{int64_t(KvExpertLoan::page)},offsets,bytes),
                 "reuse fixture lost a hot projection");
         };
-        put(1);put(2);advance();hit(1);hit(2);advance();
+        put(1);put(2);advance();
+        if(enabled) {
+            loan.set_reuse_learning(false);hit(1);hit(2);advance();
+            check(!loan.reuse_stats().promotions,"synthetic accesses promoted GPU cache entries");
+            loan.set_reuse_learning(true);
+        }
+        hit(1);hit(2);advance();
         for(int expert=10;expert<42;++expert){put(expert,99);advance();}
         check(bool(loan.find_for_exchange({17,1,0},KvExpertLoan::page))==enabled,
             "a one-use source scan displaced a protected recurring expert");

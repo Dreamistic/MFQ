@@ -512,6 +512,9 @@ void MoeExpertCache::initialize_ssd_residency() {
     if(!finalized_)throw std::logic_error("SSD expert cache requires finalized GPU arenas");
     if(const auto* option=std::getenv("MFQ_MOE_SSD_EXPERTS");option && option[0]=='0')
         throw std::runtime_error("RAM expert preloading is required when SSD expert streaming is disabled");
+    ssd_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
+    ssd_background_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
+    ssd_prefill_reader_=std::make_shared<MoeSsdPrefillReader>();
     // The checkpoint remains the immutable third tier. Only the current GPU
     // demand and the byte-bounded RAM LRU are materialized; never scan an entire
     // pool into a temporary RAM copy merely to fill the GPU cache.
@@ -532,10 +535,34 @@ void MoeExpertCache::initialize_ssd_residency() {
         auto* arena=source->cohorts_[source->expert_to_cohort_[e]].arena;
         if(available[arena]>0){--available[arena];selected[source->id_].push_back(e);}
     }
-    for(const auto& source:sources_)for(const auto e:selected[source->id_]) {
-        if(!prepare(*source,{e},true))throw std::runtime_error("SSD expert GPU placement exceeded its arena");
+    const auto placement_started=std::chrono::steady_clock::now();
+    const auto read_limit=std::min<std::size_t>(64u<<20,std::max<std::size_t>(1,host_experts_->stats().budget_bytes/2));
+    std::size_t placement_experts=0,placement_bytes=0,placement_batches=0,placement_peak=0;
+    for(const auto& source:sources_) {
+        const auto& chosen=selected[source->id_];
+        for(std::size_t first=0;first<chosen.size();) {
+            auto last=first;std::size_t bytes=0;
+            while(last<chosen.size() && last-first<64) {
+                const auto next=source->quant_source_->expert_field_bytes(chosen[last]);
+                if(last>first && (bytes>=read_limit || next>read_limit-bytes))break;
+                bytes+=next;++last;
+            }
+            const std::vector<int32_t> experts(chosen.begin()+first,chosen.begin()+last);
+            std::vector<SsdExpertRequest> requests;requests.reserve(experts.size());
+            for(const auto expert:experts)requests.emplace_back(source->quant_source_.get(),expert);
+            // Leases also coalesce acquisitions that exceed a tiny RAM budget.
+            // GPU books and uploads remain ordered on the loading thread.
+            const auto held=read_ssd_experts(requests);
+            if(!prepare(*source,experts,true))throw std::runtime_error("SSD expert GPU placement exceeded its arena");
+            placement_experts+=experts.size();placement_bytes+=bytes;++placement_batches;
+            placement_peak=std::max(placement_peak,bytes);first=last;
+        }
     }
     if(transfer_ready_recorded_)MFQ_CUDA_CHECK(cudaEventSynchronize(transfer_ready_));
+    std::cerr<<"moe_ssd_initial_placement experts="<<placement_experts<<" runtime_bytes="<<placement_bytes
+        <<" batches="<<placement_batches<<" peak_read_bytes="<<placement_peak
+        <<" io_workers="<<config_.moe_ssd_io_workers<<" ms="
+        <<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-placement_started).count()<<'\n';
     const auto trimmed=mfq::release_mapped_tensor_pages();
     std::cerr<<"moe_ssd_source_pages_released views="<<trimmed<<'\n';
     for(auto& stage:stages_) {
@@ -575,9 +602,6 @@ void MoeExpertCache::initialize_ssd_residency() {
         source->quant_source_->mark_preload_complete(false);
         initialize_mixed_nvq_dispatch(*source->active_,config_);
     }
-    ssd_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
-    ssd_background_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
-    ssd_prefill_reader_=std::make_shared<MoeSsdPrefillReader>();
     ssd_experts_=true;
     host_experts_->enable_reuse_priority();
     if(kv_expert_loan_)kv_expert_loan_->set_reuse_priority(true);
@@ -2375,6 +2399,7 @@ void set_moe_kv_expert_loan(const std::shared_ptr<MoeExpertCache>& cache,std::sh
     if(cache) {
         if(cache->kv_expert_loan_!=loan)cache->release_direct_transfer_cache();
         if(loan && cache->ssd_experts())loan->set_reuse_priority(true);
+        if(loan)loan->set_reuse_learning(cache->reuse_learning());
         cache->kv_expert_loan_=std::move(loan);
     }
 }
@@ -2392,6 +2417,9 @@ void prepare_moe_predictor_exchange(const std::shared_ptr<MoeExpertCache>& cache
 
 bool suspend_moe_residency(const std::shared_ptr<MoeExpertCache>& cache,bool suspended) {
     return cache?cache->suspend_residency(suspended):false;
+}
+bool set_moe_reuse_learning(const std::shared_ptr<MoeExpertCache>& cache,bool enabled) {
+    return cache?cache->set_reuse_learning(enabled):true;
 }
 void begin_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,int rows) {
     const auto* option=std::getenv("MFQ_MOE_MTP_COMMITTED_HEAT");

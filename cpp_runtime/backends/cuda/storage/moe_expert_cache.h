@@ -84,6 +84,7 @@ bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
 // Lend decode staging/workspace capacity to the upcoming long prefill.
 void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);
 bool suspend_moe_residency(const std::shared_ptr<MoeExpertCache>& cache,bool suspended);
+bool set_moe_reuse_learning(const std::shared_ptr<MoeExpertCache>& cache,bool enabled);
 // Return prompt-only ring and workspace storage before preparing decode graphs.
 void release_moe_prefill_buffers(MoeExpertCache* cache);
 void release_moe_prefill_buffers(const std::shared_ptr<MoeExpertCache>& cache);
