@@ -1540,7 +1540,10 @@ public:
                 parameter + " has an invalid size", parameter);
         }
         size_ = static_cast<size_t>(declared_size);
-        const auto path=std::filesystem::u8path(spec["path"].get<std::string>());
+        // Preserve UTF-8 paths on Windows by building the path from UTF-8 bytes.
+        const std::string utf8_path = spec["path"].get<std::string>();
+        const auto path = std::filesystem::path(
+            std::u8string(utf8_path.begin(), utf8_path.end()));
         const auto filename = path.filename().native();
         if (!path.is_absolute() ||
             filename.rfind(std::filesystem::path("mfq-multimodal-").native(), 0) != 0 ||

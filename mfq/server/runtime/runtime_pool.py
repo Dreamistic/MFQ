@@ -4378,7 +4378,8 @@ class RuntimePool:
         _, available = host_memory_capacity()
         limit = request.kv_memory.ram_budget_bytes
         if available is not None:
-            cold_experts = max(0, artifact.routed_expert_bytes - int((request.moe_gpu_cache_gb or 0) * (1 << 30)))
+            resident_weights = max(0, artifact.resource.total_bytes - artifact.always_streamed_bytes)
+            cold_experts = max(0, resident_weights - self._estimated_load_bytes(artifact, request))
             available = max(0, available - cold_experts - (2 << 30))
             limit = available if limit is None else min(limit, available)
         return limit

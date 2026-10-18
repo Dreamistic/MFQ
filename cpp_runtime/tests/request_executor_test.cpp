@@ -319,6 +319,22 @@ static void check_runtime_config() {
 }
 
 int main() {
+    // Text admission needs a tokenizer; a raw token request does not.
+    {
+        TestOps ops;
+        RequestExecutor executor;
+        auto text = request();
+        text.token_ids.clear();
+        bool rejected = false;
+        try {
+            executor.admit(std::move(text), nullptr, info(), ops);
+        } catch (const std::invalid_argument &error) {
+            rejected = true;
+            assert(std::string(error.what()) == "text input requires a tokenizer");
+        }
+        assert(rejected && executor.empty() && executor.status().healthy);
+        assert(executor.admit(request(), nullptr, info(), ops) == Admission::accepted);
+    }
     check_waiting_and_cleanup();
     check_preparation_steps();
     check_engine_lifecycle();

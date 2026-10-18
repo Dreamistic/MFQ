@@ -36,7 +36,11 @@ void* stream_flag_driver_entry(const char* symbol) {
 #if CUDA_VERSION >= 12000 && CUDART_VERSION >= 12000
     void* pointer=nullptr;
     cudaDriverEntryPointQueryResult result=cudaDriverEntryPointSymbolNotFound;
+#if CUDART_VERSION >= 12050
+    const auto error=cudaGetDriverEntryPointByVersion(symbol,&pointer,12000,cudaEnableDefault,&result);
+#else   // the versioned query arrived in CUDA 12.5
     const auto error=cudaGetDriverEntryPoint(symbol,&pointer,cudaEnableDefault,&result);
+#endif
     if(error==cudaErrorNotSupported) {cudaGetLastError();return nullptr;}
     MFQ_CUDA_CHECK(error);
     return result==cudaDriverEntryPointSuccess?pointer:nullptr;
