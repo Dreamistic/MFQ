@@ -44,6 +44,10 @@ def require_api_keys(request: Request) -> ApiKeyManager:
 
 
 async def authorize_websocket(websocket: WebSocket) -> bool:
+    expected = websocket.headers.get("x-mfq-instance-id") or websocket.query_params.get("server_instance")
+    if expected and expected != websocket.app.state.server_identity["instance_id"]:
+        await websocket.close(code=1008, reason="server instance changed; reconnect and confirm the server")
+        return False
     policy = websocket.app.state.auth_policy
     api_keys: ApiKeyManager | None = websocket.app.state.api_keys
     if not policy.enabled:

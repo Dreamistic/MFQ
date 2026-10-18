@@ -26,7 +26,7 @@ namespace mfq::cuda {
 using namespace mfq::engine;
 using namespace mfq::cuda::internal;
 
-namespace {
+namespace engine_detail {
 template <typename Model>
 struct CudaEngineState {
     std::shared_ptr<WeightMemoryLedger> weight_memory;
@@ -655,9 +655,9 @@ struct CudaBackend {
         state = std::unique_ptr<CudaEngineState<Qwen35CausalLm>>{};
     }
 };
-} // namespace
+} // namespace engine_detail
 
 std::unique_ptr<Engine> load_cuda_engine(CudaEngineOptions options) {
-    return std::make_unique<EngineInstance<CudaBackend>>(std::move(options));
+    return std::make_unique<EngineInstance<engine_detail::CudaBackend>>(std::move(options));
 }
 } // namespace mfq::cuda

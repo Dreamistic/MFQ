@@ -151,12 +151,12 @@ public:
             if(span.size && !span.destination)
                 throw std::invalid_argument("mapped tensor batch destination is null");
         }
-#ifdef _WIN32
         // Like Strata's PLE prefetch, submit the independent pages together.
         // NINT stores q, sub-scale/min and neuron anchors in separate streams;
         // sequential mapped reads otherwise fault those five streams in turn.
         const auto started=profile_?MappedClock::now():MappedClock::time_point{};
         if(prefetch_override_<0?mapped_prefetch_context:prefetch_override_!=0) {
+#ifdef _WIN32
         std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
         ranges.reserve(std::min<std::size_t>(spans.size(),4096));
         const auto prefetch=[&] {
@@ -168,12 +168,19 @@ public:
             if(ranges.size()==4096)prefetch();
         }
         prefetch();
+#else
+        const auto page=std::size_t(::sysconf(_SC_PAGESIZE));
+        if(page && page!=std::size_t(-1))for(const auto& span:spans)if(span.size) {
+            const auto address=reinterpret_cast<std::uintptr_t>(view_)+prefix_+std::size_t(span.offset);
+            const auto begin=address/page*page,end=(address+span.size+page-1)/page*page;
+            (void)::madvise(reinterpret_cast<void*>(begin),end-begin,MADV_WILLNEED);
+        }
+#endif
         }
         if(profile_) {
             mapped_read_totals[0].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(MappedClock::now()-started).count(),std::memory_order_relaxed);
             mapped_read_totals[4].fetch_add(1,std::memory_order_relaxed);
         }
-#endif
         for(const auto& span:spans)if(span.size)read(span.offset,span.destination,span.size);
     }
 };

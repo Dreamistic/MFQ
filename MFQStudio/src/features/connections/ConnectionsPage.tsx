@@ -21,6 +21,7 @@ import { ModelAliasMapping } from './ModelAliasMapping';
 import { InferencePolicyPanel } from './InferencePolicyPanel';
 import { ApiAuthenticationPanel } from './ApiAuthenticationPanel';
 import { toast } from '../../stores/toastStore';
+import { ServerConnectionPage } from '../../app/ServerConnectionPage';
 
 function browserConfig(): StudioConfig {
   const address = getApiBaseUrl() || 'http://127.0.0.1:8090';
@@ -111,7 +112,7 @@ export function ConnectionsPage() {
         throw new Error(tr('OpenAI 和 Anthropic 不能使用同一个端口，请为它们设置不同的端口。', 'OpenAI and Anthropic cannot share a port. Choose a different port for each API.'));
       }
       if (isStudio()) {
-        if (studio?.config.mode === 'local' && draft.mode === 'local'
+        if (studio?.connection === 'managed' && studio.config.mode === 'local' && draft.mode === 'local'
             && studio.config.local_service_port !== draft.local_service_port) {
           boundPort = (await runtimeApi.configureRuntimeListener(draft.local_service_port)).port;
           if (!current()) return;
@@ -214,6 +215,7 @@ export function ConnectionsPage() {
         )}
       />
       <div className="server-page">
+        {(studio?.connection === 'confirmation_required' || studio?.connection === 'incompatible') && <ServerConnectionPage />}
         {active && (
           <div className="server-active-notice">
             <Icon name="info" size={15} />
@@ -228,6 +230,11 @@ export function ConnectionsPage() {
         <SectionLabel title={tr('API参数', 'API parameters')} />
         <TMPanel className="server-settings-panel server-api-panel">
           <div className="setting-list">
+            {studio?.reachable && <SettingRow title={tr('服务归属', 'Server ownership')}
+              detail={studio.connection === 'managed'
+                ? tr('由 App 管理；退出 App 时停止服务。', 'Managed by this app; stopped when the app quits.')
+                : tr('独立服务；退出 App 不会停止它。', 'Independent server; quitting the app leaves it running.')}
+              trailing={<span>{studio.server && `MFQ Server ${studio.server.version} · PID ${studio.server.pid}`}</span>} />}
             <SettingRow
               title={tr('模型 ID', 'Model ID')}
               detail={tr(

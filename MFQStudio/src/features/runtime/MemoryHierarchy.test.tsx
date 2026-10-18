@@ -25,7 +25,7 @@ it('shows eight separate VRAM, RAM and SSD tiers without treating unknown RAM te
   expect(screen.getByText('VRAM-resident weights and buffers')).toBeInTheDocument();
   expect(screen.getByText('RAM-streamed experts')).toBeInTheDocument();
   expect(screen.getByText('RAM-streamed KV')).toBeInTheDocument();
-  expect(screen.queryByText('Not yet supported on this device')).not.toBeInTheDocument();
+  expect(screen.getByText('Not yet supported on this device')).toBeInTheDocument();
   expect(container.querySelector('[data-tier="ram-experts"] .resource-tier-model strong')).toHaveTextContent('4 KiB');
   expect(container.querySelector('[data-tier="ram-kv"] .resource-tier-model strong')).toHaveTextContent('2 KiB');
   expect(container.querySelector('[data-tier="kv"]')).toHaveTextContent('Prefix VRAM');

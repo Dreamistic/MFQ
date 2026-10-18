@@ -29,9 +29,11 @@ struct FileReadStats {
 };
 
 // Owning positional reads. Direct mode never silently reverts to buffered I/O.
-// Arbitrary byte ranges use aligned temporary storage. Windows Direct readers
+// Arbitrary byte ranges use aligned temporary storage. Direct readers
 // retain at most 8 MiB of idle arenas, released with the reader. Only storage is
 // reused: each request still reads the file, without a shared file-position lock.
+// Linux batches use a per-worker native AIO queue when supported by the file
+// system; otherwise the same Direct descriptor is read on that SSD worker.
 class FileRangeReader final {
 public:
     FileRangeReader(const std::filesystem::path& path, FileReadMode mode);

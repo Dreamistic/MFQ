@@ -81,6 +81,7 @@ class RequestExecutor {
             return Admission::deferred;
         const bool raw = !request.token_ids.empty();
         InferenceRequest input;
+        const MfqTokenizer *tokenizer = nullptr;
         if (raw) {
             input.prompt = std::move(request.token_ids);
             input.sampling = request.input.sampling;
@@ -89,6 +90,7 @@ class RequestExecutor {
         } else {
             if (!text)
                 throw std::invalid_argument("text input requires a tokenizer");
+            tokenizer = &text->tokenizer();
             input = text->prepare(std::move(request.input), info.max_context);
         }
         const auto plan = plan_generation(input.prompt,
@@ -98,8 +100,7 @@ class RequestExecutor {
             input.cache_plan.stable_prefix_tokens);
         input.sampling.max_tokens = plan.generation_tokens;
         input.cache_plan.stable_prefix_tokens = plan.stable_prefix_tokens;
-        auto current = std::make_unique<ExecutionRequest>(
-            std::move(input), raw ? nullptr : &text->tokenizer(), request.id);
+        auto current = std::make_unique<ExecutionRequest>(std::move(input), tokenizer, request.id);
         current->output.metrics.mtp.available = ops.mtp_available();
         current->batched = batched;
         requests_.emplace(request.id, std::move(current));

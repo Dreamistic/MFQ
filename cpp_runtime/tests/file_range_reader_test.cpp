@@ -110,10 +110,8 @@ int main() {
                     for(std::size_t i=0;i<384;++i)spans.push_back({i*167+std::size_t(round),output.data()+i*33+1,31});
                     batched.read_batch(spans);
                     if(!round)first_allocations=batched.stats().staging_allocations;
-#ifdef _WIN32
                     if(mode==mfq::FileReadMode::Direct)require(batched.stats().staging_allocations==first_allocations &&
                         batched.stats().staging_cached_bytes<=(8u<<20),"repeated Direct batches did not reuse bounded aligned arenas");
-#endif
                     for(std::size_t i=0;i<384;++i) {
                         require(output[i*33]==std::byte{0x5a} && output[i*33+32]==std::byte{0x5a},"event reuse changed a destination guard");
                         require(std::equal(output.begin()+i*33+1,output.begin()+i*33+32,expected.begin()+i*167+round),
@@ -121,11 +119,9 @@ int main() {
                     }
                 }
                 require(!batched.stats().staging_bytes && !batched.stats().errors,"event reuse leaked request staging");
-#ifdef _WIN32
                 if(mode==mfq::FileReadMode::Direct)
                     require(batched.stats().staging_peak_bytes<=128*batched.alignment(),
                         "direct row batches allocated unbounded aligned staging");
-#endif
             }
             {
                 mfq::FileRangeReader growing(path,mode);
@@ -146,10 +142,8 @@ int main() {
                 }
                 const auto stats=growing.stats();
                 require(!stats.staging_bytes && !stats.errors && stats.logical_bytes==logical,"growing batch staging accounting differs");
-#ifdef _WIN32
                 if(mode==mfq::FileReadMode::Direct)
                     require(stats.staging_peak_bytes<=64*(8193+2*growing.alignment()),"growing batch retained more than one wave");
-#endif
             }
             auto reader=std::make_shared<mfq::AsyncRangeReader>(path,mode);
             std::vector<std::future<void>> jobs;
@@ -185,6 +179,37 @@ int main() {
             try{reader->read({{0,&guard,1},{expected.size(),&guard,1}});}catch(const std::out_of_range&){invalid=true;}
             require(invalid && guard==std::byte{0x5a},"invalid batched range changed an earlier destination");
         }
+#if defined(__linux__)
+        {
+            auto reader=std::make_shared<mfq::FileRangeReader>(path,mfq::FileReadMode::Direct);
+            std::vector<std::future<void>> jobs;
+            for(int client=0;client<8;++client)jobs.push_back(std::async(std::launch::async,[&,client] {
+                for(int round=0;round<12;++round) {
+                    std::vector<std::byte> output(96*33,std::byte{0x5a});std::vector<mfq::ReadSpan> spans;
+                    for(std::size_t i=0;i<96;++i)spans.push_back({i*167+std::size_t(round+client),output.data()+i*33+1,31});
+                    reader->read_batch(spans);
+                    for(std::size_t i=0;i<96;++i)
+                        require(output[i*33]==std::byte{0x5a} && output[i*33+32]==std::byte{0x5a} &&
+                            std::equal(output.begin()+i*33+1,output.begin()+i*33+32,expected.begin()+spans[i].offset),
+                            "concurrent Linux batch completion changed bytes");
+                }
+            }));
+            for(auto& job:jobs)job.get();
+            require(!reader->stats().staging_bytes && reader->stats().staging_cached_bytes<=(8u<<20),
+                "concurrent Linux queues exceeded their staging bound");
+            {std::ofstream truncated(path,std::ios::binary|std::ios::trunc);truncated.write("short",5);}
+            std::vector<std::byte> output(64,std::byte{0x5a});bool failed=false;
+            try{reader->read_batch({{0,output.data(),3},{4096,output.data()+32,31}});}
+            catch(const std::runtime_error&){failed=true;}
+            require(failed && std::all_of(output.begin(),output.end(),[](auto b){return b==std::byte{0x5a};}) &&
+                !reader->stats().staging_bytes,"failed Linux batch published partial data or leaked staging");
+            {std::ofstream restored(path,std::ios::binary|std::ios::trunc);
+                restored.write(reinterpret_cast<const char*>(expected.data()),expected.size());}
+            reader->read_batch({{0,output.data(),3},{4096,output.data()+32,31}});
+            require(std::equal(output.begin()+32,output.begin()+63,expected.begin()+4096),
+                "Linux queue reused an incomplete failed request");
+        }
+#endif
         std::filesystem::remove(path);
         bool rejected=false;
         try { mfq::FileRangeReader missing(path,mfq::FileReadMode::Direct); } catch (const std::system_error&) { rejected=true; }

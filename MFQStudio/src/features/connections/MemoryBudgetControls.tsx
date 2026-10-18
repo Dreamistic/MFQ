@@ -120,7 +120,7 @@ export function MemoryBudgetControls({ residency, children }: { residency: strin
       trailing={<>{!totalManual && effectiveTotal != null && <small className="memory-budget-available">{(effectiveTotal / 2 ** 30).toFixed(1)} GiB</small>}
         {control(totalLabel, totalManual, changeTotalMode, totalDraft, setTotalDraft, 0.1)}</>} />
     <SettingRow title={modelLabel}
-      detail={separate ? tr('所有模型权重的显存上限；MoE 专家优先从 RAM 按需传入显存，RAM 放不下的专家从 SSD 加载。', 'VRAM ceiling across model weights; MoE experts stream from RAM to VRAM, with SSD reads when the RAM cache is full.') : tr('所有模型权重的总上限；放不下的 MoE 专家自动转为 SSD 缓存。', 'Total weight ceiling across models; overflowing MoE experts use SSD-backed caching.')}
+      detail={separate ? tr('所有模型权重的显存上限；放不下的 MoE 专家在 RAM 中按需传入显存，SSD 专家流式加载尚未支持。', 'VRAM ceiling across model weights; overflowing MoE experts stream from RAM to VRAM. SSD expert streaming is not yet supported.') : tr('所有模型权重的总上限；放不下的 MoE 专家自动转为 SSD 缓存。', 'Total weight ceiling across models; overflowing MoE experts use SSD-backed caching.')}
       trailing={control(modelLabel, modelManual, setModelManual, modelDraft, setModelDraft, 0.1)} />
     <SettingRow title={prefixLabel}
       detail={separate ? tr('所有模型可复用前缀的显存上限，不含活跃 KV；RAM 与 SSD 前缀缓存配额单独设置。', 'VRAM limit for reusable prefixes, excluding live KV. RAM and SSD prefix allowances are configured separately.') : tr('所有模型可复用前缀的 RAM 上限，不含活跃 KV。', 'RAM limit for reusable prefixes across models; excludes active KV.')}

@@ -195,7 +195,7 @@ void KvMemoryManager::finalize(std::size_t minimum_experts) {
     auto gpu=free-reserve-index;
     if(options_.gpu_limit)gpu=std::min(gpu,options_.gpu_limit);
     auto available=host_available();
-    auto ram=available> (1ULL<<30) ? available-(1ULL<<30) : 0;
+    std::size_t ram=available> (1ULL<<30) ? available-(1ULL<<30) : 0;
     if(options_.ram_limit_set)ram=std::min(ram,options_.ram_limit);
     // Long discrete-memory sessions keep canonical raw KV in RAM. The GPU
     // cache is bounded by resident cells; selected rows are resolved on-device

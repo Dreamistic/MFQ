@@ -26,6 +26,10 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <linux/aio_abi.h>
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace mfq {
@@ -49,13 +53,27 @@ struct FileRangeReader::Impl {
     mutable std::atomic<std::uint64_t> cached_staging{0},staging_allocations{0};
 #if defined(_WIN32)
     HANDLE handle = INVALID_HANDLE_VALUE;
+#else
+    int handle = -1;
+#endif
     struct Slab {void* data=nullptr;std::size_t bytes=0;std::uint64_t order=0;};
     mutable std::mutex slabs_mutex;
     mutable std::array<Slab,16> slabs{};
     mutable std::uint64_t slab_order=0;
+    static void free_staging(void* data) noexcept {
+#if defined(_WIN32)
+        _aligned_free(data);
+#else
+        std::free(data);
+#endif
+    }
     ~Impl() {
-        for(const auto& slab:slabs)if(slab.data)_aligned_free(slab.data);
+        for(const auto& slab:slabs)if(slab.data)free_staging(slab.data);
+#if defined(_WIN32)
         if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+#else
+        if (handle >= 0) ::close(handle);
+#endif
     }
     Slab borrow_staging(std::size_t bytes) const {
         Slab result;
@@ -80,7 +98,13 @@ struct FileRangeReader::Impl {
             // nearby formats, without rounding small metadata up to 64 KiB.
             const auto granule=std::max<std::size_t>(alignment,65536);
             if(bytes>=granule && bytes<=(4u<<20))bytes=(bytes+granule-1)/granule*granule;
-            result={_aligned_malloc(bytes,std::max(alignment,sizeof(void*))),bytes};
+            void* data=nullptr;
+#if defined(_WIN32)
+            data=_aligned_malloc(bytes,std::max(alignment,sizeof(void*)));
+#else
+            if(::posix_memalign(&data,std::max(alignment,sizeof(void*)),bytes))data=nullptr;
+#endif
+            result={data,bytes};
             if(!result.data)throw std::bad_alloc();
             staging_allocations.fetch_add(1,std::memory_order_relaxed);
         }
@@ -101,17 +125,13 @@ struct FileRangeReader::Impl {
                     slab.order=++slab_order;*free=slab;idle+=slab.bytes;retained=true;break;
                 }
                 if(oldest==slabs.end())break;
-                idle-=oldest->bytes;_aligned_free(oldest->data);*oldest={};
+                idle-=oldest->bytes;free_staging(oldest->data);*oldest={};
             }
             cached_staging.store(idle,std::memory_order_relaxed);
         }
         staging.fetch_sub(slab.bytes,std::memory_order_relaxed);
-        if(!retained)_aligned_free(slab.data);
+        if(!retained)free_staging(slab.data);
     }
-#else
-    int handle = -1;
-    ~Impl() { if (handle >= 0) ::close(handle); }
-#endif
     explicit Impl(FileReadMode value) : mode(value) {}
     void acquire(std::size_t bytes) const {
         const auto current = staging.fetch_add(bytes, std::memory_order_relaxed) + bytes;
@@ -222,25 +242,12 @@ void FileRangeReader::read(std::uint64_t offset, std::byte* destination, std::si
                 std::size_t bytes = 0;
                 Buffer(const Impl& value, std::size_t count, bool allocate) : owner(value) {
                     if (!allocate) return;
-#if defined(_WIN32)
                     const auto slab=owner.borrow_staging(count);
                     data=slab.data;bytes=slab.bytes;
-#else
-                    if (::posix_memalign(&data, std::max(owner.alignment, sizeof(void*)), count)) data = nullptr;
-                    if (!data) throw std::bad_alloc();
-                    bytes = count;
-                    owner.acquire(bytes);
-                    owner.staging_allocations.fetch_add(1,std::memory_order_relaxed);
-#endif
                 }
                 ~Buffer() {
                     if (!data) return;
-#if defined(_WIN32)
                     owner.return_staging({data,bytes});
-#else
-                    std::free(data);
-                    owner.staging.fetch_sub(bytes, std::memory_order_relaxed);
-#endif
                 }
             } buffer(*impl_, transfer_bytes, bounce);
             const auto actual = impl_->transfer(aligned_offset, bounce ? buffer.data : destination, transfer_bytes);
@@ -264,6 +271,53 @@ FileReadStats FileRangeReader::stats() const noexcept {
     return {p.mode, 1, p.calls.load(), p.logical.load(), p.physical.load(), p.errors.load(),
             p.staging.load(), p.peak.load(), p.nanos.load(),p.cached_staging.load(),p.staging_allocations.load()};
 }
+
+#if defined(__linux__)
+namespace {
+// Each SSD worker owns its kernel queue. A shared userspace dispatch mutex
+// would serialize independent experts, even with several outer read workers.
+struct LinuxAioContext {
+    aio_context_t context=0;
+    LinuxAioContext(){if(::syscall(SYS_io_setup,64,&context)<0)context=0;}
+    void reset() noexcept {
+        if(context){while(::syscall(SYS_io_destroy,context)<0 && errno==EINTR){}context=0;}
+    }
+    ~LinuxAioContext(){reset();}
+    bool read(std::array<iocb*,64>& requests,std::size_t count,
+              std::array<std::int64_t,64>& results) {
+        if(!context)return false;
+        std::size_t submitted=0,completed=0;int failure=0;
+        while(submitted<count) {
+            const auto n=::syscall(SYS_io_submit,context,count-submitted,requests.data()+submitted);
+            if(n<0 && errno==EINTR)continue;
+            if(n<=0){failure=n<0?errno:EIO;break;}
+            submitted+=std::size_t(n);
+        }
+        // Drain partial submissions, including a later submission failure,
+        // before any destination or iocb can be released or reused.
+        while(completed<submitted) {
+            std::array<io_event,64> events{};
+            const auto n=::syscall(SYS_io_getevents,context,1,submitted-completed,events.data(),nullptr);
+            if(n<0 && errno==EINTR)continue;
+            if(n<=0) {
+                const auto error=n<0?errno:EIO;reset();
+                throw std::system_error(error,std::generic_category(),"complete Linux model-file batch");
+            }
+            for(long i=0;i<n;++i)results.at(events[i].data)=events[i].res;
+            completed+=std::size_t(n);
+        }
+        // Filesystems without native AIO still use the same O_DIRECT fd.
+        // They run on the caller's existing SSD worker, without a global pool.
+        if(!submitted && (failure==EINVAL || failure==EOPNOTSUPP || failure==ENOSYS))return false;
+        if(failure)throw std::system_error(failure,std::generic_category(),"submit Linux model-file batch");
+        static std::atomic<bool> reported{false};
+        if(!reported.exchange(true,std::memory_order_relaxed))
+            std::fprintf(stderr,"model_linux_aio_batch enabled=1 max_requests=64\n");
+        return true;
+    }
+};
+}
+#endif
 
 void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
     for (const auto& span : spans) {
@@ -455,16 +509,73 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
     }
     impl_->nanos.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - started).count(), std::memory_order_relaxed);
-#else
-    static HostParallelPool io_workers;
-    const auto threads = std::max(1u, std::thread::hardware_concurrency());
-    io_workers.run(0, static_cast<std::int64_t>(spans.size()), 1, threads,
-        [&](std::int64_t first, std::int64_t last) {
-            for (auto index = first; index < last; ++index) {
-                const auto& span = spans[static_cast<std::size_t>(index)];
-                read(span.offset, span.destination, span.size);
+#elif defined(__linux__)
+    if(impl_->mode==FileReadMode::Buffered) {
+        for(const auto& span:spans)read(span.offset,span.destination,span.size);
+        return;
+    }
+    static thread_local LinuxAioContext queue;
+    const auto started=std::chrono::steady_clock::now();
+    struct Storage {
+        const Impl& owner;Impl::Slab slab{};
+        explicit Storage(const Impl& value):owner(value){}
+        ~Storage(){if(slab.data)owner.return_staging(slab);}
+        void ensure(std::size_t bytes) {
+            if(bytes<=slab.bytes)return;
+            if(slab.data){owner.return_staging(slab);slab={};}
+            slab=owner.borrow_staging(bytes);
+        }
+    } storage(*impl_);
+    struct Part {std::uint64_t offset;std::size_t prefix,bytes,allocation,staging;std::byte* destination;};
+    std::size_t index=0,consumed=0;
+    try {
+        while(index<spans.size()) {
+            std::array<Part,64> parts{};std::size_t count=0,bytes=0;
+            const auto alignment=impl_->alignment;
+            const auto wave_limit=std::max<std::size_t>(8u<<20,alignment);
+            while(count<parts.size() && index<spans.size()) {
+                const auto& span=spans[index];
+                if(consumed==span.size){++index;consumed=0;continue;}
+                const auto offset=span.offset+consumed,base=offset/alignment*alignment;
+                const auto prefix=std::size_t(offset-base);
+                const auto copy=std::min(span.size-consumed,wave_limit-prefix);
+                const auto allocation=(prefix+copy+alignment-1)/alignment*alignment;
+                if(count && allocation>wave_limit-bytes)break;
+                parts[count++]={base,prefix,copy,allocation,bytes,span.destination+consumed};
+                bytes+=allocation;consumed+=copy;
             }
-        });
+            if(!count)continue;
+            storage.ensure(bytes);
+            std::array<iocb,64> native{};std::array<iocb*,64> requests{};
+            std::array<std::int64_t,64> results{};
+            for(std::size_t i=0;i<count;++i) {
+                const auto& part=parts[i];auto& request=native[i];requests[i]=&request;
+                request.aio_data=i;request.aio_lio_opcode=IOCB_CMD_PREAD;request.aio_fildes=impl_->handle;
+                request.aio_buf=reinterpret_cast<std::uintptr_t>(static_cast<std::byte*>(storage.slab.data)+part.staging);
+                request.aio_nbytes=part.allocation;request.aio_offset=part.offset;
+            }
+            if(!queue.read(requests,count,results)) {
+                for(std::size_t i=0;i<count;++i)results[i]=impl_->transfer(parts[i].offset,
+                    static_cast<std::byte*>(storage.slab.data)+parts[i].staging,parts[i].allocation);
+            }
+            impl_->calls.fetch_add(count,std::memory_order_relaxed);
+            for(std::size_t i=0;i<count;++i) {
+                if(results[i]<0)throw std::system_error(int(-results[i]),std::generic_category(),"Linux model-file range read");
+                impl_->physical.fetch_add(results[i],std::memory_order_relaxed);
+                if(std::size_t(results[i])<parts[i].prefix+parts[i].bytes)
+                    throw std::runtime_error("model file was truncated during Linux batch read");
+            }
+            for(std::size_t i=0;i<count;++i) {
+                const auto& part=parts[i];
+                std::memcpy(part.destination,static_cast<std::byte*>(storage.slab.data)+part.staging+part.prefix,part.bytes);
+                impl_->logical.fetch_add(part.bytes,std::memory_order_relaxed);
+            }
+        }
+    }catch(...){impl_->errors.fetch_add(1,std::memory_order_relaxed);throw;}
+    impl_->nanos.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now()-started).count(),std::memory_order_relaxed);
+#else
+    for(const auto& span:spans)read(span.offset,span.destination,span.size);
 #endif
 }
 

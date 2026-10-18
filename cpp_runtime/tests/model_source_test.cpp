@@ -3,6 +3,7 @@
 #include "mfq/hf_safetensors_source.h"
 #include "mfq/mfq_model_source.h"
 #include "mfq/mapped_tensor_pages.h"
+#include "mfq/mapped_prefetch_scope.h"
 
 #include <algorithm>
 #include <array>
@@ -258,7 +259,10 @@ int main() {
             }();
             require(bool(batch),"retained mapped batch reader missing");
             std::vector<std::byte> actual(14);
-            batch({{8,actual.data()+8,6},{0,actual.data(),5},{5,actual.data()+5,3},{14,nullptr,0}});
+            {
+                mfq::MappedPrefetchScope prefetch(true);
+                batch({{8,actual.data()+8,6},{0,actual.data(),5},{5,actual.data()+5,3},{14,nullptr,0}});
+            }
             require_bytes(actual);batch({});
             for(const auto bad:std::vector<mfq::ReadSpan>{{13,actual.data(),2},{UINT64_MAX,actual.data(),0},{0,nullptr,1}}) {
                 std::fill(actual.begin(),actual.end(),std::byte{0x7f});
