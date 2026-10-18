@@ -448,7 +448,7 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
         s.projection_marks.emplace_back(std::size_t(source->n_experts()),uint8_t(0));
         s.observations.emplace_back(std::size_t(source->n_experts()),0.0f);
         s.speculative_routes.emplace_back();
-        if(s.speculative_window_heat)s.speculative_routes.back().heat_seen.resize(
+        s.speculative_routes.back().heat_seen.resize(
             (std::size_t(source->n_experts())+63)/64);
         for(int id:bundle)if(cache->sources_.at(id)->layer_id_!=source->layer_id_ ||
                 cache->sources_.at(id)->n_experts()!=source->n_experts())
@@ -718,14 +718,27 @@ void MoeResidencyManager::commit_speculative_routes(int rows) {
     if(s.cache->ssd_experts()) {
         s.speculative_host_keys.clear();
         for(std::size_t b=0;b<s.speculative_routes.size();++b) {
-            const auto& record=s.speculative_routes[b];if(!record.rows)continue;
+            auto& record=s.speculative_routes[b];if(!record.rows)continue;
             const auto count=std::size_t(rows)*(record.ids.size()/record.rows);
             const auto& bundle=s.cache->pipeline_bundles_[b];
-            for(std::size_t i=0;i<count;++i)for(int p=0;p<3;++p) {
-                if(p && bundle[p]==bundle[p-1])continue;
-                const auto& source=*s.cache->sources_[bundle[p]];const auto expert=record.ids[i];
-                s.speculative_host_keys.push_back({source.id_,source.expert_to_cohort_[expert],expert});
+            std::fill(record.heat_seen.begin(),record.heat_seen.end(),uint64_t(0));
+            const auto first=s.speculative_host_keys.size();
+            // One verification window confirms one reuse per expert. Keep
+            // last-use order without repeatedly hashing/splicing identical
+            // rows. Primary GPU residents have no retained RAM image.
+            for(std::size_t i=count;i--;) {
+                const auto expert=record.ids[i];auto& word=record.heat_seen[unsigned(expert)/64];
+                const auto bit=uint64_t(1)<<(unsigned(expert)%64);
+                if(word&bit)continue;
+                word|=bit;
+                for(int p=2;p>=0;--p) {
+                    if(p && bundle[p]==bundle[p-1])continue;
+                    const auto& source=*s.cache->sources_[bundle[p]];
+                    if(source.quant_source_->gpu_resident(expert))continue;
+                    s.speculative_host_keys.push_back({source.id_,source.expert_to_cohort_[expert],expert});
+                }
             }
+            std::reverse(s.speculative_host_keys.begin()+first,s.speculative_host_keys.end());
         }
         s.cache->host_experts_->commit_speculative_learning(s.speculative_host_keys);
     }
