@@ -1,5 +1,5 @@
 import type { ModelArtifact, ModelCacheProfile, RuntimeStatus } from '../../shared/api/types';
-import { hasSeparateVram } from '../runtime/memoryArchitecture';
+import { availableResidentMemory, hasSeparateVram } from '../runtime/memoryArchitecture';
 import { estimateCacheBytes, quantizedCacheProfile } from './cacheData';
 import type { LoadContextDefaults } from './loadContextDefaults';
 
@@ -7,11 +7,10 @@ function measured(value: number | null | undefined): value is number {
   return value != null && Number.isFinite(value) && value >= 0;
 }
 
-/** Available RAM and the chosen device's free VRAM; shared memory counts once. */
 export function availableLoadMemory(runtime?: RuntimeStatus | null, deviceIds: string[] = []): number | null {
+  if (!hasSeparateVram(runtime)) return availableResidentMemory(runtime);
   const ram = runtime?.host_memory_available_bytes;
   if (!measured(ram)) return null;
-  if (!hasSeparateVram(runtime)) return ram;
   const devices = runtime?.gpu_devices ?? [];
   const selected = deviceIds.length ? devices.filter(device => deviceIds.includes(device.id)) : devices.slice(0, 1);
   if (selected.length && (!deviceIds.length || selected.length === deviceIds.length)) {

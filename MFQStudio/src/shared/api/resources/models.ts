@@ -1,6 +1,7 @@
 /** 封装 models 领域资源请求，不保存组件状态。 */
 import type {
   ModelArtifact,
+  ModelDeletionPlan,
   ModelCacheProfile,
   CheckpointAnalysis,
   ModelDirectoryList,
@@ -65,6 +66,16 @@ export const modelsApi = {
 
   modelArtifactDirectory(modelId: string): Promise<ModelDirectoryList> {
     return request(`/api/v1/models/${encodeURIComponent(modelId)}/directory`);
+  },
+
+  modelDeletionPlan(modelId: string): Promise<ModelDeletionPlan> {
+    return request(`/api/v1/models/${encodeURIComponent(modelId)}/deletion`);
+  },
+
+  deleteModel(modelId: string, token: string): Promise<{ files: number; total_bytes: number }> {
+    return request(`/api/v1/models/${encodeURIComponent(modelId)}/delete`, {
+      method: 'POST', body: JSON.stringify({ token }),
+    });
   },
 
   checkpointAnalysis(modelId: string, signal?: AbortSignal): Promise<CheckpointAnalysis> {

@@ -30,6 +30,7 @@ from mfq.server.state.catalog import (
     ModelRegistrationError,
 )
 from mfq.server.services.checkpoint_analysis import analyze_checkpoint
+from mfq.server.services.model_deletion import ModelDeletionError, delete_model_files, model_deletion_plan
 from mfq.server.services.model_memory import checkpoint_cache_profile
 from mfq.server.services.documents import DocumentExtractionError, extract_document
 from mfq.server.services.desktop import FileManagerUnavailableError, open_directory
@@ -94,6 +95,7 @@ from mfq.server.protocol.models import (
     ModelArtifactList,
     ModelCacheProfile,
     ModelDirectoryList,
+    ModelDeletionPlan,
     ModelLoadRequest,
     RuntimeMemoryPolicy,
     RuntimeInferencePolicy,
@@ -197,6 +199,7 @@ class ServiceError(RuntimeError):
 @dataclass(frozen=True)
 class PreparedResponse:
     request: CreateResponseRequest
+    model: str
     begin: BeginResponseResult
     backend_messages: tuple[dict[str, Any], ...]
 
@@ -1059,6 +1062,50 @@ class ServerService:
         directory = artifact.path if artifact.resource.format == "hf" else artifact.path.parent
         return await self.model_directories(path=str(directory))
 
+    async def model_deletion_plan(self, model_id: str) -> ModelDeletionPlan:
+        if self.catalog is None:
+            raise ServiceError(501, "model_catalog_unavailable", "model catalog is unavailable")
+        try:
+            artifact = await self.catalog.get(model_id, refresh=True)
+            return await asyncio.to_thread(model_deletion_plan, artifact)
+        except ModelArtifactNotFoundError as error:
+            raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
+        except ModelDeletionError as error:
+            raise ServiceError(409, str(error), "Model files cannot be safely deleted") from error
+        except (OSError, ValueError) as error:
+            raise ServiceError(409, "model_delete_changed", "Model files changed; refresh the list and try again") from error
+
+    async def delete_model_artifact(self, model_id: str, token: str) -> dict[str, int]:
+        if self.catalog is None or not hasattr(self.runtime_manager, "model_deletion_guard"):
+            raise ServiceError(501, "model_delete_unavailable", "Model deletion requires a managed runtime")
+        try:
+            async with self._download_job_lock:
+                artifact = await self.catalog.get(model_id, refresh=True)
+                if self.tool_handlers is not None:
+                    for job in await asyncio.to_thread(self.store.active_download_jobs):
+                        _, destination = await asyncio.to_thread(self.tool_handlers.download_request, job.kind, job.payload)
+                        if artifact.path.resolve().is_relative_to(destination.resolve()):
+                            raise ServiceError(409, "model_delete_downloading", "Wait for the model download to finish or cancel it first")
+                async with self.runtime_manager.model_deletion_guard(artifact):
+                    deletion = asyncio.create_task(asyncio.to_thread(delete_model_files, artifact, token))
+                    try:
+                        result = await asyncio.shield(deletion)
+                    except asyncio.CancelledError:
+                        await deletion
+                        raise
+                    finally:
+                        await self.catalog.invalidate()
+                        await self.catalog.list(refresh=True)
+                return result
+        except ModelArtifactNotFoundError as error:
+            raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
+        except ModelDeletionError as error:
+            raise ServiceError(409, str(error), "Model files changed or cannot be safely deleted") from error
+        except BackendError as error:
+            raise ServiceError(error.status_code or 409, error.code, str(error)) from error
+        except OSError as error:
+            raise ServiceError(409, "model_delete_failed", "Could not delete all model files; check permissions and refresh the list") from error
+
     async def model_cache_profile(self, model_id: str, *, include_recurrent: bool = False) -> ModelCacheProfile | None:
         if self.catalog is None:
             raise ServiceError(501, "model_catalog_unavailable", "model catalog is unavailable")
@@ -1607,6 +1654,10 @@ class ServerService:
         request: CreateResponseRequest,
     ) -> PreparedResponse:
         try:
+            session = await asyncio.to_thread(self.store.get_session, session_id)
+            model = request.model or session.model
+            if not model:
+                raise ServiceError(400, "model_required", "Select a model before sending a message")
             history = await asyncio.to_thread(self.store.list_messages, session_id)
             await asyncio.to_thread(
                 self._validate_media_parts,
@@ -1638,6 +1689,7 @@ class ServerService:
                 request.input,
                 ResponseRequestSettings(
                     sampling=request.sampling,
+                    model=model,
                     system_prompt=request.system_prompt,
                     include_reasoning_history=request.include_reasoning_history,
                     input_role=request.input_role,
@@ -1687,6 +1739,7 @@ class ServerService:
             backend_messages = (*backend_messages, backend_input)
         return PreparedResponse(
             request=request,
+            model=model,
             begin=begin,
             backend_messages=tuple(backend_messages),
         )
@@ -1698,7 +1751,7 @@ class ServerService:
         accumulator = _OutputAccumulator()
         try:
             async for delta in self.backend.stream(
-                model=prepared.begin.session.model,
+                model=prepared.model,
                 messages=prepared.backend_messages,
                 sampling=prepared.request.sampling,
                 session_id=prepared.begin.session.id,
@@ -1839,7 +1892,7 @@ class ServerService:
         try:
             async with closing_backend_stream(
                 self.backend.stream(
-                    model=prepared.begin.session.model,
+                    model=prepared.model,
                     messages=prepared.backend_messages,
                     sampling=prepared.request.sampling,
                     session_id=prepared.begin.session.id,
@@ -2019,6 +2072,8 @@ class ServerService:
     @staticmethod
     def _request_fingerprint(request: CreateResponseRequest) -> str:
         value = request.model_dump(mode="json", exclude={"stream"})
+        if request.model is None:
+            value.pop("model", None)
         encoded = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 

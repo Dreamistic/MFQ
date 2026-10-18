@@ -7,12 +7,13 @@ import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { ModelLoadProgress } from './ModelLoadProgress';
 import { formatNumber } from '../../app/formatters';
 import { ModelPressureBars } from './ModelMemoryPressure';
-import { hasSeparateVram } from '../runtime/memoryArchitecture';
+import { availableResidentMemory, hasSeparateVram } from '../runtime/memoryArchitecture';
+import { ModelDeleteDialog } from './ModelDeleteDialog';
 
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
-    setModelFilter, filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles } = catalog;
+    setModelFilter, filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles, prepareModelDeletion } = catalog;
   const [status, setStatus] = useState('all');
   const [architecture, setArchitecture] = useState('all');
   const [format, setFormat] = useState('all');
@@ -25,8 +26,8 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
     .sort((a, b) => sort === 'name' ? a.name.localeCompare(b.name) : sort === 'size'
       ? b.total_bytes - a.total_bytes : (Date.parse(b.modified_at) || 0) - (Date.parse(a.modified_at) || 0));
   const filterCount = [status, architecture, format].filter(value => value !== 'all').length;
-  const available = runtime?.runtime_memory_headroom_bytes;
   const separate = hasSeparateVram(runtime);
+  const available = separate ? runtime?.runtime_memory_headroom_bytes : availableResidentMemory(runtime);
   const system = separate ? { physical_memory_bytes: runtime?.host_memory_total_bytes, memory_pools: [
     { kind: 'vram' as const, capacity_bytes: runtime?.device_memory_total_bytes },
     { kind: 'ram' as const, capacity_bytes: runtime?.host_memory_total_bytes },
@@ -100,7 +101,9 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                     <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">
                       {tr('加载', 'Load')}
                     </button>
-                  )}</div>
+                  )}<button className="model-delete-action" aria-label={tr(`删除模型：${item.name}`, `Delete model: ${item.name}`)}
+                    disabled={busy || loaded} title={loaded ? tr('请先卸载模型再删除', 'Unload the model before deleting it') : tr('删除模型', 'Delete model')}
+                    onClick={() => void prepareModelDeletion(item.id)} type="button"><Icon name="trash" size={14} /></button></div>
                 </div>
               );
             })}
@@ -120,6 +123,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
           }
         />
       )}
+      <ModelDeleteDialog catalog={catalog} />
     </>
   );
 }

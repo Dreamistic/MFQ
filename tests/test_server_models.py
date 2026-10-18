@@ -134,6 +134,7 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gib = 1 << 30
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.process_physical_footprint", lambda _: 0)
     monkeypatch.setattr(
         "mfq.server.runtime.runtime_pool.total_physical_memory",
         lambda: 128 * gib,
@@ -165,8 +166,8 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
     explicit._load_bytes["resident"] = 30 * gib
     explicit._resident_process_usage_locked = lambda: (30 * gib, 0)
 
-    assert automatic._effective_runtime_memory_budget_locked() == 30 * gib
-    assert explicit._effective_runtime_memory_budget_locked() == 30 * gib
+    assert automatic._effective_runtime_memory_budget_locked() == 50 * gib
+    assert explicit._effective_runtime_memory_budget_locked() == 50 * gib
     assert HostMemorySnapshot(0, -1, 10, -1, 0).reclaimable(
         active_ratio=2.0
     ) == 10

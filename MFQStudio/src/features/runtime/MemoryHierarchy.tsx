@@ -47,7 +47,7 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, runtime, conne
   const pool = (capacity: number | null | undefined, weights: Tier, caches: Tier, available?: number | null) =>
     memoryPoolUsage(capacity, loaded.map(item => value(item, weights)), loaded.map(item => value(item, caches)), available);
   const residentPool = pool(memoryCapacityBytes, 'weights', 'kv',
-    separate ? runtime?.device_free_bytes : runtime?.host_memory_available_bytes);
+    separate ? runtime?.device_free_bytes : runtime?.runtime_memory_effective_budget_bytes != null ? undefined : runtime?.host_memory_available_bytes);
   const ramPool = separate ? memoryPoolUsage(runtime?.host_memory_total_bytes,
     loaded.map(item => value(item, 'ram-experts')), loaded.map(item => {
       const kv = value(item, 'ram-kv');

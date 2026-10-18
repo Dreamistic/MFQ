@@ -49,7 +49,8 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
   it('test_studio_handles_a_running_server_without_a_loaded_model', () => {
     const sessions = readSources('features/chat/hooks/useConversationSessions.ts');
     const runtime = readSources('app/RuntimeProvider.tsx');
-    expect(sessions).toContain('if (!selectedModel || transitioning) return');
+    expect(sessions).toContain('if (!ready || transitioning || generationBusy) return');
+    expect(sessions).toContain('sessionsApi.createSession(undefined, mode)');
     expect(sessions).toContain('modelAvailable');
     expect(sessions).toContain('historyLoadedId === activeId');
     expect(runtime).toContain('isRuntimeReady(status.runtime_state)');
@@ -62,10 +63,10 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     const overview = readSources('features/runtime/OverviewPage.tsx');
     expect(overview).toContain('availableModelNames.map((name)');
     expect(APP).not.toContain('artifacts.slice(0, 8)');
-    expect(sessions).toContain('.forkSession(active.id, null, true, active.title, selectedModel)');
-    expect(sessions).toContain('setSelectedModel(session.model)');
+    expect(sessions).not.toContain('.forkSession(');
+    expect(sessions).not.toContain('setSelectedModel(');
     expect(sessions).toContain('setActiveId(id)');
-    expect(sessions).toContain('active.model === selectedModel');
+    expect(readSources('features/chat/ChatProvider.tsx')).toContain('model: inference.selectedModel');
     expect(sessions).toContain('generationBusy');
     expect(sessions).toContain('controller.abort()');
     expect(readSources('features/chat/components/ChatPageHeader.tsx')).toContain('disabled={conversation.transitioning}');

@@ -76,6 +76,62 @@ beforeEach(() => {
 });
 
 describe('useModelCatalog', () => {
+  it('prepares deletion without removing files and requires explicit confirmation', async () => {
+    state.ready = true;
+    const plan = { model_id: artifact.id, name: artifact.name, files: ['/models/model.mfq'], total_bytes: 128, token: 'a'.repeat(64) };
+    vi.spyOn(modelsApi, 'modelDeletionPlan').mockResolvedValue(plan);
+    const remove = vi.spyOn(modelsApi, 'deleteModel').mockResolvedValue({ files: 1, total_bytes: 128 });
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toEqual([artifact]));
+    await act(async () => result.current.prepareModelDeletion(artifact.id));
+    expect(result.current.modelDeletion).toEqual(plan);
+    expect(remove).not.toHaveBeenCalled();
+    act(() => result.current.cancelModelDeletion());
+    expect(result.current.modelDeletion).toBeNull();
+    expect(remove).not.toHaveBeenCalled();
+    await act(async () => result.current.prepareModelDeletion(artifact.id));
+    vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([]);
+    await act(async () => result.current.confirmModelDeletion());
+    expect(remove).toHaveBeenCalledExactlyOnceWith(artifact.id, plan.token);
+    expect(result.current.modelDeletion).toBeNull();
+    expect(result.current.artifacts).toEqual([]);
+  });
+
+  it('connection changes dismiss deletion confirmation and discard old previews', async () => {
+    state.ready = true;
+    let resolve!: (plan: Awaited<ReturnType<typeof modelsApi.modelDeletionPlan>>) => void;
+    vi.spyOn(modelsApi, 'modelDeletionPlan').mockReturnValue(new Promise(done => { resolve = done; }));
+    const remove = vi.spyOn(modelsApi, 'deleteModel');
+    const { result, rerender } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toEqual([artifact]));
+    let pending!: Promise<void>;
+    act(() => { pending = result.current.prepareModelDeletion(artifact.id); });
+    setApiBaseUrl('http://other-server:8090');
+    state.connectionRevision++;
+    rerender();
+    await act(async () => {
+      resolve({ model_id: artifact.id, name: artifact.name, files: ['/models/model.mfq'], total_bytes: 128, token: 'a'.repeat(64) });
+      await pending;
+    });
+    expect(result.current.modelDeletion).toBeNull();
+    await act(async () => result.current.confirmModelDeletion());
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('deletion failure preserves the model and confirmation for retry', async () => {
+    state.ready = true;
+    const plan = { model_id: artifact.id, name: artifact.name, files: ['/models/model.mfq'], total_bytes: 128, token: 'a'.repeat(64) };
+    vi.spyOn(modelsApi, 'modelDeletionPlan').mockResolvedValue(plan);
+    vi.spyOn(modelsApi, 'deleteModel').mockRejectedValue(new Error('permission denied'));
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toEqual([artifact]));
+    await act(async () => result.current.prepareModelDeletion(artifact.id));
+    await act(async () => result.current.confirmModelDeletion());
+    expect(result.current.modelDeletion).toEqual(plan);
+    expect(result.current.artifacts).toEqual([artifact]);
+    expect(result.current.busy).toBe(false);
+  });
+
   it('removes deleted checkpoints on the next fresh scan without a job change', async () => {
     vi.useFakeTimers();
     try {

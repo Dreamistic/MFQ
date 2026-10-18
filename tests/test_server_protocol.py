@@ -168,6 +168,8 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
         "/api/v1/models/directories/register",
         "/api/v1/models/directories/open",
         "/api/v1/models/{model_id}/directory",
+        "/api/v1/models/{model_id}/deletion",
+        "/api/v1/models/{model_id}/delete",
         "/api/v1/models/{model_id}/analysis",
         "/api/v1/models/{model_id}/cache-profile",
         "/api/v1/models/load",
