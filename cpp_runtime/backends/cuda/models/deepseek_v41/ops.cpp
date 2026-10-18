@@ -37,6 +37,7 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
     result->shared = shared;
     if (config.has_engram(layer)) {
         result->engram = Engram::load(execution, model, config, static_cast<int>(layer));
+        shared->engram_prefetch.push_back(result->engram.get());
     }
     result->attention_norm = load_dense_gpu(execution, model, prefix + "attention.norm.weight")
                                  .to(mfq_tensor_backend::kFloat32).contiguous();

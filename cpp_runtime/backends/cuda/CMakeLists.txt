@@ -346,6 +346,8 @@ endfunction()
 set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/deepseek_v4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/ops.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/engram.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/prefill.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
     ${MFQ_CUDA_ROOT}/models/qwen4_exp/ops.cpp
     ${MFQ_CUDA_ROOT}/runtime/kv_offload.cpp
@@ -673,6 +675,22 @@ if(BUILD_TESTING)
     add_test(NAME mfq-float-projection-test COMMAND mfq-float-projection-test)
     add_test(NAME mfq-gr-prefill-blas-test COMMAND mfq-float-projection-test --prefill-blas-check)
 
+    add_executable(mfq-deepseek-v41-ced-test ${MFQ_CUDA_ROOT}/tests/deepseek_v41_ced_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-deepseek-v41-ced-test)
+    target_link_libraries(mfq-deepseek-v41-ced-test PRIVATE mfq-cuda-runtime)
+    target_compile_definitions(mfq-deepseek-v41-ced-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    add_test(NAME mfq-deepseek-v41-ced-test COMMAND mfq-deepseek-v41-ced-test)
+    set_tests_properties(mfq-deepseek-v41-ced-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-deepseek-v41-engram-test ${MFQ_CUDA_ROOT}/tests/deepseek_v41_engram_test.cpp)
+    target_link_libraries(mfq-deepseek-v41-engram-test PRIVATE mfq-cuda-runtime)
+    mfq_configure_cuda_runtime_target(mfq-deepseek-v41-engram-test)
+    target_compile_definitions(mfq-deepseek-v41-engram-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    add_test(NAME mfq-deepseek-v41-engram-test COMMAND mfq-deepseek-v41-engram-test)
+    set_tests_properties(mfq-deepseek-v41-engram-test PROPERTIES SKIP_RETURN_CODE 77)
+    if(MSVC)
+        target_compile_options(mfq-deepseek-v41-engram-test PRIVATE /EHsc)
+        target_compile_options(mfq-deepseek-v41-ced-test PRIVATE /EHsc)
+    endif()
     add_executable(mfq-deepseek-v41-hc-bench ${MFQ_REPOSITORY_ROOT}/bench/cuda_deepseek_v41_hc_bench.cpp)
     mfq_configure_cuda_runtime_target(mfq-deepseek-v41-hc-bench)
     target_compile_definitions(mfq-deepseek-v41-hc-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)

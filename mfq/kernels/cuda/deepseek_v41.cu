@@ -11,6 +11,7 @@
 
 namespace {
 
+template<bool Projection>
 __global__ void hc_prepare_kernel(const half* residual, const float* previous_pre,
                                   const float* norm, float* normalized, half* branch,
                                   int hidden, float epsilon) {
@@ -26,7 +27,7 @@ __global__ void hc_prepare_kernel(const half* residual, const float* previous_pr
 #pragma unroll
         for (int source = 0; source < 4; ++source) {
             const float value = __half2float(residual[(row * 4 + source) * hidden + col]);
-            flat_square = __fadd_rn(flat_square, __fmul_rn(value, value));
+            if constexpr (Projection) flat_square = __fadd_rn(flat_square, __fmul_rn(value, value));
             mixed = __fadd_rn(mixed, __fmul_rn(value, pre[source]));
         }
         branch_square = __fadd_rn(branch_square, __fmul_rn(mixed, mixed));
@@ -56,7 +57,7 @@ __global__ void hc_prepare_kernel(const half* residual, const float* previous_pr
         for (int source = 0; source < 4; ++source) {
             const auto index = (row * 4 + source) * hidden + col;
             const float value = __half2float(residual[index]);
-            normalized[index] = __fmul_rn(value, inverse[0]);
+            if constexpr (Projection) normalized[index] = __fmul_rn(value, inverse[0]);
             mixed = __fadd_rn(mixed, __fmul_rn(value, pre[source]));
         }
         branch[row * hidden + col] = __float2half_rn(
@@ -147,9 +148,9 @@ void require_input(
 
 } // namespace
 
-std::vector<mfq_tensor_backend::Tensor> deepseek_v41_hc_prepare_cuda(
+static std::vector<mfq_tensor_backend::Tensor> hc_prepare_impl(
     mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor previous_pre,
-    mfq_tensor_backend::Tensor norm, double epsilon) {
+    mfq_tensor_backend::Tensor norm, double epsilon, bool projection) {
     MFQ_RUNTIME_CHECK(residual.is_cuda() && residual.is_contiguous() &&
                           residual.scalar_type() == mfq_tensor_backend::kFloat16 &&
                           residual.dim() == 4 && residual.size(2) == 4 &&
@@ -166,17 +167,37 @@ std::vector<mfq_tensor_backend::Tensor> deepseek_v41_hc_prepare_cuda(
     const auto rows = residual.size(0) * residual.size(1), hidden = residual.size(3);
     MFQ_RUNTIME_CHECK(rows > 0 && rows <= INT_MAX,
                       "deepseek_v41_hc_prepare: row count is out of range");
-    auto normalized = mfq_tensor_backend::empty(
+    mfq_tensor_backend::Tensor normalized;
+    if (projection) normalized = mfq_tensor_backend::empty(
         {residual.size(0), residual.size(1), 4 * hidden}, previous_pre.options());
     auto branch = mfq_tensor_backend::empty(
         {residual.size(0), residual.size(1), hidden}, residual.options());
-    hc_prepare_kernel<<<static_cast<int>(rows), 256, 0, mfq_current_cuda_stream()>>>(
-        reinterpret_cast<const half*>(residual.data_ptr<mfq_half>()), previous_pre.data_ptr<float>(),
-        norm.data_ptr<float>(), normalized.data_ptr<float>(),
-        reinterpret_cast<half*>(branch.data_ptr<mfq_half>()), static_cast<int>(hidden),
-        static_cast<float>(epsilon));
+    if (projection) {
+        hc_prepare_kernel<true><<<static_cast<int>(rows), 256, 0, mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const half*>(residual.data_ptr<mfq_half>()), previous_pre.data_ptr<float>(),
+            norm.data_ptr<float>(), normalized.data_ptr<float>(),
+            reinterpret_cast<half*>(branch.data_ptr<mfq_half>()), static_cast<int>(hidden),
+            static_cast<float>(epsilon));
+    } else {
+        hc_prepare_kernel<false><<<static_cast<int>(rows), 256, 0, mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const half*>(residual.data_ptr<mfq_half>()), previous_pre.data_ptr<float>(),
+            norm.data_ptr<float>(), nullptr, reinterpret_cast<half*>(branch.data_ptr<mfq_half>()),
+            static_cast<int>(hidden), static_cast<float>(epsilon));
+    }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return {normalized, branch};
+}
+
+std::vector<mfq_tensor_backend::Tensor> deepseek_v41_hc_prepare_cuda(
+    mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor previous_pre,
+    mfq_tensor_backend::Tensor norm, double epsilon) {
+    return hc_prepare_impl(residual, previous_pre, norm, epsilon, true);
+}
+
+mfq_tensor_backend::Tensor deepseek_v41_hc_input_cuda(
+    mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor previous_pre,
+    mfq_tensor_backend::Tensor norm, double epsilon) {
+    return hc_prepare_impl(residual, previous_pre, norm, epsilon, false).at(1);
 }
 
 mfq_tensor_backend::Tensor deepseek_v41_mxfp8_e4m3_sim_cuda(
@@ -201,6 +222,122 @@ mfq_tensor_backend::Tensor deepseek_v41_mxfp4_e4m3_scale_sim_cuda(
         mfq_current_cuda_stream()>>>(
         reinterpret_cast<const half*>(input.data_ptr<mfq_half>()),
         reinterpret_cast<half*>(output.data_ptr<mfq_half>()));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+namespace {
+__global__ void engram_rows_kernel(const uint8_t* packed, const int64_t* inverse,
+                                   half* output, int width, int64_t elements) {
+    const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    const int col = int(index % width);
+    const auto* row = packed + inverse[index / width] * (width + width / 32);
+    __nv_fp8_e4m3 value;
+    value.__x = row[col];
+    const float scale = ldexpf(1.f, int(row[width + col / 32]) - 127);
+    output[index] = __float2half_rn(static_cast<float>(value) * scale);
+}
+
+template<class Projected>
+__global__ void engram_gate_add_kernel(const half* source, const Projected* projected,
+                                       const float* weight, half* output, int hidden,
+                                       int streams, float epsilon) {
+    const int stream = blockIdx.x % streams;
+    const int64_t row = blockIdx.x / streams;
+    const int64_t source_offset = (row * streams + stream) * hidden;
+    const int64_t key_offset = (row * (streams + 1) + stream) * hidden;
+    float xs = 0, ks = 0, dot = 0;
+    for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+        const float x = __half2float(source[source_offset + col]);
+        const float k = static_cast<float>(projected[key_offset + col]);
+        xs = __fadd_rn(xs, __fmul_rn(x, x));
+        ks = __fadd_rn(ks, __fmul_rn(k, k));
+        dot = __fadd_rn(dot, __fmul_rn(__fmul_rn(x, k), weight[stream * hidden + col]));
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int shift = 16; shift; shift >>= 1) {
+        xs += __shfl_down_sync(0xffffffff, xs, shift);
+        ks += __shfl_down_sync(0xffffffff, ks, shift);
+        dot += __shfl_down_sync(0xffffffff, dot, shift);
+    }
+    __shared__ float sums[3][8];
+    __shared__ float gate;
+    if (!lane) { sums[0][warp] = xs; sums[1][warp] = ks; sums[2][warp] = dot; }
+    __syncthreads();
+    if (!warp) {
+        xs = lane < 8 ? sums[0][lane] : 0;
+        ks = lane < 8 ? sums[1][lane] : 0;
+        dot = lane < 8 ? sums[2][lane] : 0;
+        for (int shift = 16; shift; shift >>= 1) {
+            xs += __shfl_down_sync(0xffffffff, xs, shift);
+            ks += __shfl_down_sync(0xffffffff, ks, shift);
+            dot += __shfl_down_sync(0xffffffff, dot, shift);
+        }
+        if (!lane) {
+            const float inverse = __fmul_rn(rsqrtf(xs / hidden + epsilon), rsqrtf(ks / hidden + epsilon));
+            const float score = __fmul_rn(dot, inverse) / sqrtf(float(hidden));
+            const float sign = float(score > 0) - float(score < 0);
+            const float transformed = sign * sqrtf(fmaxf(fabsf(score), 1.e-6f));
+            gate = 1.f / (1.f + expf(-transformed));
+        }
+    }
+    __syncthreads();
+    for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+        const float value = static_cast<float>(projected[(row * (streams + 1) + streams) * hidden + col]);
+        output[source_offset + col] = __float2half_rn(__fadd_rn(
+            __half2float(source[source_offset + col]), __fmul_rn(gate, value)));
+    }
+}
+}
+
+mfq_tensor_backend::Tensor deepseek_v41_engram_rows_cuda(
+    mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor inverse, int64_t width) {
+    namespace tb = mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(packed.is_cuda() && packed.is_contiguous() && packed.scalar_type() == tb::kUInt8 &&
+        packed.dim() == 2 && packed.size(0) > 0 && width > 0 && width <= INT_MAX && width % 32 == 0 &&
+        packed.size(1) == width + width / 32 && inverse.is_cuda() && inverse.is_contiguous() &&
+        inverse.scalar_type() == tb::kInt64 && inverse.dim() == 1 && inverse.numel() > 0 &&
+        packed.device() == inverse.device(), "invalid Engram MXFP8 row packet");
+    MFQ_RUNTIME_CHECK(inverse.numel() <= int64_t(INT_MAX) * 256 / width,
+                      "Engram row output exceeds launch bounds");
+    auto output = tb::empty({inverse.numel(), width}, packed.options().dtype(tb::kFloat16));
+    engram_rows_kernel<<<int((output.numel() + 255) / 256), 256, 0, mfq_current_cuda_stream()>>>(
+        packed.data_ptr<uint8_t>(), inverse.data_ptr<int64_t>(),
+        reinterpret_cast<half*>(output.data_ptr<mfq_half>()), int(width), output.numel());
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+mfq_tensor_backend::Tensor deepseek_v41_engram_gate_add_cuda(
+    mfq_tensor_backend::Tensor hidden, mfq_tensor_backend::Tensor projected,
+    mfq_tensor_backend::Tensor query_key_weight, double epsilon) {
+    namespace tb = mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(hidden.is_cuda() && hidden.is_contiguous() && hidden.scalar_type() == tb::kFloat16 &&
+        hidden.dim() == 4 && hidden.size(2) > 0 && hidden.size(3) > 0 && hidden.size(3) <= INT_MAX &&
+        projected.is_cuda() && projected.is_contiguous() && projected.dim() == 3 &&
+        (projected.scalar_type() == tb::kFloat16 || projected.scalar_type() == tb::kFloat32) &&
+        projected.size(0) == hidden.size(0) && projected.size(1) == hidden.size(1) &&
+        projected.size(2) == (hidden.size(2) + 1) * hidden.size(3) &&
+        query_key_weight.is_cuda() && query_key_weight.is_contiguous() &&
+        query_key_weight.scalar_type() == tb::kFloat32 &&
+        query_key_weight.numel() == hidden.size(2) * hidden.size(3) &&
+        hidden.device() == projected.device() && hidden.device() == query_key_weight.device() &&
+        std::isfinite(epsilon) && epsilon > 0, "invalid Engram gate/add tensors");
+    const auto rows = hidden.size(0) * hidden.size(1) * hidden.size(2);
+    MFQ_RUNTIME_CHECK(rows > 0 && rows <= INT_MAX, "Engram gate/add launch exceeds bounds");
+    auto output = tb::empty_like(hidden);
+    if (projected.scalar_type() == tb::kFloat16)
+        engram_gate_add_kernel<<<int(rows), 256, 0, mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const half*>(hidden.data_ptr<mfq_half>()),
+            reinterpret_cast<const half*>(projected.data_ptr<mfq_half>()), query_key_weight.data_ptr<float>(),
+            reinterpret_cast<half*>(output.data_ptr<mfq_half>()), int(hidden.size(3)),
+            int(hidden.size(2)), float(epsilon));
+    else
+        engram_gate_add_kernel<<<int(rows), 256, 0, mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const half*>(hidden.data_ptr<mfq_half>()), projected.data_ptr<float>(),
+            query_key_weight.data_ptr<float>(), reinterpret_cast<half*>(output.data_ptr<mfq_half>()),
+            int(hidden.size(3)), int(hidden.size(2)), float(epsilon));
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

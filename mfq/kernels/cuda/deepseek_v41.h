@@ -3,7 +3,20 @@
 #include "mfq_tensor_backend.h"
 #include <vector>
 
+mfq_tensor_backend::Tensor deepseek_v41_engram_rows_cuda(
+    mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor inverse, int64_t width);
+
+mfq_tensor_backend::Tensor deepseek_v41_engram_gate_add_cuda(
+    mfq_tensor_backend::Tensor hidden, mfq_tensor_backend::Tensor projected,
+    mfq_tensor_backend::Tensor query_key_weight, double epsilon);
+
 std::vector<mfq_tensor_backend::Tensor> deepseek_v41_hc_prepare_cuda(
+    mfq_tensor_backend::Tensor residual,
+    mfq_tensor_backend::Tensor previous_pre,
+    mfq_tensor_backend::Tensor norm,
+    double epsilon);
+
+mfq_tensor_backend::Tensor deepseek_v41_hc_input_cuda(
     mfq_tensor_backend::Tensor residual,
     mfq_tensor_backend::Tensor previous_pre,
     mfq_tensor_backend::Tensor norm,

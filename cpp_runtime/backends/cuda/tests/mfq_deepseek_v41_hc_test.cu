@@ -39,6 +39,9 @@ void check_single_pass_prepare(int batch, int tokens, int hidden) {
     auto pre = tensor(previous).reshape({batch, tokens, 4}).to(gpu).contiguous();
     auto weight = tensor(gamma).to(gpu).contiguous();
     auto prepared = deepseek_v41_hc_prepare_cuda(residual, pre, weight, 1.e-20);
+    auto input_only = deepseek_v41_hc_input_cuda(residual, pre, weight, 1.e-20);
+    if (!input_only.equal(prepared.at(1)))
+        throw std::runtime_error("mHC encoder projection input changed without coefficient prediction");
     auto normalized = prepared.at(0).cpu();
     auto branch = prepared.at(1).to(kFloat32).cpu();
     for (int row = 0; row < rows; ++row) {
@@ -85,6 +88,23 @@ void check_single_pass_prepare(int batch, int tokens, int hidden) {
         close(next_pre.data_ptr<float>()[row * 4 + col], 1.f / (1.f + std::exp(-affine)) + 1.e-6f,
               3.e-7f, "single-pass mHC next weights");
     }
+}
+
+void check_candidate_scores(int heads) {
+    namespace tb=mfq_tensor_backend;
+    auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
+    auto q=tb::randn({2,3,heads,128},options).to(tb::kFloat16).contiguous();
+    auto k=tb::randn({2,131,128},options).to(tb::kFloat16).contiguous();
+    auto weights=tb::randn({2,3,heads},options).to(tb::kFloat16).contiguous();
+    std::vector<int64_t> ids(2*3*79);
+    for(size_t i=0;i<ids.size();++i)ids[i]=i%13==0?-1:int64_t((i*17)%131);
+    auto selected=tb::tensor(ids).reshape({2,3,79}).to(tb::kCUDA).contiguous();
+    auto full=dsv4_indexer_scores_cuda(q,k,weights,126,1);
+    auto safe=selected.clamp(0.,130.);
+    auto expected=tb::where(selected>=0.,full.gather(-1,safe),
+                              -std::numeric_limits<float>::infinity());
+    auto actual=dsv4_indexer_candidate_scores_cuda(q,k,weights,selected,126,1);
+    if(!actual.equal(expected))throw std::runtime_error("C4A candidate scores differ from full scoring");
 }
 
 void check_v41_geometry() {
@@ -336,6 +356,8 @@ int main() {
         check_single_pass_prepare(1, 1, 5120);
         check_single_pass_prepare(2, 3, 33);
         check_single_pass_prepare(1, 17, 5120);
+        check_candidate_scores(32);
+        check_candidate_scores(64);
         check_v41_geometry();
         check_released_activation_boundaries();
         check_v41_indexer_geometry();

@@ -17,6 +17,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -39,6 +40,7 @@ struct SharedState {
     Tensor attention_meta;
     std::unique_ptr<EngramHashState> engram_hash;
     EngramHashBatch engram_hashes;
+    std::vector<Engram*> engram_prefetch;
     std::vector<Tensor> dspark_target_hiddens;
     bool capture_dspark_targets = false;
     std::int64_t compressed_length = 0;
@@ -142,6 +144,7 @@ struct SharedState {
                                   token_ids.size(1) == current_tokens,
                               "DeepSeek-V4.1 Engram token state is unavailable");
             engram_hashes = engram_hash->forward(token_ids, current_position);
+            for (const auto* memory : engram_prefetch) memory->prefetch(engram_hashes);
         }
         MFQ_RUNTIME_CHECK(layer == next_layer && layer >= 0 && layer < layer_count &&
                               current_batch == batch && current_tokens == tokens &&
@@ -349,6 +352,8 @@ struct Block final : ::Block {
     std::int64_t speculative_compressed_length = 0;
     std::int64_t speculative_partial_length = 0;
     bool speculative_pending = false;
+    std::int64_t prefilled_global_end = -1;
+    bool replay_local_window = false;
 
     bool kv_source() const noexcept { return config.is_kv_source(layer); }
 
@@ -386,6 +391,8 @@ struct Block final : ::Block {
         speculative_partial_score = Tensor();
         speculative_position = -1;
         speculative_pending = false;
+        prefilled_global_end = -1;
+        replay_local_window = false;
         if (layer == 0)
             shared->reset_session(batch);
     }
@@ -515,7 +522,9 @@ struct Block final : ::Block {
 
     void publish_compressed_source(CudaExecutionContext &execution, const Tensor &input,
                                    std::int64_t position) {
-        auto latent = update_compressed_source(execution, input, position);
+        std::optional<Tensor> latent;
+        if (prefilled_global_end == position + input.size(1)) prefilled_global_end = -1;
+        else latent = update_compressed_source(execution, input, position);
         if (latent) {
             const auto count = latent->size(1);
             const auto begin = state.compressed_length;
@@ -547,6 +556,7 @@ struct Block final : ::Block {
         const auto batch = input.size(0);
         const auto tokens = input.size(1);
         const auto pool_length = shared->compressed_length;
+        Tensor candidates;
         return mfq::models::deepseek_v41::hierarchical_index(
             ratio, index_source(), layer, config.candidate_source_layer, pool_length,
             [&] { return empty_topk(batch, tokens, input.device()); },
@@ -569,10 +579,20 @@ struct Block final : ::Block {
                                    .reshape({batch, tokens, config.index_n_heads})
                                    .to(mfq_tensor_backend::kFloat16)
                                    .contiguous();
-                auto scores = dsv4_indexer_scores_cuda(
-                    query, shared->index_k.narrow(1, 0, pool_length).contiguous(), weights,
-                    position, ratio);
-                return scores;
+                auto keys = shared->index_k.narrow(1, 0, pool_length).contiguous();
+                if (layer > config.candidate_source_layer) {
+                    MFQ_RUNTIME_CHECK(shared->candidate_blocks.defined(),
+                                      "DeepSeek-V4.1 hierarchical indexer has no candidates");
+                    candidates = candidate_positions(shared->candidate_blocks,
+                                                     config.candidate_block_size, pool_length);
+                    return execution.profiler.measure("deepseek_v41.indexer.candidate_scores", [&] {
+                        return dsv4_indexer_candidate_scores_cuda(query, keys, weights, candidates,
+                                                                  position, ratio);
+                    });
+                }
+                return execution.profiler.measure("deepseek_v41.indexer.full_scores", [&] {
+                    return dsv4_indexer_scores_cuda(query, keys, weights, position, ratio);
+                });
             },
             [&](Tensor scores) {
                 shared->candidate_blocks = candidate_blocks_from_scores(
@@ -580,15 +600,8 @@ struct Block final : ::Block {
                     config.candidate_block_size);
             },
             [&](Tensor scores) {
-                MFQ_RUNTIME_CHECK(shared->candidate_blocks.defined(),
-                                  "DeepSeek-V4.1 hierarchical indexer has no candidates");
-                auto candidates = candidate_positions(shared->candidate_blocks,
-                                                      config.candidate_block_size, pool_length);
-                auto safe = candidates.clamp(0.0, static_cast<double>(pool_length - 1));
-                auto candidate_scores = scores.gather(-1, safe);
-                candidate_scores = mfq_tensor_backend::where(
-                    candidates >= 0.0, candidate_scores, -std::numeric_limits<float>::infinity());
-                return select_topk(candidate_scores, config.index_topk, pool_length, candidates);
+                MFQ_RUNTIME_CHECK(candidates.defined(), "DeepSeek-V4.1 candidate scores are unavailable");
+                return select_topk(scores, config.index_topk, pool_length, candidates);
             },
             [&](Tensor scores) { return select_topk(scores, config.index_topk, pool_length); },
             [&](Tensor topk) { shared->topk = std::move(topk); });
@@ -596,9 +609,11 @@ struct Block final : ::Block {
 
     Tensor attention_forward(CudaExecutionContext &execution, const Tensor &input,
                              const Tensor &positions, std::int64_t position,
-                             const MfqOptional<Tensor> &sequence_lengths) {
+                             const MfqOptional<Tensor> &sequence_lengths,
+                             bool truncated_local = false) {
         const auto batch = input.size(0);
         const auto tokens = input.size(1);
+        const auto local_history = truncated_local ? 0 : std::min(position, config.sliding_window);
         return mfq::models::deepseek_v41::attention(
             kv_source(), ratio,
             [&] {
@@ -642,7 +657,7 @@ struct Block final : ::Block {
                     state.local_kv.index_copy_(1, slot, local);
                     local_for_attention = state.local_kv;
                 } else {
-                    const auto history = std::min(position, config.sliding_window);
+                    const auto history = local_history;
                     std::vector<Tensor> local_parts;
                     if (history > 0) {
                         auto slots = mfq_tensor_backend::arange(
@@ -696,7 +711,7 @@ struct Block final : ::Block {
                     MFQ_RUNTIME_CHECK(
                         !sequence_lengths.has_value(),
                         "DeepSeek-V4.1 chunked prefill does not accept per-row lengths");
-                    const auto history = std::min(position, config.sliding_window);
+                    const auto history = local_history;
                     plan =
                         dsv4_build_prefill_plan_cuda(topk, position, history, pool_length,
                                                      ratio > 0 ? ratio : 1, config.sliding_window);
@@ -733,6 +748,7 @@ struct Block final : ::Block {
                             hidden.device(), current_ids);
 
         const auto batch = hidden.size(0), tokens = hidden.size(1);
+        const bool truncated_local = std::exchange(replay_local_window, false);
         return mfq::models::deepseek_v41::decoder_layer(
             std::move(hidden), bool(engram), shared->previous_pre,
             [&](Tensor value) {
@@ -752,7 +768,7 @@ struct Block final : ::Block {
             },
             [&](Tensor value) {
                 return attention_forward(execution, value, positions, cache_position,
-                                         sequence_lengths);
+                                         sequence_lengths, truncated_local);
             },
             [&](Tensor value, Tensor residual, const auto &mix, int branch) {
                 return expand(profiler, value, residual, mix,
@@ -829,6 +845,10 @@ struct DeepseekV41Model : CausalResources {
 };
 
 extern template struct CudaSessionCodec<DeepseekV41Model>;
+
+mfq_tensor_backend::Tensor deepseek_v41_prefill_hidden(
+    DeepseekV41CausalLm& model, mfq_tensor_backend::Tensor ids, std::int64_t compute_chunk,
+    const std::function<bool()>& stopped = {});
 
 } // namespace mfq::cuda
 

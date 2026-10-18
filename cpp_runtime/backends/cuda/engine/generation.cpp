@@ -111,6 +111,11 @@ template <typename Model> struct CudaGenerationOps {
                     [&] {return output && output->stopped();},nullptr,false,finish_prefill);
             }
         }
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
+            if(!prepared || !prepared->transformed())
+                hidden=deepseek_v41_prefill_hidden(model,ids,prefill_compute_chunk,
+                    [&] {return output && output->stopped();});
+        }
         if(output && output->stopped()) {
             finish_prefill();
             return timer.elapsed_ms();
@@ -460,6 +465,9 @@ template <class Model> struct CudaGenerationContext {
                 (!prepared || !prepared->transformed()) &&
                 qwen4_layer_major_prefill_eligible(model,input.prompt.size()))
                 logical_chunk=input.prompt.size();
+        }
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
+            if(!prepared || !prepared->transformed())logical_chunk=input.prompt.size();
         }
         return mfq::engine::generate_sequence(
             CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr,
