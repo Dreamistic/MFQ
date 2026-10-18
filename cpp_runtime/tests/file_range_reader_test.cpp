@@ -104,10 +104,16 @@ int main() {
             }
             {
                 mfq::FileRangeReader batched(path,mode);
+                std::uint64_t first_allocations=0;
                 for(int round=0;round<4;++round) {
                     std::vector<std::byte> output(384*33,std::byte{0x5a});std::vector<mfq::ReadSpan> spans;
                     for(std::size_t i=0;i<384;++i)spans.push_back({i*167+std::size_t(round),output.data()+i*33+1,31});
                     batched.read_batch(spans);
+                    if(!round)first_allocations=batched.stats().staging_allocations;
+#ifdef _WIN32
+                    if(mode==mfq::FileReadMode::Direct)require(batched.stats().staging_allocations==first_allocations &&
+                        batched.stats().staging_cached_bytes<=(8u<<20),"repeated Direct batches did not reuse bounded aligned arenas");
+#endif
                     for(std::size_t i=0;i<384;++i) {
                         require(output[i*33]==std::byte{0x5a} && output[i*33+32]==std::byte{0x5a},"event reuse changed a destination guard");
                         require(std::equal(output.begin()+i*33+1,output.begin()+i*33+32,expected.begin()+i*167+round),

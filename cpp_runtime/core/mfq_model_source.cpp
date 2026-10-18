@@ -813,6 +813,7 @@ FileReadStats MfqModelSource::file_read_stats() const noexcept {
         result.logical_bytes += value.logical_bytes; result.physical_bytes += value.physical_bytes;
         result.errors += value.errors; result.staging_bytes += value.staging_bytes;
         result.staging_peak_bytes += value.staging_peak_bytes; result.read_nanoseconds += value.read_nanoseconds;
+        result.staging_cached_bytes+=value.staging_cached_bytes;result.staging_allocations+=value.staging_allocations;
     }
     {
         std::lock_guard lock(impl_->pipeline_reader_mutex);
@@ -821,6 +822,7 @@ FileReadStats MfqModelSource::file_read_stats() const noexcept {
             result.physical_bytes+=value.physical_bytes;result.errors+=value.errors;
             result.staging_bytes+=value.staging_bytes;result.staging_peak_bytes+=value.staging_peak_bytes;
             result.read_nanoseconds+=value.read_nanoseconds;
+            result.staging_cached_bytes+=value.staging_cached_bytes;result.staging_allocations+=value.staging_allocations;
         }
     }
     return result;

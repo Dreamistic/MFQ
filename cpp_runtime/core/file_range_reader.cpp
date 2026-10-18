@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -45,9 +46,68 @@ struct FileRangeReader::Impl {
     std::size_t alignment = 1;
     std::uint64_t size = 0;
     mutable std::atomic<std::uint64_t> calls{0}, logical{0}, physical{0}, errors{0}, staging{0}, peak{0}, nanos{0};
+    mutable std::atomic<std::uint64_t> cached_staging{0},staging_allocations{0};
 #if defined(_WIN32)
     HANDLE handle = INVALID_HANDLE_VALUE;
-    ~Impl() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+    struct Slab {void* data=nullptr;std::size_t bytes=0;std::uint64_t order=0;};
+    mutable std::mutex slabs_mutex;
+    mutable std::array<Slab,16> slabs{};
+    mutable std::uint64_t slab_order=0;
+    ~Impl() {
+        for(const auto& slab:slabs)if(slab.data)_aligned_free(slab.data);
+        if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+    }
+    Slab borrow_staging(std::size_t bytes) const {
+        Slab result;
+        {
+            std::lock_guard lock(slabs_mutex);
+            auto best=slabs.end();
+            for(auto it=slabs.begin();it!=slabs.end();++it)
+                if(it->data && it->bytes>=bytes && it->bytes-bytes<=std::max<std::size_t>(bytes,65536) &&
+                        (best==slabs.end() || it->bytes<best->bytes))best=it;
+            if(best!=slabs.end()) {
+                result=*best;*best={};
+                cached_staging.fetch_sub(result.bytes,std::memory_order_relaxed);
+            }
+        }
+        if(result.data) {
+            static std::atomic<bool> reported{false};
+            if(!reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
+                std::fprintf(stderr,"model_direct_staging_pool scope=first_reuse enabled=1 max_idle_bytes=8388608 bytes=%zu\n",result.bytes);
+        }
+        if(!result.data) {
+            // Sector-aligned size classes reuse ordinary expert images across
+            // nearby formats, without rounding small metadata up to 64 KiB.
+            const auto granule=std::max<std::size_t>(alignment,65536);
+            if(bytes>=granule && bytes<=(4u<<20))bytes=(bytes+granule-1)/granule*granule;
+            result={_aligned_malloc(bytes,std::max(alignment,sizeof(void*))),bytes};
+            if(!result.data)throw std::bad_alloc();
+            staging_allocations.fetch_add(1,std::memory_order_relaxed);
+        }
+        acquire(result.bytes);return result;
+    }
+    void return_staging(Slab slab) const noexcept {
+        bool retained=false;
+        if(slab.bytes<=(4u<<20)) {
+            std::lock_guard lock(slabs_mutex);
+            auto idle=cached_staging.load(std::memory_order_relaxed);
+            for(;;) {
+                auto free=slabs.end(),oldest=slabs.end();
+                for(auto it=slabs.begin();it!=slabs.end();++it) {
+                    if(!it->data)free=it;
+                    else if(oldest==slabs.end() || it->order<oldest->order)oldest=it;
+                }
+                if(free!=slabs.end() && slab.bytes<=(8u<<20)-idle) {
+                    slab.order=++slab_order;*free=slab;idle+=slab.bytes;retained=true;break;
+                }
+                if(oldest==slabs.end())break;
+                idle-=oldest->bytes;_aligned_free(oldest->data);*oldest={};
+            }
+            cached_staging.store(idle,std::memory_order_relaxed);
+        }
+        staging.fetch_sub(slab.bytes,std::memory_order_relaxed);
+        if(!retained)_aligned_free(slab.data);
+    }
 #else
     int handle = -1;
     ~Impl() { if (handle >= 0) ::close(handle); }
@@ -163,22 +223,24 @@ void FileRangeReader::read(std::uint64_t offset, std::byte* destination, std::si
                 Buffer(const Impl& value, std::size_t count, bool allocate) : owner(value) {
                     if (!allocate) return;
 #if defined(_WIN32)
-                    data = _aligned_malloc(count, owner.alignment);
+                    const auto slab=owner.borrow_staging(count);
+                    data=slab.data;bytes=slab.bytes;
 #else
                     if (::posix_memalign(&data, std::max(owner.alignment, sizeof(void*)), count)) data = nullptr;
-#endif
                     if (!data) throw std::bad_alloc();
                     bytes = count;
                     owner.acquire(bytes);
+                    owner.staging_allocations.fetch_add(1,std::memory_order_relaxed);
+#endif
                 }
                 ~Buffer() {
                     if (!data) return;
 #if defined(_WIN32)
-                    _aligned_free(data);
+                    owner.return_staging({data,bytes});
 #else
                     std::free(data);
-#endif
                     owner.staging.fetch_sub(bytes, std::memory_order_relaxed);
+#endif
                 }
             } buffer(*impl_, transfer_bytes, bounce);
             const auto actual = impl_->transfer(aligned_offset, bounce ? buffer.data : destination, transfer_bytes);
@@ -200,7 +262,7 @@ void FileRangeReader::read(std::uint64_t offset, std::byte* destination, std::si
 FileReadStats FileRangeReader::stats() const noexcept {
     const auto& p = *impl_;
     return {p.mode, 1, p.calls.load(), p.logical.load(), p.physical.load(), p.errors.load(),
-            p.staging.load(), p.peak.load(), p.nanos.load()};
+            p.staging.load(), p.peak.load(), p.nanos.load(),p.cached_staging.load(),p.staging_allocations.load()};
 }
 
 void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
@@ -294,15 +356,12 @@ void FileRangeReader::read_batch(const std::vector<ReadSpan>& spans) const {
         explicit BatchStorage(const Impl& value):owner(value) {}
         void release() {
             if(!data)return;
-            _aligned_free(data);data=nullptr;
-            owner.staging.fetch_sub(capacity,std::memory_order_relaxed);capacity=0;
+            owner.return_staging({data,capacity});data=nullptr;capacity=0;
         }
         void ensure(std::size_t bytes) {
             if(bytes<=capacity)return;
             // Every preceding wave was drained before the arena can grow.
-            release();data=_aligned_malloc(bytes,std::max(owner.alignment,sizeof(void*)));
-            if(!data)throw std::bad_alloc();
-            capacity=bytes;owner.acquire(capacity);
+            release();const auto slab=owner.borrow_staging(bytes);data=slab.data;capacity=slab.bytes;
         }
         ~BatchStorage(){release();}
     };

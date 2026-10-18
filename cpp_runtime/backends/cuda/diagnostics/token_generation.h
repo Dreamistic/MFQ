@@ -32,6 +32,7 @@ inline void report_source_file_io(const mfq::ModelSource* source, const char* ph
                   << " logical_bytes=" << stats.logical_bytes << " physical_bytes=" << stats.physical_bytes
                   << " errors=" << stats.errors << " staging_bytes=" << stats.staging_bytes
                   << " staging_peak_sum_bytes=" << stats.staging_peak_bytes
+                  << " staging_cached_bytes=" << stats.staging_cached_bytes << " staging_allocations=" << stats.staging_allocations
                   << " read_ms=" << double(stats.read_nanoseconds) / 1e6 << std::endl;
     } catch (const std::exception&) { } // Optional diagnostics cannot abort generation.
 }
