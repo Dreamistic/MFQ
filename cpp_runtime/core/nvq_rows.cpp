@@ -51,12 +51,13 @@ void unpack_group64(const std::vector<std::uint64_t>& records,std::size_t rows,i
                 for(int pair=0;pair<4;++pair) {
                     const auto a=records[row*groups+group+pair*2];
                     const auto b=records[row*groups+group+pair*2+1];
-                    const std::uint32_t index0=std::uint32_t(a&4095)|std::uint32_t((a>>20)&4095)<<12;
-                    const std::uint32_t index1=std::uint32_t((a>>40)&4095)|std::uint32_t(b&4095)<<12;
-                    const std::uint32_t index2=std::uint32_t((b>>20)&4095)|std::uint32_t((b>>40)&4095)<<12;
-                    std::memcpy(indices+pair*9,&index0,3);
-                    std::memcpy(indices+pair*9+3,&index1,3);
-                    std::memcpy(indices+pair*9+6,&index2,3);
+                    const auto index_a=(a&4095)|((a>>20)&4095)<<12|((a>>40)&4095)<<24;
+                    const auto index_b=(b&4095)|((b>>20)&4095)<<12|((b>>40)&4095)<<24;
+                    const auto word=index_a|(index_b<<36);
+                    // Six indices occupy nine bytes. A word and its tail
+                    // avoid six narrow stores without writing past the field.
+                    std::memcpy(indices+pair*9,&word,8);
+                    indices[pair*9+8]=std::uint8_t(index_b>>28);
                     signs[pair]=((a>>12)&127)|((a>>32)&127)<<7|((a>>52)&127)<<14|
                         ((b>>12)&127)<<21|((b>>32)&127)<<28|((b>>52)&127)<<35;
                 }
