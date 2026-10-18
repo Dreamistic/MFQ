@@ -360,6 +360,9 @@ public:
     void prewarm();
     void preload_complete_residency();
     void initialize_ssd_residency();
+    void initialize_ssd_readers();
+    struct SsdPlacementStats {std::size_t experts=0,bytes=0,batches=0,peak=0;};
+    void prepare_ssd_placement(MoeCachedSource& source,const std::vector<int32_t>& experts,SsdPlacementStats& stats);
     using SsdExpertRequest=std::pair<MoeQuantRangeSource*,int>;
     std::vector<MoeHostExpertCache::Lease> read_ssd_experts(const std::vector<SsdExpertRequest>& requests,bool background=false);
     struct SsdExpertCopy {MoeQuantRangeSource* source;int expert;std::vector<mfq_tensor_backend::Tensor> fields;};

@@ -508,13 +508,38 @@ void MoeExpertCache::finalize(std::size_t kv_growth_reserve, std::size_t kv_budg
     else if(config_.moe_pipeline) initialize_ssd_residency();
 }
 
+void MoeExpertCache::initialize_ssd_readers() {
+    if(!ssd_read_pool_)ssd_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
+    if(!ssd_background_read_pool_)ssd_background_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
+    if(!ssd_prefill_reader_)ssd_prefill_reader_=std::make_shared<MoeSsdPrefillReader>();
+}
+
+void MoeExpertCache::prepare_ssd_placement(MoeCachedSource& source,const std::vector<int32_t>& chosen,SsdPlacementStats& stats) {
+    const auto read_limit=std::min<std::size_t>(64u<<20,std::max<std::size_t>(1,host_experts_->stats().budget_bytes/2));
+    for(std::size_t first=0;first<chosen.size();) {
+        auto last=first;std::size_t bytes=0;
+        while(last<chosen.size() && last-first<64) {
+            const auto next=source.quant_source_->expert_field_bytes(chosen[last]);
+            if(last>first && (bytes>=read_limit || next>read_limit-bytes))break;
+            bytes+=next;++last;
+        }
+        const std::vector<int32_t> experts(chosen.begin()+first,chosen.begin()+last);
+        std::vector<SsdExpertRequest> requests;requests.reserve(experts.size());
+        for(const auto expert:experts)requests.emplace_back(source.quant_source_.get(),expert);
+        // Leases also coalesce acquisitions that exceed a tiny RAM budget.
+        // GPU books and uploads remain ordered on the loading thread.
+        const auto held=read_ssd_experts(requests);
+        if(!prepare(source,experts,true))throw std::runtime_error("SSD expert GPU placement exceeded its arena");
+        stats.experts+=experts.size();stats.bytes+=bytes;++stats.batches;
+        stats.peak=std::max(stats.peak,bytes);first=last;
+    }
+}
+
 void MoeExpertCache::initialize_ssd_residency() {
     if(!finalized_)throw std::logic_error("SSD expert cache requires finalized GPU arenas");
     if(const auto* option=std::getenv("MFQ_MOE_SSD_EXPERTS");option && option[0]=='0')
         throw std::runtime_error("RAM expert preloading is required when SSD expert streaming is disabled");
-    ssd_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
-    ssd_background_read_pool_=std::make_unique<mfq::HostParallelPool>(std::function<void(std::size_t)>{},false);
-    ssd_prefill_reader_=std::make_shared<MoeSsdPrefillReader>();
+    initialize_ssd_readers();
     // The checkpoint remains the immutable third tier. Only the current GPU
     // demand and the byte-bounded RAM LRU are materialized; never scan an entire
     // pool into a temporary RAM copy merely to fill the GPU cache.
@@ -536,31 +561,11 @@ void MoeExpertCache::initialize_ssd_residency() {
         if(available[arena]>0){--available[arena];selected[source->id_].push_back(e);}
     }
     const auto placement_started=std::chrono::steady_clock::now();
-    const auto read_limit=std::min<std::size_t>(64u<<20,std::max<std::size_t>(1,host_experts_->stats().budget_bytes/2));
-    std::size_t placement_experts=0,placement_bytes=0,placement_batches=0,placement_peak=0;
-    for(const auto& source:sources_) {
-        const auto& chosen=selected[source->id_];
-        for(std::size_t first=0;first<chosen.size();) {
-            auto last=first;std::size_t bytes=0;
-            while(last<chosen.size() && last-first<64) {
-                const auto next=source->quant_source_->expert_field_bytes(chosen[last]);
-                if(last>first && (bytes>=read_limit || next>read_limit-bytes))break;
-                bytes+=next;++last;
-            }
-            const std::vector<int32_t> experts(chosen.begin()+first,chosen.begin()+last);
-            std::vector<SsdExpertRequest> requests;requests.reserve(experts.size());
-            for(const auto expert:experts)requests.emplace_back(source->quant_source_.get(),expert);
-            // Leases also coalesce acquisitions that exceed a tiny RAM budget.
-            // GPU books and uploads remain ordered on the loading thread.
-            const auto held=read_ssd_experts(requests);
-            if(!prepare(*source,experts,true))throw std::runtime_error("SSD expert GPU placement exceeded its arena");
-            placement_experts+=experts.size();placement_bytes+=bytes;++placement_batches;
-            placement_peak=std::max(placement_peak,bytes);first=last;
-        }
-    }
+    SsdPlacementStats placement;
+    for(const auto& source:sources_)prepare_ssd_placement(*source,selected[source->id_],placement);
     if(transfer_ready_recorded_)MFQ_CUDA_CHECK(cudaEventSynchronize(transfer_ready_));
-    std::cerr<<"moe_ssd_initial_placement experts="<<placement_experts<<" runtime_bytes="<<placement_bytes
-        <<" batches="<<placement_batches<<" peak_read_bytes="<<placement_peak
+    std::cerr<<"moe_ssd_initial_placement experts="<<placement.experts<<" runtime_bytes="<<placement.bytes
+        <<" batches="<<placement.batches<<" peak_read_bytes="<<placement.peak
         <<" io_workers="<<config_.moe_ssd_io_workers<<" ms="
         <<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-placement_started).count()<<'\n';
     const auto trimmed=mfq::release_mapped_tensor_pages();
@@ -1542,11 +1547,16 @@ void MoeExpertCache::prewarm() {
         }
     }
     prewarming_ = true;
+    const bool streamed=config_.moe_pipeline && !config_.moe_preload_all &&
+        std::all_of(sources_.begin(),sources_.end(),[](const auto& source){return bool(source->quant_source_);});
+    SsdPlacementStats placement;
+    if(streamed)initialize_ssd_readers();
     try {
         for (const auto & source : sources_) {
             const auto found = source_experts.find(source.get());
             if (found == source_experts.end()) continue;
-            prepare(*source, found->second, true);
+            if(streamed)prepare_ssd_placement(*source,found->second,placement);
+            else prepare(*source, found->second, true);
         }
         if (transfer_ready_recorded_) {
             MFQ_CUDA_CHECK(
@@ -1570,6 +1580,9 @@ void MoeExpertCache::prewarm() {
     const double elapsed_ms =
         std::chrono::duration<double, std::milli>(
             stopped - started).count();
+    if(streamed)std::cerr<<"moe_ssd_profile_placement experts="<<placement.experts<<" runtime_bytes="<<placement.bytes
+        <<" batches="<<placement.batches<<" peak_read_bytes="<<placement.peak
+        <<" io_workers="<<config_.moe_ssd_io_workers<<" ms="<<elapsed_ms<<'\n';
     const int64_t prewarm_h2d_bytes = stats_.h2d_bytes;
     const int64_t prewarm_range_read_bytes = stats_.range_read_bytes;
     const int64_t prewarm_range_read_calls = stats_.range_read_calls;

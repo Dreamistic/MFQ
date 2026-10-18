@@ -229,6 +229,9 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
         config.moe_residency_adapt=true;config.moe_residency_warm=true;config.moe_residency_projection_heat=true;
         config.moe_host_cache_bytes=128*1024;
         auto cache=make_moe_expert_cache(64*1024,config);
+        mfq::MoeCacheProfile profile;profile.path="ssd-fixture";
+        profile.layers[0].ranking={0,1};profile.layers[0].frequencies={{0,.6},{1,.4}};
+        set_moe_expert_cache_profile(*cache,std::move(profile));
         std::vector<std::shared_ptr<MoeQuantRangeSource>> quant_sources;
         std::array<MoeFfnForward,2> forward;
         for(int layer=0;layer<2;++layer) {
