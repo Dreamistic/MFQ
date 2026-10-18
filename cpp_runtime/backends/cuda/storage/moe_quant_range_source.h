@@ -17,6 +17,7 @@ public:
     const std::shared_ptr<MixedMoeRuntime>& metadata() const { return metadata_; }
     const mfq::MfeQuantExpertStore& store() const { return *store_; }
     MixedMoePool read_expert(int expert) const;
+    MixedMoePool allocate_expert(int expert) const;
     void copy_expert_fields(int expert,const std::vector<mfq_tensor_backend::Tensor>& targets,bool touch_cache=true) const;
     bool copy_nvq_expert_fields(const std::vector<int>& experts,
         const std::array<mfq_tensor_backend::Tensor,4>& targets) const;

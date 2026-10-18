@@ -99,9 +99,21 @@ MoeQuantRangeSource::MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStor
 
 MixedMoePool MoeQuantRangeSource::read_expert(int expert) const {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-    const auto index=store_->expert_pool(expert);
     if(pinned_arena_) {
-        auto block=pinned_arena_->allocate(arena_bytes_.at(index));
+        auto pool=allocate_expert(expert);
+        copy_expert_fields(expert,expert_field_tensors(pool));
+        return pool;
+    }
+#endif
+    return read_expert_canonical(expert);
+}
+
+MixedMoePool MoeQuantRangeSource::allocate_expert(int expert) const {
+    const auto index=store_->expert_pool(expert);
+    std::vector<tb::Tensor> fields;
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    {
+        auto block=pinned_arena_?pinned_arena_->allocate(arena_bytes_.at(index)):nullptr;
         std::shared_ptr<void> owner;
         std::uint8_t* base=nullptr;
         if(block) {owner=block;base=block->data();}
@@ -113,7 +125,6 @@ MixedMoePool MoeQuantRangeSource::read_expert(int expert) const {
                 tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8)));
             owner=storage;base=static_cast<std::uint8_t*>(storage->data_ptr());
         }
-        std::vector<tb::Tensor> fields;
         for(const auto& layout:field_layouts_.at(index)) {
             auto storage=std::make_shared<tb::TensorStorage>();
             const auto device=tb::Device{tb::kCPU,0};
@@ -122,20 +133,21 @@ MixedMoePool MoeQuantRangeSource::read_expert(int expert) const {
             storage->device=device;storage->pinned=bool(block);
             fields.emplace_back(storage,tb::make_contiguous_view(address,layout.shape,layout.dtype,device));
         }
-        copy_expert_fields(expert,fields);
-        auto pool=metadata_->pools.at(index);pool.local_experts=1;pool.expert_local={};
-        if(pool.family==MixedMoeFamily::Nvq) {
-            auto& w=pool.nvq;w.workspaces.clear();
-            w.indices_packed=fields[0];w.aux_packed=fields[1];w.sub_scale_packed=fields[2];w.neuron_scale=fields[3];
-        } else {
-            auto& w=pool.nint;w.workspaces.clear();
-            w.q_packed=fields[0];w.row_q_bits=fields[1];w.row_q_bit_offsets=fields[2];
-            w.sub_scale=fields[3];w.sub_min=fields[4];w.neuron_scale=fields[5];w.neuron_min=fields[6];
-        }
-        return pool;
     }
+#else
+    for(const auto& layout:field_layouts_.at(index))
+        fields.push_back(tb::empty(layout.shape,tb::TensorOptions().device(tb::kCPU).dtype(layout.dtype)));
 #endif
-    return read_expert_canonical(expert);
+    auto pool=metadata_->pools.at(index);pool.local_experts=1;pool.expert_local={};
+    if(pool.family==MixedMoeFamily::Nvq) {
+        auto& w=pool.nvq;w.workspaces.clear();
+        w.indices_packed=fields[0];w.aux_packed=fields[1];w.sub_scale_packed=fields[2];w.neuron_scale=fields[3];
+    } else {
+        auto& w=pool.nint;w.workspaces.clear();
+        w.q_packed=fields[0];w.row_q_bits=fields[1];w.row_q_bit_offsets=fields[2];
+        w.sub_scale=fields[3];w.sub_min=fields[4];w.neuron_scale=fields[5];w.neuron_min=fields[6];
+    }
+    return pool;
 }
 
 MixedMoePool MoeQuantRangeSource::read_expert_canonical(int expert) const {

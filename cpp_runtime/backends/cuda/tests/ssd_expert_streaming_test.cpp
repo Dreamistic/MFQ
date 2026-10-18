@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <cmath>
 #include <filesystem>
+#include <exception>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -223,14 +224,16 @@ void check_output(const tb::Tensor& actual,const tb::Tensor& expected) {
     }
 }
 void check_ssd_predictor_overlap(const std::filesystem::path& root) {
-    for(bool shared_arena:{false,true}) {
+    for(int variant:{0,1,2,3}) {
+        const bool shared_arena=variant!=0,wide=variant>=2,fail_image=variant==3;
+        const int width=wide?384:96;
         CudaExecutionContext execution;auto& config=execution.config;
         config.moe_pipeline=true;config.moe_two_stage_ffn=true;config.moe_direct_ram=true;
         config.moe_ram_pcie=true;config.moe_ram_pcie_fraction=1.;
         config.moe_preload_all=false;config.moe_assert_resident=false;
         config.moe_residency_adapt=true;config.moe_residency_warm=true;config.moe_residency_projection_heat=true;
-        config.moe_host_cache_bytes=128*1024;
-        auto cache=make_moe_expert_cache(64*1024,config);
+        config.moe_host_cache_bytes=wide?4*1024*1024:128*1024;
+        auto cache=make_moe_expert_cache(wide?512*1024:64*1024,config);
         mfq::MoeCacheProfile profile;profile.path="ssd-fixture";
         profile.layers[0].ranking={0,1};profile.layers[0].frequencies={{0,.6},{1,.4}};
         set_moe_expert_cache_profile(*cache,std::move(profile));
@@ -239,7 +242,7 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
         for(int layer=0;layer<2;++layer) {
             std::vector<std::shared_ptr<MfeWeight>> gu,down;
             for(int p=0;p<3;++p) {
-                const auto family=layer && !shared_arena?"nint":"nvq3j";
+                const auto family=wide?"phase-wide":layer && !shared_arena?"nint":"nvq3j";
                 auto quant=source(root/(std::string(family)+"-"+std::to_string(p)+".mfq"));
                 quant_sources.push_back(quant);
                 auto weight=std::make_shared<MfeWeight>(cache_quant_moe_weight(cache,
@@ -250,7 +253,7 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
         }
         finalize_moe_expert_cache(cache);
         auto loan=std::make_shared<mfq::cuda::KvExpertLoan>();
-        auto loan_storage=tb::empty({2<<20},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+        auto loan_storage=tb::empty({wide?8<<20:2<<20},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
         loan->add(loan_storage,loan_storage.numel(),1,true,1,true,true);
         set_moe_kv_expert_loan(cache,loan);
         bool pageable_target=false;
@@ -264,52 +267,65 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
             // The tiny fixture is below the cache's 64 KiB admission floor.
             // Add a private tail while retaining the real fields' geometry.
             std::size_t packed=0;for(const auto size:sizes)packed=((packed+15)&~std::size_t(15))+size;
-            sizes.push_back((64<<10)-((packed+15)&~std::size_t(15)));
+            if(packed<(64<<10))sizes.push_back((64<<10)-((packed+15)&~std::size_t(15)));
             bool hit=false;
             const auto* cached=loan->pin_projection(quant->host_key(33).source,33,sizes,mfq_current_cuda_stream(),hit,
                 [&](void* target,const std::array<std::size_t,8>& offsets) {
                     for(std::size_t f=0;f<fields.size();++f)if(sizes[f])
                         MFQ_CUDA_CHECK(cudaMemcpyAsync(static_cast<uint8_t*>(target)+offsets[f],fields[f].data_ptr(),
                             std::size_t(sizes[f]),cudaMemcpyHostToDevice,mfq_current_cuda_stream()));
-                    MFQ_CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(target)+offsets[fields.size()],0,
-                        std::size_t(sizes.back()),mfq_current_cuda_stream()));
+                    if(sizes.size()>fields.size())MFQ_CUDA_CHECK(cudaMemsetAsync(
+                        static_cast<uint8_t*>(target)+offsets[fields.size()],0,std::size_t(sizes.back()),mfq_current_cuda_stream()));
                 });
             check(cached!=nullptr,"SSD GPU refill fixture did not enter the cache");
             MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
+            if(wide)quant->host_cache()->erase(quant->host_key(33));
         }
         if(const auto* cap=std::getenv("MFQ_MOE_RAM_PIN_GIB");cap && std::atof(cap)*(1LL<<30)==16384)
             check(pageable_target,"SSD partial pin fixture did not include pageable experts");
-        auto x=tb::full({1,96},.017,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
+        auto x=tb::full({1,width},.017,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
         auto ids=tb::tensor(std::vector<int32_t>{31,32}).reshape({1,2}).to(tb::kCUDA);
         auto weights=tb::full({1,2},.5,x.options().dtype(tb::kFloat32));
         const auto target=forward[0](execution,x,ids,weights).cpu().clone();
         const auto predictor=forward[1](execution,x,ids,weights).cpu().clone();
         std::mutex mutex;std::condition_variable changed;bool held=false,release=false;
         MoeResidencyManager manager(cache.get(),[&](const char* event,std::size_t) {
+            if(fail_image && std::string(event)=="gpu_image")throw std::runtime_error("injected GPU image failure");
             if(std::string(event)!="ssd_predictor_overlap_ready")return;
             std::unique_lock lock(mutex);held=true;changed.notify_all();
             if(!changed.wait_for(lock,std::chrono::seconds(5),[&]{return release;}))
                 throw std::runtime_error("SSD predictor waited for a held background read");
         });
         for(int i=0;i<8;++i)manager.after_layer(0,std::vector<int32_t>(10,33),1);
-        manager.prepare_predictor();
+        bool failed=false;
+        try {manager.prepare_predictor();}
+        catch(const std::runtime_error& error) {
+            if(std::string(error.what())!="injected GPU image failure")throw;
+            failed=true;
+        }
         if(!shared_arena) {
             {std::unique_lock lock(mutex);
                 check(changed.wait_for(lock,std::chrono::seconds(5),[&]{return held;}),"SSD predictor did not overlap a background read");}
             check_output(forward[1](execution,x,ids,weights),predictor);
         }
         {std::lock_guard lock(mutex);release=true;}changed.notify_all();
-        manager.apply_pending();
-        check(manager.stats().kv_refill_bytes>0,"SSD expert promotion reread an existing GPU cache copy");
+        try {manager.apply_pending();}
+        catch(const std::runtime_error& error) {
+            if(std::string(error.what())!="injected GPU image failure")throw;
+            failed=true;
+        }
+        check(failed==fail_image,"GPU image failure did not propagate");
+        if(!fail_image)check(manager.stats().kv_refill_bytes>0,"SSD expert promotion reread an existing GPU cache copy");
+        if(wide && !fail_image)check(manager.stats().ssd_gpu_image_bytes>0,"SSD exchange reloaded a complete GPU image from disk");
         if(const auto* option=std::getenv("MFQ_MOE_RESIDENCY_NATIVE_DMA");option && option[0]=='1' &&
-                mfq::cuda::NativeDmaBatch::available())
+                mfq::cuda::NativeDmaBatch::available() && !fail_image)
             check(manager.stats().native_dma_batches>0,"SSD expert exchange bypassed native DMA batching");
         check(bool(manager.stats().predictor_overlap_serves)==!shared_arena,
             "SSD predictor overlap ignored shared arena ownership");
         check_output(forward[0](execution,x,ids,weights),target);
         check_output(forward[1](execution,x,ids,weights),predictor);
         std::array<tb::Tensor,2> prefill_expected;
-        auto prompt=tb::full({143,96},.017,x.options());
+        auto prompt=tb::full({143,width},.017,x.options());
         std::vector<int32_t> prompt_routes(286);
         for(std::size_t i=0;i<prompt_routes.size();++i)prompt_routes[i]=31+int(i%2);
         auto prompt_ids=tb::tensor(prompt_routes).reshape({143,2}).to(tb::kCUDA);
@@ -328,6 +344,13 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
 }
 }
 int main(int argc,char** argv)try {
+    std::set_terminate([] {
+        if(auto error=std::current_exception())try {std::rethrow_exception(error);}
+        catch(const std::exception& value){std::fprintf(stderr,"SSD test terminated: %s\n",value.what());}
+        catch(...){std::fprintf(stderr,"SSD test terminated: unknown exception\n");}
+        else std::fprintf(stderr,"SSD test terminated without an exception\n");
+        std::fflush(stderr);std::abort();
+    });
     check_packed_metadata();
     check_pinned_arena();
     check_reused_expert_pages();

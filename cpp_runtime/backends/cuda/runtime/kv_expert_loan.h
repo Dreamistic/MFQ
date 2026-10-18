@@ -235,6 +235,16 @@ public:
     }
     // Residency exchange holds the completed window and joins before the next
     // packet/KV growth. It may reuse these bytes until that exchange finishes.
+    bool contains_projection(int64_t source,int64_t expert,const std::vector<int64_t>& sizes) const {
+        std::lock_guard lock(mutex_);
+        const auto found=entries_.find({source,expert,-1});
+        if(found==entries_.end() || !found->second->projection)return false;
+        const auto& layout=*found->second->projection;
+        if(sizes.size()!=std::size_t(layout.fields))return false;
+        for(std::size_t f=0;f<sizes.size();++f)
+            if(sizes[f]<0 || std::size_t(sizes[f])!=layout.bytes[f])return false;
+        return true;
+    }
     const void* find_for_exchange(const Key& key,std::size_t bytes,ExchangeReadGuard* guard=nullptr) const {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto retain=[&](Entry& entry) {
