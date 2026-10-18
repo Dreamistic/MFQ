@@ -157,6 +157,10 @@ template <class Model> struct CudaMtpOps {
     return false;
   }
   void trace_prompt_prefill(double target_ms,double predictor_ms,double workspace_ms) const {
+    // Block predictors seed only their bounded target window and skip the
+    // teacher-forced priming hook that restores workspace for chain predictors.
+    if(!mtp.teacher_forced_prompt_prime() && model.restore_decode_workspace)
+      model.restore_decode_workspace();
     std::cerr<<"runtime_mtp_prefill target_ms="<<target_ms<<" predictor_ms="<<predictor_ms
         <<" predictor_workspace_ms="<<workspace_ms<<" streamed="<<stream_prompt_history(input_ids.size(1))<<std::endl;
   }

@@ -169,11 +169,9 @@ template <typename Model> struct CudaGenerationOps {
     }
     std::int64_t first_token() {
         const auto token=pending.template item<int64_t>();
-        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
-            // prefill()'s sequence-sized temporaries have now retired. Cache
-            // restoration remains before token publication, inside TTFT.
-            if(model.restore_decode_workspace)model.restore_decode_workspace();
-        }
+        // Prefill temporaries have retired; expert-cache maintenance remains
+        // before token publication, inside TTFT for every CUDA model family.
+        if(model.restore_decode_workspace)model.restore_decode_workspace();
         return token;
     }
 
@@ -389,7 +387,7 @@ template <class Model> struct CudaGenerationContext {
     }
     void reserve_workspace(std::size_t bytes) {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+        {
             reserve_moe_workspace(model.execution->moe_expert_cache,bytes);
             auto context=mfq::cuda::default_context(mfq_current_cuda_device());
             auto available=context->available_memory();

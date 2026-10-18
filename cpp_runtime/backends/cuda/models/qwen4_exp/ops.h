@@ -107,7 +107,6 @@ struct Qwen4Model : CausalResources {
     int64_t decode_reserve_until=0;
     bool speculative_prefix_retention=false;
     std::function<void(std::size_t)> reserve_kv_workspace;
-    std::function<void()> restore_decode_workspace;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model& model,mfq_tensor_backend::Tensor ids,int kind) {
         if (ids.dim()==2 && ids.size(0)==1 &&

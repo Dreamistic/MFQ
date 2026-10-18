@@ -253,9 +253,9 @@ struct CudaEngineState {
             else throw std::invalid_argument("continuous batching is unavailable for this model");
         }
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
+        if(execution->moe_expert_cache) {
             graph_expert_loan=execution->kv_memory?execution->kv_memory->expert_loan():nullptr;
-            if(!graph_expert_loan && components.mtp) {
+            if(!graph_expert_loan && (components.mtp || moe_expert_cache_ssd_experts(execution->moe_expert_cache))) {
                 graph_expert_loan=std::make_shared<KvExpertLoan>();
                 set_moe_kv_expert_loan(execution->moe_expert_cache,graph_expert_loan);
             }
@@ -265,6 +265,8 @@ struct CudaEngineState {
                 [this](std::size_t bytes) {
                     cache.reserve_ram(bytes);reclaim_moe_optional_host(execution->moe_expert_cache,bytes);
                 });
+        }
+        if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
             language.reserve_kv_workspace = [this](std::size_t bytes) {
                 const auto device = execution->layer_placement.primary_device();
                 auto context = mfq::cuda::default_context(device);
