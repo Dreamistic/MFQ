@@ -67,6 +67,7 @@ void resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache, std::
 // Reclaim lower-priority cache storage before reducing prefill transfer overlap.
 void set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCache>& cache,
     std::function<void(std::size_t)> reserve,std::function<void(std::size_t)> reserve_ram={});
+void reserve_moe_workspace(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
 std::size_t reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cache,
     std::size_t allocation_bytes=0);
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);

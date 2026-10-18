@@ -1927,6 +1927,7 @@ mfq_tensor_backend::Tensor Qwen4BatchRequestState::prefill(
         Qwen4CausalLm& model, mfq_tensor_backend::Tensor ids) {
     MFQ_RUNTIME_CHECK(ids.size(0) == 1 && ids.size(1) > 0 &&
         ids.size(1) <= model.max_position_embeddings() - position(), "invalid Flash-Next request prefill");
+    if(ids.size(1)>1024)reserve_moe_workspace(model.execution->moe_expert_cache,runtime_options::workspace_reserve_bytes());
     if (model.reserve_kv_workspace)
         model.reserve_kv_workspace(state_->growth_bytes(ids.size(1)) + (std::size_t(256) << 20));
     state_->swap(model);
@@ -2216,6 +2217,7 @@ std::vector<mfq_tensor_backend::Tensor> qwen4_batch_prefill(Qwen4CausalLm& model
     auto ids=tb::cat(chunks,1);
     auto host_ids=ids.to(tb::kCPU);
     const auto tokens=offsets.back();
+    if(tokens>1024)reserve_moe_workspace(model.execution->moe_expert_cache,runtime_options::workspace_reserve_bytes());
     auto hidden=model.adapter_prepare_hidden(model.embed_tokens(ids),1,tokens);
     for (std::size_t i=0;i<model.blocks.size();++i) {
         NintPrefillDecodeCacheScope decode_reuse(true);

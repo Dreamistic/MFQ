@@ -373,6 +373,7 @@ template <class Model> struct CudaGenerationContext {
     void reserve_workspace(std::size_t bytes) {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            reserve_moe_workspace(model.execution->moe_expert_cache,bytes);
             auto context=mfq::cuda::default_context(mfq_current_cuda_device());
             auto available=context->available_memory();
             if(available>=bytes)return;

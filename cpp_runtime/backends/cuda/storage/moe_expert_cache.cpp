@@ -766,11 +766,11 @@ std::size_t MoeExpertCache::begin_prefill_loan(std::size_t workspace_bytes) {
     if(prefill_loan_)throw std::logic_error("prefill workspace loan is already active");
     const auto* option=std::getenv("MFQ_PREFILL_BORROW");
     const bool force=option && std::string_view(option)=="force";
-    if((option && option[0]=='0') || !complete_residency_ || !layer_prefill_ready())return 0;
     const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     // Reclaim revocable expert overflow before backing up and borrowing the
     // primary expert arrays. Both consumers use the same physical headroom.
     if(reserve_workspace_ && context->available_memory()<workspace_bytes)reserve_workspace_(workspace_bytes);
+    if((option && option[0]=='0') || !complete_residency_ || !layer_prefill_ready())return 0;
     if(!force && context->available_memory()>=workspace_bytes)return 0;
     const auto loan_started=std::chrono::steady_clock::now();
     finish_pipeline_exchanges();
@@ -2300,6 +2300,9 @@ void resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache,std::s
 void set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCache>& cache,
         std::function<void(std::size_t)> reserve,std::function<void(std::size_t)> reserve_ram) {
     if(cache)cache->set_workspace_reservation(std::move(reserve),std::move(reserve_ram));
+}
+void reserve_moe_workspace(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes) {
+    if(cache)cache->reserve_workspace(bytes);
 }
 std::size_t reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cache,std::size_t allocation_bytes) {
     return cache?cache->reclaim_optional_host(allocation_bytes):0;

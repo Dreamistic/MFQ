@@ -41,6 +41,7 @@ public:
     std::size_t prefill_transfer_bytes(bool predictor=false) const;
     std::optional<std::size_t> available_host_ram() const;
     std::size_t reclaim_optional_host(std::size_t allocation_bytes);
+    void reserve_workspace(std::size_t bytes) {if(reserve_workspace_)reserve_workspace_(bytes);}
     void set_workspace_reservation(std::function<void(std::size_t)> reserve,
                                    std::function<void(std::size_t)> reserve_ram={}) {
         reserve_workspace_=std::move(reserve);reserve_ram_workspace_=std::move(reserve_ram);

@@ -457,6 +457,16 @@ int main(int argc,char** argv)try {
             }
         }
         if(std::string(format)=="phase-wide") {
+            bool reserved=false;
+            const auto requested=mfq::cuda::default_context()->available_memory()+(std::size_t(1)<<30);
+            set_moe_workspace_reservation(candidate.cache,[&](std::size_t bytes){
+                check(bytes==requested,"SSD prefill changed its workspace reservation");reserved=true;
+            });
+            {
+                MoePrefillWorkspaceLoan loan(candidate.cache);
+                check(!loan.begin(requested) && reserved,"SSD prefill skipped cache reclamation when primary expert borrowing was unavailable");
+            }
+            set_moe_workspace_reservation(candidate.cache,{});
             const auto suspended=candidate.cache->suspend_residency(true);
             auto input=tb::full({1,width},.015,tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16));
             auto ids=tb::full({1,2},51,input.options().dtype(tb::kInt32));
