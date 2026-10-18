@@ -15,7 +15,7 @@ bool gr_prefill_pipeline_supported(const mfq_tensor_backend::Tensor& input) {
     return found->second.first>=8 && found->second.second>=bytes;
 }
 template<class Input,int BM,int BN,int BK,bool Packed=false> union GrPrefillPipelineShared {
-    struct {Input a[2][BM][BK+(std::is_same_v<Input,float>?4:8)];float w[2][BN][BK+(Packed?4:1)];} tile;
+    struct {Input a[2][BM][BK+(std::is_same<Input,float>::value?4:8)];float w[2][BN][BK+(Packed?4:1)];} tile;
     float products[BM][BN];
 };
 template<class Input,class Value,bool AlignedQ8,bool Zero,bool Mix,int RN,int RM,int BK=32,int BM=256,int TileN=32,bool Packed=false>
@@ -23,8 +23,8 @@ __global__ __launch_bounds__(BM*TileN/(RN*RM),1) void gr_prefill_pipeline_kernel
         const Input* input,const uint8_t* packed,const uint8_t* row_bits,
         const int64_t* row_offsets,const uint8_t* scales,const uint8_t* minima,
         const float* row_scales,const float* row_minima,const __half* zero_scales,
-        const Value* normalized,std::conditional_t<!Mix || std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>* output,int rows,int width,int outputs,int groups,int gs) {
-    using Output=std::conditional_t<!Mix || std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
+        const Value* normalized,std::conditional_t<!Mix || std::is_same<Input,float>::value || std::is_same_v<Value,float>,float,__half>* output,int rows,int width,int outputs,int groups,int gs) {
+    using Output=std::conditional_t<!Mix || std::is_same<Input,float>::value || std::is_same_v<Value,float>,float,__half>;
     constexpr int BN=TileN,Threads=BM*BN/(RN*RM),Columns=BN/RN,HiddenN=BN/4;
     extern __shared__ __align__(16) unsigned char bytes[];
     auto& shared=*reinterpret_cast<GrPrefillPipelineShared<Input,BM,BN,BK,Packed>*>(bytes);
@@ -138,7 +138,7 @@ template<bool Mix,class Input,class Value,bool Aligned,bool Zero>
 void launch_gr_prefill_pipeline(const NintWeight& weight,const mfq_tensor_backend::Tensor& input,
         const mfq_tensor_backend::Tensor& normalized,mfq_tensor_backend::Tensor& output) {
     namespace tb=mfq_tensor_backend;
-    using Output=std::conditional_t<!Mix || std::is_same_v<Input,float> || std::is_same_v<Value,float>,float,__half>;
+    using Output=std::conditional_t<!Mix || std::is_same<Input,float>::value || std::is_same_v<Value,float>,float,__half>;
     const auto rows=input.numel()/weight.neuron_len;
     const auto launch=[&](auto rn_tag,auto rm_tag,auto bm_tag,auto bn_tag,auto bk_tag,auto packed_tag) {
         constexpr int rn=decltype(rn_tag)::value,rm=decltype(rm_tag)::value;
@@ -162,7 +162,7 @@ void launch_gr_prefill_pipeline(const NintWeight& weight,const mfq_tensor_backen
             output.data_ptr<Output>(),int(rows),int(weight.neuron_len),int(weight.out),int(weight.ng),int(weight.gs));
     };
     const auto* option=std::getenv(Mix?"MFQ_GR_PREFILL_FUSED_MIX":"MFQ_GR_PREFILL_MATMUL");
-    int mode=option?std::atoi(option):(Mix?(std::is_same_v<Input,__half>?12:10):31);
+    int mode=option?std::atoi(option):(Mix?(std::is_same<Input,__half>::value?12:10):31);
     if constexpr(!Mix)if(mode==32)mode=31;
     if constexpr(!Mix) {
         if((mode==29 || mode==31) && weight.out<=4) {

@@ -139,6 +139,10 @@ set_source_files_properties(${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul.cu PROPERTIES
     OBJECT_DEPENDS "${MFQ_CUDA_KERNEL_ROOT}/packed_nvq.cuh;${MFQ_CUDA_KERNEL_ROOT}/glu.cuh")
 set_source_files_properties(${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu PROPERTIES
     COMPILE_OPTIONS "--maxrregcount=80")
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+    set_property(SOURCE ${MFQ_CUDA_ROOT}/kernels/gated_residual_fused.cu APPEND
+        PROPERTY COMPILE_OPTIONS "--split-compile=0")
+endif()
 target_compile_definitions(mfq-cuda-native-kernels PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1
 )
