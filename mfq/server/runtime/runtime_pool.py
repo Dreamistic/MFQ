@@ -143,6 +143,9 @@ class _Runtime(BaseModel):
     last_used_at: datetime | None = None
     active_requests: int = 0
     queued_requests: int = 0
+    serving_snapshot: dict[str, Any] = Field(default_factory=dict)
+    serving_sampled_at: float = 0.0
+    serving_refreshing: bool = False
     control_leases: int = 0
     read_control_leases: int = 0
     request_slots: asyncio.Semaphore | None = None
@@ -853,6 +856,7 @@ class RuntimePool:
             await context.progress(0.02, message="Starting runtime process")
             process = await asyncio.create_subprocess_exec(
                 *command,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 stdin=(
                     asyncio.subprocess.PIPE
                     if self.transport == "stdio"
@@ -2137,6 +2141,32 @@ class RuntimePool:
             if backend is None:
                 raise BackendError("model_not_loaded", "no runtime is available")
             return await backend.capabilities()
+
+    async def serving_activity(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        async def refresh(item: _Runtime) -> None:
+            if not item.active_requests or item.serving_refreshing or now - item.serving_sampled_at < 0.45:
+                return
+            item.serving_refreshing = True
+            try:
+                status = await asyncio.wait_for(item.backend.runtime_status(), timeout=0.25)
+                live = status.get("live_requests")
+                if isinstance(live, dict):
+                    item.serving_snapshot = {key: value for key, value in live.items() if isinstance(value, dict)}
+                    item.serving_sampled_at = time.monotonic()
+            except Exception:
+                pass
+            finally:
+                item.serving_refreshing = False
+        await asyncio.gather(*(refresh(item) for item in tuple(self._instances.values())))
+        now = time.monotonic()
+        return [{"instance_id": str(item.id), "model": item.artifact.resource.name,
+            "state": item.state.value, "active_requests": item.active_requests,
+            "queued_requests": item.queued_requests,
+            "sample_age_seconds": now - item.serving_sampled_at if item.serving_sampled_at else None,
+            "requests": [{"id": key, **value} for key, value in item.serving_snapshot.items()]
+                if item.active_requests else []}
+            for item in self._instances.values() if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}]
 
     async def runtime_status(
         self,
@@ -4111,6 +4141,10 @@ class RuntimePool:
             if kv_bytes is not None:
                 instance.kv_bytes = kv_bytes
             if status is not None:
+                live = status.get("live_requests")
+                if isinstance(live, dict):
+                    instance.serving_snapshot = {key: value for key, value in live.items() if isinstance(value, dict)}
+                    instance.serving_sampled_at = time.monotonic()
                 instance.memory = self._memory_resources(status, instance.memory, device_ids=getattr(instance, "device_ids", ()))
                 instance.prefix_dynamic_budget = status.get("prefix_cache_dynamic_budget") == 1
                 instance.prefix_concurrent_maintenance = status.get("prefix_cache_concurrent_maintenance") == 1

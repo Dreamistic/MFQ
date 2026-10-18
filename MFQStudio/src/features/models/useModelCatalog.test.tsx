@@ -513,4 +513,30 @@ describe('useModelCatalog', () => {
     renderHook(useModelCatalog, { wrapper: Wrapper });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
+
+  it('reports an interrupted load without requiring an error in the first terminal SSE event', () => {
+    const job = { id: 'interrupted-load', kind: 'model.load', status: 'running', progress: .2,
+      cancel_requested: false, payload: { model: 'Local Model' },
+      created_at: '2026-09-23T10:00:00Z', updated_at: '2026-09-23T10:00:01Z' } as JobResource;
+    renderHook(useModelCatalog, { wrapper: Wrapper });
+    act(() => useJobStore.getState().setJobs([job]));
+    act(() => useJobStore.getState().updateJob(job.id, { status: 'interrupted' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('Model loading was interrupted. Please load the model again.');
+    act(() => useJobStore.getState().setJobs([{ ...job, status: 'interrupted' }]));
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+  });
+
+  it('waits for the failure detail instead of losing the error after a terminal state-only event', () => {
+    const job = { id: 'failed-load', kind: 'model.load', status: 'running', progress: .2,
+      cancel_requested: false, payload: { model: 'Local Model' },
+      created_at: '2026-09-23T10:00:00Z', updated_at: '2026-09-23T10:00:01Z' } as JobResource;
+    renderHook(useModelCatalog, { wrapper: Wrapper });
+    act(() => useJobStore.getState().setJobs([job]));
+    act(() => useJobStore.getState().updateJob(job.id, { status: 'failed' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    act(() => useJobStore.getState().updateJob(job.id, {
+      error: { code: 'LOAD_FAILED', message: 'load failed', retryable: false, details: {} },
+    }));
+    expect(screen.getByRole('alert')).toHaveTextContent('LOAD_FAILED: load failed');
+  });
 });

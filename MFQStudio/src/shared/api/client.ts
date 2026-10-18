@@ -19,8 +19,23 @@ export class ApiError extends Error {
 
 let apiBaseUrl = '';
 let apiToken = '';
+const authenticationListeners = new Set<() => void>();
 const BROWSER_SERVICE_KEY = 'mfq.studio.service-url';
 let browserUrlOverride: string | undefined;
+
+export function onAuthenticationRequired(listener: () => void): () => void {
+  authenticationListeners.add(listener);
+  return () => { authenticationListeners.delete(listener); };
+}
+
+export async function verifyApiToken(token: string, signal?: AbortSignal): Promise<void> {
+  const response = await fetch(apiUrl('/api/v1/runtime/instances'), {
+    headers: new Headers({ Authorization: `Bearer ${token.trim()}` }),
+    cache: 'no-store',
+    signal,
+  });
+  if (!response.ok) throw await errorFromResponse(response);
+}
 
 export function browserServiceUrl(): string {
   if (browserUrlOverride !== undefined) return browserUrlOverride;
@@ -92,13 +107,21 @@ export async function errorFromResponse(response: Response): Promise<ApiError> {
 
 /** 发起可取消的 JSON 请求，保留调用方 Headers 语义并统一处理失败状态。 */
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const endpoint = apiBaseUrl;
+  const token = apiToken;
   const headers = authorizedHeaders(init?.headers);
   if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
   const response = await fetch(apiUrl(path), {
     ...init,
     headers,
   });
-  if (!response.ok) throw await errorFromResponse(response);
+  if (!response.ok) {
+    const error = await errorFromResponse(response);
+    if (error.status === 401 && endpoint === apiBaseUrl && token === apiToken && !init?.signal?.aborted) {
+      authenticationListeners.forEach((listener) => listener());
+    }
+    throw error;
+  }
   return (await response.json()) as T;
 }
 

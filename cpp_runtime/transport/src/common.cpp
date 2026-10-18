@@ -1214,6 +1214,7 @@ void RuntimeRequestMetrics::complete(
         const RequestMetricValues & values) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_requests_ > 0) --active_requests_;
+    live_requests_.erase(id);
     total_prompt_tokens_ += prompt_tokens;
     total_completion_tokens_ +=
         static_cast<uint64_t>(std::max<int32_t>(result.completion_tokens, 0));
@@ -1239,8 +1240,14 @@ void RuntimeRequestMetrics::complete(
     };
 }
 
-void RuntimeRequestMetrics::fail() {
+void RuntimeRequestMetrics::progress(const std::string & id, const json & value) {
     std::lock_guard<std::mutex> lock(mutex_);
+    live_requests_[id] = value;
+}
+
+void RuntimeRequestMetrics::fail(const std::string & id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    live_requests_.erase(id);
     if (active_requests_ > 0) --active_requests_;
     ++failed_requests_;
 }
@@ -1274,6 +1281,7 @@ json RuntimeRequestMetrics::snapshot(
         {"total_prompt_tokens", total_prompt_tokens_},
         {"total_completion_tokens", total_completion_tokens_},
         {"last_request", last_request_},
+        {"live_requests", live_requests_},
     };
 }
 
@@ -1283,7 +1291,12 @@ ActiveRequest::ActiveRequest(RuntimeRequestMetrics & metrics)
 }
 
 ActiveRequest::~ActiveRequest() {
-    if (!completed_) metrics_.fail();
+    if (!completed_) metrics_.fail(id_);
+}
+
+void ActiveRequest::progress(const std::string & id, const json & value) {
+    id_ = id;
+    metrics_.progress(id, value);
 }
 
 void ActiveRequest::complete(
@@ -2287,6 +2300,10 @@ std::optional<std::vector<common_chat_msg_diff>> CompletionStream::next() {
         std::visit([&](auto& data) {
             using T = std::decay_t<decltype(data)>;
             if constexpr (std::is_same_v<T, mfq::engine::OutputDelta>) {
+                if (!data.token_ids.empty()) {
+                    if (!generated_tokens_) first_token_ = std::chrono::steady_clock::now();
+                    generated_tokens_ += data.token_ids.size();
+                }
                 for (const auto& diff : data.diffs) {
                     result.text += diff.content_delta;
                     result.reasoning_text += diff.reasoning_content_delta;
@@ -2300,6 +2317,13 @@ std::optional<std::vector<common_chat_msg_diff>> CompletionStream::next() {
                 }
                 diffs.insert(diffs.end(), std::make_move_iterator(data.diffs.begin()),
                              std::make_move_iterator(data.diffs.end()));
+            } else if constexpr (std::is_same_v<T, mfq::engine::PrefillProgress>) {
+                const auto & timing = data.timing;
+                const double interval = timing.llm_ms - prefill_ms_;
+                if (interval > 0 && timing.prompt_tokens >= processed_tokens_)
+                    prefill_tps_ = 1000.0 * (timing.prompt_tokens - processed_tokens_) / interval;
+                processed_tokens_ = timing.prompt_tokens;
+                prefill_ms_ = timing.llm_ms;
             } else if constexpr (std::is_same_v<T, mfq::engine::Completed> ||
                                  std::is_same_v<T, mfq::engine::Cancelled>) {
                 result.completion_tokens = static_cast<std::int32_t>(data.usage.completion_tokens);
@@ -2318,6 +2342,17 @@ std::optional<std::vector<common_chat_msg_diff>> CompletionStream::next() {
         }, event.data);
     }
     return diffs;
+}
+
+json CompletionStream::progress() const {
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - started_).count();
+    const double decode = generated_tokens_ ? std::chrono::duration<double>(now - first_token_).count() : 0;
+    return {{"phase", generated_tokens_ ? "generating" : "prefilling"},
+        {"processed_tokens", processed_tokens_}, {"generated_tokens", generated_tokens_},
+        {"prefill_tps", prefill_tps_}, {"elapsed_seconds", elapsed},
+        {"decode_tps", decode > 0 ? (generated_tokens_ - 1) / decode : 0},
+        {"updated_at", unix_time_seconds()}};
 }
 
 } // namespace mfq::transport_detail

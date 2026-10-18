@@ -1,11 +1,13 @@
 {
   "bundle": {
     "targets": ["nsis"],
+    "useLocalToolsDir": true,
     "externalBin": [
       "../../packaging/sidecars/mfq-runtime",
       "../../packaging/sidecars/mfq-diagnostics"
     ],
     "resources": {
+      "../dist": "web-ui",
       "../../packaging/windows-runtime/": "",
       "../../packaging/Resources/mfq-cli": "mfq-cli",
       "../../packaging/Resources/licenses": "licenses"

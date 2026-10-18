@@ -868,7 +868,13 @@ public:
                                 request_id("run-");
                             const int64_t created = unix_time_seconds();
                             ActiveRequest active_request(request_metrics_store);
+                            auto next_progress = std::chrono::steady_clock::time_point{};
                             while (auto diffs = completion->next()) {
+                                const auto now = std::chrono::steady_clock::now();
+                                if (now >= next_progress) {
+                                    active_request.progress(response_id, completion->progress());
+                                    next_progress = now + std::chrono::milliseconds(250);
+                                }
                                 if (!work.stream) continue;
                                 for (const auto& diff : *diffs) {
                                     json delta = chat_diff_json(diff);

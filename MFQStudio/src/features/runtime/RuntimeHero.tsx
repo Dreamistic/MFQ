@@ -69,7 +69,7 @@ export function RuntimeHero() {
         state: 'failed' as const,
       };
     }
-    if (latestLifecycleJob?.kind === 'model.load' && latestLifecycleJob.status === 'failed') {
+    if (latestLifecycleJob?.kind === 'model.load' && ['failed', 'interrupted'].includes(latestLifecycleJob.status)) {
       const failedJobModel =
         typeof latestLifecycleJob.payload.model === 'string'
           ? latestLifecycleJob.payload.model
@@ -77,6 +77,7 @@ export function RuntimeHero() {
       return {
         name: failedJobModel || runtimeModelName,
         state: 'failed' as const,
+        interrupted: latestLifecycleJob.status === 'interrupted',
       };
     }
     return { name: runtimeModelName, state: 'idle' as const };
@@ -87,7 +88,8 @@ export function RuntimeHero() {
       : modelHero.state === 'ready'
         ? tr('运行中', 'Running')
         : modelHero.state === 'failed'
-          ? tr('加载失败', 'Failed')
+          ? 'interrupted' in modelHero && modelHero.interrupted
+            ? tr('加载中断', 'Interrupted') : tr('加载失败', 'Failed')
           : tr('空闲', 'Idle');
   return (
     <TMPanel className="runtime-hero">

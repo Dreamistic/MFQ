@@ -5,6 +5,7 @@
 #include "mfe_ffn_compact.h"
 #include "mfe_ffn_prepare.h"
 #include "mfe_ffn_token_groups.h"
+#include "mfe_ffn_shared.h"
 #include "mfe_nvq_dense_bounds.h"
 #include "mfq_cuda_nint_route_hint.h"
 #include "runtime/decode_window.h"
@@ -170,6 +171,9 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         batch_.shared_dense_math=dense_math_option && *dense_math_option;
         if(!shared[0] || !shared[1] || !shared[2] || !shared_gate.defined() || shared_gate.numel()!=batch_.tokens)
             throw std::invalid_argument("two-stage MFE shared projection incomplete");
+        shared_short_encoding_=std::all_of(shared.begin(),shared.end(),[](const NintWeight* w) {
+            return w->gs==24 || w->gs==28 || w->gs==32;
+        });
         batch_.shared_intermediate=int(shared[0]->out);
         if(shared[1]->out!=shared[0]->out || shared[0]->neuron_len!=batch_.input_width ||
             shared[1]->neuron_len!=batch_.input_width || shared[2]->neuron_len!=shared[0]->out ||
@@ -274,8 +278,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         // complete small window. Other shapes retain their previous capacity.
         const auto* wide_compact=std::getenv("MFQ_MFE_TOKEN_WIDE_COMPACT");
         const bool wide_default=(!wide_compact || wide_compact[0]!='0') && batch_.token_group_compact &&
-            batch_.input_width==2560 && batch_.intermediate==640 && batch_.output_width==2560 &&
-            batch_.routes==10 && (batch_.tokens==3 || batch_.tokens==4);
+            (batch_.tokens==3 || batch_.tokens==4);
         batch_.token_group_capacity=batch_.tokens<=8?(wide_default?4:2):8;
         if(token_group_capacity_hint==4 || token_group_capacity_hint==8)
             batch_.token_group_capacity=token_group_capacity_hint;
@@ -301,8 +304,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         // Short compact mixed batches are dominated by singleton/pair groups.
         // Their smaller independent Gate/Up CTAs outperform the aligned CTA,
         // including its fused quantizer. Keep the existing explicit override.
-        const bool short_compact=batch_.tokens==4 && batch_.token_group_compact && batch_.nvq_format_mask &&
-            batch_.input_width==2560 && batch_.intermediate==640 && batch_.output_width==2560 && batch_.routes==10;
+        const bool short_compact=batch_.tokens==4 && batch_.token_group_compact && batch_.nvq_format_mask;
         batch_.token_group_aligned_gu=batch_.tokens<=8 &&
             (aligned_gu?*aligned_gu:batch_.tokens==4 && !short_compact);
         if(short_compact && !aligned_gu && !batch_.token_group_aligned_gu) {
@@ -484,6 +486,9 @@ void MfeFfnRuntime::enable_cached_dispatch(const mfq::cuda::MfeCachedExpert* map
     for(int p=0;p<3;++p) {
         const int count=batch_.projection_counts[p];
         original_offsets[p]=batch_.projection_offsets[p];
+        int64_t capacity=0;
+        for(int c=0;c<count;++c)capacity+=host_views_[batch_.projection_offsets[p]+c].local_experts;
+        cached_dispatch_.primary_incomplete|=capacity<batch_.experts;
         if(bytes[p].size()!=std::size_t(count))throw std::invalid_argument("MFE cache cohort geometry differs");
         offsets[p]=int(views.size());counts[p]=count+batch_.experts;cached_dispatch_.primary_counts[p]=count;
         for(int c=0;c<count;++c)views.push_back(projection_view(p,host_views_[batch_.projection_offsets[p]+c]));
@@ -513,7 +518,7 @@ void MfeFfnRuntime::enable_cached_dispatch(const mfq::cuda::MfeCachedExpert* map
     cached_dispatch_.snapshot_tags=reinterpret_cast<uint64_t*>(cached_snapshot_tags_.data_ptr<int64_t>());
     cached_dispatch_.snapshot_ready=snapshot_ready;
     if(batch_.tokens==1 && batch_.routes<=32)
-        cached_transfer_routes_=tb::empty({batch_.routes+1},input_.options().dtype(tb::kInt32));
+        cached_transfer_routes_=tb::empty({batch_.routes+2},input_.options().dtype(tb::kInt32));
 }
 bool MfeFfnRuntime::try_fuse_prepare_shared_gate(const NintWeight& w,const tb::Tensor& output) {
     if(!cached_dispatch_.mapped || !batch_.shared || batch_.tokens<1 || batch_.tokens>6 ||
@@ -548,6 +553,7 @@ bool MfeFfnRuntime::try_fuse_prepare_shared_gate(const NintWeight& w,const tb::T
 }
 void MfeFfnRuntime::prepare(int32_t* published_ids,uint32_t* ready){
     trace_dispatch();
+    if(ready && published_ids)start_shared(true);
     auto prepared=batch_;
     const bool shared_plan=batch_.token_group_capacity>mfq::cuda::kMfeSharedGroupEncoding;
     if(shared_plan)prepared.token_group_capacity=2;
@@ -556,8 +562,14 @@ void MfeFfnRuntime::prepare(int32_t* published_ids,uint32_t* ready){
     const auto* warp_prepare=std::getenv("MFQ_MFE_PREPARE_WARP");
     const auto prepare=!warp_prepare || warp_prepare[0]!='0'?mfq::cuda::mfe_ffn_prepare_warp:mfq::cuda::mfe_ffn_prepare;
     const auto* quantization=reinterpret_cast<const mfq::cuda::MfeInputQuantization*>(quantization_.data_ptr());
-    if(ready && cached_dispatch_.mapped)mfq::cuda::mfe_ffn_prepare_publish_cached(prepared,quantization,quantization_count_,quantization_groups_,
-        published_ids,ready,cached_dispatch_,mfq_current_cuda_stream());
+    if(ready && cached_dispatch_.mapped) {
+        auto cache=cached_dispatch_;
+        // The existing shared event also protects its scalar gate. Its
+        // ordered readout is needed at final combination, after join_shared().
+        if(shared_in_flight_ && early_shared_gate_.activation)cache.gate={};
+        mfq::cuda::mfe_ffn_prepare_publish_cached(prepared,quantization,quantization_count_,quantization_groups_,
+            published_ids,ready,cache,mfq_current_cuda_stream());
+    }
     else if(ready)mfq::cuda::mfe_ffn_prepare_publish(prepared,quantization,quantization_count_,quantization_groups_,
         published_ids,ready,mfq_current_cuda_stream());
     else prepare(prepared,quantization,quantization_count_,quantization_groups_,mfq_current_cuda_stream());
@@ -590,7 +602,111 @@ std::pair<tb::Tensor,tb::Tensor> MfeFfnRuntime::reserve_input_quantization(int g
     return {q,s};
 }
 void MfeFfnRuntime::gate_up(){mfq::cuda::mfe_ffn_gate_up(batch_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();}
-void MfeFfnRuntime::resident(){mfq::cuda::mfe_ffn_resident(batch_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();}
+void MfeFfnRuntime::resident(){
+    start_shared(false);
+    mfq::cuda::mfe_ffn_resident(arithmetic_batch(),mfq_current_cuda_stream());
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
+void MfeFfnRuntime::start_shared(bool early){
+    if(shared_in_flight_)return;
+    if(early) {
+        const auto* setting=std::getenv("MFQ_MFE_SHARED_EARLY");
+        if(batch_.tokens!=1 || !batch_.plan_ready || (setting && setting[0]=='0'))return;
+    }
+    const auto* option=std::getenv("MFQ_MOE_SHARED_STREAM");
+    const auto grouped=mfq::cuda::runtime_options::mfe_group_dot();
+    const auto token_groups=mfq::cuda::runtime_options::mfe_token_groups();
+    const int shared_capacity=split_shared_groups_?2:batch_.token_group_capacity>mfq::cuda::kMfeSharedGroupEncoding?
+        batch_.token_group_capacity-mfq::cuda::kMfeSharedGroupEncoding:batch_.token_group_capacity;
+    const bool grouped_shared=batch_.token_group_counts && shared_capacity>0 && shared_capacity<=8 &&
+        (!token_groups || *token_groups);
+    if((batch_.tokens==1 || grouped_shared) && batch_.shared && batch_.resident_pairs && batch_.default_math && (!grouped || *grouped) &&
+            (!option || option[0]!='0')) {
+        if(early && !early_shared_descriptors_.defined()) {
+            cudaStreamCaptureStatus capture;
+            MFQ_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(),&capture));
+            if(capture!=cudaStreamCaptureStatusNone)return;
+            std::array<View,3> views;
+            std::copy_n(host_views_.end()-3,3,views.begin());
+            std::map<std::pair<int,int>,std::pair<tb::Tensor,tb::Tensor>> inputs;
+            std::vector<mfq::cuda::MfeInputQuantization> quantizers;
+            for(int p=0;p<2;++p) {
+                auto& d=views[p];const auto key=std::make_pair(d.groups,d.group_size);
+                auto found=inputs.find(key);
+                if(found==inputs.end()) {
+                    auto q=tb::empty({d.groups*d.group_size},input_.options().dtype(tb::kInt8));
+                    auto s=tb::empty({d.groups},input_.options().dtype(tb::kFloat32));
+                    found=inputs.emplace(key,std::make_pair(q,s)).first;
+                    early_shared_inputs_.push_back(q);early_shared_inputs_.push_back(s);
+                    quantizers.push_back({q.data_ptr<int8_t>(),s.data_ptr<float>(),d.groups,d.group_size});
+                    early_shared_groups_+=d.groups;
+                }
+                d.fields[7]=found->second.first.data_ptr();d.fields[8]=found->second.second.data_ptr();
+            }
+            if(cached_dispatch_.gate.activation) {
+                early_shared_gate_=cached_dispatch_.gate;
+                const auto key=std::make_pair(early_shared_gate_.groups,48);
+                auto found=inputs.find(key);
+                if(found==inputs.end()) {
+                    auto q=tb::empty({early_shared_gate_.groups*48},input_.options().dtype(tb::kInt8));
+                    auto s=tb::empty({early_shared_gate_.groups},input_.options().dtype(tb::kFloat32));
+                    found=inputs.emplace(key,std::make_pair(q,s)).first;
+                    early_shared_inputs_.push_back(q);early_shared_inputs_.push_back(s);
+                    quantizers.push_back({q.data_ptr<int8_t>(),s.data_ptr<float>(),early_shared_gate_.groups,48});
+                    early_shared_groups_+=early_shared_gate_.groups;
+                }
+                early_shared_gate_.activation=found->second.first.data_ptr<int8_t>();
+                early_shared_gate_.activation_scales=found->second.second.data_ptr<float>();
+            }
+            early_shared_descriptors_=upload(std::vector<View>(views.begin(),views.end()));
+            early_shared_quantizers_=upload(quantizers);early_shared_quantizer_count_=int(quantizers.size());
+        }
+        if(!shared_stream_) {
+            // Initialization is outside graph capture: pipeline warmup owns
+            // these resources before recording the steady decode graph.
+            shared_stream_=std::make_unique<mfq::cuda::Stream>(input_.get_device());
+            shared_fork_=std::make_unique<mfq::cuda::Event>(cudaEventDisableTiming);
+            shared_done_=std::make_unique<mfq::cuda::Event>(cudaEventDisableTiming);
+        }
+        MFQ_CUDA_CHECK(cudaEventRecord(shared_fork_->get(),mfq_current_cuda_stream()));
+        MFQ_CUDA_CHECK(cudaStreamWaitEvent(shared_stream_->get(),shared_fork_->get(),0));
+        auto shared_batch=batch_;
+        if(early) {
+            shared_batch.shared=reinterpret_cast<const View*>(early_shared_descriptors_.data_ptr());
+            mfq::cuda::mfe_ffn_shared_prepare_input(batch_.input,batch_.input_width,
+                reinterpret_cast<const mfq::cuda::MfeInputQuantization*>(early_shared_quantizers_.data_ptr()),
+                early_shared_quantizer_count_,early_shared_groups_,shared_stream_->get());
+        }
+        if(split_shared_groups_)shared_batch.token_group_capacity=mfq::cuda::kMfeSharedGroupEncoding+2;
+        const auto* short_option=std::getenv("MFQ_MFE_SHARED_SHORT");
+        const bool scalar_gate=early && early_shared_gate_.activation;
+        const bool short_shared=!scalar_gate && shared_short_encoding_ && (!short_option || short_option[0]!='0') &&
+            mfq::cuda::mfe_ffn_shared_short_resident(shared_batch,shared_stream_->get());
+        if(scalar_gate)mfq::cuda::mfe_ffn_shared_resident_with_gate(shared_batch,early_shared_gate_,shared_stream_->get());
+        else if(!short_shared)mfq::cuda::mfe_ffn_shared_resident(shared_batch,shared_stream_->get());
+        if(short_shared && !shared_short_reported_) {
+            shared_short_reported_=true;
+            std::fprintf(stderr,"mfe_shared_short_dispatch scope=first_short_shared enabled=1 tokens=%d capacity=%d groups=%d\n",
+                batch_.tokens,shared_capacity,(batch_.tokens+shared_capacity-1)/shared_capacity);
+        }
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        MFQ_CUDA_CHECK(cudaEventRecord(shared_done_->get(),shared_stream_->get()));
+        shared_in_flight_=true;
+        if(early && !shared_early_reported_) {
+            shared_early_reported_=true;
+            std::fprintf(stderr,"mfe_shared_early_dispatch scope=first_prepare enabled=1 tokens=1 quantizers=%d groups=%d scalar_gate_async=%d scalar_gate_fused=%d\n",
+                early_shared_quantizer_count_,early_shared_groups_,int(early_shared_gate_.activation!=nullptr),int(scalar_gate));
+        }
+        if(!shared_stream_reported_) {
+            shared_stream_reported_=true;
+            std::fprintf(stderr,"mfe_shared_stream_dispatch scope=first_resident enabled=1 tokens=%d routes=%d shared_width=%d gu_quant_fused=%d\n",
+                batch_.tokens,batch_.routes,batch_.shared_intermediate,int(batch_.tokens==1));
+        }
+    }
+}
+void MfeFfnRuntime::join_shared(){
+    if(shared_in_flight_)MFQ_CUDA_CHECK(cudaStreamWaitEvent(mfq_current_cuda_stream(),shared_done_->get(),0));
+}
 void MfeFfnRuntime::wait_transfer(const void* mapped_table,void* snapshot,uint64_t capacity,
         const void* mapped_descriptors,uint64_t descriptor_capacity_words){
     const auto* route_list=std::getenv("MFQ_MFE_TRANSFER_ROUTE_LIST");
@@ -610,11 +726,20 @@ void MfeFfnRuntime::wait_transfer(const void* mapped_table,void* snapshot,uint64
 }
 void MfeFfnRuntime::transferred(){
     const auto stream=mfq_current_cuda_stream();
-    if(!cached_dispatch_.mapped || !mfq::cuda::mfe_ffn_compact_transferred_fused(batch_,stream,
+    const auto b=arithmetic_batch();
+    if(!cached_dispatch_.mapped || !mfq::cuda::mfe_ffn_compact_transferred_fused(b,stream,
             cached_transfer_routes_ready_?cached_transfer_routes_.data_ptr<int32_t>():nullptr))
-        mfq::cuda::mfe_ffn_transferred(batch_,stream);
+        mfq::cuda::mfe_ffn_transferred(b,stream);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 void MfeFfnRuntime::wait_cpu(){mfq::cuda::mfe_ffn_wait_cpu(batch_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();}
-void MfeFfnRuntime::down_reduce_compute(){mfq::cuda::mfe_ffn_down_reduce_compute(batch_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();}
-void MfeFfnRuntime::down_reduce(){mfq::cuda::mfe_ffn_down_reduce(batch_,mfq_current_cuda_stream());MFQ_CUDA_KERNEL_LAUNCH_CHECK();}
+void MfeFfnRuntime::down_reduce_compute(){
+    join_shared();
+    const auto b=arithmetic_batch();const auto stream=mfq_current_cuda_stream();
+    const auto* cached=cached_transfer_routes_ready_?
+        reinterpret_cast<const uint32_t*>(cached_transfer_routes_.data_ptr<int32_t>()+batch_.routes+1):nullptr;
+    if(!cached || !mfq::cuda::mfe_ffn_compact_cached_down(b,cached,stream))
+        mfq::cuda::mfe_ffn_down_reduce_compute(b,stream);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();shared_in_flight_=false;
+}
+void MfeFfnRuntime::down_reduce(){wait_cpu();down_reduce_compute();}

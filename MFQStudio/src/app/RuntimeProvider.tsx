@@ -10,7 +10,7 @@ import {
 } from 'react';
 import { runtimeApi, type QsaKvStorageSettings, type KvQuantizationSettings, type KvMemorySettings } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
-import { browserServiceUrl, getApiToken, setApiBaseUrl, setApiToken } from '../shared/api/client';
+import { ApiError, browserServiceUrl, getApiToken, onAuthenticationRequired, setApiBaseUrl, setApiToken } from '../shared/api/client';
 import type {
   JobResource,
   RuntimeStatus,
@@ -42,6 +42,7 @@ interface RuntimeContextValue {
   connectionRevision: number;
   ready: boolean;
   loading: boolean;
+  authenticationRequired: boolean;
   connectionError: string | null;
   refreshError: string | null;
   jobStreamErrors: Record<string, string>;
@@ -62,6 +63,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const [selectedModel, setSelectedModel] = useState('');
   const [ready, setReady] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [authenticationRequired, setAuthenticationRequired] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [jobStreamErrors, setJobStreamErrors] = useState<Record<string, string>>({});
@@ -74,6 +76,23 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const initializationVersion = useRef(0);
   const selectedRef = useRef(selectedModel);
   selectedRef.current = selectedModel;
+  const transientRuntime = useRef(false);
+  transientRuntime.current = Boolean(runtime?.reloading || runtime?.runtime_state === 'loading' ||
+    instances.some((instance) => instance.state === 'loading' || instance.state === 'unloading'));
+
+  const requireAuthentication = useCallback(() => {
+    ++requestVersion.current;
+    ++jobRequestVersion.current;
+    setAuthenticationRequired(true);
+    setReady(false);
+    setLoading(false);
+    setConnectionError(null);
+    setRefreshError(null);
+    setJobStreamErrors({});
+    useJobStore.getState().clearJobStreams();
+  }, []);
+
+  useEffect(() => onAuthenticationRequired(requireAuthentication), [requireAuthentication]);
 
   const refreshRuntime = useCallback(async (quiet = true): Promise<boolean> => {
     const version = ++requestVersion.current;
@@ -118,15 +137,19 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             ? status.model
             : (names[0] ?? ''),
       );
+      setAuthenticationRequired(false);
       setRefreshError(null);
       return true;
     } catch (cause) {
-      if (mounted.current && version === requestVersion.current) setRefreshError(errorMessage(cause));
+      if (mounted.current && version === requestVersion.current) {
+        if (cause instanceof ApiError && cause.status === 401) requireAuthentication();
+        else setRefreshError(errorMessage(cause));
+      }
       return false;
     } finally {
       if (mounted.current && version === requestVersion.current) setLoading(false);
     }
-  }, []);
+  }, [requireAuthentication]);
 
   const reloadModelContext = useCallback(async (instanceId: string, contextSize: number | null, yarnEnabled?: boolean, qsaKvOffload?: QsaKvStorageSettings, kvQuantization?: KvQuantizationSettings, kvMemory?: KvMemorySettings) => {
     const version = initializationVersion.current;
@@ -192,12 +215,13 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       return refreshed && mounted.current && version === initializationVersion.current;
     } catch (cause) {
       if (mounted.current && version === initializationVersion.current) {
-        setConnectionError(errorMessage(cause));
+        if (cause instanceof ApiError && cause.status === 401) requireAuthentication();
+        else setConnectionError(errorMessage(cause));
         setLoading(false);
       }
       return false;
     }
-  }, [refreshRuntime]);
+  }, [refreshRuntime, requireAuthentication]);
 
   useEffect(() => {
     mounted.current = true;
@@ -265,12 +289,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         useJobStore.getState().setJobs(jobs);
         retryJobStreams();
         const active = useJobStore.getState().activeJobIds;
-        if (previous.slice().sort().join(',') !== active.slice().sort().join(',')) void refreshRuntime();
+        if (previous.slice().sort().join(',') !== active.slice().sort().join(',') || transientRuntime.current) await refreshRuntime();
       } catch {
         if (!disposed) retryJobStreams();
       } finally {
         running = false;
-        if (!disposed) timer = setTimeout(() => void syncJobs(), useJobStore.getState().activeJobIds.length ? 1000 : 5000);
+        if (!disposed) timer = setTimeout(() => void syncJobs(), useJobStore.getState().activeJobIds.length || transientRuntime.current ? 1000 : 5000);
       }
     };
     const resume = () => {
@@ -317,6 +341,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       connectionRevision,
       ready,
       loading,
+      authenticationRequired,
       connectionError,
       refreshError,
       jobStreamErrors,
@@ -340,6 +365,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       connectionRevision,
       ready,
       loading,
+      authenticationRequired,
       connectionError,
       refreshError,
       jobStreamErrors,

@@ -10,6 +10,7 @@
 #endif
 #include "mfe_ffn.h"
 #include <cuda_bf16.h>
+#include "mfe_ffn_cached_reduce.cuh"
 #include "packed_nint.cuh"
 #include "packed_nvq.cuh"
 #include "mfe_e8_narrow.cuh"
@@ -1157,14 +1158,18 @@ __global__ void mfe_ffn_transfer_ready_kernel(MfeFfnBatch b) {
             reinterpret_cast<const volatile int32_t*>(b.host_transfer_index)[expert]);
     }
 }
-template<bool UnifiedProjection,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
-__global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel(MfeFfnBatch b,int partition) {
+template<bool UnifiedProjection,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false,bool CachedReduce=false>
+__global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel(MfeFfnBatch b,int partition,const uint32_t* cached=nullptr) {
+    if constexpr(CachedReduce)if(mfe_ffn_cached_reduce<32>(b,cached))return;
     partition&=3;
     const int token=blockIdx.y,first=int(blockIdx.x)*2,lane=threadIdx.x;
     if(first>=b.output_width)return;
     const int all_routes=b.routes+(b.shared?1:0);
     __shared__ __half results[32][2];
     for(int route=threadIdx.y;route<all_routes;route+=blockDim.y) {
+        // Zero shared width reserves its original slot while an independent
+        // stream computes the shared expert. Never overwrite that slot here.
+        if(route==b.routes && b.shared_intermediate==0 && partition==1)continue;
         __half values[2]={__float2half(0.0f),__float2half(0.0f)};
         const MfePackedProjection* descriptor=nullptr;int descriptor_local=-1;
         if(route<b.routes) {
@@ -1190,7 +1195,7 @@ __global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel(MfeFfnBatch b
                     }
                 }
             }
-        }else if(partition==2) {
+        }else if(partition==2 || b.shared_intermediate==0) {
     #pragma unroll
             for(int row=0;row<2;++row)if(first+row<b.output_width)
                 values[row]=b.resident_pairs[(int64_t(token)*all_routes+route)*b.output_width+first+row];
@@ -1243,14 +1248,16 @@ __global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel(MfeFfnBatch b
         else static_cast<__half*>(b.output)[index]=__float2half(output);
     }
 }
-template<bool UnifiedProjection,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false>
-__global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel_quad(MfeFfnBatch b,int partition) {
+template<bool UnifiedProjection,bool Grouped,uint32_t Formats=0x3fffeu,bool DefaultMath=false,bool E8Narrow=false,bool CachedReduce=false>
+__global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel_quad(MfeFfnBatch b,int partition,const uint32_t* cached=nullptr) {
+    if constexpr(CachedReduce)if(mfe_ffn_cached_reduce<32>(b,cached))return;
     partition&=3;
     const int token=blockIdx.y,first=int(blockIdx.x)*4,lane=threadIdx.x;
     if(first>=b.output_width)return;
     const int all_routes=b.routes+(b.shared?1:0);
     __shared__ __half results[32][4];
     for(int route=threadIdx.y;route<all_routes;route+=blockDim.y) {
+        if(route==b.routes && b.shared_intermediate==0 && partition==1)continue;
         __half values[4]={__float2half(0.0f),__float2half(0.0f)};
         const MfePackedProjection* descriptor=nullptr;int descriptor_local=-1;
         if(route<b.routes) {
@@ -1276,7 +1283,7 @@ __global__ void __launch_bounds__(1024) mfe_ffn_down_reduce_kernel_quad(MfeFfnBa
                     }
                 }
             }
-        }else if(partition==2) {
+        }else if(partition==2 || b.shared_intermediate==0) {
     #pragma unroll
             for(int row=0;row<4;++row)if(first+row<b.output_width)
                 values[row]=b.resident_pairs[(int64_t(token)*all_routes+route)*b.output_width+first+row];

@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runtimeApi } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
-import type { JobEventResource, JobResource, RuntimeStatus } from '../shared/api/types';
+import type { JobEventResource, JobResource, RuntimeStatus, RuntimeInstance } from '../shared/api/types';
 import { studioStatus } from '../studio';
 import { useJobStore } from '../stores/jobStore';
 import { RuntimeProvider, useRuntime } from './RuntimeProvider';
@@ -109,6 +109,32 @@ describe('RuntimeProvider 故障状态', () => {
       expect(useJobStore.getState().jobs).toEqual([]);
       await act(async () => { resolve([finished]); });
       expect(useJobStore.getState().jobs).toEqual([]);
+    } finally { view.unmount(); vi.useRealTimers(); }
+  });
+
+  it('keeps refreshing transient instances after a load job ends until runtime cleanup settles', async () => {
+    vi.useFakeTimers();
+    const loading = { id: 'instance-a', model: 'test-model', state: 'loading', devices: [],
+      active_sessions: 0, queued_requests: 0 } as RuntimeInstance;
+    vi.mocked(jobsApi.jobs).mockResolvedValue([activeJob]);
+    vi.mocked(runtimeApi.runtimeInstances).mockResolvedValue([loading]);
+    vi.mocked(runtimeApi.runtimeStatus).mockResolvedValue({ runtime_state: 'loading', model: 'test-model' } as RuntimeStatus);
+    vi.spyOn(jobsApi, 'streamJobEvents').mockImplementation(() => new Promise<void>(() => {}));
+    const view = render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    try {
+      await act(async () => {});
+      expect(capturedRuntime.ready).toBe(true);
+      vi.mocked(jobsApi.jobs).mockResolvedValue([{ ...activeJob, status: 'interrupted' }]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+      expect(useJobStore.getState().activeJobIds).toEqual([]);
+      expect(capturedRuntime.runtime?.runtime_state).toBe('loading');
+      const calls = vi.mocked(runtimeApi.runtimeInstances).mock.calls.length;
+      vi.mocked(runtimeApi.runtimeInstances).mockResolvedValue([]);
+      vi.mocked(runtimeApi.runtimeStatus).mockResolvedValue({ runtime_state: 'idle' } as RuntimeStatus);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+      expect(runtimeApi.runtimeInstances).toHaveBeenCalledTimes(calls + 1);
+      expect(capturedRuntime.runtime?.runtime_state).toBe('idle');
+      expect(capturedRuntime.instances).toEqual([]);
     } finally { view.unmount(); vi.useRealTimers(); }
   });
 

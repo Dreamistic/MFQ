@@ -1,13 +1,75 @@
 import asyncio
 import socket
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 import uvicorn
 
 from mfq.server.api import create_app
 from mfq.server.api.auth import required_scope
 from mfq.server.api.listener import RuntimeServer, saved_service_port
+from mfq.server.state.storage import SessionStore
+
+
+@pytest.mark.parametrize("protocol", ["openai", "anthropic"])
+def test_occupied_listener_never_recovers_another_servers_running_jobs(tmp_path: Path, protocol: str) -> None:
+    async def run():
+        store = SessionStore(tmp_path / "server.sqlite3")
+        job = store.create_job("model.load", {"model": "fixture-model"})
+        store.claim_job(job.id)
+        store.update_job_progress(job.id, .2)
+        service = SimpleNamespace(
+            start=AsyncMock(side_effect=lambda: store.recover_interrupted_jobs()),
+            aclose=AsyncMock(),
+        )
+        with socket.socket() as occupied, socket.socket() as available:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            occupied_port = occupied.getsockname()[1]
+            available.bind(("127.0.0.1", 0))
+            available_port = available.getsockname()[1]
+            available.close()
+            primary = occupied_port if protocol == "openai" else available_port
+            secondary = available_port if protocol == "openai" else occupied_port
+            server = RuntimeServer(uvicorn.Config(create_app(service), host="127.0.0.1", port=primary,
+                log_level="error"), anthropic_port=secondary)
+            with pytest.raises(SystemExit):
+                await server.serve()
+            service.start.assert_not_awaited()
+            service.aclose.assert_not_awaited()
+            current = store.get_job(job.id)
+            assert current.status.value == "running"
+            assert current.progress == .2
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", available_port))
+    asyncio.run(run())
+
+
+def test_listener_startup_failure_releases_both_reserved_ports():
+    async def run():
+        service = SimpleNamespace(start=AsyncMock(side_effect=RuntimeError("fixture startup failure")), aclose=AsyncMock())
+        config = uvicorn.Config(create_app(service), host="127.0.0.1", port=0, log_level="error")
+        server = RuntimeServer(config, anthropic_port=0)
+        reserved = []
+        bind = uvicorn.Config.bind_socket
+
+        def track(config):
+            sock = bind(config)
+            reserved.append(sock.getsockname()[1])
+            return sock
+
+        from unittest.mock import patch
+        with patch.object(uvicorn.Config, "bind_socket", track), pytest.raises(SystemExit):
+            await server.serve()
+        service.aclose.assert_awaited_once()
+        assert len(reserved) == 2
+        for port in reserved:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", port))
+    asyncio.run(run())
 
 
 def test_listener_changes_port_without_restarting_service(tmp_path: Path) -> None:

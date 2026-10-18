@@ -368,7 +368,7 @@ static void check_speculative(MlxQwen4CausalLm& runtime, int batch) {
         std::vector<MlxQwen4TextSessionState> committed;
         std::vector<array> expected;
         for (int row = 0; row < batch; ++row) {
-            auto history = prompt(33 + row * 64, row + depth);
+            auto history = prompt(batch == 8 ? 17 + row : 33 + row * 64, row + depth);
             auto window = prompt(depth + 1, row + 3);
             history[history.size() - 2] = runtime.config().eos_token_id;
             window[depth / 2] = runtime.config().eos_token_id;
@@ -686,6 +686,7 @@ int main(int argc, char** argv) {
         std::cout << "Independent request state comparison passed\n";
         check_speculative(runtime, 1);
         check_speculative(runtime, 3);
+        check_speculative(runtime, 8);
         check_ragged_speculative(runtime);
         std::cout << "Independent speculative verification and rollback passed\n";
         check_penalties(runtime);

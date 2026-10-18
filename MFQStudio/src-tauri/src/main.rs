@@ -1,4 +1,8 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod updater;
+#[cfg(target_os = "windows")]
+mod windows_icon;
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -15,6 +19,11 @@ const LOG_ROTATE_BYTES: u64 = 16 * 1024 * 1024;
 const PID_FILE: &str = "mfq-server.pid";
 const CREDENTIAL_SERVICE: &str = "MFQ Studio";
 const CREDENTIAL_ACCOUNT: &str = "mfq-server-api-key";
+
+#[tauri::command]
+fn studio_custom_titlebar() -> bool {
+    cfg!(target_os = "windows")
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -315,7 +324,6 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
     }
     command
         .arg("serve")
-        .arg("--no-web-ui")
         .arg("--no-access-log")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -571,7 +579,18 @@ fn main() {
     tauri::Builder::default()
         .manage(StudioState::default())
         .manage(updater::UpdateState::default())
+        .setup(|app| {
+            #[cfg(target_os = "windows")]
+            if let Some(window) = app.get_webview_window("main") {
+                windows_icon::set(&window)?;
+                window.set_decorations(false)?;
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = app;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
+            studio_custom_titlebar,
             studio_status,
             studio_configure,
             studio_start_local,

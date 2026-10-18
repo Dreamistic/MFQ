@@ -204,11 +204,21 @@ int verify_nint_dispatch(const std::filesystem::path& root) {
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     const auto stream=mfq_current_cuda_stream();
     context->begin_graph_pool(stream);
-    const auto same=[](const tb::Tensor& a,const tb::Tensor& b) {
+    const auto same=[](const tb::Tensor& a,const tb::Tensor& b,bool down,int tokens,int step) {
         auto x=a.cpu().contiguous(),y=b.cpu().contiguous();
-        if(x.sizes()!=y.sizes() || x.scalar_type()!=y.scalar_type() ||
-            std::memcmp(x.data_ptr(),y.data_ptr(),x.numel()*x.element_size()))
-            throw std::runtime_error("grouped NINT output differs from original pool kernels");
+        if(x.sizes()!=y.sizes() || x.scalar_type()!=y.scalar_type())
+            throw std::runtime_error("grouped NINT output shape or dtype differs from original pool kernels");
+        if(std::memcmp(x.data_ptr(),y.data_ptr(),x.numel()*x.element_size())) {
+            const auto* actual=static_cast<const uint8_t*>(x.data_ptr());
+            const auto* expected=static_cast<const uint8_t*>(y.data_ptr());
+            std::size_t byte=0;while(actual[byte]==expected[byte])++byte;
+            const auto index=byte/x.element_size();
+            auto xf=x.to(tb::kFloat32),yf=y.to(tb::kFloat32);
+            std::ostringstream message;message<<"grouped NINT output differs from original pool kernels"
+                <<" down="<<down<<" tokens="<<tokens<<" step="<<step<<" index="<<index
+                <<" actual="<<xf.data_ptr<float>()[index]<<" expected="<<yf.data_ptr<float>()[index];
+            throw std::runtime_error(message.str());
+        }
     };
     for(bool down:{false,true}) {
         const int width=down?640:2560,output=down?2560:640;
@@ -249,7 +259,7 @@ int verify_nint_dispatch(const std::filesystem::path& root) {
                 x.copy_(tb::tensor(values).reshape(x.sizes().vec()).to(tb::kFloat16).to(tb::kCUDA));
                 ids.copy_(tb::tensor(selected).reshape({tokens,10}).to(tb::kCUDA));
                 execution.config.moe_nint_heterogeneous_decode=false;auto expected=forward();
-                execution.config.moe_nint_heterogeneous_decode=true;window.run();same(actual,expected);
+                execution.config.moe_nint_heterogeneous_decode=true;window.run();same(actual,expected,down,tokens,step);
                 ++cases;
             }
         }
@@ -1200,8 +1210,9 @@ int verify_active_nvq(const std::filesystem::path& root) {
 int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cache=false,bool comparison=false,
         bool compare_input_views=false,bool compare_default_math=false,bool compare_e8_narrow=false,
         bool compare_resident_overlap=false,bool compare_dense=false,bool compare_nint_whole=false,
-        bool compare_token_groups=false) {
-    const bool compare_math=compare_default_math || compare_e8_narrow || compare_resident_overlap || compare_dense || compare_nint_whole || compare_token_groups;
+        bool compare_token_groups=false,bool compare_shared_stream=false,bool compare_group_quant=false,bool compare_shared_short=false,
+        bool compare_cached_reduce=false,bool compare_shared_early=false) {
+    const bool compare_math=compare_default_math || compare_e8_narrow || compare_resident_overlap || compare_dense || compare_nint_whole || compare_token_groups || compare_shared_stream || compare_group_quant || compare_shared_short || compare_cached_reduce || compare_shared_early;
     struct MathEnvironment {
         const char* option;
         bool enabled;
@@ -1218,8 +1229,10 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
         }
         void select(bool candidate)const {if(enabled)set(candidate?"1":"0");}
         ~MathEnvironment(){if(enabled)set(previous.c_str());}
-    } math_environment(compare_math,compare_token_groups?"MFQ_MFE_TOKEN_GROUPS":compare_nint_whole?"MFQ_MFE_NINT_WHOLE":compare_dense?"MFQ_MOE_NVQ_DENSE":compare_resident_overlap?"MFQ_MFE_RESIDENT_PLAN_OVERLAP":
+    } math_environment(compare_math,compare_shared_early?"MFQ_MFE_SHARED_EARLY":compare_cached_reduce?"MFQ_MFE_CACHED_REDUCE":compare_shared_short?"MFQ_MFE_SHARED_SHORT":compare_group_quant?"MFQ_MFE_GU_GROUP_QUANT":compare_shared_stream?"MFQ_MOE_SHARED_STREAM":compare_token_groups?"MFQ_MFE_TOKEN_GROUPS":compare_nint_whole?"MFQ_MFE_NINT_WHOLE":compare_dense?"MFQ_MOE_NVQ_DENSE":compare_resident_overlap?"MFQ_MFE_RESIDENT_PLAN_OVERLAP":
         compare_e8_narrow?"MFQ_MFE_E8_NARROW":"MFQ_MFE_DEFAULT_MATH");
+    MathEnvironment early_overlap_environment(compare_shared_early,"MFQ_MFE_RESIDENT_PLAN_OVERLAP");
+    if(compare_shared_early)early_overlap_environment.set("1");
     struct RestoreEnvironment {
         std::string previous;
         bool present=false;
@@ -1261,7 +1274,8 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
     const std::array<MfqCudaStream,2> streams={mfq_get_stream_from_pool(),mfq_get_current_cuda_stream()};
     int cases=0;std::int64_t cpu=0,transfers=0,resident=0,mapped_serves=0,mapped_bytes=0,mapped_overlaps=0,phased_serves=0,dense_conversions=0;
     for(bool graph:{false,true})for(auto gate_type:{tb::kFloat16,tb::kBFloat16,tb::kFloat32})
-    for(int tokens:compare_token_groups?std::vector<int>{2,3,4,5,6,8,16,32}:std::vector<int>{1,3,6})for(int routes:{3,10}) {
+    for(int tokens:compare_shared_short?std::vector<int>{2,3,4,5,6,8}:(compare_group_quant || compare_cached_reduce || compare_shared_early)?std::vector<int>{1}:compare_token_groups?std::vector<int>{2,3,4,5,6,8,16,32}:
+        compare_shared_stream?std::vector<int>{1,2,3,4,5,6,8}:std::vector<int>{1,3,6})for(int routes:{3,10}) {
         std::array<CudaExecutionContext,2> executions;
         std::array<std::shared_ptr<MoeExpertCache>,2> caches;
         std::array<std::array<std::shared_ptr<MoeQuantRangeSource>,3>,2> sources;
@@ -1282,7 +1296,7 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
             executions[mode].continuous_batch_cache_serial=compare_token_groups && tokens>8;
             config.moe_two_stage_ffn=mode==1 || compare_input_views || compare_math;
             config.moe_ram_pcie_fraction=transfer_cache && !comparison?1.0:.5;
-            if(comparison)config.moe_residency_adapt=false;
+            if(comparison || compare_cached_reduce || compare_shared_early)config.moe_residency_adapt=false;
             if(transfer_cache)config.moe_direct_ram=true;
             config.moe_preload_all=true;config.moe_assert_resident=true;
             config.moe_pipeline=true;config.moe_ram_pcie=true;
@@ -1356,7 +1370,7 @@ int verify_two_stage_shared(const std::filesystem::path& root,bool transfer_cach
             std::vector<int32_t> selected(tokens*routes);
             for(std::size_t i=0;i<values.size();++i)values[i]=std::sin(float(i+step*31)*.017f)*.13f;
             for(int i=0;i<tokens*routes;++i) {
-                selected[i]=(i+step)%3;
+                selected[i]=compare_cached_reduce && step==3?0:(i+step)%3;
                 route_weights[i]=float((i*7+step*3)%17+1)/37;
             }
             input.copy_(tb::tensor(values).reshape({tokens,2560}).to(tb::kFloat16).to(tb::kCUDA));
@@ -2191,6 +2205,7 @@ void verify_predictor_residency(const std::filesystem::path& root,bool prefer_re
 #include "mfe_token_group_test.h"
 #include "d4_bank_map_test.h"
 #include "mfe_wide_compact_test.h"
+#include "mfe_shape_dispatch_test.h"
 #include "d4_analytic_scale_test.h"
 void verify_yarn() {
     // Independent values for dim=64, theta=10000, original context=4096,
@@ -2413,12 +2428,33 @@ int main(int argc,char** argv)try {
     auto cuda_context=mfq::cuda::default_context(mfq_current_cuda_device());
     if(argc==3) {
         if(std::string(argv[2])=="--online-budget-check") {verify_online_expert_budget(root);return 0;}
+        if(std::string(argv[2])=="--mfe-shared-early-check") {
+            for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,false,false,false,false,false,false,false,true);
+            return 0;
+        }
+        if(std::string(argv[2])=="--mfe-cached-reduce-check") {
+            for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,false,false,false,false,false,false,true);
+            return 0;
+        }
+        if(std::string(argv[2])=="--mfe-shared-short-check") {
+            for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,false,false,false,false,false,true);
+            return 0;
+        }
+        if(std::string(argv[2])=="--mfe-gu-group-pipeline-check") {
+            for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,false,false,false,false,true);
+            return 0;
+        }
+        if(std::string(argv[2])=="--mfe-shared-stream-check") {
+            for(bool transfer_cache:{false,true})verify_two_stage_shared(root,transfer_cache,false,false,false,false,false,false,false,false,true);
+            return 0;
+        }
         if(std::string(argv[2])=="--yarn-check") {verify_yarn();return 0;}
         if(std::string(argv[2])=="--nvq-bank-map-check") {verify_nvq_bank_map(root);return 0;}
         if(std::string(argv[2])=="--d4-bank-map-check") {verify_d4_bank_map(root);return 0;}
         if(std::string(argv[2])=="--d4-bank-map-memory-check") {verify_d4_bank_map(root,false);return 0;}
         if(std::string(argv[2])=="--d4-bank-map-stages") {verify_d4_bank_map(root,2);return 0;}
         if(std::string(argv[2])=="--mfe-wide-compact-check") {verify_mfe_wide_compact(root);return 0;}
+        if(std::string(argv[2])=="--mfe-shape-dispatch-check") {verify_mfe_shape_dispatch(root);return 0;}
         if(std::string(argv[2])=="--mfe-wide-compact-memory-check") {verify_mfe_wide_compact(root,false);return 0;}
         if(std::string(argv[2])=="--mfe-aligned-compact-check") {verify_mfe_wide_compact(root,true,true);return 0;}
         if(std::string(argv[2])=="--mfe-aligned-compact-memory-check") {verify_mfe_wide_compact(root,false,true);return 0;}
