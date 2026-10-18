@@ -73,15 +73,17 @@ MfeWeight load_mfe_gpu(
                 reader=mfq.mapped_tensor_reader(name);
                 batch_reader=mfq.mapped_tensor_batch_reader(name);
                 mapped=bool(reader);
-            }else if(!execution.config.moe_preload_all && direct) {
-                batch_reader=mfq.tensor_batch_reader(name);
-                if(batch_reader)reader=[batch=batch_reader](uint64_t offset,std::byte* out,std::size_t count) {
-                    batch({{offset,out,count}});
-                };
             }
+            // Final GPU allocation can leave too little RAM for complete
+            // residency. Keep batched I/O ready even when that decision is
+            // made after these canonical sources have been registered.
+            if(!batch_reader)batch_reader=mfq.tensor_batch_reader(name);
+            if(direct && batch_reader)reader=[batch=batch_reader](uint64_t offset,std::byte* out,std::size_t count) {
+                batch({{offset,out,count}});
+            };
             if(!reader)reader=mfq.tensor_reader(name);
             static std::atomic_bool reported{false};
-            if(!execution.config.moe_preload_all && reader && !reported.exchange(true))
+            if(reader && !reported.exchange(true))
                 std::fprintf(stderr,"moe_ssd_source_dispatch mapped=%d parallel_reads=%d batch_fields=%d direct=%d\n",
                     int(mapped),int(mapped || mfq.supports_parallel_tensor_reads()),int(bool(batch_reader)),int(direct));
         } catch (const mfq::TensorReaderUnsupported&) {

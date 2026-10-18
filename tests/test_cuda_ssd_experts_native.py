@@ -58,8 +58,8 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma,ram_p
 
 
 @pytest.mark.parametrize("wide,grouped", [(False, True), (True, True), (True, False)])
-@pytest.mark.parametrize("read_mode", ["buffered", "direct"])
-def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode):
+@pytest.mark.parametrize("read_mode,preload_requested", [("buffered",False),("direct",False),("direct",True)])
+def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode,preload_requested):
     from mfq.server.runtime.client import StdioRuntimeClient
     from tests.test_cuda_flash_next_runtime import mtp_fixture, write_qwen_fixture
     from tests.test_native_nint_ple import _worker_tokenizer
@@ -98,7 +98,7 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode):
     async def run(ssd):
         env = dict(os.environ, MFQ_MODEL_FILE_IO=read_mode, MFQ_PLE_FILE_MAP="0", MFQ_PROFILE_SSD_EXPERTS="1",
             MFQ_MOE_PIPELINE="1", MFQ_MOE_TWO_STAGE_FFN="1", MFQ_MOE_SSD_EXPERTS="1",
-            MFQ_MOE_PRELOAD_ALL=str(int(not ssd)), MFQ_MOE_ASSERT_RESIDENT=str(int(not ssd)), MFQ_MOE_NVQ_DENSE="0",
+            MFQ_MOE_PRELOAD_ALL=str(int(not ssd or preload_requested)), MFQ_MOE_ASSERT_RESIDENT=str(int(not ssd)), MFQ_MOE_NVQ_DENSE="0",
             MFQ_MOE_HOST_CACHE_BYTES=str((1 << 19 if wide else 4096) if ssd else 1 << 28), MFQ_MOE_RAM_PCIE="1", MFQ_MOE_RAM_PCIE_FRACTION="1",
             MFQ_MOE_RESIDENCY_WARM="1", MFQ_MOE_RESIDENCY_PROJECTION_HEAT="1", MFQ_MOE_RESIDENCY_PROMOTE_TRANSFER="1",
             MFQ_MOE_PREFILL_LAYER="0", MFQ_RUNTIME_DISABLE_PREFIX_CACHE="1",
@@ -146,6 +146,7 @@ def test_ssd_experts_across_requests_and_mtp(tmp_path, wide, grouped,read_mode):
                     assert "moe_ssd_prefill_dispatch path=grouped" in text
                 if ssd:
                     assert f"moe_ssd_source_dispatch mapped={int(read_mode == 'buffered')} " in text
+                    assert "batch_fields=1" in text
                 return outputs
             finally:
                 with suppress(Exception):
