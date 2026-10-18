@@ -471,6 +471,10 @@ struct CudaEngineState {
                 {"mtp_supported", double(capabilities.mtp_supported)}, {"mtp_available", double(capabilities.mtp_available)}};
             auto experts = moe_expert_memory_metrics(execution->moe_expert_cache);
             metrics.insert(metrics.end(), experts.begin(), experts.end());
+            if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
+                auto phases=qwen4_decode_graph_profile_metrics(language,components.mtp.get());
+                metrics.insert(metrics.end(),phases.begin(),phases.end());
+            }
             if(language.source) {
                 const auto io=language.source->file_read_stats();
                 metrics.insert(metrics.end(),{{"model_io_direct",io.mode==mfq::FileReadMode::Direct?1.0:0.0},

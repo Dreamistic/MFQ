@@ -1520,6 +1520,39 @@ void qwen4_report_decode_graph(const Qwen4CausalLm& model,std::ostream& output) 
                 <<" samples="<<phase.samples<<" total_ns="<<phase.total_ns<<'\n';
 }
 
+std::vector<std::pair<std::string,double>> qwen4_decode_graph_profile_metrics(
+        const Qwen4CausalLm& model,const MtpModule* mtp) {
+    std::vector<std::pair<std::string,double>> result;
+    if(!mfq::cuda::runtime_options::layer_timings())return result;
+    const auto append=[&](const auto& cells,const char* role,const char* attribute,const char* state) {
+        for(const auto& [key,cell]:cells) {
+            const auto prefix=std::string("cuda_graph_profile_")+role+"_rows_"+
+                std::to_string(std::get<0>(key))+"_"+attribute+"_"+std::to_string(std::get<1>(key))+
+                "_"+state+"_"+std::to_string(std::get<2>(key))+"_";
+            struct Sample {int64_t total_ns=0,max_ns=0;uint64_t samples=0;};
+            std::map<std::string,Sample> phases;
+            uint64_t windows=0;
+            for(const auto& phase:cell->window.gpu_phases())if(phase.samples) {
+                auto& sample=phases[phase.from+"_to_"+phase.to];
+                sample.total_ns+=phase.total_ns;sample.samples+=phase.samples;
+                sample.max_ns=std::max(sample.max_ns,phase.max_ns);
+                windows=std::max(windows,phase.samples);
+            }
+            if(!windows)continue;
+            result.emplace_back(prefix+"windows",double(windows));
+            for(const auto& [name,sample]:phases) {
+                result.emplace_back(prefix+name+"_ms",sample.total_ns/1e6);
+                result.emplace_back(prefix+name+"_samples",double(sample.samples));
+                result.emplace_back(prefix+name+"_max_ms",sample.max_ns/1e6);
+            }
+        }
+    };
+    if(model.graph_registry)append(model.graph_registry->cells,"target","kind","confirmed");
+    const auto* predictor=dynamic_cast<const qwen4_exp::Qwen4ExpMtp*>(mtp);
+    if(predictor && predictor->graph_registry)append(predictor->graph_registry->cells,"predictor","dtype","mode");
+    return result;
+}
+
 std::optional<mfq_tensor_backend::Tensor> qwen4_decode_graph_hidden(
         Qwen4CausalLm& model,mfq_tensor_backend::Tensor ids,mfq_tensor_backend::Tensor* raw_hidden,int64_t confirmed,
         bool* initialized,const mfq_tensor_backend::Tensor& host_ids,mfq_tensor_backend::Tensor* logits,
