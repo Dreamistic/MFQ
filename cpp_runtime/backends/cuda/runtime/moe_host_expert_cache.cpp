@@ -60,6 +60,7 @@ struct MoeHostExpertCache::Impl {
     struct Entry {
         Lease value;std::list<mfq::MoeCacheKey>::iterator position;bool reused=false;
         Entry *device_prev=nullptr,*device_next=nullptr;bool device_duplicate=false;
+        std::uint64_t birth_epoch=0;
     };
     struct Flight {
         bool ready=false;
@@ -83,6 +84,8 @@ struct MoeHostExpertCache::Impl {
     std::size_t exchange_placeholders=0;
     MoeHostExpertCacheStats counters;
     bool preserve=false,reuse_learning=true;
+    bool speculative_learning=false;
+    std::uint64_t learning_epoch=0;
     std::shared_ptr<DeviceCacheHints> device_hints;
     std::unordered_set<mfq::MoeCacheKey,mfq::MoeCacheKeyHash> device_cached;
     Entry *device_head=nullptr,*device_tail=nullptr;
@@ -128,7 +131,7 @@ struct MoeHostExpertCache::Impl {
         entries.erase(found);
     }
     void touch(mfq::MoeCacheKey key,Entry& entry) {
-        if(!reuse_learning)return;
+        if(!reuse_learning || speculative_learning)return;
         if(entry.device_duplicate){device_duplicate(entry,false);device_duplicate(entry,true);}
         if(!counters.reuse_priority || key.source<0) {
             lru.splice(lru.begin(),lru,entry.position);return;
@@ -197,6 +200,7 @@ struct MoeHostExpertCache::Impl {
             const auto [found,inserted]=entries.emplace(key,Entry{value,lru.begin()});
             if (!inserted)
                 throw std::logic_error("duplicate host expert publication");
+            found->second.birth_epoch=speculative_learning?learning_epoch:0;
             device_duplicate(found->second,device_cached.contains(key));
         }
         catch (...) { lru.pop_front(); throw; }
@@ -212,6 +216,40 @@ void MoeHostExpertCache::enable_reuse_priority() {
 }
 void MoeHostExpertCache::set_reuse_learning(bool enabled) {
     std::lock_guard lock(impl_->mutex);impl_->reuse_learning=enabled;
+}
+void MoeHostExpertCache::begin_speculative_learning() {
+    auto& state=*impl_;std::lock_guard lock(state.mutex);
+    if(state.speculative_learning)throw std::logic_error("nested RAM expert cache speculation");
+    if(++state.learning_epoch==0) {
+        for(auto& [key,entry]:state.entries)entry.birth_epoch=0;
+        state.learning_epoch=1;
+    }
+    state.speculative_learning=true;
+}
+void MoeHostExpertCache::commit_speculative_learning(const std::vector<mfq::MoeCacheKey>& accepted) {
+    auto& state=*impl_;std::lock_guard lock(state.mutex);
+    if(!state.speculative_learning)return;
+    state.speculative_learning=false;
+    state.counters.speculative_accepted_keys+=accepted.size();
+    if(++state.counters.speculative_windows==1)std::fprintf(stderr,
+        "moe_ram_speculative_learning scope=first_commit enabled=1 accepted_keys=%zu\n",accepted.size());
+    if(!state.reuse_learning)return;
+    for(const auto key:accepted)if(!state.exchanging.contains(key)) {
+        const auto found=state.entries.find(key);if(found==state.entries.end())continue;
+        auto& entry=found->second;
+        if(entry.birth_epoch!=state.learning_epoch)state.touch(key,entry);
+        else {
+            // A newly loaded image has one confirmed use, even when several
+            // speculative rows selected it. It remains on probation.
+            state.lru.splice(state.lru.begin(),state.lru,entry.position);
+            if(entry.device_duplicate){state.device_duplicate(entry,false);state.device_duplicate(entry,true);}
+        }
+    }
+}
+void MoeHostExpertCache::discard_speculative_learning() noexcept {
+    auto& state=*impl_;std::lock_guard lock(state.mutex);
+    if(state.speculative_learning)++state.counters.speculative_cancels;
+    state.speculative_learning=false;
 }
 void MoeHostExpertCache::set_device_cache_hints(std::shared_ptr<DeviceCacheHints> hints) {
     auto& state=*impl_;std::lock_guard lock(state.mutex);
@@ -419,6 +457,7 @@ bool MoeHostExpertCache::exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey out
     const bool was_reused=found->second.reused;
     // Allocate the new lookup entry before copying into the reused fields.
     state.entries.emplace(outgoing,Impl::Entry{value,position});
+    state.entries.at(outgoing).birth_epoch=state.speculative_learning?state.learning_epoch:0;
     try {value->weights=copy(expected->weights);}
     catch(...) {state.entries.erase(outgoing);throw;}
     state.device_duplicate(state.entries.at(incoming),false);
@@ -462,9 +501,11 @@ bool MoeHostExpertCache::exchange_batch(const std::vector<Exchange>& changes,
         if(reserved)state.exchange_placeholders-=changes.size();
     };
     try {
-        for(;allocated<changes.size();++allocated)
+        for(;allocated<changes.size();++allocated) {
             state.entries.emplace(changes[allocated].outgoing,
                 Impl::Entry{prepared[allocated].value,prepared[allocated].position});
+            state.entries.at(changes[allocated].outgoing).birth_epoch=state.speculative_learning?state.learning_epoch:0;
+        }
         if(keyed) {
             state.exchanging.reserve(state.exchanging.size()+keys.size());
             for(const auto& key:keys)state.exchanging.insert(key);

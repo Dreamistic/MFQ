@@ -34,6 +34,44 @@ void wait_coalesced(const MoeHostExpertCache& cache,std::promise<void>& release)
 }
 
 int main() try {
+    {
+        MoeHostExpertCache cache(192);cache.enable_reuse_priority();
+        for(int e:{0,1,2})cache.acquire(key(e),64,[e]{return weight(64,e+1);});
+        cache.begin_speculative_learning();
+        bytes_equal(cache.find(key(1)),2);bytes_equal(cache.find(key(1)),2);bytes_equal(cache.find(key(0)),1);
+        check(!cache.stats().reuse_promotions,"rejected draft rows changed RAM reuse priority before commit");
+        cache.commit_speculative_learning({key(0),key(0)});
+        check(cache.stats().reuse_promotions==1,"accepted prefix did not protect exactly one prior RAM image");
+        cache.acquire(key(3),64,[]{return weight(64,4);});
+        check(cache.contains(key(0)) && !cache.contains(key(1)),"rejected MTP access displaced an accepted RAM expert");
+    }
+    {
+        MoeHostExpertCache cache(128);cache.enable_reuse_priority();
+        cache.begin_speculative_learning();
+        cache.acquire(key(0),64,[]{return weight(64,1);});cache.acquire(key(1),64,[]{return weight(64,2);});
+        cache.commit_speculative_learning({key(0),key(0)});
+        check(!cache.stats().reuse_promotions,"one verification window promoted a newly loaded RAM image twice");
+        cache.acquire(key(2),64,[]{return weight(64,3);});
+        check(cache.contains(key(0)) && !cache.contains(key(1)),"accepted first use lost recency to a rejected image");
+        cache.begin_speculative_learning();bytes_equal(cache.find(key(0)),1);
+        cache.commit_speculative_learning({key(0)});
+        cache.begin_speculative_learning();bytes_equal(cache.find(key(2)),3);cache.discard_speculative_learning();
+        check(cache.stats().reuse_promotions==1 && cache.stats().speculative_windows==2 && cache.stats().speculative_cancels==1,
+            "speculative RAM learning/cancellation counters differ");
+        cache.acquire(key(3),64,[]{return weight(64,4);});
+        check(cache.contains(key(0)) && !cache.contains(key(2)),"cancelled verification protected its RAM accesses");
+    }
+    {
+        MoeHostExpertCache cache(128);cache.enable_reuse_priority();
+        cache.acquire(key(0),64,[]{return weight(64,1);});auto held=cache.find(key(0),false);
+        cache.begin_speculative_learning();
+        check(cache.exchange(key(0),key(1),held,[](const MixedMoePool&){return weight(64,2);}),"speculative RAM exchange failed");
+        held.reset();cache.commit_speculative_learning({key(1)});
+        check(!cache.stats().reuse_promotions,"a GPU demotion inherited an incoming RAM expert's prior use");
+        cache.set_reuse_learning(false);cache.begin_speculative_learning();
+        bytes_equal(cache.find(key(1)),2);cache.commit_speculative_learning({key(1)});
+        check(!cache.stats().reuse_promotions,"synthetic MTP warmup modified RAM reuse priority");
+    }
     for(bool reuse:{false,true}) {
         MoeHostExpertCache cache(192);if(reuse)cache.enable_reuse_priority();
         auto hints=std::make_shared<MoeHostExpertCache::DeviceCacheHints>(

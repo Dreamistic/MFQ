@@ -142,6 +142,7 @@ struct MoeResidencyManager::Impl {
         int rows=0;
     };
     std::vector<SpeculativeRoutes> speculative_routes;
+    std::vector<mfq::MoeCacheKey> speculative_host_keys;
     int speculative_rows=0;
     // One streamed expert serves every matching row of a verification window.
     // Rank its avoided transfer once, rather than counting each routed token.
@@ -703,6 +704,7 @@ void MoeResidencyManager::begin_speculative_routes(int rows) {
     if(rows<2 || rows>32)throw std::invalid_argument("speculative route row count is out of range");
     if(s.speculative_rows)throw std::logic_error("speculative routes already pending");
     for(auto& row:s.speculative_routes){row.ids.clear();row.rows=0;}
+    if(s.cache->ssd_experts())s.cache->host_experts_->begin_speculative_learning();
     s.speculative_rows=rows;
 }
 void MoeResidencyManager::commit_speculative_routes(int rows) {
@@ -713,6 +715,20 @@ void MoeResidencyManager::commit_speculative_routes(int rows) {
     for(const auto& record:s.speculative_routes)
         if(record.rows && (record.rows<rows || record.ids.size()%record.rows))
             throw std::logic_error("speculative route publication lost row alignment");
+    if(s.cache->ssd_experts()) {
+        s.speculative_host_keys.clear();
+        for(std::size_t b=0;b<s.speculative_routes.size();++b) {
+            const auto& record=s.speculative_routes[b];if(!record.rows)continue;
+            const auto count=std::size_t(rows)*(record.ids.size()/record.rows);
+            const auto& bundle=s.cache->pipeline_bundles_[b];
+            for(std::size_t i=0;i<count;++i)for(int p=0;p<3;++p) {
+                if(p && bundle[p]==bundle[p-1])continue;
+                const auto& source=*s.cache->sources_[bundle[p]];const auto expert=record.ids[i];
+                s.speculative_host_keys.push_back({source.id_,source.expert_to_cohort_[expert],expert});
+            }
+        }
+        s.cache->host_experts_->commit_speculative_learning(s.speculative_host_keys);
+    }
     uint64_t committed=0,heat_routes=0;
     for(std::size_t b=0;b<s.speculative_routes.size();++b) {
         auto& record=s.speculative_routes[b];if(!record.rows)continue;
@@ -758,6 +774,7 @@ void MoeResidencyManager::commit_speculative_routes(int rows) {
 }
 void MoeResidencyManager::discard_speculative_routes() noexcept {
     auto& s=*impl_;if(!s.speculative_rows)return;
+    if(s.cache->ssd_experts())s.cache->host_experts_->discard_speculative_learning();
     for(auto& record:s.speculative_routes){s.speculative_routes_discarded+=record.ids.size();record.ids.clear();record.rows=0;}
     ++s.speculative_route_cancels;s.speculative_rows=0;
 }

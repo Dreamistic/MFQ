@@ -31,6 +31,7 @@ struct MoeHostExpertCacheStats {
     std::uint64_t reuse_promotions=0;
     std::uint64_t scan_admissions=0,scan_admitted_bytes=0;
     std::uint64_t device_duplicate_evictions=0,device_duplicate_evicted_bytes=0;
+    std::uint64_t speculative_windows=0,speculative_accepted_keys=0,speculative_cancels=0;
 };
 
 // Engine-wide, byte-bounded LRU for immutable CPU expert fields. CPU leases
@@ -67,6 +68,11 @@ public:
     // A streaming scan must not evict repeatedly consumed decoded images.
     void enable_reuse_priority();
     void set_reuse_learning(bool enabled);
+    // Verification can read rejected draft rows. Keep their immutable images,
+    // but learn recency/reuse only from the accepted route prefix.
+    void begin_speculative_learning();
+    void commit_speculative_learning(const std::vector<mfq::MoeCacheKey>& accepted);
+    void discard_speculative_learning() noexcept;
     // Complete-residency mode cannot evict the last copy of an expert.
     void preserve_resident_experts();
     // Notifications take a separate lock and never call back into a device
