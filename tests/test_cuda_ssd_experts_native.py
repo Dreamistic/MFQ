@@ -31,6 +31,12 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma,ram_p
                       if family == "nint" else make_flat_family(family.upper(), rows=64 * output, neuron_len=width, seed=2038+projection))
             save(tmp_path / f"{family}-{projection}.mfq", FileHeader(version=2, model_arch="qwen4_exp"),
                  {"linear.weight": MfeTensor((64, output, width), (MfePool(np.arange(64, dtype=np.int32), values),))})
+    # Complete projections must exceed the GPU loan's 64 KiB admission floor
+    # to exercise GU uploads preceding the completion of Down's SSD reads.
+    for projection in range(3):
+        values=quantize(rng.normal(0,.03,(64*384,384)).astype(np.float32),NintSpec(4,24,6))
+        save(tmp_path / f"phase-wide-{projection}.mfq",FileHeader(version=2,model_arch="qwen4_exp"),
+             {"linear.weight":MfeTensor((64,384,384),(MfePool(np.arange(64,dtype=np.int32),values),))})
     families = ("nint", "nvq2j", "nvq3j", "nvq2j-l", "nvq2j-xl", "nvq3j-l")
     for projection in range(3):
         pools = []
@@ -52,7 +58,9 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma,ram_p
         MFQ_CUDA_WORKSPACE_RESERVE_GIB="0.01", CUDA_MODULE_LOADING="LAZY")
     result = subprocess.run([executable, str(tmp_path)], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "SSD expert streaming cases=216 PASS" in result.stdout
+    assert "SSD expert streaming cases=243 PASS" in result.stdout
+    if native_dma == "1" and pcie_fraction == 1 and ram_pin_bytes == "0":
+        assert "moe_ssd_gu_io_overlap scope=first_upload enabled=1" in result.stderr
     if os.name == "nt" and read_mode == "direct":
         assert "model_direct_staging_batch enabled=1" in result.stderr
 

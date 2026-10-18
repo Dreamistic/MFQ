@@ -152,11 +152,12 @@ struct Run {
             c.moe_ram_pcie_fraction=std::stod(fraction);hybrid=*c.moe_ram_pcie_fraction<1;
         }
         const bool mixed=path.stem()=="mixed";
-        c.moe_host_cache_bytes=prefix.empty()?(streaming?(mixed?512*1024:32768):8*1024*1024):(streaming?32*1024*1024:4LL*1024*1024*1024);
+        const bool phase_wide=path.stem()=="phase-wide";
+        c.moe_host_cache_bytes=prefix.empty()?(streaming?(phase_wide?1<<20:mixed?512*1024:32768):64*1024*1024):(streaming?32*1024*1024:4LL*1024*1024*1024);
         // CPU/GPU arithmetic parity needs the same placement in both runs.
         // The GPU-only variant separately exercises adaptive exchanges.
         c.moe_residency_adapt=streaming && !hybrid;c.moe_residency_warm=streaming && !hybrid;c.moe_residency_projection_heat=true;
-        cache=make_moe_expert_cache(prefix.empty()?(mixed?512*1024:32768):64*1024*1024,c);
+        cache=make_moe_expert_cache(prefix.empty()?((mixed || phase_wide)?512*1024:32768):64*1024*1024,c);
         const auto separator=prefix.find(';');
         std::vector<std::string> prefixes=separator==std::string::npos?std::vector<std::string>{prefix}:
             std::vector<std::string>{prefix.substr(0,separator),prefix.substr(separator+1)};
@@ -198,7 +199,7 @@ struct Run {
             return output;
         };
         finalize_moe_expert_cache(cache);
-        if(!prefix.empty()) {
+        if(!prefix.empty() || phase_wide) {
             auto loan=std::make_shared<mfq::cuda::KvExpertLoan>();
             auto storage=tb::empty({32*1024*1024},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
             loan->add(storage,storage.numel(),1,true,1,true,true);
@@ -335,7 +336,7 @@ int main(int argc,char** argv)try {
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     int cases=0;
     if(argc==2)check_ssd_predictor_overlap(argv[1]);
-    for(const char* format:{"nint","nvq2j","nvq3j","nvq2j-l","nvq2j-xl","nvq3j-l","nint-combined","mixed"}) {
+    for(const char* format:{"nint","nvq2j","nvq3j","nvq2j-l","nvq2j-xl","nvq3j-l","nint-combined","mixed","phase-wide"}) {
         if(argc==3 && std::string(format)!="nint")continue;
         const bool combined=std::string(format)=="nint-combined";
         const auto path=argc==3?std::filesystem::path(argv[1]):std::filesystem::path(argv[1])/(std::string(combined?"nint":format)+".mfq");

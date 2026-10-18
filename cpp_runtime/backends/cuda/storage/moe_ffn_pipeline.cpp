@@ -3273,8 +3273,21 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             const auto* cached=loan.pin_projection(source.id_,expert,sizes,cache_->weight_stream_,hit,
                 [&](void* destination,const std::array<std::size_t,8>& offsets) {
                     cache_->pipeline_dma_leases_.push_back(lease);
+                    const auto first_copy=copies.size();
                     for(std::size_t f=0;f<sizes.size();++f)if(sizes[f]) {
-                        copies.push_back({static_cast<uint8_t*>(destination)+offsets[f],fields[f].data_ptr(),std::size_t(sizes[f])});
+                        auto* target=static_cast<uint8_t*>(destination)+offsets[f];
+                        const auto* origin=fields[f].data_ptr();
+                        bool merged=false;
+                        if(copies.size()>first_copy) {
+                            auto& previous=copies.back();
+                            const auto gap=reinterpret_cast<uintptr_t>(origin)-reinterpret_cast<uintptr_t>(previous.source);
+                            if(gap>=previous.bytes && gap-previous.bytes<=15 &&
+                                    reinterpret_cast<uintptr_t>(target)-reinterpret_cast<uintptr_t>(previous.destination)==gap) {
+                                previous.bytes=gap+std::size_t(sizes[f]);merged=true;
+                                ++cache_->stats_.pipeline_projection_dma_merges;
+                            }
+                        }
+                        if(!merged)copies.push_back({target,origin,std::size_t(sizes[f])});
                         bytes+=std::size_t(sizes[f]);
                     }
                 });
@@ -3292,8 +3305,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         mfq::cuda::check_stream_progress(cache_->weight_stream_);
         auto& stats=cache_->stats_;
         stats.ram_pcie_bytes+=bytes;stats.pipeline_direct_ram_bytes+=bytes;
-        stats.pipeline_dma_copies+=copies.size();stats.pipeline_direct_ram_copies+=copies.size();
-        stats.pipeline_window_dma_copies+=copies.size();stats.pipeline_window_dma_bytes+=bytes;
+        // fetch_registered counts these projections once when it builds the
+        // phase packet. Keep its payload/copy accounting independent of which
+        // subset was submitted early; native DMA tracks actual submissions.
+        stats.pipeline_direct_ram_copies+=copies.size();
         stats.pipeline_ssd_gu_overlap_bytes+=bytes;
         if(++stats.pipeline_ssd_gu_overlap_serves==1)
             std::fprintf(stderr,"moe_ssd_gu_io_overlap scope=first_upload enabled=1 copies=%zu bytes=%zu\n",copies.size(),bytes);
@@ -3410,7 +3425,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     cache_->stats_.pipeline_ssd_read_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now()-started).count();
                 };
-                if(ssd_reads->ready.valid() && std::any_of(ssd_reads->missing.begin(),ssd_reads->missing.end(),
+                if(ssd_reads->ready.valid() && ssd_reads->ready.wait_for(std::chrono::seconds(0))!=std::future_status::ready &&
+                        std::any_of(ssd_reads->missing.begin(),ssd_reads->missing.end(),
                         [&](auto index){return index>=ssd_reads->gate_up_requests;})) {
                     wait(true);
                     upload_ssd_gate_up(cell,*ssd_reads);
