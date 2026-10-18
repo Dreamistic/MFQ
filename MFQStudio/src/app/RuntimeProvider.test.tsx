@@ -5,7 +5,7 @@ import { runtimeApi } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
 import { ApiError } from '../shared/api/client';
 import type { JobEventResource, JobResource, RuntimeStatus, RuntimeInstance } from '../shared/api/types';
-import { startLocalStudio, studioCredential, studioStatus } from '../studio';
+import { connectExistingStudio, startLocalStudio, studioCredential, studioStatus } from '../studio';
 import { useJobStore } from '../stores/jobStore';
 import { RuntimeProvider, useRuntime } from './RuntimeProvider';
 
@@ -15,6 +15,7 @@ vi.mock('../studio', () => ({
   studioStatus: vi.fn(),
   studioCredential: vi.fn(),
   startLocalStudio: vi.fn(),
+  connectExistingStudio: vi.fn(),
 }));
 vi.mock('../features/settings/SettingsProvider', () => ({
   useSettings: () => ({ setContextSize: vi.fn() }),
@@ -31,6 +32,7 @@ function RuntimeFixture() {
       <span data-testid="refresh-error">{runtime.refreshError}</span>
       <span data-testid="stream-error">{Object.values(runtime.jobStreamErrors).join('; ')}</span>
       <button onClick={() => void runtime.reloadService()} type="button">Reconnect</button>
+      <button onClick={() => void runtime.connectExistingServer()} type="button">Connect existing</button>
       <button onClick={() => void runtime.refreshRuntime()} type="button">Refresh</button>
       <button onClick={runtime.retryJobStreams} type="button">Retry stream</button>
       <span data-testid="reloading">{JSON.stringify(runtime.reloadingInstances)}</span>
@@ -77,6 +79,33 @@ describe('RuntimeProvider 故障状态', () => {
     render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
     await waitFor(() => expect(screen.getByTestId('connection-error')).toHaveTextContent('Anthropic API port 8091'));
     expect(screen.getByTestId('ready')).toHaveTextContent('false');
+  });
+
+  it('does not use an external backend until its exact instance is explicitly confirmed', async () => {
+    const server = { instance_id: 'instance-a', workspace_id: 'workspace-a', version: '0.1.0', pid: 1234, launch_mode: 'cli' as const };
+    const pending = { config: { mode: 'local' as const, remote_url: 'http://127.0.0.1:8090', local_service_port: 8090 },
+      service_url: 'http://127.0.0.1:8090', reachable: false, managed_pid: null, connection: 'confirmation_required' as const, server };
+    vi.mocked(studioStatus).mockResolvedValue(pending);
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(capturedRuntime.studio?.connection).toBe('confirmation_required'));
+    expect(capturedRuntime.ready).toBe(false);
+    expect(startLocalStudio).not.toHaveBeenCalled();
+    expect(runtimeApi.runtimeInstances).not.toHaveBeenCalled();
+    vi.mocked(studioStatus).mockResolvedValue({ ...pending, reachable: true, connection: 'external' });
+    vi.mocked(connectExistingStudio).mockResolvedValue({ ...pending, reachable: true, connection: 'external' });
+    fireEvent.click(screen.getByRole('button', { name: 'Connect existing' }));
+    await waitFor(() => expect(capturedRuntime.ready).toBe(true));
+    expect(connectExistingStudio).toHaveBeenCalledExactlyOnceWith('instance-a', 'workspace-a');
+    expect(startLocalStudio).not.toHaveBeenCalled();
+  });
+
+  it('does not query workspace APIs or start a second backend when the existing server is incompatible', async () => {
+    vi.mocked(studioStatus).mockResolvedValue({ config: { mode: 'local', remote_url: 'http://127.0.0.1:8090', local_service_port: 8090 },
+      service_url: 'http://127.0.0.1:8090', reachable: false, managed_pid: null, connection: 'incompatible', connection_error: 'Update the server' });
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(screen.getByTestId('connection-error')).toHaveTextContent('Update the server'));
+    expect(startLocalStudio).not.toHaveBeenCalled();
+    expect(runtimeApi.runtimeInstances).not.toHaveBeenCalled();
   });
 
   it('opens an unauthenticated workspace when the desktop credential vault is unavailable', async () => {

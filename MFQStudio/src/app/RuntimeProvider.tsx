@@ -10,7 +10,7 @@ import {
 } from 'react';
 import { runtimeApi, type QsaKvStorageSettings, type KvQuantizationSettings, type KvMemorySettings } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
-import { ApiError, browserServiceUrl, getApiToken, onAuthenticationRequired, setApiBaseUrl, setApiToken } from '../shared/api/client';
+import { ApiError, browserServiceUrl, getApiToken, onAuthenticationRequired, onServerInstanceChanged, setApiBaseUrl, setApiToken, setApiServerInstance } from '../shared/api/client';
 import type {
   JobResource,
   RuntimeStatus,
@@ -20,7 +20,7 @@ import type {
   RealtimeCapabilities,
   VoiceOutputComponentStatus,
 } from '../shared/api/types';
-import { studioStatus, studioCredential, startLocalStudio, type StudioStatus } from '../studio';
+import { studioStatus, studioCredential, startLocalStudio, connectExistingStudio, type StudioStatus } from '../studio';
 import { isRuntimeReady, runtimeSelectionNames } from '../features/runtime/modelSelection';
 import { errorMessage } from './formatters';
 import { useJobStore } from '../stores/jobStore';
@@ -38,6 +38,7 @@ interface RuntimeContextValue {
   refreshRuntime: (quiet?: boolean) => Promise<boolean>;
   addJob: (job: JobResource) => void;
   reloadService: () => Promise<boolean>;
+  connectExistingServer: () => Promise<boolean>;
   retryJobStreams: () => void;
   connectionRevision: number;
   ready: boolean;
@@ -191,13 +192,20 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       let status = await studioStatus();
       if (!mounted.current || version !== initializationVersion.current) return false;
       setStudio(status);
+      if (status?.connection === 'incompatible' || status?.connection === 'confirmation_required') {
+        setConnectionError(status.connection_error ?? null);
+        setLoading(false);
+        return false;
+      }
       if (status?.config.mode === 'local' && !status.reachable) {
         await startLocalStudio();
         status = await studioStatus();
       }
+      if (status && !status.reachable) throw new Error(status.connection_error || 'The server is not ready. Refresh and try again.');
       const token = status ? await studioCredential().catch(() => '') : getApiToken();
       if (!mounted.current || version !== initializationVersion.current) return false;
       setApiBaseUrl(status?.service_url ?? browserServiceUrl());
+      setApiServerInstance(status?.server?.instance_id ?? '');
       setApiToken(token);
       setStudio(status);
       setSelectedModel('');
@@ -222,6 +230,21 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       return false;
     }
   }, [refreshRuntime, requireAuthentication]);
+
+  const connectExistingServer = useCallback(async () => {
+    if (!studio?.server) return false;
+    setLoading(true);
+    try {
+      await connectExistingStudio(studio.server.instance_id, studio.server.workspace_id);
+      return await reloadService();
+    } catch (cause) {
+      setConnectionError(errorMessage(cause));
+      setLoading(false);
+      return false;
+    }
+  }, [studio, reloadService]);
+
+  useEffect(() => onServerInstanceChanged(() => { void reloadService(); }), [reloadService]);
 
   useEffect(() => {
     mounted.current = true;
@@ -337,6 +360,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       refreshRuntime,
       addJob,
       reloadService,
+      connectExistingServer,
       retryJobStreams,
       connectionRevision,
       ready,
@@ -361,6 +385,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       refreshRuntime,
       addJob,
       reloadService,
+      connectExistingServer,
       retryJobStreams,
       connectionRevision,
       ready,

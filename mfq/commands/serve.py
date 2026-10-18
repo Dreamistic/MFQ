@@ -228,11 +228,27 @@ def _server_storage_paths(
 
 
 def _run(args: argparse.Namespace) -> int:
+    from mfq.server.api.network import network_auth_error
+    from mfq.server.instance import ServerAlreadyRunningError, ServerInstanceLock
+
+    if error := network_auth_error(args.host, os.environ.get(args.api_key_env, "")):
+        raise ValueError(error)
+    instance_id = getattr(args, "studio_instance_id", None)
+    studio_owned = bool(getattr(args, "exit_on_stdin_close", False))
+    if instance_id and not studio_owned:
+        raise ValueError("--studio-instance-id requires --exit-on-stdin-close")
+    try:
+        with ServerInstanceLock(args.data_dir, instance_id=instance_id, studio_owned=studio_owned) as instance:
+            return _run_locked(args, instance.identity)
+    except ServerAlreadyRunningError as error:
+        print(f"MFQ Server not started: {error}", file=sys.stderr)
+        return 1
+
+
+def _run_locked(args: argparse.Namespace, identity: dict[str, str | int]) -> int:
     from mfq.server.api.network import install_system_proxy_environment, network_auth_error
 
     client_api_key = os.environ.get(args.api_key_env, "")
-    if error := network_auth_error(args.host, client_api_key):
-        raise ValueError(error)
     install_system_proxy_environment()
     import uvicorn
 
@@ -372,7 +388,8 @@ def _run(args: argparse.Namespace) -> int:
     if web_root is None:
         print("Web UI disabled by --no-web-ui; serving the API only")
     listener_settings = data_dir / "listener.json"
-    app = create_app(service, web_root=web_root, api_keys=api_keys, auth_settings_path=data_dir / "auth.json")
+    app = create_app(service, web_root=web_root, api_keys=api_keys, auth_settings_path=data_dir / "auth.json",
+        server_identity=identity)
     if error := network_auth_error(args.host, "configured" if app.state.auth_policy.enabled else ""):
         raise ValueError(error)
     RuntimeServer(uvicorn.Config(
@@ -399,6 +416,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument("--model", type=Path, help="optional MFQ model to load at startup")
     parser.add_argument("--exit-on-stdin-close", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--studio-instance-id", help=argparse.SUPPRESS)
     parser.add_argument(
         "--running-executable",
         type=Path,
