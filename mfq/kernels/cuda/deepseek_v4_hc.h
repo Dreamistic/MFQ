@@ -13,6 +13,13 @@ std::vector<mfq_tensor_backend::Tensor> dsv4_hc_pre_cuda(
     std::int64_t iterations,
     double eps);
 
+std::vector<mfq_tensor_backend::Tensor> dsv4_hc_coefficients_cuda(
+    mfq_tensor_backend::Tensor mixes,
+    mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor base,
+    std::int64_t iterations,
+    double eps);
+
 mfq_tensor_backend::Tensor dsv4_hc_post_cuda(
     mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor residual,

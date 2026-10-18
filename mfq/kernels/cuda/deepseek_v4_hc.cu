@@ -44,6 +44,7 @@ __global__ void dsv4_hc_pre_finalize_kernel(
     half * __restrict__ reduced,
     float * __restrict__ post,
     float * __restrict__ combination,
+    float * __restrict__ next_pre,
     int rows,
     int hidden,
     int iterations,
@@ -67,6 +68,8 @@ __global__ void dsv4_hc_pre_finalize_kernel(
                 base[thread]);
             shared_pre[thread] = __fadd_rn(
                 dsv4_sigmoid(pre_affine), eps);
+            if (next_pre)
+                next_pre[static_cast<int64_t>(row) * kHyperConnections + thread] = shared_pre[thread];
 
             const int post_index = kHyperConnections + thread;
             const float post_affine = __fadd_rn(
@@ -181,6 +184,8 @@ __global__ void dsv4_hc_pre_finalize_kernel(
         }
     }
     __syncthreads();
+
+    if (!reduced) return;
 
     for (int feature = thread; feature < hidden; feature += blockDim.x) {
         float value = 0.0f;
@@ -300,12 +305,45 @@ std::vector<mfq_tensor_backend::Tensor> dsv4_hc_pre_cuda(
         base.data_ptr<float>(),
         reinterpret_cast<half *>(reduced.data_ptr<mfq_half>()),
         post.data_ptr<float>(), combination.data_ptr<float>(),
+        nullptr,
         rows, hidden, static_cast<int>(iterations), static_cast<float>(eps));
     const cudaError_t status = cudaGetLastError();
     MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
         "dsv4_hc_pre launch failed: ", cudaGetErrorString(status));
     return {reduced, post, combination};
+}
+
+std::vector<mfq_tensor_backend::Tensor> dsv4_hc_coefficients_cuda(
+    mfq_tensor_backend::Tensor mixes,
+    mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor base,
+    int64_t iterations,
+    double eps) {
+    MFQ_RUNTIME_CHECK(mixes.is_cuda() && mixes.is_contiguous() &&
+                          mixes.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                          mixes.dim() == 3 && mixes.size(2) == kHyperMixWidth,
+                      "dsv4_hc_coefficients: expected CUDA f32 [B,T,24]");
+    MFQ_RUNTIME_CHECK(scale.is_cuda() && scale.is_contiguous() &&
+                          scale.scalar_type() == mfq_tensor_backend::kFloat32 && scale.numel() == 3 &&
+                          base.is_cuda() && base.is_contiguous() &&
+                          base.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                          base.numel() == kHyperMixWidth && iterations > 0 && iterations <= INT_MAX &&
+                          std::isfinite(eps) && eps > 0,
+                      "dsv4_hc_coefficients: invalid coefficient parameters");
+    const auto rows = mixes.size(0) * mixes.size(1);
+    MFQ_RUNTIME_CHECK(rows > 0 && rows <= INT_MAX,
+                      "dsv4_hc_coefficients: row count is out of range");
+    auto pre = mfq_tensor_backend::empty({mixes.size(0), mixes.size(1), kHyperConnections}, mixes.options());
+    auto post = mfq_tensor_backend::empty_like(pre);
+    auto combination = mfq_tensor_backend::empty(
+        {mixes.size(0), mixes.size(1), kHyperConnections, kHyperConnections}, mixes.options());
+    dsv4_hc_pre_finalize_kernel<<<static_cast<int>(rows), 32, 0, mfq_current_cuda_stream()>>>(
+        nullptr, mixes.data_ptr<float>(), scale.data_ptr<float>(), base.data_ptr<float>(), nullptr,
+        post.data_ptr<float>(), combination.data_ptr<float>(), pre.data_ptr<float>(),
+        static_cast<int>(rows), 0, static_cast<int>(iterations), static_cast<float>(eps));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return {pre, post, combination};
 }
 
 mfq_tensor_backend::Tensor dsv4_hc_post_cuda(

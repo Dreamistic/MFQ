@@ -38,8 +38,10 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
     if (config.has_engram(layer)) {
         result->engram = Engram::load(execution, model, config, static_cast<int>(layer));
     }
-    result->attention_norm = load_dense_gpu(execution, model, prefix + "attention.norm.weight");
-    result->mlp_norm = load_dense_gpu(execution, model, prefix + "mlp.norm.weight");
+    result->attention_norm = load_dense_gpu(execution, model, prefix + "attention.norm.weight")
+                                 .to(mfq_tensor_backend::kFloat32).contiguous();
+    result->mlp_norm = load_dense_gpu(execution, model, prefix + "mlp.norm.weight")
+                           .to(mfq_tensor_backend::kFloat32).contiguous();
     result->query_a_norm =
         load_dense_gpu(execution, model, prefix + "attention.query_a_norm.weight");
     result->key_value_norm =

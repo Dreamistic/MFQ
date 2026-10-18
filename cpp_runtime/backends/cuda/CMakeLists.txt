@@ -672,6 +672,14 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-float-projection-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-float-projection-test COMMAND mfq-float-projection-test)
     add_test(NAME mfq-gr-prefill-blas-test COMMAND mfq-float-projection-test --prefill-blas-check)
+
+    add_executable(mfq-deepseek-v41-hc-bench ${MFQ_REPOSITORY_ROOT}/bench/cuda_deepseek_v41_hc_bench.cpp)
+    mfq_configure_cuda_runtime_target(mfq-deepseek-v41-hc-bench)
+    target_compile_definitions(mfq-deepseek-v41-hc-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-deepseek-v41-hc-bench PRIVATE mfq-cuda-runtime)
+    if(MSVC)
+        target_compile_options(mfq-deepseek-v41-hc-bench PRIVATE /EHsc)
+    endif()
 endif()
 target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver

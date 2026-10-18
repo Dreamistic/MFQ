@@ -28,6 +28,65 @@ void close(float actual, float expected, float tolerance, const char* name) {
     }
 }
 
+void check_single_pass_prepare(int batch, int tokens, int hidden) {
+    const auto gpu = Device{DeviceType::cuda, 0};
+    const int rows = batch * tokens;
+    std::vector<float> input(rows * 4 * hidden), previous(rows * 4), gamma(hidden);
+    for (std::size_t i = 0; i < input.size(); ++i) input[i] = float(int(i * 17 % 97) - 48) / 64;
+    for (std::size_t i = 0; i < previous.size(); ++i) previous[i] = .1f + float(i % 7) * .07f;
+    for (int i = 0; i < hidden; ++i) gamma[i] = .5f + float(i % 13) / 16;
+    auto residual = tensor(input).reshape({batch, tokens, 4, hidden}).to(gpu).to(kFloat16).contiguous();
+    auto pre = tensor(previous).reshape({batch, tokens, 4}).to(gpu).contiguous();
+    auto weight = tensor(gamma).to(gpu).contiguous();
+    auto prepared = deepseek_v41_hc_prepare_cuda(residual, pre, weight, 1.e-20);
+    auto normalized = prepared.at(0).cpu();
+    auto branch = prepared.at(1).to(kFloat32).cpu();
+    for (int row = 0; row < rows; ++row) {
+        double flat_square = 0, branch_square = 0;
+        std::vector<float> mixed(hidden, 0);
+        for (int source = 0; source < 4; ++source) {
+            for (int col = 0; col < hidden; ++col) {
+                const auto index = (row * 4 + source) * hidden + col;
+                const auto value = __half2float(__float2half_rn(input[index]));
+                flat_square += double(value) * value;
+                mixed[col] += value * previous[row * 4 + source];
+            }
+        }
+        for (auto value : mixed) branch_square += double(value) * value;
+        const auto flat_inverse = float(1 / std::sqrt(flat_square / (4 * hidden) + 1.e-20));
+        const auto branch_inverse = float(1 / std::sqrt(branch_square / hidden + 1.e-20));
+        for (int source = 0; source < 4; ++source) {
+            for (int col = 0; col < hidden; ++col) {
+                const auto index = (row * 4 + source) * hidden + col;
+                const auto value = __half2float(__float2half_rn(input[index]));
+                close(normalized.data_ptr<float>()[index], value * flat_inverse, 3.e-6f,
+                      "single-pass mHC projection input");
+            }
+        }
+        for (int col = 0; col < hidden; ++col) {
+            const auto expected = __half2float(__float2half_rn(mixed[col] * branch_inverse * gamma[col]));
+            close(branch.data_ptr<float>()[row * hidden + col], expected, 2.e-3f,
+                  "single-pass mHC previous-weight branch");
+        }
+    }
+    std::vector<float> mix(rows * 24), scales{.25f, -.5f, .75f}, bases(24);
+    for (std::size_t i = 0; i < mix.size(); ++i) mix[i] = float(int(i * 11 % 37) - 18) / 5;
+    for (int i = 0; i < 24; ++i) bases[i] = float(i - 12) / 9;
+    auto mixes = tensor(mix).reshape({batch, tokens, 24}).to(gpu).contiguous();
+    auto scale = tensor(scales).to(gpu).contiguous();
+    auto base = tensor(bases).to(gpu).contiguous();
+    auto reference = dsv4_hc_pre_cuda(residual, mixes, scale, base, 20, 1.e-6);
+    auto coefficients = dsv4_hc_coefficients_cuda(mixes, scale, base, 20, 1.e-6);
+    if (!coefficients.at(1).equal(reference.at(1)) || !coefficients.at(2).equal(reference.at(2)))
+        throw std::runtime_error("mHC coefficient-only path changed post/Sinkhorn values");
+    const auto next_pre = coefficients.at(0).cpu();
+    for (int row = 0; row < rows; ++row) for (int col = 0; col < 4; ++col) {
+        const auto affine = mix[row * 24 + col] * scales[0] + bases[col];
+        close(next_pre.data_ptr<float>()[row * 4 + col], 1.f / (1.f + std::exp(-affine)) + 1.e-6f,
+              3.e-7f, "single-pass mHC next weights");
+    }
+}
+
 void check_v41_geometry() {
     constexpr std::int64_t batch = 1;
     constexpr std::int64_t tokens = 2;
@@ -274,6 +333,9 @@ int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     try {
+        check_single_pass_prepare(1, 1, 5120);
+        check_single_pass_prepare(2, 3, 33);
+        check_single_pass_prepare(1, 17, 5120);
         check_v41_geometry();
         check_released_activation_boundaries();
         check_v41_indexer_geometry();

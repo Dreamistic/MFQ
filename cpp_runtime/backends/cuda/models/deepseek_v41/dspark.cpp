@@ -67,8 +67,10 @@ struct DeepseekV41Dspark final : MtpModule {
         result->layer = config.n_layers + stage;
         result->ratio = 0;
         result->max_context = config.max_position_embeddings;
-        result->attention_norm = load_dense_gpu(execution, model, prefix + "attention.norm.weight");
-        result->mlp_norm = load_dense_gpu(execution, model, prefix + "mlp.norm.weight");
+        result->attention_norm = load_dense_gpu(execution, model, prefix + "attention.norm.weight")
+                                     .to(mfq_tensor_backend::kFloat32).contiguous();
+        result->mlp_norm = load_dense_gpu(execution, model, prefix + "mlp.norm.weight")
+                               .to(mfq_tensor_backend::kFloat32).contiguous();
         result->query_a_norm =
             load_dense_gpu(execution, model, prefix + "attention.query_a_norm.weight");
         result->key_value_norm =

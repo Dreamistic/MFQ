@@ -443,21 +443,12 @@ struct Block final : ::Block {
                        const Tensor &function, const Tensor &scale, const Tensor &base,
                        const Tensor &norm, const char *profile) const {
         return profiler.measure(profile, [&]() {
-            auto flat = residual.flatten(2).to(mfq_tensor_backend::kFloat32);
-            auto inverse = mfq_tensor_backend::rsqrt(flat.square().mean(-1, true) + config.rms_eps);
-            auto mixes = mfq_tensor_backend::matmul(flat * inverse, function.transpose(0, 1));
-            auto expansion = dsv4_hc_pre_cuda(residual, mixes.contiguous(), scale, base,
-                                              config.hc_sinkhorn_iters, config.hc_eps);
-            auto next_pre =
-                mfq_tensor_backend::sigmoid(mixes.slice(-1, 0, config.hc_mult) * scale.index({0}) +
-                                            base.slice(0, 0, config.hc_mult)) +
-                config.hc_eps;
-            auto branch = (previous_pre.to(mfq_tensor_backend::kFloat32).unsqueeze(-1) *
-                           residual.to(mfq_tensor_backend::kFloat32))
-                              .sum(2);
-            branch = weighted_rms(branch, norm, config.rms_eps);
-            return MhcResult{std::move(branch), next_pre.contiguous(), expansion.at(1),
-                             expansion.at(2)};
+            auto prepared = deepseek_v41_hc_prepare_cuda(residual, previous_pre, norm, config.rms_eps);
+            auto mixes = mfq_tensor_backend::matmul(prepared.at(0), function.transpose(0, 1));
+            auto coefficients = dsv4_hc_coefficients_cuda(mixes.contiguous(), scale, base,
+                                                          config.hc_sinkhorn_iters, config.hc_eps);
+            return MhcResult{std::move(prepared.at(1)), std::move(coefficients.at(0)),
+                             std::move(coefficients.at(1)), std::move(coefficients.at(2))};
         });
     }
 

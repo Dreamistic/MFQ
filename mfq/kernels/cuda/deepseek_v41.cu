@@ -5,9 +5,64 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cmath>
+#include <climits>
 #include <limits>
 
 namespace {
+
+__global__ void hc_prepare_kernel(const half* residual, const float* previous_pre,
+                                  const float* norm, float* normalized, half* branch,
+                                  int hidden, float epsilon) {
+    const auto row = static_cast<int64_t>(blockIdx.x);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const float* pre = previous_pre + row * 4;
+    __shared__ float sums[2][8];
+    __shared__ float inverse[2];
+    float flat_square = 0, branch_square = 0;
+    for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+        float mixed = 0;
+#pragma unroll
+        for (int source = 0; source < 4; ++source) {
+            const float value = __half2float(residual[(row * 4 + source) * hidden + col]);
+            flat_square = __fadd_rn(flat_square, __fmul_rn(value, value));
+            mixed = __fadd_rn(mixed, __fmul_rn(value, pre[source]));
+        }
+        branch_square = __fadd_rn(branch_square, __fmul_rn(mixed, mixed));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        flat_square += __shfl_down_sync(0xffffffff, flat_square, offset);
+        branch_square += __shfl_down_sync(0xffffffff, branch_square, offset);
+    }
+    if (!lane) { sums[0][warp] = flat_square; sums[1][warp] = branch_square; }
+    __syncthreads();
+    if (!warp) {
+        flat_square = lane < 8 ? sums[0][lane] : 0;
+        branch_square = lane < 8 ? sums[1][lane] : 0;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            flat_square += __shfl_down_sync(0xffffffff, flat_square, offset);
+            branch_square += __shfl_down_sync(0xffffffff, branch_square, offset);
+        }
+        if (!lane) {
+            inverse[0] = rsqrtf(flat_square / (4.0f * hidden) + epsilon);
+            inverse[1] = rsqrtf(branch_square / hidden + epsilon);
+        }
+    }
+    __syncthreads();
+    for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+        float mixed = 0;
+#pragma unroll
+        for (int source = 0; source < 4; ++source) {
+            const auto index = (row * 4 + source) * hidden + col;
+            const float value = __half2float(residual[index]);
+            normalized[index] = __fmul_rn(value, inverse[0]);
+            mixed = __fadd_rn(mixed, __fmul_rn(value, pre[source]));
+        }
+        branch[row * hidden + col] = __float2half_rn(
+            __fmul_rn(__fmul_rn(mixed, inverse[1]), norm[col]));
+    }
+}
 
 __device__ __forceinline__ float e4m3(float value) {
     const float bounded = fminf(448.0f, fmaxf(-448.0f, value));
@@ -91,6 +146,38 @@ void require_input(
 }
 
 } // namespace
+
+std::vector<mfq_tensor_backend::Tensor> deepseek_v41_hc_prepare_cuda(
+    mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor previous_pre,
+    mfq_tensor_backend::Tensor norm, double epsilon) {
+    MFQ_RUNTIME_CHECK(residual.is_cuda() && residual.is_contiguous() &&
+                          residual.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                          residual.dim() == 4 && residual.size(2) == 4 &&
+                          residual.size(3) > 0 && residual.size(3) <= INT_MAX,
+                      "deepseek_v41_hc_prepare: expected CUDA f16 [B,T,4,H]");
+    MFQ_RUNTIME_CHECK(previous_pre.is_cuda() && previous_pre.is_contiguous() &&
+                          previous_pre.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                          previous_pre.dim() == 3 && previous_pre.size(0) == residual.size(0) &&
+                          previous_pre.size(1) == residual.size(1) && previous_pre.size(2) == 4 &&
+                          norm.is_cuda() && norm.is_contiguous() &&
+                          norm.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                          norm.numel() == residual.size(3) && std::isfinite(epsilon) && epsilon > 0,
+                      "deepseek_v41_hc_prepare: invalid previous weights, norm, or epsilon");
+    const auto rows = residual.size(0) * residual.size(1), hidden = residual.size(3);
+    MFQ_RUNTIME_CHECK(rows > 0 && rows <= INT_MAX,
+                      "deepseek_v41_hc_prepare: row count is out of range");
+    auto normalized = mfq_tensor_backend::empty(
+        {residual.size(0), residual.size(1), 4 * hidden}, previous_pre.options());
+    auto branch = mfq_tensor_backend::empty(
+        {residual.size(0), residual.size(1), hidden}, residual.options());
+    hc_prepare_kernel<<<static_cast<int>(rows), 256, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half*>(residual.data_ptr<mfq_half>()), previous_pre.data_ptr<float>(),
+        norm.data_ptr<float>(), normalized.data_ptr<float>(),
+        reinterpret_cast<half*>(branch.data_ptr<mfq_half>()), static_cast<int>(hidden),
+        static_cast<float>(epsilon));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return {normalized, branch};
+}
 
 mfq_tensor_backend::Tensor deepseek_v41_mxfp8_e4m3_sim_cuda(
     mfq_tensor_backend::Tensor input) {
