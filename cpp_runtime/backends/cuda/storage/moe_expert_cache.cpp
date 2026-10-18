@@ -1734,14 +1734,7 @@ void MoeExpertCache::invalidate(
             const auto rows=arena.layouts[i].slot_shape[0];
             fields.push_back(arena.fields[i].narrow(0,slot*rows,rows).to(mfq_tensor_backend::kCPU).contiguous());
         }
-        if (pool.family==MixedMoeFamily::Nint) {
-            pool.nint.q_packed=fields[0]; pool.nint.row_q_bits=fields[1]; pool.nint.row_q_bit_offsets=fields[2];
-            pool.nint.sub_scale=fields[3]; pool.nint.sub_min=fields[4];
-            pool.nint.neuron_scale=fields[5]; pool.nint.neuron_min=fields[6];
-        } else {
-            pool.nvq.indices_packed=fields[0]; pool.nvq.aux_packed=fields[1];
-            pool.nvq.sub_scale_packed=fields[2]; pool.nvq.neuron_scale=fields[3];
-        }
+        pool=moe_replace_quant_fields(std::move(pool),fields);
         copied=true;
         return pool;
     });

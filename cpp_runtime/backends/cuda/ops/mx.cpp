@@ -1,6 +1,35 @@
 #include "mfq_cuda_quant_ops.h"
 #include "mx.h"
 #include "format.h"
+#include "cpu_projection_rows.h"
+#include <cmath>
+
+CpuProjectionRows make_cpu_projection_rows(const Mxfp4Weight& w) {
+    MFQ_RUNTIME_CHECK(!w.values.is_cuda() && !w.scales.is_cuda() && w.neuron_len>0 &&
+        w.neuron_len%32==0 && w.values.numel()==w.out*(w.neuron_len/2) &&
+        w.scales.numel()==w.out*(w.neuron_len/32),"invalid CPU MXFP4 projection fields");
+    CpuProjectionRows plan;plan.width=int(w.neuron_len);plan.outputs=int(w.out);
+    const auto* values=w.values.data_ptr<uint8_t>();const auto* scales=w.scales.data_ptr<uint8_t>();
+    const int width=plan.width;
+    plan.scalar_rows=[values,scales,width](const float* input,int batch,int input_stride,
+            float* output,int output_stride,int begin,int end) {
+        static constexpr float table[16]={0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
+        for(int row=begin;row<end;++row)for(int token=0;token<batch;++token) {
+            float sum=0;
+            for(int group=0;group<width/32;++group) {
+                const float scale=std::ldexp(1.0f,int(scales[std::size_t(row)*(width/32)+group])-127);
+                const auto* packed=values+std::size_t(row)*(width/2)+group*16;
+                const auto* x=input+std::size_t(token)*input_stride+group*32;
+                for(int i=0;i<16;++i) {
+                    sum+=x[2*i]*float(mfq_half(table[packed[i]&15]*scale));
+                    sum+=x[2*i+1]*float(mfq_half(table[packed[i]>>4]*scale));
+                }
+            }
+            output[std::size_t(token)*output_stride+row]=sum;
+        }
+    };
+    return plan;
+}
 
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;

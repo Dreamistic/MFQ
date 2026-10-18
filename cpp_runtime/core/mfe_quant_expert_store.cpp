@@ -299,6 +299,20 @@ MfeQuantExpertStore::MfeQuantExpertStore(std::size_t bytes,Read reader,NintRows:
         } else if (pool.dtype=="NVQ" || pool.dtype=="NPQ") {
             pool.nvq=std::make_shared<mfq::NvqRows>(static_cast<std::size_t>(bytes),body,body_batch);
             rows=pool.nvq->rows(); columns=pool.nvq->width();
+        } else if (pool.dtype=="MXFP4") {
+            const auto mx=read(cursor,56);
+            const std::uint64_t expected_rows=std::uint64_t(count)*output;
+            if(width%32 || bytes<56 || std::memcmp(mx.data(),"MXT1",4) || mx[4]!=1 || mx[5]!=4 ||
+                value<std::uint16_t>(mx,6)!=0 || value<std::uint64_t>(mx,8)!=expected_rows ||
+                value<std::uint64_t>(mx,16)!=width || value<std::uint64_t>(mx,24)!=expected_rows ||
+                value<std::uint64_t>(mx,32)!=width/2 || value<std::uint64_t>(mx,40)!=expected_rows ||
+                value<std::uint64_t>(mx,48)!=width/32 ||
+                expected_rows>(bytes-56)/(width/2+width/32) ||
+                bytes-56!=expected_rows*(width/2+width/32))
+                throw std::runtime_error("invalid mixed MXFP4 row layout");
+            pool.mx_values=pool.offset+56;
+            pool.mx_scales=pool.mx_values+std::size_t(expected_rows)*(width/2);
+            rows=static_cast<int>(expected_rows);columns=width_;
         } else throw MfeQuantRangeUnsupported("unsupported mixed expert range dtype: "+pool.dtype);
         if (rows!=static_cast<int>(count*output) || columns!=width_)
             throw std::runtime_error("mixed expert pool shape mismatch");
@@ -313,7 +327,7 @@ std::size_t MfeQuantExpertStore::index_nbytes() const noexcept {
     std::size_t bytes=owners_.size()*sizeof(Expert);
     for (const auto& pool: pools_)
         bytes+=pool.ids.size()*sizeof(std::int32_t)+pool.dtype.size()+
-            (pool.nint ? pool.nint->index_nbytes() : pool.nvq->index_nbytes());
+            (pool.nint ? pool.nint->index_nbytes() : pool.nvq ? pool.nvq->index_nbytes() : 2*sizeof(std::size_t));
     return bytes;
 }
 
@@ -326,7 +340,42 @@ MfeQuantExpert MfeQuantExpertStore::read_expert(int expert) const {
     if (expert<0 || expert>=experts_) throw std::out_of_range("mixed expert ID");
     const auto& owner=owners_[expert]; const auto& pool=pools_[owner.pool];
     const auto begin=std::int64_t(owner.local)*output_,end=begin+output_;
+    if(pool.dtype=="MXFP4") {
+        MfeQuantExpert result{pool.dtype,{'M','X','T','1',1,4,0,0}};
+        for(const auto dimension:{std::uint64_t(output_),std::uint64_t(width_),std::uint64_t(output_),
+                std::uint64_t(width_/2),std::uint64_t(output_),std::uint64_t(width_/32)}) {
+            const auto offset=result.payload.size();result.payload.resize(offset+8);
+            std::memcpy(result.payload.data()+offset,&dimension,8);
+        }
+        const auto values=std::size_t(output_)*(width_/2),scales=std::size_t(output_)*(width_/32);
+        result.payload.resize(56+values+scales);
+        copy_mxfp4_fields(expert,{{{result.payload.data()+56,values},
+            {result.payload.data()+56+values,scales}}});
+        return result;
+    }
     return {pool.dtype,pool.nint ? pool.nint->slice_rows_blob(begin,end) : pool.nvq->slice_rows_blob(begin,end)};
+}
+
+bool MfeQuantExpertStore::copy_mxfp4_fields(int expert,const std::array<QuantFieldTarget,2>& targets,
+        std::size_t* source_bytes) const {
+    if(expert<0 || expert>=experts_)throw std::out_of_range("mixed MXFP4 expert ID");
+    const auto& owner=owners_[expert];const auto& pool=pools_[owner.pool];
+    if(pool.dtype!="MXFP4")return false;
+    const std::array<std::size_t,2> sizes{std::size_t(output_)*(width_/2),std::size_t(output_)*(width_/32)};
+    for(std::size_t field=0;field<2;++field)
+        if(targets[field].bytes!=sizes[field] || !targets[field].data)
+            throw std::invalid_argument("MXFP4 expert field target size differs");
+    const std::array<std::size_t,2> starts{pool.mx_values,pool.mx_scales};
+    std::vector<ReadSpan> spans;
+    for(std::size_t field=0;field<2;++field)
+        spans.push_back({starts[field]+std::size_t(owner.local)*sizes[field],
+            reinterpret_cast<std::byte*>(targets[field].data),sizes[field]});
+    if(read_batch_)read_batch_(spans);
+    else for(const auto& span:spans)read_(span.offset,reinterpret_cast<std::uint8_t*>(span.destination),span.size);
+    if(std::find(targets[1].data,targets[1].data+sizes[1],255)!=targets[1].data+sizes[1])
+        throw std::runtime_error("MXFP4 expert contains a NaN scale");
+    if(source_bytes)*source_bytes=sizes[0]+sizes[1];
+    return true;
 }
 
 std::optional<NvqRows::Fields> MfeQuantExpertStore::read_nvq_fields(int expert) const {
@@ -377,6 +426,14 @@ void MfeQuantExpertStore::visit_pool_experts(std::size_t index,
         HostParallelPool* workers,int threads) const {
     if (!visitor) throw std::invalid_argument("missing expert preload visitor");
     const auto& pool=pools_.at(index);
+    if(pool.dtype=="MXFP4") {
+        const auto visit=[&](int64_t begin,int64_t end) {
+            for(auto local=begin;local<end;++local)visitor(pool.ids[local],read_expert(pool.ids[local]));
+        };
+        if(workers)workers->run(0,pool.ids.size(),1,threads,visit);
+        else visit(0,pool.ids.size());
+        return;
+    }
     std::vector<std::uint8_t> payload(pool.bytes);
     read_(pool.offset,payload.data(),payload.size());
     const Read memory=[&payload](std::size_t offset,std::uint8_t* destination,std::size_t bytes) {
@@ -407,6 +464,7 @@ std::size_t MfeQuantExpertStore::expert_payload_nbytes(int expert) const {
     if (expert<0 || expert>=experts_) throw std::out_of_range("mixed expert ID");
     const auto& owner=owners_[expert]; const auto& pool=pools_[owner.pool];
     const auto begin=std::int64_t(owner.local)*output_,end=begin+output_;
+    if(pool.dtype=="MXFP4")return 56+std::size_t(output_)*(width_/2+width_/32);
     return pool.nint ? pool.nint->row_range_nbytes(begin,end) : pool.nvq->row_range_nbytes(begin,end);
 }
 

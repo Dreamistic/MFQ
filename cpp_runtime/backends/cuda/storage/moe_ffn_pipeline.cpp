@@ -99,10 +99,22 @@ MixedMoePool fields_pool(MixedMoePool pool,const std::vector<tb::Tensor>& fields
         auto& w=pool.nvq;w.workspaces.clear();w.indices_packed=fields[0];w.aux_packed=fields[1];
         w.sub_scale_packed=fields[2];w.neuron_scale=fields[3];
         w.out=int64_t(slots)*output;if(!w.shape.empty())w.shape[0]=w.out;
+    } else if(pool.family==MixedMoeFamily::Mxfp4) {
+        pool.mxfp4.values=fields[0];pool.mxfp4.scales=fields[1];
+        pool.mxfp4.out=int64_t(slots)*output;
     } else throw std::runtime_error("MFQ FFN CPU callback lacks this packed format");
     return pool;
 }
 CpuProjectionRows rows_plan(const MixedMoePool& p,bool up_half=false) {
+    if(p.family==MixedMoeFamily::Mxfp4) {
+        auto w=p.mxfp4;
+        if(up_half) {
+            w.out/=2;
+            w.values=w.values.narrow(0,w.out,w.out);
+            w.scales=w.scales.narrow(0,w.out,w.out);
+        }
+        return make_cpu_projection_rows(w);
+    }
     if(up_half) {
         const auto half=[](const tb::Tensor& field) {
             return field.reshape({-1}).narrow(0,field.numel()/2,field.numel()/2);

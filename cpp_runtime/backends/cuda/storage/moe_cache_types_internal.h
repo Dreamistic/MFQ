@@ -170,6 +170,9 @@ static MixedMoePool moe_replace_quant_fields(MixedMoePool pool,const Fields& fie
     }else if(pool.family==MixedMoeFamily::Nvq) {
         if(fields.size()!=4)throw std::invalid_argument("NVQ RAM complement layout mismatch");
         pool.nvq.indices_packed=fields[0];pool.nvq.aux_packed=fields[1];pool.nvq.sub_scale_packed=fields[2];pool.nvq.neuron_scale=fields[3];
+    }else if(pool.family==MixedMoeFamily::Mxfp4) {
+        if(fields.size()!=2)throw std::invalid_argument("MXFP4 RAM complement layout mismatch");
+        pool.mxfp4.values=fields[0];pool.mxfp4.scales=fields[1];
     }else throw std::invalid_argument("unsupported canonical RAM complement format");
     return pool;
 }

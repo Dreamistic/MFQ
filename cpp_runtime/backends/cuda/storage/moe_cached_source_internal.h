@@ -88,6 +88,8 @@ public:
                 if (pool.family==MixedMoeFamily::Nint) {
                     pool.nint.q_packed={}; pool.nint.row_q_bits={}; pool.nint.row_q_bit_offsets={};
                     pool.nint.sub_scale={}; pool.nint.sub_min={}; pool.nint.neuron_scale={}; pool.nint.neuron_min={};
+                } else if(pool.family==MixedMoeFamily::Mxfp4) {
+                    pool.mxfp4.values={};pool.mxfp4.scales={};
                 } else {
                     pool.nvq.indices_packed={}; pool.nvq.aux_packed={}; pool.nvq.sub_scale_packed={}; pool.nvq.neuron_scale={};
                 }

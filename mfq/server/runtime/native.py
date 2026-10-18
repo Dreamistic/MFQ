@@ -59,7 +59,7 @@ def supports_cuda_ram_expert_pipeline(model: Path) -> bool:
                 view = store.blob_view(record)
                 try:
                     _, pools = inspect_mfe_header(view)
-                    if any(pool.dtype not in {"NINT", "NVQ", "NPQ"} for pool in pools):
+                    if any(pool.dtype not in {"NINT", "NVQ", "NPQ", "MXFP4"} for pool in pools):
                         return False
                 finally:
                     view.release()

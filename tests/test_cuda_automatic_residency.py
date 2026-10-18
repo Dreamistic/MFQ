@@ -15,14 +15,22 @@ from mfq.server.runtime.runtime_pool import RuntimePool
 from mfq.server.services.hardware import GpuMemory, HardwareIdentity
 from mfq.server.state.catalog import DiscoveredModel, ModelCatalog
 from mfq.server.services.jobs import JobExecutionError
-from tests.mixed_family_fixtures import make_flat_family
+from mfq.formats.nvq import E8_256, NVQ2_E8, NvqJscTensor
+
+
+def make_nvq_fixture():
+    return NvqJscTensor((6, 96), 0, 96, np.ones(6, dtype=np.float32),
+        np.arange(16, dtype=np.float32), np.zeros(16, dtype=np.uint8),
+        np.ones((6, 4), dtype=np.uint8), np.zeros((6, 12), dtype=np.uint8),
+        np.zeros((6, 12), dtype=np.uint8), (E8_256[None].astype(np.int16) * 8).astype(np.int8),
+        base_spec=NVQ2_E8)
 
 GIB = 1 << 30
 
 
 def artifact(tmp_path):
     path = tmp_path / "model.mfq"
-    experts = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), make_flat_family("NVQ2J")),))
+    experts = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), make_nvq_fixture()),))
     save(path, FileHeader(version=2, model_arch="qwen4_exp"),
          {"model.block.0.mlp.experts.gate.weight": experts})
     resource = ModelArtifactResource(id="1" * 32, name="model", architecture="qwen4_exp",
@@ -130,4 +138,19 @@ def test_cuda_ram_pipeline_accepts_packed_nint_predictor_experts(tmp_path):
     packed = replace(quantize(np.ones((6, 96), dtype=np.float32), NintSpec(4, 24, 6), axis=0), shape=(2, 3, 96))
     save(model.path, FileHeader(version=2, model_arch="qwen4_exp"),
          {"predictor.block.0.mlp.experts.gate_up.weight": packed})
+    assert supports_cuda_ram_expert_pipeline(model.path)
+
+
+def test_cuda_ram_pipeline_accepts_mxfp4_predictor_with_quantized_target(tmp_path):
+    from mfq.formats.mx import MxTensor
+
+    model = artifact(tmp_path)
+    target = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), make_nvq_fixture()),))
+    mx = MxTensor("MXFP4", (6, 96), np.zeros((6, 48), dtype=np.uint8),
+                  np.full((6, 3), 127, dtype=np.uint8))
+    predictor = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), mx),))
+    save(model.path, FileHeader(version=2, model_arch="deepseek_v41"), {
+        "model.block.0.mlp.experts.gate.weight": target,
+        "predictor.stage.0.mlp.experts.down.weight": predictor,
+    })
     assert supports_cuda_ram_expert_pipeline(model.path)

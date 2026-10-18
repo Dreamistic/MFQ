@@ -40,6 +40,7 @@ std::vector<tb::Tensor> expert_field_tensors(const MixedMoePool& pool) {
     if (pool.family==MixedMoeFamily::Nint)
         fields={pool.nint.q_packed,pool.nint.row_q_bits,pool.nint.row_q_bit_offsets,
             pool.nint.sub_scale,pool.nint.sub_min,pool.nint.neuron_scale,pool.nint.neuron_min};
+    else if(pool.family==MixedMoeFamily::Mxfp4)fields={pool.mxfp4.values,pool.mxfp4.scales};
     else fields={pool.nvq.indices_packed,pool.nvq.aux_packed,pool.nvq.sub_scale_packed,pool.nvq.neuron_scale};
     return fields;
 }
@@ -142,6 +143,8 @@ MixedMoePool MoeQuantRangeSource::allocate_expert(int expert) const {
     if(pool.family==MixedMoeFamily::Nvq) {
         auto& w=pool.nvq;w.workspaces.clear();
         w.indices_packed=fields[0];w.aux_packed=fields[1];w.sub_scale_packed=fields[2];w.neuron_scale=fields[3];
+    } else if(pool.family==MixedMoeFamily::Mxfp4) {
+        pool.mxfp4.values=fields[0];pool.mxfp4.scales=fields[1];
     } else {
         auto& w=pool.nint;w.workspaces.clear();
         w.q_packed=fields[0];w.row_q_bits=fields[1];w.row_q_bit_offsets=fields[2];
@@ -192,8 +195,9 @@ MixedMoePool MoeQuantRangeSource::read_expert_canonical(int expert) const {
         encoded_ns_.fetch_add(encoded_time,std::memory_order_relaxed);
         const auto materialize=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_done).count();
         materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
-        (result.family==MixedMoeFamily::Nint?nint_materialize_ns_:nvq_materialize_ns_).fetch_add(materialize,std::memory_order_relaxed);
-        record_format_io(result.family==MixedMoeFamily::Nint?0:result.nvq.kernel_format,
+        if(result.family!=MixedMoeFamily::Mxfp4)
+            (result.family==MixedMoeFamily::Nint?nint_materialize_ns_:nvq_materialize_ns_).fetch_add(materialize,std::memory_order_relaxed);
+        record_format_io(result.family==MixedMoeFamily::Nint?0:result.family==MixedMoeFamily::Nvq?result.nvq.kernel_format:-1,
             source_bytes,encoded_time,materialize);
     }
     return result;
@@ -227,6 +231,25 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
         throw std::runtime_error("expert disk copy forbidden after complete residency preload");
     }
     const auto& prototype=metadata_->pools.at(index);
+    if(prototype.family==MixedMoeFamily::Mxfp4 && targets.size()==2) {
+        using Clock=std::chrono::steady_clock;
+        const bool profile=profile_ssd_ && preloaded_.load();
+        const auto begin=profile?Clock::now():Clock::time_point{};
+        std::array<mfq::QuantFieldTarget,2> fields;
+        for(std::size_t f=0;f<2;++f)fields[f]={static_cast<std::uint8_t*>(targets[f].data_ptr()),
+            std::size_t(targets[f].nbytes())};
+        std::size_t source_bytes=0;
+        if(!store_->copy_mxfp4_fields(expert,fields,&source_bytes))
+            throw std::logic_error("MXFP4 range source differs from prototype");
+        ++direct_field_reads_;++materializations_;
+        if(preloaded_.load()) {
+            ++disk_reads_after_preload_;
+            disk_bytes_after_preload_.fetch_add(source_bytes,std::memory_order_relaxed);
+        }
+        if(profile)encoded_ns_.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-begin).count(),std::memory_order_relaxed);
+        return;
+    }
     if(prototype.family==MixedMoeFamily::Nint && targets.size()==7) {
         using Clock=std::chrono::steady_clock;
         const bool profile=profile_ssd_ && preloaded_.load();
@@ -377,6 +400,9 @@ MixedMoePool MoeQuantRangeSource::decode_expert(int expert,const mfq::MfeQuantEx
             pool.nint.q_packed=std::move(padded);
             pool.nint.q_expert_stride=stride;
         }
+    } else if(encoded.dtype=="MXFP4") {
+        pool.family=MixedMoeFamily::Mxfp4;
+        pool.mxfp4=to_device_mxfp4(unpack_mxfp4(encoded.payload),false);
     } else {
         pool.family=MixedMoeFamily::Nvq;
         pool.nvq=to_cpu_nvq(unpack_nvq(encoded.payload,encoded.dtype));
@@ -470,7 +496,8 @@ tb::Tensor MoeQuantRangeSource::forward_cpu(CudaExecutionContext& execution,tb::
         if(positions.empty()) continue;
         auto lease=prepared ? prepared->at(expert) : acquire_expert(expert);
         const auto& pool=lease->weights;
-        auto projection=pool.family==MixedMoeFamily::Nint ? make_cpu_projection_rows(pool.nint) : make_cpu_projection_rows(pool.nvq);
+        auto projection=pool.family==MixedMoeFamily::Nint ? make_cpu_projection_rows(pool.nint) :
+            pool.family==MixedMoeFamily::Mxfp4 ? make_cpu_projection_rows(pool.mxfp4) : make_cpu_projection_rows(pool.nvq);
         for(std::size_t row=0;row<positions.size();++row) {
             const int source=input.dim()==2 ? positions[row]/routes : positions[row];
             std::memcpy(packed.data_ptr<float>()+std::size_t(offset+row)*width,
