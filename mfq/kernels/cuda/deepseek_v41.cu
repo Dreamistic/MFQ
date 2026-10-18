@@ -341,3 +341,61 @@ mfq_tensor_backend::Tensor deepseek_v41_engram_gate_add_cuda(
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
+
+namespace {
+// Split the small FP32 projection across the reduction dimension, as the GR
+// projection kernels do. Normalization is a row scalar and is applied by the
+// coefficient stage, so no expanded FP32 activation buffer is needed.
+__global__ void hc_project_partial_kernel(const half* residual, const float* previous,
+    const float* function, float* partials, int hidden, int parts) {
+    const int part=blockIdx.x, row=blockIdx.y, tid=threadIdx.x;
+    const int column=part*64+tid, width=4*hidden;
+    float terms[26]{};
+    if(column<width) {
+        const float x=__half2float(residual[int64_t(row)*width+column]);
+        #pragma unroll
+        for(int f=0;f<24;++f)terms[f]=__fmul_rn(x,function[int64_t(f)*width+column]);
+        terms[24]=__fmul_rn(x,x);
+        if(column<hidden) {
+            float mixed=0;
+            #pragma unroll
+            for(int stream=0;stream<4;++stream)
+                mixed=__fadd_rn(mixed,__fmul_rn(previous[row*4+stream],
+                    __half2float(residual[(int64_t(row)*4+stream)*hidden+column])));
+            terms[25]=__fmul_rn(mixed,mixed);
+        }
+    }
+    #pragma unroll
+    for(int f=0;f<26;++f) {
+        #pragma unroll
+        for(int offset=16;offset;offset>>=1)terms[f]+=__shfl_down_sync(0xffffffff,terms[f],offset);
+    }
+    __shared__ float reduced[26][2];
+    if((tid&31)==0) {
+        #pragma unroll
+        for(int f=0;f<26;++f)reduced[f][tid>>5]=terms[f];
+    }
+    __syncthreads();
+    if(tid<26)partials[(int64_t(row)*parts+part)*26+tid]=reduced[tid][0]+reduced[tid][1];
+}
+}
+
+mfq_tensor_backend::Tensor deepseek_v41_hc_project_cuda(mfq_tensor_backend::Tensor residual,
+    mfq_tensor_backend::Tensor previous, mfq_tensor_backend::Tensor function) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(residual.is_cuda() && residual.is_contiguous() && residual.scalar_type()==tb::kFloat16 &&
+        residual.dim()==4 && residual.size(2)==4 && residual.size(3)>0 && residual.size(3)<=INT_MAX/4 &&
+        previous.is_cuda() && previous.is_contiguous() && previous.scalar_type()==tb::kFloat32 &&
+        previous.dim()==3 && previous.size(0)==residual.size(0) && previous.size(1)==residual.size(1) &&
+        previous.size(2)==4 && function.is_cuda() && function.is_contiguous() &&
+        function.scalar_type()==tb::kFloat32 && function.dim()==2 && function.size(0)==24 &&
+        function.size(1)==4*residual.size(3) && residual.device()==function.device() &&
+        residual.device()==previous.device(), "invalid mHC split projection tensors");
+    const auto rows=residual.size(0)*residual.size(1), hidden=residual.size(3), parts=(4*hidden+63)/64;
+    MFQ_RUNTIME_CHECK(rows>0 && rows<=65535,"mHC split projection row count exceeds launch bounds");
+    auto partials=tb::empty({rows,parts,26},previous.options());
+    hc_project_partial_kernel<<<dim3(int(parts),int(rows)),64,0,mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half*>(residual.data_ptr<mfq_half>()),previous.data_ptr<float>(),
+        function.data_ptr<float>(),partials.data_ptr<float>(),int(hidden),int(parts));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();return partials;
+}

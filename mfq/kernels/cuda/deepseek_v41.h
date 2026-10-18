@@ -27,3 +27,13 @@ mfq_tensor_backend::Tensor deepseek_v41_mxfp8_e4m3_sim_cuda(
 
 mfq_tensor_backend::Tensor deepseek_v41_mxfp4_e4m3_scale_sim_cuda(
     mfq_tensor_backend::Tensor input);
+
+mfq_tensor_backend::Tensor deepseek_v41_hc_project_cuda(
+    mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor previous,
+    mfq_tensor_backend::Tensor function);
+
+std::vector<mfq_tensor_backend::Tensor> deepseek_v41_hc_finalize_cuda(
+    mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor previous,
+    mfq_tensor_backend::Tensor norm, mfq_tensor_backend::Tensor partials,
+    mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor base,
+    int64_t iterations, double rms_epsilon, double hc_epsilon);

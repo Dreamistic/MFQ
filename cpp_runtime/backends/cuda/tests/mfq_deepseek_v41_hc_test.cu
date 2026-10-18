@@ -82,6 +82,17 @@ void check_single_pass_prepare(int batch, int tokens, int hidden) {
     auto coefficients = dsv4_hc_coefficients_cuda(mixes, scale, base, 20, 1.e-6);
     if (!coefficients.at(1).equal(reference.at(1)) || !coefficients.at(2).equal(reference.at(2)))
         throw std::runtime_error("mHC coefficient-only path changed post/Sinkhorn values");
+    auto function=mfq_tensor_backend::randn({24,4*hidden},pre.options())/std::sqrt(double(4*hidden));
+    auto partials=deepseek_v41_hc_project_cuda(residual,pre,function);
+    auto fused=deepseek_v41_hc_finalize_cuda(residual,pre,weight,partials,scale,base,20,1.e-20,1.e-6);
+    auto projected=mfq_tensor_backend::matmul(prepared[0],function.transpose(0,1));
+    auto projected_coefficients=dsv4_hc_coefficients_cuda(projected.contiguous(),scale,base,20,1.e-6);
+    for(int index=0;index<4;++index) {
+        auto expected=index==0?prepared[1]:projected_coefficients[index-1];
+        const auto error=(fused[index].to(kFloat32)-expected.to(kFloat32)).abs().max().item<double>();
+        if(!std::isfinite(error) || error>(index==0?.0021:.00003))
+            throw std::runtime_error("two-stage mHC changed branch or coefficient values");
+    }
     const auto next_pre = coefficients.at(0).cpu();
     for (int row = 0; row < rows; ++row) for (int col = 0; col < 4; ++col) {
         const auto affine = mix[row * 24 + col] * scales[0] + bases[col];

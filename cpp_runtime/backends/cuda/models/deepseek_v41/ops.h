@@ -450,6 +450,12 @@ struct Block final : ::Block {
                        const Tensor &function, const Tensor &scale, const Tensor &base,
                        const Tensor &norm, const char *profile) const {
         return profiler.measure(profile, [&]() {
+            if(residual.size(0)*residual.size(1)<=8) {
+                auto partials=deepseek_v41_hc_project_cuda(residual,previous_pre,function);
+                auto result=deepseek_v41_hc_finalize_cuda(residual,previous_pre,norm,partials,scale,base,
+                    config.hc_sinkhorn_iters,config.rms_eps,config.hc_eps);
+                return MhcResult{std::move(result[0]),std::move(result[1]),std::move(result[2]),std::move(result[3])};
+            }
             auto prepared = deepseek_v41_hc_prepare_cuda(residual, previous_pre, norm, config.rms_eps);
             auto mixes = mfq_tensor_backend::matmul(prepared.at(0), function.transpose(0, 1));
             auto coefficients = dsv4_hc_coefficients_cuda(mixes.contiguous(), scale, base,
