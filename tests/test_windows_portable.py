@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -25,7 +26,17 @@ def project(tmp_path):
     tauri = root / "MFQStudio/src-tauri"
     tauri.mkdir(parents=True)
     (tauri / "icons").mkdir()
-    shutil.copyfile(Path(__file__).parents[1] / "MFQStudio/src-tauri/icons/icon.ico", tauri / "icons/icon.ico")
+    images = []
+    entries = []
+    offset = 6 + 16 * 3
+    for size in (16, 32, 48):
+        mask = b"\0" * (((size + 31) // 32) * 4 * size)
+        pixels = b"\x20\x40\x60\xff" * size * size
+        image = struct.pack("<IiiHHIIiiII", 40, size, size * 2, 1, 32, 0, len(pixels) + len(mask), 0, 0, 0, 0) + pixels + mask
+        entries.append(struct.pack("<BBBBHHII", size, size, 0, 0, 1, 32, len(image), offset))
+        images.append(image)
+        offset += len(image)
+    (tauri / "icons/icon.ico").write_bytes(struct.pack("<HHH", 0, 1, 3) + b"".join(entries + images))
     (root / "packaging").mkdir()
     shutil.copyfile(Path(__file__).parents[1] / "packaging/windows_standalone.nsi", root / "packaging/windows_standalone.nsi")
     (tauri / "tauri.conf.json").write_text(json.dumps({"version": "0.4.0"}))
