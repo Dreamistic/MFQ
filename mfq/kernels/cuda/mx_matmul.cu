@@ -584,11 +584,10 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_small_m_f32_cuda(
 namespace {
 
 __device__ __forceinline__ float decode_mxfp4_e2m1(std::uint8_t code) {
-    constexpr float magnitude[8] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    };
-    const float value = magnitude[code & 7u];
-    return (code & 8u) == 0u ? value : -value;
+    const unsigned magnitude=code&7u;
+    const unsigned bits=magnitude<2u ? magnitude*0x3f000000u :
+        ((126u+(magnitude>>1u))<<23u)|((magnitude&1u)<<22u);
+    return __uint_as_float(bits|((unsigned(code)&8u)<<28u));
 }
 
 __global__ void mxfp4_dequant_kernel(
@@ -843,9 +842,14 @@ __global__ void __launch_bounds__(128) mxfp4_moe_grouped_tensor_kernel(
         int routes,int global_experts,int pool_experts,
         int outputs,int width,int max_tiles,int output_tiles,bool routed_input) {
     using namespace nvcuda;
-    __shared__ __align__(16) __half a[16*32];
-    __shared__ __align__(16) __half b[64*32];
-    __shared__ __align__(16) float c[4][16*16];
+    constexpr int tile_k=64;
+    constexpr int stride=tile_k+8; // Rotate shared-memory banks between rows.
+    __shared__ __align__(16) __half a[16*stride];
+    // The final accumulators are stored only after all weight readers finish.
+    // Reuse their storage to widen K without retaining another output tile.
+    __shared__ __align__(16) unsigned char tile_storage[64*stride*sizeof(__half)];
+    auto* b=reinterpret_cast<__half*>(tile_storage);
+    auto* c=reinterpret_cast<float*>(tile_storage);
     __shared__ int pair_ids[16];
     const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
     const int64_t tasks=int64_t(max_tiles)*output_tiles;
@@ -864,40 +868,42 @@ __global__ void __launch_bounds__(128) mxfp4_moe_grouped_tensor_kernel(
         __syncthreads();
         wmma::fragment<wmma::accumulator,16,16,16,float> acc;
         wmma::fill_fragment(acc,0.0f);
-        for(int k=0;k<width;k+=32) {
-            for(int i=threadIdx.x;i<16*32;i+=128) {
-                const int pair=pair_ids[i/32];
+        for(int k=0;k<width;k+=tile_k) {
+            for(int i=threadIdx.x;i<16*tile_k;i+=128) {
+                const int pair=pair_ids[i/tile_k],column=k+i%tile_k;
                 const int source_row=routed_input?pair:pair/routes;
-                a[i]=pair>=0?input[int64_t(source_row)*width+k+i%32]:__float2half_rn(0);
+                a[(i/tile_k)*stride+i%tile_k]=pair>=0 && column<width?
+                    input[int64_t(source_row)*width+column]:__float2half_rn(0);
             }
-            for(int i=threadIdx.x;i<64*32;i+=128) {
-                const int neuron=first_output+i/32,column=k+i%32;
-                float weight=0;
-                if(neuron<outputs) {
+            for(int i=threadIdx.x;i<64*(tile_k/2);i+=128) {
+                const int neuron=first_output+i/(tile_k/2),column=k+2*(i%(tile_k/2));
+                float lo=0,hi=0;
+                if(neuron<outputs && column<width) {
                     const int64_t packed_row=int64_t(local)*outputs+neuron;
                     const auto packed=values[packed_row*(width/2)+column/2];
-                    weight=decode_mxfp4_e2m1((packed>>((column&1)*4))&15u)*
-                        decode_e8m0(scales[packed_row*(width/32)+column/32]);
+                    const float scale=decode_e8m0(scales[packed_row*(width/32)+column/32]);
+                    lo=decode_mxfp4_e2m1(packed&15u)*scale;
+                    hi=decode_mxfp4_e2m1(packed>>4u)*scale;
                 }
-                b[i]=__float2half_rn(weight);
+                reinterpret_cast<__half2*>(b)[(i/(tile_k/2))*(stride/2)+i%(tile_k/2)]=__floats2half2_rn(lo,hi);
             }
             __syncthreads();
             #pragma unroll
-            for(int sub=0;sub<32;sub+=16) {
+            for(int sub=0;sub<tile_k;sub+=16) {
                 wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
                 wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
-                wmma::load_matrix_sync(af,a+sub,32);
-                wmma::load_matrix_sync(bf,b+warp*16*32+sub,32);
+                wmma::load_matrix_sync(af,a+sub,stride);
+                wmma::load_matrix_sync(bf,b+warp*16*stride+sub,stride);
                 wmma::mma_sync(acc,af,bf,acc);
             }
             __syncthreads();
         }
-        wmma::store_matrix_sync(c[warp],acc,16,wmma::mem_row_major);
+        wmma::store_matrix_sync(c+warp*16*16,acc,16,wmma::mem_row_major);
         __syncwarp();
         for(int i=lane;i<16*16;i+=32) {
             const int pair=pair_ids[i/16],neuron=first_output+warp*16+i%16;
             if(pair>=0 && neuron<outputs)
-                output[int64_t(pair)*outputs+neuron]=__float2half_rn(c[warp][i]);
+                output[int64_t(pair)*outputs+neuron]=__float2half_rn(c[warp*16*16+i]);
         }
         __syncthreads();
     }

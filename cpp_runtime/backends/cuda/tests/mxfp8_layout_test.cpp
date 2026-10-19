@@ -148,16 +148,23 @@ void benchmark_mxfp4_prefill() {
         auto scales=tb::full({pool*outputs,width/32},127,options);
         auto input=tb::full({tokens,width},.03125,options.dtype(tb::kFloat16));
         auto output=tb::full({tokens,routes,outputs},-7,options.dtype(tb::kFloat16));
+        const auto launch=[&] {
+            mxfp4_moe_grouped_matmul_pool_f16_cuda(packed,scales,input,route_ids,locals,
+                experts,pool,outputs,width,output,positions,starts,tiles,owners);
+        };
+        for(int i=0;i<2;++i)launch();
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_current_cuda_stream()));
         cudaEvent_t start,stop;MFQ_CUDA_CHECK(cudaEventCreate(&start));MFQ_CUDA_CHECK(cudaEventCreate(&stop));
         MFQ_CUDA_CHECK(cudaEventRecord(start,mfq_current_cuda_stream()));
-        mxfp4_moe_grouped_matmul_pool_f16_cuda(packed,scales,input,route_ids,locals,
-            experts,pool,outputs,width,output,positions,starts,tiles,owners);
+        constexpr int iterations=20;
+        for(int i=0;i<iterations;++i)launch();
         MFQ_CUDA_CHECK(cudaEventRecord(stop,mfq_current_cuda_stream()));MFQ_CUDA_CHECK(cudaEventSynchronize(stop));
         float ms=0;MFQ_CUDA_CHECK(cudaEventElapsedTime(&ms,start,stop));
         auto sample=output.select(0,0).to(tb::kCPU).to(tb::kFloat32).contiguous();
         for(int r=0;r<routes;++r)for(int n=0;n<outputs;++n)
             require(sample.data_ptr<float>()[r*outputs+n]==width*.03125f,"MXFP4 prefill independent oracle differs");
-        std::cout<<"mxfp4_prefill rows="<<tokens<<" width="<<width<<" outputs="<<outputs<<" ms="<<ms<<'\n';
+        std::cout<<"mxfp4_prefill rows="<<tokens<<" width="<<width<<" outputs="<<outputs
+            <<" ms="<<ms/iterations<<" iterations="<<iterations<<" warmup=2\n";
         MFQ_CUDA_CHECK(cudaEventDestroy(start));MFQ_CUDA_CHECK(cudaEventDestroy(stop));
     }
 }
