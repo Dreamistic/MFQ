@@ -26,12 +26,29 @@ template <typename Model>
 static mfq_tensor_backend::Tensor sample_token(Model &model, mfq_tensor_backend::Tensor ids,
     mfq::cuda::Sampler &sampler, mfq_tensor_backend::Tensor counts,
     const MfqTokenConstraintPtr &token_constraint) {
-    if (sampler.greedy() && !sampler.has_penalties() && !token_constraint) {
-        return model.next_token(ids);
-    }
+    const auto run = [&]() {
+        if (sampler.greedy() && !sampler.has_penalties() && !token_constraint) {
+            return model.next_token(ids);
+        }
 
-    auto logits = model.last_logits(ids).contiguous().view({1, -1});
-    return mfq::cuda::sample_logits(sampler, std::move(logits), counts, token_constraint);
+        auto logits = model.last_logits(ids).contiguous().view({1, -1});
+        return mfq::cuda::sample_logits(sampler, std::move(logits), counts, token_constraint);
+    };
+    const auto* setting = std::getenv("MFQ_PROFILE_DECODE");
+    if (!setting || setting[0] != '1' || ids.numel() > 8) return run();
+    auto& profiler = model.execution->profiler;
+    const bool previous = profiler.enabled;
+    profiler.reset();
+    profiler.enabled = true;
+    try {
+        auto next = profiler.measure("runtime.decode", run);
+        profiler.report("runtime.decode");
+        profiler.enabled = previous;
+        return next;
+    } catch (...) {
+        profiler.enabled = previous;
+        throw;
+    }
 }
 
 template <typename Model> struct CudaGenerationOps {

@@ -4,6 +4,8 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
@@ -824,6 +826,83 @@ __global__ void __launch_bounds__(256) mxfp4_moe_grouped_f16_kernel(
     }
 }
 
+// Merge adjacent eight-row tiles from the same expert into one WMMA tile.
+// Four warps share its activation and decode only 64x32 weights at a time.
+// The remaining WMMA rows are zero, so partial expert groups need no padding
+// in the caller and compressed weights never acquire a persistent expansion.
+__global__ void __launch_bounds__(128) mxfp4_moe_grouped_tensor_kernel(
+        const std::uint8_t* __restrict__ values,
+        const std::uint8_t* __restrict__ scales,
+        const __half* __restrict__ input,
+        const std::int32_t* __restrict__ expert_local,
+        const std::int32_t* __restrict__ ids_dst,
+        const std::int32_t* __restrict__ expert_bounds,
+        const std::int32_t* __restrict__ tile_bounds,
+        const std::int32_t* __restrict__ tile_experts,
+        __half* __restrict__ output,
+        int routes,int global_experts,int pool_experts,
+        int outputs,int width,int max_tiles,int output_tiles,bool routed_input) {
+    using namespace nvcuda;
+    __shared__ __align__(16) __half a[16*32];
+    __shared__ __align__(16) __half b[64*32];
+    __shared__ __align__(16) float c[4][16*16];
+    __shared__ int pair_ids[16];
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    const int64_t tasks=int64_t(max_tiles)*output_tiles;
+    for(int64_t task=blockIdx.x;task<tasks;task+=gridDim.x) {
+        const int tile=int(task/output_tiles);
+        if(tile>=tile_bounds[global_experts])continue;
+        const int expert=tile_experts[tile],local=expert_local[expert];
+        if(static_cast<unsigned>(local)>=static_cast<unsigned>(pool_experts))continue;
+        const int local_tile=tile-tile_bounds[expert];
+        if(local_tile&1)continue;
+        const int first=expert_bounds[expert]+local_tile*8;
+        const int last=min(first+16,expert_bounds[expert+1]);
+        const int first_output=int(task%output_tiles)*64;
+        if(threadIdx.x<16)pair_ids[threadIdx.x]=first+threadIdx.x<last?
+            ids_dst[first+threadIdx.x]:-1;
+        __syncthreads();
+        wmma::fragment<wmma::accumulator,16,16,16,float> acc;
+        wmma::fill_fragment(acc,0.0f);
+        for(int k=0;k<width;k+=32) {
+            for(int i=threadIdx.x;i<16*32;i+=128) {
+                const int pair=pair_ids[i/32];
+                const int source_row=routed_input?pair:pair/routes;
+                a[i]=pair>=0?input[int64_t(source_row)*width+k+i%32]:__float2half_rn(0);
+            }
+            for(int i=threadIdx.x;i<64*32;i+=128) {
+                const int neuron=first_output+i/32,column=k+i%32;
+                float weight=0;
+                if(neuron<outputs) {
+                    const int64_t packed_row=int64_t(local)*outputs+neuron;
+                    const auto packed=values[packed_row*(width/2)+column/2];
+                    weight=decode_mxfp4_e2m1((packed>>((column&1)*4))&15u)*
+                        decode_e8m0(scales[packed_row*(width/32)+column/32]);
+                }
+                b[i]=__float2half_rn(weight);
+            }
+            __syncthreads();
+            #pragma unroll
+            for(int sub=0;sub<32;sub+=16) {
+                wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+                wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+                wmma::load_matrix_sync(af,a+sub,32);
+                wmma::load_matrix_sync(bf,b+warp*16*32+sub,32);
+                wmma::mma_sync(acc,af,bf,acc);
+            }
+            __syncthreads();
+        }
+        wmma::store_matrix_sync(c[warp],acc,16,wmma::mem_row_major);
+        __syncwarp();
+        for(int i=lane;i<16*16;i+=32) {
+            const int pair=pair_ids[i/16],neuron=first_output+warp*16+i%16;
+            if(pair>=0 && neuron<outputs)
+                output[int64_t(pair)*outputs+neuron]=__float2half_rn(c[warp][i]);
+        }
+        __syncthreads();
+    }
+}
+
 void validate_mxfp4_moe(
         const mfq_tensor_backend::Tensor & values,
         const mfq_tensor_backend::Tensor & scales,
@@ -991,6 +1070,26 @@ mfq_tensor_backend::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
                         tile_bounds.numel() >= global_experts + 1,
                     "MXFP4 compact route map is invalid");
         const int max_tiles = (pairs + 7) / 8 + static_cast<int>(global_experts);
+        if(pairs>=8*global_experts) {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                "mxfp4_moe_prefill_dispatch path=packed_tensor_core tokens=%d routes=%d experts=%lld pool=%lld width=%lld outputs=%lld\n",
+                tokens,routes,static_cast<long long>(global_experts),static_cast<long long>(pool_experts),
+                static_cast<long long>(neuron_len),static_cast<long long>(out_per_expert));
+            const int output_tiles=(static_cast<int>(out_per_expert)+63)/64;
+            const int blocks=static_cast<int>(std::min<int64_t>(int64_t(max_tiles)*output_tiles,4096));
+            mxfp4_moe_grouped_tensor_kernel<<<blocks,128,0,stream>>>(
+                values.data_ptr<std::uint8_t>(),scales.data_ptr<std::uint8_t>(),
+                reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+                expert_local.data_ptr<std::int32_t>(),ids_dst.data_ptr<std::int32_t>(),
+                expert_bounds.data_ptr<std::int32_t>(),tile_bounds.data_ptr<std::int32_t>(),
+                tile_experts.data_ptr<std::int32_t>(),reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+                routes,static_cast<int>(global_experts),static_cast<int>(pool_experts),
+                static_cast<int>(out_per_expert),static_cast<int>(neuron_len),max_tiles,
+                output_tiles,input.dim()==3);
+            MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+            return output;
+        }
         const int blocks = static_cast<int>(std::min<int64_t>(
             static_cast<int64_t>(max_tiles) * row_tiles, 4096));
         mxfp4_moe_grouped_f16_kernel<true><<<blocks, threads, 0, stream>>>(
