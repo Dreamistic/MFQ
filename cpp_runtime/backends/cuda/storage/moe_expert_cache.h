@@ -86,6 +86,8 @@ std::size_t reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cac
     std::size_t allocation_bytes=0);
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);
 std::uint64_t moe_expert_streamed_bytes(const std::shared_ptr<MoeExpertCache>& cache);
+// Successful private FFN captures change this counter for every model family.
+std::uint64_t moe_expert_graph_captures(const std::shared_ptr<MoeExpertCache>& cache);
 // Finish the adaptive transaction before a session reset or a prefill loan.
 void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache);
 void prepare_moe_predictor_exchange(const std::shared_ptr<MoeExpertCache>& cache);

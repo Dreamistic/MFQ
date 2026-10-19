@@ -347,6 +347,8 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
             }
             check(cache->stats().pipeline_two_stage_serves>=16,
                 "clipped FFN did not execute its two-stage kernels");
+            check(moe_expert_graph_captures(cache)>0,
+                "private FFN initialization was not visible to shared MTP policy");
             if(ssd && mixed && mfq::cuda::NativeDmaBatch::available()) {
                 const auto spec=loan->speculative_stats();
                 check(spec.windows==9 && spec.cancels==1 && spec.disabled==0,

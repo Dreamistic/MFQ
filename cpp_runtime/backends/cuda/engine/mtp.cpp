@@ -72,6 +72,7 @@ template <class Model> struct CudaMtpOps {
   std::optional<mfq::cuda::Sampler> sampler_;
   bool penalties = false;
   bool target_maintenance = false;
+  std::uint64_t target_graph_captures = 0;
   std::uint64_t target_transfer_bytes=0;
   std::shared_ptr<MoeExpertCache> target_route_cache;
   CudaMtpOps(CudaMtpOps&&)=default;
@@ -88,7 +89,12 @@ template <class Model> struct CudaMtpOps {
     else commit_moe_speculative_routes(target_route_cache,rows);
     target_route_cache.reset();
   }
-  bool take_target_maintenance() { return std::exchange(target_maintenance,false); }
+  bool take_target_maintenance() {
+    const auto captures=moe_expert_graph_captures(model.execution->moe_expert_cache);
+    const bool initialized=captures!=target_graph_captures;
+    target_graph_captures=captures;
+    return std::exchange(target_maintenance,false) || initialized;
+  }
   bool gradual_mtp_warmup() const {return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>;}
   bool metal_mtp_policy() const {
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
@@ -203,7 +209,9 @@ template <class Model> struct CudaMtpOps {
         position_axes(transformed_prompt && prepared->positions.dim() == 2 &&
                               prepared->positions.size(0) == 3
                           ? 3
-                          : 1), prefill_compute_chunk(compute_chunk), output(output) {}
+                          : 1), prefill_compute_chunk(compute_chunk), output(output) {
+    target_graph_captures=moe_expert_graph_captures(model.execution->moe_expert_cache);
+  }
   void initialize(const std::vector<int64_t> &prompt,
                   const MfqSamplingParams &sampling) {
     input_ids = ids_for(prompt);

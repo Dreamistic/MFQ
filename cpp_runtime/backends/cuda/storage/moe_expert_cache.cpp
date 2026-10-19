@@ -2355,6 +2355,9 @@ bool moe_expert_cache_finalized(
         const std::shared_ptr<MoeExpertCache>& cache) {
     return cache && cache->finalized();
 }
+std::uint64_t moe_expert_graph_captures(const std::shared_ptr<MoeExpertCache>& cache) {
+    return cache?cache->stats().pipeline_graph_captures:0;
+}
 
 std::size_t moe_expert_cache_minimum_bytes(const std::shared_ptr<MoeExpertCache>& cache) {
     return cache ? cache->minimum_bytes() : 0;

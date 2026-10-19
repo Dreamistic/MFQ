@@ -371,6 +371,7 @@ struct MoeCacheStats {
     int64_t ram_pcie_experts=0,ram_pcie_bytes=0;
     int64_t pipeline_serves=0,pipeline_route_wait_ns=0,pipeline_plan_ns=0;
     int64_t pipeline_two_stage_serves=0;
+    std::uint64_t pipeline_graph_captures=0;
     int64_t pipeline_transfer_cache_hits=0,pipeline_transfer_cache_misses=0,pipeline_transfer_cache_saved_bytes=0;
     int64_t pipeline_fetch_ns=0,pipeline_cpu_ns=0;
     int64_t pipeline_ssd_read_ns=0,pipeline_window_ssd_read_ns=0;

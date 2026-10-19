@@ -906,6 +906,7 @@ public:
             {"expert_route_wait_ms",double(stats_.pipeline_route_wait_ns)/1e6},
             {"expert_plan_ms",double(stats_.pipeline_plan_ns)/1e6},
             {"expert_host_fetch_ms",double(stats_.pipeline_fetch_ns)/1e6},
+            {"expert_graph_captures",double(stats_.pipeline_graph_captures)},
             {"expert_logical_transfer_bytes",double(stats_.ram_pcie_bytes)},
             {"ssd_expert_encoded_ms",double(disk_times[0])/1e6},
             {"ssd_expert_materialize_ms",double(disk_times[1])/1e6},

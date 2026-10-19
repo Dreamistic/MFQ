@@ -1990,6 +1990,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         MFQ_CUDA_CHECK(cudaStreamSynchronize(stream_));cell.output={};
         std::string error;
         if(!cell.graphs->record(1,cell.tokens,[&]{launch_body(cell,execution);},error))throw std::runtime_error(error);
+        ++cache_->stats_.pipeline_graph_captures;
     }
     tb::Tensor activation(const tb::Tensor& gate,const tb::Tensor& up,bool fused) {
         if(swiglu_limit_>0)return clipped_silu_mul_cuda(gate,up,swiglu_limit_);
