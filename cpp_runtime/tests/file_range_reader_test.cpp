@@ -2,11 +2,13 @@
 #include "mfq/async_range_reader.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -14,6 +16,61 @@
 
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+void exercise_shared_staging(const std::filesystem::path& base) {
+    struct Fixtures {
+        std::array<std::filesystem::path,2> paths;
+        ~Fixtures() {
+            for(const auto& path:paths) {
+                std::error_code ignored;
+                std::filesystem::remove(path,ignored);
+            }
+        }
+    } fixtures{{base.string()+"-shard-a",base.string()+"-shard-b"}};
+    const std::size_t bytes=(6u<<20)+17;
+    std::array<std::vector<std::byte>,2> expected;
+    for(std::size_t shard=0;shard<2;++shard) {
+        expected[shard].resize(bytes+4096);
+        for(std::size_t i=0;i<expected[shard].size();++i)
+            expected[shard][i]=std::byte((i*37+i/113+shard*97)&255);
+        std::ofstream stream(fixtures.paths[shard],std::ios::binary);
+        stream.write(reinterpret_cast<const char*>(expected[shard].data()),expected[shard].size());
+        require(bool(stream),"cannot write shared staging fixture");
+    }
+    auto check=[&](mfq::FileRangeReader& reader,std::size_t shard,std::size_t offset) {
+        std::vector<std::byte> actual(bytes+2,std::byte{0x5a});
+        reader.read(offset,actual.data()+1,bytes);
+        require(actual.front()==std::byte{0x5a} && actual.back()==std::byte{0x5a},
+                "shared staging overwrote destination guards");
+        require(std::equal(actual.begin()+1,actual.end()-1,expected[shard].begin()+offset),
+                "shared staging reused another shard's contents");
+        require(!reader.stats().staging_bytes,"shared staging retained an active read");
+    };
+    auto first=std::make_unique<mfq::FileRangeReader>(fixtures.paths[0],mfq::FileReadMode::Direct);
+    check(*first,0,3);
+    require(first->stats().staging_cached_bytes>=bytes,"large expert staging was not cached");
+    {
+        mfq::FileRangeReader second(fixtures.paths[1],mfq::FileReadMode::Direct);
+        check(second,1,5);
+        require(!second.stats().staging_allocations && !first->stats().staging_cached_bytes &&
+                second.stats().staging_cached_bytes>=bytes,
+                "large staging was not shared or its ownership accounting was duplicated");
+    }
+    const auto allocations=first->stats().staging_allocations;
+    check(*first,0,7);
+    require(first->stats().staging_allocations==allocations,
+            "closing the previous reader discarded reusable shared staging");
+    std::vector<std::unique_ptr<mfq::FileRangeReader>> readers;
+    for(int i=0;i<12;++i)
+        readers.push_back(std::make_unique<mfq::FileRangeReader>(fixtures.paths[i%2],mfq::FileReadMode::Direct));
+    std::vector<std::future<void>> jobs;
+    for(int i=0;i<12;++i)jobs.push_back(std::async(std::launch::async,[&,i] {
+        for(int round=0;round<3;++round)check(*readers[i],i%2,11+i+round);
+    }));
+    for(auto& job:jobs)job.get();
+    auto cached=first->stats().staging_cached_bytes;
+    for(const auto& reader:readers)cached+=reader->stats().staging_cached_bytes;
+    require(cached>0 && cached<=(64u<<20),"shared staging exceeded its process-wide idle budget");
+}
 void exercise(const std::filesystem::path& path, const std::vector<std::byte>& expected, mfq::FileReadMode mode) {
     auto reader = std::make_shared<mfq::FileRangeReader>(path, mode);
     const auto alignment = reader->alignment();
@@ -210,6 +267,7 @@ int main() {
                 "Linux queue reused an incomplete failed request");
         }
 #endif
+        exercise_shared_staging(path);
         std::filesystem::remove(path);
         bool rejected=false;
         try { mfq::FileRangeReader missing(path,mfq::FileReadMode::Direct); } catch (const std::system_error&) { rejected=true; }

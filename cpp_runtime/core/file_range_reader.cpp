@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <mutex>
 #include <stdexcept>
@@ -50,16 +51,18 @@ struct FileRangeReader::Impl {
     std::size_t alignment = 1;
     std::uint64_t size = 0;
     mutable std::atomic<std::uint64_t> calls{0}, logical{0}, physical{0}, errors{0}, staging{0}, peak{0}, nanos{0};
-    mutable std::atomic<std::uint64_t> cached_staging{0},staging_allocations{0};
+    std::shared_ptr<std::atomic<std::uint64_t>> cached_staging=
+        std::make_shared<std::atomic<std::uint64_t>>(0);
+    mutable std::atomic<std::uint64_t> staging_allocations{0};
 #if defined(_WIN32)
     HANDLE handle = INVALID_HANDLE_VALUE;
 #else
     int handle = -1;
 #endif
-    struct Slab {void* data=nullptr;std::size_t bytes=0;std::uint64_t order=0;};
-    mutable std::mutex slabs_mutex;
-    mutable std::array<Slab,16> slabs{};
-    mutable std::uint64_t slab_order=0;
+    struct Slab {
+        void* data=nullptr;std::size_t bytes=0;std::uint64_t order=0;
+        std::shared_ptr<std::atomic<std::uint64_t>> charge;
+    };
     static void free_staging(void* data) noexcept {
 #if defined(_WIN32)
         _aligned_free(data);
@@ -67,8 +70,25 @@ struct FileRangeReader::Impl {
         std::free(data);
 #endif
     }
+    struct StagingPool {
+        static constexpr std::size_t budget=64u<<20,maximum_slab=8u<<20;
+        std::mutex mutex;
+        std::array<Slab,16> slabs{};
+        std::size_t idle=0;
+        std::uint64_t order=0;
+        void erase(Slab& slab) noexcept {
+            if(!slab.data)return;
+            idle-=slab.bytes;slab.charge->fetch_sub(slab.bytes,std::memory_order_relaxed);
+            free_staging(slab.data);slab={};
+        }
+        ~StagingPool(){for(auto& slab:slabs)erase(slab);}
+    };
+    static StagingPool& staging_pool() {
+        // All shard readers use the same bounded idle storage. Active reads
+        // own their slabs exclusively, and never retain a file handle here.
+        static StagingPool pool;return pool;
+    }
     ~Impl() {
-        for(const auto& slab:slabs)if(slab.data)free_staging(slab.data);
 #if defined(_WIN32)
         if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
 #else
@@ -77,27 +97,29 @@ struct FileRangeReader::Impl {
     }
     Slab borrow_staging(std::size_t bytes) const {
         Slab result;
+        auto& pool=staging_pool();
         {
-            std::lock_guard lock(slabs_mutex);
-            auto best=slabs.end();
-            for(auto it=slabs.begin();it!=slabs.end();++it)
+            std::lock_guard lock(pool.mutex);
+            auto best=pool.slabs.end();
+            for(auto it=pool.slabs.begin();it!=pool.slabs.end();++it)
                 if(it->data && it->bytes>=bytes && it->bytes-bytes<=std::max<std::size_t>(bytes,65536) &&
-                        (best==slabs.end() || it->bytes<best->bytes))best=it;
-            if(best!=slabs.end()) {
-                result=*best;*best={};
-                cached_staging.fetch_sub(result.bytes,std::memory_order_relaxed);
+                        reinterpret_cast<std::uintptr_t>(it->data)%alignment==0 &&
+                        (best==pool.slabs.end() || it->bytes<best->bytes))best=it;
+            if(best!=pool.slabs.end()) {
+                result=std::move(*best);*best={};pool.idle-=result.bytes;
+                result.charge->fetch_sub(result.bytes,std::memory_order_relaxed);result.charge.reset();
             }
         }
         if(result.data) {
             static std::atomic<bool> reported{false};
             if(!reported.load(std::memory_order_relaxed) && !reported.exchange(true,std::memory_order_relaxed))
-                std::fprintf(stderr,"model_direct_staging_pool scope=first_reuse enabled=1 max_idle_bytes=8388608 bytes=%zu\n",result.bytes);
+                std::fprintf(stderr,"model_direct_staging_pool scope=first_reuse shared=1 max_idle_bytes=67108864 bytes=%zu\n",result.bytes);
         }
         if(!result.data) {
             // Sector-aligned size classes reuse ordinary expert images across
             // nearby formats, without rounding small metadata up to 64 KiB.
             const auto granule=std::max<std::size_t>(alignment,65536);
-            if(bytes>=granule && bytes<=(4u<<20))bytes=(bytes+granule-1)/granule*granule;
+            if(bytes>=granule && bytes<=StagingPool::maximum_slab)bytes=(bytes+granule-1)/granule*granule;
             void* data=nullptr;
 #if defined(_WIN32)
             data=_aligned_malloc(bytes,std::max(alignment,sizeof(void*)));
@@ -112,22 +134,22 @@ struct FileRangeReader::Impl {
     }
     void return_staging(Slab slab) const noexcept {
         bool retained=false;
-        if(slab.bytes<=(4u<<20)) {
-            std::lock_guard lock(slabs_mutex);
-            auto idle=cached_staging.load(std::memory_order_relaxed);
+        if(slab.bytes<=StagingPool::maximum_slab) {
+            auto& pool=staging_pool();std::lock_guard lock(pool.mutex);
             for(;;) {
-                auto free=slabs.end(),oldest=slabs.end();
-                for(auto it=slabs.begin();it!=slabs.end();++it) {
+                auto free=pool.slabs.end(),oldest=pool.slabs.end();
+                for(auto it=pool.slabs.begin();it!=pool.slabs.end();++it) {
                     if(!it->data)free=it;
-                    else if(oldest==slabs.end() || it->order<oldest->order)oldest=it;
+                    else if(oldest==pool.slabs.end() || it->order<oldest->order)oldest=it;
                 }
-                if(free!=slabs.end() && slab.bytes<=(8u<<20)-idle) {
-                    slab.order=++slab_order;*free=slab;idle+=slab.bytes;retained=true;break;
+                if(free!=pool.slabs.end() && slab.bytes<=StagingPool::budget-pool.idle) {
+                    slab.order=++pool.order;slab.charge=cached_staging;*free=slab;
+                    pool.idle+=slab.bytes;cached_staging->fetch_add(slab.bytes,std::memory_order_relaxed);
+                    retained=true;break;
                 }
-                if(oldest==slabs.end())break;
-                idle-=oldest->bytes;free_staging(oldest->data);*oldest={};
+                if(oldest==pool.slabs.end())break;
+                pool.erase(*oldest);
             }
-            cached_staging.store(idle,std::memory_order_relaxed);
         }
         staging.fetch_sub(slab.bytes,std::memory_order_relaxed);
         if(!retained)free_staging(slab.data);
@@ -269,7 +291,7 @@ void FileRangeReader::read(std::uint64_t offset, std::byte* destination, std::si
 FileReadStats FileRangeReader::stats() const noexcept {
     const auto& p = *impl_;
     return {p.mode, 1, p.calls.load(), p.logical.load(), p.physical.load(), p.errors.load(),
-            p.staging.load(), p.peak.load(), p.nanos.load(),p.cached_staging.load(),p.staging_allocations.load()};
+            p.staging.load(), p.peak.load(), p.nanos.load(),p.cached_staging->load(),p.staging_allocations.load()};
 }
 
 #if defined(__linux__)
