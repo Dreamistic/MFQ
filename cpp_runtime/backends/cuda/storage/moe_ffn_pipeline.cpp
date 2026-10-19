@@ -1532,7 +1532,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         cell.two_stage=execution.config.moe_two_stage_ffn && cell.batch_decode && cell.routes+(shared_?1:0)<=32 &&
             execution.kl_mmq.mode==KlMmqMode::Default;
         for(const auto& source:sources_)for(const auto& cohort:source->cohorts_)
-            cell.two_stage=cell.two_stage && (cohort.active.family==MixedMoeFamily::Nint || cohort.active.family==MixedMoeFamily::Nvq);
+            cell.two_stage=cell.two_stage && (cohort.active.family==MixedMoeFamily::Nint ||
+                cohort.active.family==MixedMoeFamily::Nvq || cohort.active.family==MixedMoeFamily::Mxfp4);
         if(shared_) {
             cell.two_stage=cell.two_stage && bool(shared_weights_.gate);
             for(const auto& weight:shared_weights_.projections)
@@ -1638,13 +1639,13 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         const int native_default=0;
 #endif
         const int native_requested=native_dma?std::clamp(std::atoi(native_dma),0,2):native_default;
-        if(cell.in_window && cell.phased_transfer && native_requested && mfq::cuda::NativeDmaBatch::available())
+        if(cell.graph_replay && cell.phased_transfer && native_requested && mfq::cuda::NativeDmaBatch::available())
             cell.native_dma_mode=native_requested;
         const auto* direct_read=std::getenv("MFQ_MOE_KV_DIRECT_READ");
         const bool direct_enabled=direct_read?direct_read[0]!='0':cell.native_dma_mode>0;
         const auto* poll_ready=std::getenv("MFQ_MOE_POLL_TRANSFER_READY");
         const bool poll_enabled=poll_ready?poll_ready[0]=='1':(native_default && cell.native_dma_mode && direct_enabled);
-        if(cell.in_window && cell.phased_transfer && cell.skip_cpu_wait && poll_enabled) {
+        if(cell.graph_replay && cell.phased_transfer && cell.skip_cpu_wait && poll_enabled) {
             cell.transfer_notification=std::make_unique<mfq::cuda::Event>();
         }
         // Eight-row tiles need eight route lists. Large windows trade some
@@ -1845,7 +1846,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 const auto* fuse=std::getenv("MFQ_MOE_FUSED_TRANSFER_COPY");
                 cell.fused_transfer_copy=(fuse?fuse[0]!='0':cell.tokens<=8) && bool(cell.transfer_route_plan);
                 const auto* host_packet=std::getenv("MFQ_MOE_KV_HOST_PACKET");
-                cell.host_cache_packet=cell.in_window && cell.skip_cpu_wait && cell.fused_transfer_copy &&
+                cell.host_cache_packet=cell.graph_replay && cell.skip_cpu_wait && cell.fused_transfer_copy &&
                     cell.native_dma_mode && direct_enabled && (!host_packet || host_packet[0]=='1');
                 const auto* direct_packet=std::getenv("MFQ_MOE_NATIVE_DIRECT_PACKET");
                 // The packet owns the union of routed experts, not one row's
@@ -1913,6 +1914,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                             if(view.family==1) {
                                 a[1]=ff_;a[2]=std::size_t(ff_)*8;
                                 a[3]=a[4]=std::size_t(ff_)*view.groups;a[5]=a[6]=std::size_t(ff_)*4;
+                            }else if(view.family==3) {
+                                a[0]=std::size_t(sizes[e][0])/2;a[1]=std::size_t(sizes[e][1])/2;
                             }else {
                                 for(int f=0;f<3;++f)a[f]=std::size_t(sizes[e][f])/2;
                                 a[3]=std::size_t(ff_)*4;
@@ -2575,7 +2578,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             for(std::size_t i=0;i<cell.transfer_views.size();i+=3) {
                 auto up=cell.transfer_views[i+1];
                 // Gate and Up share one staged compressed expert image.
-                for(int f=0;f<(up.family==1?7:4);++f)up.fields[f]=cell.transfer_views[i].fields[f];
+                for(int f=0;f<(up.family==1?7:up.family==3?2:4);++f)up.fields[f]=cell.transfer_views[i].fields[f];
                 views[i+1]=cell.fused->projection_view(1,up);
             }
         }
@@ -2583,7 +2586,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         for(std::size_t i=0;i<cell.transfer_views.size();++i) {
             if(early_image && i%3==2)continue;
             const auto& view=uploaded[i];
-            for(int f=0;f<(view.family==1?7:5);++f)
+            for(int f=0;f<(view.family==1?7:view.family==3?2:5);++f)
                 if(!view.fields[f] && !(view.family==2 && ((f<3 && !view.sizes[f]) || f==4)))
                     throw std::logic_error("MFE transfer descriptor field not published: family="+
                         std::to_string(view.family)+" format="+std::to_string(view.format)+
@@ -2617,7 +2620,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         const auto* lookup_option=std::getenv("MFQ_MOE_KV_LOOKUP_FIRST");
         const auto* direct_loan=std::getenv("MFQ_MOE_KV_DIRECT_READ");
         const bool direct_enabled=direct_loan?direct_loan[0]!='0':cell.native_dma_mode>0;
-        const bool projection_cache=cell.phased_transfer && direct_enabled && cell.in_window &&
+        const bool projection_cache=cell.phased_transfer && direct_enabled && cell.graph_replay &&
             cell.skip_cpu_wait && cell.two_stage && cell.transfer_cache && cell.kv_loan_table &&
             (projection_option?projection_option[0]=='1':cell.native_dma_mode>0);
         const bool lookup_first=projection_cache && (!lookup_option || lookup_option[0]=='1');
@@ -2801,7 +2804,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             std::array<int64_t,2> staged_begin{},staged_end{},staged_host_begin{};
             int64_t offset=cell.wire_header_bytes,direct_bytes=0,staged_bytes=0,gate_up_end=0;
             int64_t host_offset=cell.wire_header_bytes;
-            const bool consume_loan=direct_enabled && cell.in_window &&
+            const bool consume_loan=direct_enabled && cell.graph_replay &&
                 cell.skip_cpu_wait && cell.two_stage && cell.transfer_cache && cell.kv_loan_table;
             auto& projection_copies=scratch.projection_copies;
             std::size_t submitted_projection_copies=0;

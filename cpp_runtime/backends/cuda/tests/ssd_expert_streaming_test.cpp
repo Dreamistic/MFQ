@@ -236,7 +236,7 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
     check_output(clipped_silu_mul_cuda(gate,up,10),
         (tb::silu(expected_gate)*expected_up).to(tb::kFloat16));
     int cases=0;
-    for(const char* format:{"nint","nvq3j","mxfp4"}) {
+    for(const char* format:{"nint","nvq3j","mxfp4","mixed"}) {
         if(const auto* selected=std::getenv("MFQ_SSD_EXPERT_TEST_FORMAT");selected &&
                 std::string(selected).find(format)==std::string::npos)continue;
         if(!std::filesystem::exists(root/(std::string(format)+"-0.mfq")))continue;
@@ -248,7 +248,8 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
             config.moe_preload_all=!ssd;config.moe_assert_resident=!ssd;
             config.moe_residency_adapt=false;config.moe_residency_warm=false;
             config.moe_host_cache_bytes=ssd?32768:16*1024*1024;
-            auto cache=make_moe_expert_cache(32768,config);
+            const bool mixed=std::string(format)=="mixed";
+            auto cache=make_moe_expert_cache(mixed?1<<20:32768,config);
             std::array<MfeWeight,3> resident;
             if(!ssd)for(int p=0;p<3;++p) {
                 auto model=mfq::open_model_source((root/(std::string(format)+"-"+std::to_string(p)+".mfq")).string());
@@ -268,7 +269,8 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
                     (p==0?ffn.moe_gate:p==1?ffn.moe_up:ffn.moe_down)=std::move(weight);
                 }
                 ffn.moe_router=tb::zeros({experts,width},options.dtype(tb::kFloat32));
-                ffn.moe_hash_ids=tb::tensor(std::vector<int32_t>{0,1}).reshape({1,2}).to(tb::kCUDA);
+                const int base=mixed?6:0;
+                ffn.moe_hash_ids=tb::tensor(std::vector<int32_t>{base,base+1,base+1,base+2,base+2,base}).reshape({3,2}).to(tb::kCUDA);
                 ffn.shared=std::make_unique<FFN>();ffn.shared->swiglu_limit=limit;
                 auto dense=[&](int out,int in) {
                     QuantLinear value;value.kind=QuantLinearKind::Dense;
@@ -281,17 +283,30 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
                 check(bool(ffn.moe_pipeline_forward),"generic FFN did not register its SSD pipeline");
             }
             finalize_moe_expert_cache(cache);
-            for(int tokens:{1,6,11,143})for(auto& ffn:layers) {
+            std::shared_ptr<mfq::cuda::KvExpertLoan> loan;
+            tb::Tensor loan_storage;
+            uint64_t loan_region=0;
+            if(ssd && mixed) {
+                loan=std::make_shared<mfq::cuda::KvExpertLoan>();
+                loan_storage=tb::empty({4<<20},options.dtype(tb::kUInt8));
+                loan_region=loan->add(loan_storage,loan_storage.numel(),1,true,1,true,true);
+                set_moe_kv_expert_loan(cache,loan);
+            }
+            for(int tokens:{1,2,3,4,5,6,1,11,143,1})for(auto& ffn:layers) {
                 std::fprintf(stderr,"clipped_check format=%s ssd=%d limit=%g tokens=%d layer=%d phase=reference\n",
                     format,int(ssd),limit,tokens,ffn.moe_layer);
                 std::vector<float> input(tokens*width);
-                const float amplitude=std::string(format)=="nvq3j"?.003f:.3f;
+                const float amplitude=std::string(format)=="nvq3j" || mixed?.003f:.3f;
                 for(std::size_t i=0;i<input.size();++i)input[i]=std::sin(float(i)*.13f)*amplitude;
                 auto x=tb::tensor(input).reshape({tokens,width}).to(options);
+                std::vector<int32_t> selected(tokens*2);
+                std::vector<int64_t> input_ids(tokens);
+                for(int t=0;t<tokens;++t) {
+                    input_ids[t]=(t+tokens+ffn.moe_layer)%3;
+                    for(int r=0;r<2;++r)selected[t*2+r]=(mixed?6:0)+int(input_ids[t]+r)%3;
+                }
                 const auto key=std::make_tuple(limit,tokens,ffn.moe_layer);
                 if(!ssd) {
-                    std::vector<int32_t> selected(tokens*2);
-                    for(int i=0;i<tokens*2;++i)selected[i]=i%2;
                     auto ids=tb::tensor(selected).reshape({tokens,2}).to(tb::kCUDA);
                     auto route=build_moe_route_plan(ids,experts);
                     auto weights=moe_sqrtsoftplus_weights_cuda(tb::zeros({tokens,experts},options.dtype(tb::kFloat32)),ids,1e-20,1);
@@ -307,11 +322,20 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
                 }
                 execution.force_moe_materialized_swiglu=false;
                 std::fprintf(stderr,"clipped_check phase=pipeline\n");
-                check_output(ffn.forward(execution,x,tb::zeros({tokens},options.dtype(tb::kInt64))),references.at(key));++cases;
+                check_output(ffn.forward(execution,x,tb::tensor(input_ids).to(tb::kCUDA)),references.at(key));++cases;
+                if(loan && tokens==143 && ffn.moe_layer==1) {
+                    // The final M=1 replay must refresh descriptors after KV
+                    // growth revokes every borrowed expert page.
+                    loan->remove(loan_region);
+                    MFQ_CUDA_CHECK(cudaMemsetAsync(loan_storage.data_ptr(),0xa5,
+                        loan_storage.numel(),mfq_current_cuda_stream()));
+                }
             }
-            if(std::string(format)!="mxfp4") {
-                check(cache->stats().pipeline_two_stage_serves>=4,
-                    "clipped FFN did not execute its two-stage kernels");
+            check(cache->stats().pipeline_two_stage_serves>=16,
+                "clipped FFN did not execute its two-stage kernels");
+            if(ssd && mixed && mfq::cuda::NativeDmaBatch::available()) {
+                check(cache->stats().pipeline_host_packet_serves>0,"private FFN graphs did not use host cache packets");
+                check(cache->stats().pipeline_kv_projection_hits>0,"private FFN graphs did not reuse borrowed GPU expert copies");
             }
             release_moe_prefill_buffers(cache);
         }

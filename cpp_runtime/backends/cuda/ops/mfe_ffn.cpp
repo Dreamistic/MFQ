@@ -69,7 +69,15 @@ View pool_view(const MixedMoePool& pool,int rows,std::vector<tb::Tensor>& owners
             result.fields[6]=w.decode_records.data_ptr();owners.push_back(w.decode_records);
             result.decode_record_bytes=w.decode_records.numel();
         }
-    } else throw std::invalid_argument("two-stage MFE requires native NINT/NVQ projections");
+    } else if(pool.family==MixedMoeFamily::Mxfp4) {
+        const auto& w=pool.mxfp4;
+        result.family=3;result.output_rows=rows;result.local_experts=pool.local_experts;
+        result.input_width=int(w.neuron_len);result.group_size=32;result.groups=result.input_width/32;
+        const std::array<tb::Tensor,2> fields{w.values,w.scales};
+        for(int i=0;i<2;++i) {
+            result.fields[i]=fields[i].data_ptr();result.sizes[i]=fields[i].nbytes();owners.push_back(fields[i]);
+        }
+    } else throw std::invalid_argument("two-stage MFE requires native NINT/NVQ/MXFP4 projections");
     if(result.group_size<1 || result.group_size>64 || result.groups<=0)
         throw std::invalid_argument("two-stage MFE input group geometry unsupported");
     if(pool.family==MixedMoeFamily::Nvq && (result.group_size!=24 || result.format<1 || result.format>17))
@@ -241,7 +249,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         !(batch_.nvq_format_mask&~grouped_formats) &&
         (!(batch_.nvq_format_mask&compact_formats) || batch_.compact_nvq) &&
         std::all_of(views.begin(),views.end(),[](const View& d) {
-            return d.family==2 || (d.family==1 &&
+            return d.family==2 || d.family==3 || (d.family==1 &&
                 (d.group_size==24 || d.group_size==28 || d.group_size==32));
         });
     descriptors_=upload(views);cohorts_=tb::tensor(mapping).to(tb::kCUDA);
@@ -425,10 +433,11 @@ mfq::cuda::MfePackedProjection MfeFfnRuntime::expert_view(int p,int expert,
     // pools, so it does not select the single-pool late-scale hint. This
     // also applies to resident fields retained in a partially cold bundle.
     if(view.nint_late_bits>0)view.nint_late_bits=0;
-    if(bytes.size()!=std::size_t(view.family==1?7:4))throw std::invalid_argument("MFE transfer field count differs");
+    if(bytes.size()!=std::size_t(view.family==1?7:view.family==3?2:4))throw std::invalid_argument("MFE transfer field count differs");
     for(std::size_t f=0;f<bytes.size();++f)view.fields[f]=slot>=0?
         static_cast<const unsigned char*>(view.fields[f])+int64_t(slot)*bytes[f]:nullptr;
     if(view.family==2)for(int i=0;i<3;++i)view.sizes[i]=bytes[i];
+    if(view.family==3)for(int i=0;i<2;++i)view.sizes[i]=bytes[i];
     if(view.family==1) {
         view.sizes[0]=bytes[0];
         if(view.q_expert_stride>bytes[0])throw std::invalid_argument("MFE transferred NINT payload is shorter than its stride");

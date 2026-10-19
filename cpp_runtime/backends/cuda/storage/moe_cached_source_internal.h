@@ -28,6 +28,7 @@ public:
         return std::all_of(cohorts_.begin(),cohorts_.end(),[](const auto& cohort) {
             const auto& p=*cohort.cpu;
             if(p.family==MixedMoeFamily::Nint)return p.nint.gs>0 && p.nint.gs<=64;
+            if(p.family==MixedMoeFamily::Mxfp4)return p.mxfp4.neuron_len%32==0;
             return p.family==MixedMoeFamily::Nvq && p.nvq.gs==24 &&
                 p.nvq.kernel_format>=1 && p.nvq.kernel_format<=17;
         });

@@ -112,7 +112,7 @@ struct CudaEngineState {
 
     void restore_graph_expert_space() {
         if(preparing_graph_depth)return;
-        release_moe_prefill_buffers(execution->moe_expert_cache);
+        prepare_moe_decode_residency(execution->moe_expert_cache);
         mfq::cuda::default_context(execution->layer_placement.primary_device())->reclaim_idle_memory();
         restore_mtp_expert_space();
         if(!graph_expert_loan)return;

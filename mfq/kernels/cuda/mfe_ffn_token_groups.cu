@@ -169,8 +169,19 @@ __device__ __forceinline__ void shared_nint_project(const MfePackedProjection& d
 template<int Capacity,int Rows,bool Compact=false>
 __device__ __forceinline__ void token_project(const MfePackedProjection* d,int local,int first,
         const int8_t* const* inputs,const float* const* scales,int count,
-        __half result[Capacity][4],bool multi_sum,bool canonical,bool narrow) {
+        __half result[Capacity][4],bool multi_sum,bool canonical,bool narrow,
+        const __half* original,int original_stride,const int* slots,int slot_divisor) {
     if(d && local>=0 && local<d->local_experts) {
+        if(d->family==3) {
+#pragma unroll
+            for(int k=0;k<Capacity;++k)if(k<count) {
+                const auto* source=original+int64_t(slots[k]/slot_divisor)*original_stride;
+#pragma unroll
+                for(int pair=0;pair<Rows/2;++pair)
+                    mfe_mxfp4_pair(*d,local,first+pair*2,source,result[k]+pair*2);
+            }
+            return;
+        }
         if(d->family==2) {
             constexpr int lanes=Rows==4?8:16;
             if(Compact || !canonical || Rows==2) {
@@ -316,7 +327,8 @@ __global__ void __launch_bounds__(256,Capacity<=2?4:Capacity<=4?3:2) token_gate_
         scales[k]=static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups;
     }
     __half values[Capacity][4]{};
-    token_project<Capacity,2,Compact>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq);
+    token_project<Capacity,2,Compact>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq,
+        b.input,b.input_width,slots,all_routes);
     __shared__ __half projected[8][Capacity][2];
     if(lane==0) {
 #pragma unroll
@@ -371,7 +383,8 @@ __device__ __forceinline__ void token_aligned_pair(const MfeFfnBatch& b,
             scales[k]=static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups;
         }
         __half values[Capacity][4]{};
-        token_project<Capacity,2,Compact>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq);
+        token_project<Capacity,2,Compact>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq,
+            b.input,b.input_width,slots,all_routes);
         #pragma unroll
         for(int k=0;k<Capacity;++k)if(k<count) {
             if(p==0) {
@@ -519,7 +532,8 @@ __global__ void __launch_bounds__(128,Capacity<=2?8:Capacity<=4?6:4) token_down(
         scales[k]=b.hidden_scales+int64_t(slots[k])*b.scale_stride;
     }
     __half values[Capacity][4]{};
-    token_project<Capacity,Rows,Compact>(d,local,first,inputs,scales,count,values,b.warp_multi_sum,b.shared_dense_math,b.compact_nvq);
+    token_project<Capacity,Rows,Compact>(d,local,first,inputs,scales,count,values,b.warp_multi_sum,b.shared_dense_math,b.compact_nvq,
+        b.hidden,b.hidden_stride,slots,1);
 #pragma unroll
     for(int k=0;k<Capacity;++k)if(k<count) {
 #pragma unroll

@@ -72,7 +72,8 @@ __global__ void __launch_bounds__(32*Warps,Worklist?3:Warps<=16?32/Warps:1) mfe_
         __half values[2]{};
         if(first<width)project_pair<true,Formats,true>(d,locals[role],first,
             d?static_cast<const int8_t*>(d->fields[7])+int64_t(token)*d->groups*d->group_size:nullptr,
-            d?static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups:nullptr,values,b.warp_multi_sum);
+            d?static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups:nullptr,values,b.warp_multi_sum,
+            b.input+int64_t(token)*b.input_width);
 #pragma unroll
         for(int r=0;r<2;++r)if(lane==r && offset+r<gs)projected[role][offset+r]=values[r];
     }

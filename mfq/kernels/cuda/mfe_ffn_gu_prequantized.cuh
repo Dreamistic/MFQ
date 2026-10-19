@@ -69,7 +69,8 @@ __global__ void __launch_bounds__(512,2) mfe_ffn_gu_prequantized_kernel(MfeFfnBa
     __half values[2]={__float2half(0.f),__float2half(0.f)};
     if(first<width)project_pair<true,Formats,true,false>(d,locals[role],first,
         d?static_cast<const int8_t*>(d->fields[7])+int64_t(token)*d->groups*d->group_size:nullptr,
-        d?static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups:nullptr,values,b.warp_multi_sum);
+        d?static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups:nullptr,values,b.warp_multi_sum,
+        b.input+int64_t(token)*b.input_width);
     __shared__ __half projected[8][2];
     if(!lane){projected[warp][0]=values[0];projected[warp][1]=values[1];}
     __syncthreads();

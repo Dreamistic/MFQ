@@ -29,7 +29,7 @@ __global__ void __launch_bounds__(512,2) mfe_ffn_gu_transfer_routes_kernel(
         __half values[2]={__float2half(0.f),__float2half(0.f)};
         if(first<width)project_pair<true,Formats,true,false>(d,locals[role],first,
             d?static_cast<const int8_t*>(d->fields[7]):nullptr,
-            d?static_cast<const float*>(d->fields[8]):nullptr,values,b.warp_multi_sum);
+            d?static_cast<const float*>(d->fields[8]):nullptr,values,b.warp_multi_sum,b.input);
         if(!lane){projected[warp][0]=values[0];projected[warp][1]=values[1];}
         __syncthreads();
         if(!warp) {

@@ -10,7 +10,7 @@ struct MfePackedProjection {
     const void* fields[9]{};
     std::int64_t sizes[3]{};
     const std::int32_t* expert_local=nullptr;
-    int family=0; // 1: canonical NINT; 2: packed NVQ.
+    int family=0; // 1: canonical NINT; 2: packed NVQ; 3: canonical MXFP4.
     int local_experts=0,output_rows=0,input_width=0,groups=0,group_size=0;
     int format=0,sub_bits=0,sign_mode=0,nvec=0,nsign=0;
     int q_expert_stride=0,fallback=-1;
