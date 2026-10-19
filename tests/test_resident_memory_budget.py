@@ -292,6 +292,57 @@ def test_load_reservation_is_shared_and_passed_to_native(tmp_path, monkeypatch):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('busy', [False, True])
+def test_moe_load_uses_remaining_shared_capacity_and_streams_excess_experts(tmp_path, busy):
+    from unittest.mock import AsyncMock, Mock
+    from tests.test_server_models import _fake_runtime, _model
+
+    async def run():
+        executable = tmp_path / 'runtime'
+        _fake_runtime(executable)
+        model = tmp_path / 'incoming.mfq'
+        _model(model)
+        incoming = artifact(tmp_path, 'incoming', 20, 18)
+        catalog = ModelCatalog([])
+        catalog.resolve = AsyncMock(return_value=incoming)
+        pool = RuntimePool(catalog, executable, max_runtime_memory_bytes=12 * GIB,
+            startup_timeout_seconds=5)
+        pool._launch_configuration = Mock(wraps=pool._launch_configuration)
+        old = instance(tmp_path, 'old', limit=8 * GIB)
+        if busy:
+            old.state, old.active_requests = RuntimeInstanceState.BUSY, 1
+        pool._instances[old.id] = old
+        context = _TestJobContext()
+        try:
+            await pool.load(context, {'model': 'incoming'})
+            new = next(item for item in pool._instances.values() if item is not old)
+            assert new.state == RuntimeInstanceState.READY
+            assert 2 * GIB < new.reserved_bytes < 12 * GIB
+            assert new.reserved_bytes < incoming.resource.total_bytes
+            request = pool._launch_configuration.call_args.args[1]
+            assert 0 < request.moe_gpu_cache_gb < 18
+            assert new.reserved_bytes == 2 * GIB + int(request.moe_gpu_cache_gb * GIB)
+            assert old.backend.kv == GIB
+            assert sum(item.resident_budget_limit for item in pool._instances.values()) <= 12 * GIB
+            if busy:
+                assert old.backend.events == []
+                assert old.backend.limit == 8 * GIB
+            else:
+                assert old.backend.experts < 3 * GIB
+        finally:
+            pool._instances.pop(old.id)
+            await context.cleanup()
+            await pool.aclose()
+    asyncio.run(run())
+
+
+def test_expert_load_headroom_preserves_pending_load_reservations(tmp_path):
+    pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime', max_runtime_memory_bytes=12 * GIB)
+    pool._resident_load_limits['pending'] = 8 * GIB
+    pool._load_bytes['pending'] = 6 * GIB
+    assert pool._expert_load_headroom_locked(12 * GIB, 'incoming') == 4 * GIB - (256 << 20)
+
+
 @pytest.mark.parametrize('readers', [0, 2])
 @pytest.mark.parametrize('activation_state', [RuntimeInstanceState.READY, RuntimeInstanceState.LOADING])
 def test_activation_rebalances_its_own_load_lease_without_releasing_it(tmp_path, readers, activation_state):

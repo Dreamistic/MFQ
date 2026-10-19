@@ -625,16 +625,18 @@ class RuntimePool:
             if self._memory_configuration_job is not None and self._memory_configuration_job != context.job_id:
                 raise _job_error("memory_plan_busy", "memory settings are being applied", retryable=True)
             residency_ceiling = self._effective_runtime_memory_budget_locked()
+            if self.backend == "metal" and artifact.routed_expert_bytes > 0 and residency_ceiling is not None:
+                residency_ceiling = self._expert_load_headroom_locked(residency_ceiling, artifact.resource.name)
             if self.memory_policy.model_limit_bytes is not None:
                 other_weights = sum((item.memory.resident_weight_bytes if item.memory and item.memory.resident_weight_bytes is not None else item.reserved_bytes or 0)
                     for item in self._instances.values() if item.artifact.resource.name != artifact.resource.name)
                 other_weights += sum(size for name, size in self._load_bytes.items() if name != artifact.resource.name)
                 available_weights = max(1, self.memory_policy.model_limit_bytes - other_weights)
                 available_weights = min(available_weights, self._policy_model_limits.get(artifact.resource.name, available_weights))
-                residency_ceiling = min(residency_ceiling or available_weights, available_weights)
+                residency_ceiling = min(residency_ceiling, available_weights) if residency_ceiling is not None else available_weights
             elif artifact.resource.name in self._policy_model_limits:
                 limit = self._policy_model_limits[artifact.resource.name]
-                residency_ceiling = min(residency_ceiling or limit, limit)
+                residency_ceiling = min(residency_ceiling, limit) if residency_ceiling is not None else limit
         if self.memory_policy.total_limit_bytes is not None or self.memory_policy.model_limit_bytes is not None or self.memory_policy.prefix_limit_bytes is not None:
             request = request.model_copy(update={"moe_gpu_cache_gb": None})
         request = self._apply_automatic_expert_residency(
@@ -3632,6 +3634,24 @@ class RuntimePool:
             cache_bytes = int(cache_gb * (1 << 30))
         resident_expert_bytes = min(streamed_bytes, cache_bytes)
         return total_bytes - streamed_bytes + resident_expert_bytes
+
+    def _expert_load_headroom_locked(self, ceiling: int, model: str) -> int:
+        current = [item for item in self._instances.values()
+            if item.state != RuntimeInstanceState.FAILED and item.artifact.resource.name != model]
+        reserve = min(256 << 20, ceiling // 20)
+        fixed = 0
+        for item in current:
+            if (getattr(item, "resident_dynamic_budget", False) and item.state == RuntimeInstanceState.READY
+                and not item.active_requests and not item.queued_requests
+                and item.control_leases == getattr(item, "read_control_leases", 0)):
+                prefix = (item.memory.prefix_cache_bytes or 0) if item.memory else 0
+                fixed += max(0, item.resident_memory_used - item.reclaimable_weight_bytes - prefix) + reserve
+            else:
+                fixed += getattr(item, "resident_budget_limit", 0) or self._committed_runtime_bytes(item)
+        names = {item.artifact.resource.name for item in current} | {model}
+        fixed += sum(max(self._load_bytes.get(name, 0), self._resident_load_limits.get(name, 0))
+            for name in self._load_bytes.keys() | self._resident_load_limits.keys() if name not in names)
+        return max(0, ceiling - fixed - reserve)
 
     def _cuda_device_ids(self, request: ModelLoadRequest) -> list[str]:
         if request.device_ids:
