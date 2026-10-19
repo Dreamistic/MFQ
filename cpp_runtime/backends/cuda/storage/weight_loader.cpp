@@ -19,7 +19,7 @@
 #include <atomic>
 
 std::shared_ptr<mfq::NintRows> load_nint_row_table(
-        const mfq::ModelSource& source, const std::string& name) {
+        const mfq::ModelSource& source, const std::string& name, bool prefer_mapping) {
     const auto& metadata = require_tensor(source, name);
     MFQ_RUNTIME_CHECK(metadata.dtype == "NINT", "NINT row table requires packed NINT");
     MFQ_RUNTIME_CHECK(metadata.nbytes <= std::numeric_limits<std::size_t>::max(),
@@ -30,7 +30,7 @@ std::shared_ptr<mfq::NintRows> load_nint_row_table(
     auto batch=(!batched || batched[0]!='0') ? source.tensor_batch_reader(name) : mfq::ModelSource::TensorBatchReader{};
     bool mapped_file=false;
     const auto mapped=mfq::cuda::runtime_options::ple_file_map();
-    if(mapped.value_or(false)) {
+    if(mapped.value_or(prefer_mapping && source.file_read_stats().mode!=mfq::FileReadMode::Direct)) {
         if(auto mapping=source.mapped_tensor_batch_reader(name)) {
             batch=std::move(mapping);
             read=[batch](uint64_t offset,std::byte* out,std::size_t count){batch({{offset,out,count}});};

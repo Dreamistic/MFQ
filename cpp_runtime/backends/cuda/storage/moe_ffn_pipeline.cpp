@@ -1833,12 +1833,6 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(cell.batch_decode) {
             const auto routes=std::min(cell.entries,experts_);
             cell.wire_header_bytes=(32+24*routes*route_fields+15)&~int64_t(15);
-            // All backbone cells share one pre-sized wire image, avoiding
-            // retained intermediate images as differently sized layers appear.
-            const auto capacity=((32+24*routes*wire_geometry.second+15)&~int64_t(15))+routes*wire_geometry.first;
-            if(!cache_->pipeline_wire_gpu_.defined() || cache_->pipeline_wire_gpu_.numel()<capacity)
-                cache_->pipeline_wire_gpu_=tb::empty({capacity},cell.input.options().dtype(tb::kUInt8));
-            cell.wire=cache_->pipeline_wire_gpu_;
             if(cell.phased_transfer && cache_->kv_expert_loan_) {
                 const auto bytes=2*(32+32*routes*route_fields);
                 cell.kv_loan_table=std::make_unique<Mapped>(std::size_t(bytes));
@@ -1858,14 +1852,24 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     cell.ssd_gate_up_descriptors=std::make_unique<Mapped>(cell.transfer_descriptors->bytes);
                 if(cell.wire_fallback && !cell.direct_packet)
                     throw std::logic_error("wire fallback requires a native direct packet");
-                if(cell.wire_fallback && !cache_->pipeline_wire_fallback_cells_++)
-                    std::fprintf(stderr,"moe_wire_fallback_dispatch scope=first_cell tokens=%d cache_bytes=%zu wire_bytes=%lld\n",
-                        cell.tokens,std::size_t(tensor_nbytes(cache_->pipeline_direct_cache_storage_)),static_cast<long long>(cell.wire.numel()));
                 if(std::getenv("MFQ_TRACE_HOST_CACHE_PACKET"))std::fprintf(stderr,
                     "host_cache_packet window=%d skip_cpu=%d fused=%d native=%d direct=%d option=%s enabled=%d\n",
                     int(cell.in_window),int(cell.skip_cpu_wait),int(cell.fused_transfer_copy),cell.native_dma_mode,
                     int(direct_enabled),host_packet?host_packet:"unset",int(cell.host_cache_packet));
             }
+            // Direct packets publish final stage/cache pointers; their graph
+            // never scatters payload from this image. Retain only its header.
+            // The wire fallback still needs space for every routed payload.
+            const auto capacity=cell.direct_packet && !cell.wire_fallback ? cell.wire_header_bytes :
+                ((32+24*routes*wire_geometry.second+15)&~int64_t(15))+routes*wire_geometry.first;
+            if(!cache_->pipeline_wire_gpu_.defined() || cache_->pipeline_wire_gpu_.numel()<capacity) {
+                cache_->reserve_workspace(std::size_t(capacity)+(std::size_t(64)<<20));
+                cache_->pipeline_wire_gpu_=tb::empty({capacity},cell.input.options().dtype(tb::kUInt8));
+            }
+            cell.wire=cache_->pipeline_wire_gpu_;
+            if(cell.wire_fallback && !cache_->pipeline_wire_fallback_cells_++)
+                std::fprintf(stderr,"moe_wire_fallback_dispatch scope=first_cell tokens=%d cache_bytes=%zu wire_bytes=%lld\n",
+                    cell.tokens,std::size_t(tensor_nbytes(cache_->pipeline_direct_cache_storage_)),static_cast<long long>(cell.wire.numel()));
             MFQ_CUDA_CHECK(cudaMemsetAsync(cell.wire.data_ptr(),0,32,stream_));
             MFQ_CUDA_CHECK(mfq::cuda::moe_wire_launch_geometry(&cell.wire_blocks,&cell.wire_threads));
         }

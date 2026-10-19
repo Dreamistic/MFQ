@@ -261,7 +261,7 @@ std::shared_ptr<EngramTable> EngramTable::load(const mfq::ModelSource &model, co
                                              std::size_t cache_capacity_rows) {
         const auto record = require_tensor(model, name);
         if(record.dtype=="NINT") {
-            auto table=load_nint_row_table(model,name);
+            auto table=load_nint_row_table(model,name,true);
             if(table->rows()!=expected_rows || table->width()!=expected_width)
                 throw std::runtime_error("DeepSeek-V4.1 Engram NINT table shape disagrees: "+name);
             std::fprintf(stderr,"deepseek_v41_engram_dispatch format=NINT row_pipeline=ple rows=%lld width=%d\n",

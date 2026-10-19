@@ -18,9 +18,11 @@ class Rows final : public mfq::ModelSource {
     bool batched;
     std::vector<uint8_t> data;
     mutable std::atomic<int> reads{0};
+    mutable std::atomic<int> mapped_reads{0};
+    bool mapped=false;
     std::vector<float> nint_reference;
     std::vector<mfq::TensorMetadata> records;
-    Rows(bool batch,bool nint=false) : batched(batch), data(56 + count * (width + width / 32), 0) {
+    Rows(bool batch,bool nint=false,bool mapping=false) : batched(batch), data(56 + count * (width + width / 32), 0),mapped(mapping) {
         if(nint) {
             auto fixture=mfq::test::fixture(count,width,24,6);
             data=std::move(fixture.blob);nint_reference=std::move(fixture.reference);
@@ -68,6 +70,13 @@ class Rows final : public mfq::ModelSource {
             read_range_into("table",offset,destination,bytes);
         };
     }
+    TensorBatchReader mapped_tensor_batch_reader(std::string_view) const override {
+        if(!mapped)return {};
+        return [this](const std::vector<mfq::ReadSpan>& spans) {
+            ++mapped_reads;
+            for(auto span:spans)read_range_into("table",span.offset,span.destination,span.size);
+        };
+    }
     bool supports_parallel_tensor_reads() const noexcept override { return !batched; }
     const std::vector<std::string>& assets() const noexcept override {
         static const std::vector<std::string> names; return names;
@@ -83,8 +92,8 @@ class Rows final : public mfq::ModelSource {
     }
 };
 
-void check_rows(bool batched, size_t capacity,bool nint=false) {
-    Rows source(batched,nint);
+void check_rows(bool batched, size_t capacity,bool nint=false,bool mapped=false) {
+    Rows source(batched,nint,mapped);
     auto table = EngramTable::load(source,"table", Rows::count, Rows::width, capacity);
     const auto device = tb::Device(tb::kCUDA, 0);
     const auto check = [&](const std::vector<int64_t>& ids, int batch, int tokens, int columns) {
@@ -108,6 +117,7 @@ void check_rows(bool batched, size_t capacity,bool nint=false) {
     const int64_t first[]{8,9}, second[]{4,6};
     table->prefetch(first,2); table->prefetch(second,2);
     check({4,6},1,1,2);
+    require((source.mapped_reads>0)==mapped,"Engram row source did not use the selected reader");
 }
 
 void check_bad_row(bool scale) {
@@ -182,6 +192,7 @@ int main(int argc,char** argv) try {
     if(argc==2 && std::string(argv[1])=="--bench") {benchmark_gate();return 0;}
     check_rows(true,64); check_rows(false,2); check_rows(false,0);
     check_rows(true,64,true);check_rows(false,2,true);check_rows(false,0,true);
+    check_rows(true,64,true,true);check_rows(false,2,true,true);check_rows(false,0,true,true);
     check_bad_row(false); check_bad_row(true);
     check_gate(1,1,5120,false); check_gate(2,3,67,true); check_gate(1,128,5120,false);
     std::cout<<"DeepSeek-V4.1 Engram row pipeline and fused gate tests passed\n";

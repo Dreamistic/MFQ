@@ -404,6 +404,22 @@ template <class Model> struct CudaGenerationContext {
         }
 #endif
     }
+    void prepare_prefill_workspace(std::size_t tokens) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
+            if(tokens>8 && moe_expert_cache_ssd_experts(model.execution->moe_expert_cache)) {
+                // Private FFN graphs retain their transfer arenas after a
+                // request. Retire consumers before a new grouped prefill;
+                // otherwise these arenas can reduce its ring to one expert.
+                graph.invalidate();
+                release_moe_decode_buffers(model.execution->moe_expert_cache);
+                mfq::cuda::default_context(mfq_current_cuda_device())->reclaim_idle_memory();
+            }
+        }
+#endif
+        if(tokens>1024 || moe_expert_cache_ssd_experts(model.execution->moe_expert_cache))
+            reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
+    }
     bool prepare_snapshot() {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
@@ -452,8 +468,7 @@ template <class Model> struct CudaGenerationContext {
     Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
                      size_t reused, size_t stable) {
         if (batching) return batching->generate(request_id, input, output);
-        if(input.prompt.size()-reused>1024 || moe_expert_cache_ssd_experts(model.execution->moe_expert_cache))
-            reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
+        prepare_prefill_workspace(input.prompt.size()-reused);
         auto logical_chunk=config.generation.prefill_chunk_size;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
             // Bound residual/FFN storage as well as projection tiles. Long
@@ -474,8 +489,7 @@ template <class Model> struct CudaGenerationContext {
     }
     Generation speculate(mfq::engine::InferenceRequest &input, mfq::engine::InferenceOutput &output,
         size_t reused, Hidden restored, Hidden *committed) {
-        if(input.prompt.size()-reused>1024 || moe_expert_cache_ssd_experts(model.execution->moe_expert_cache))
-            reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
+        prepare_prefill_workspace(input.prompt.size()-reused);
         return run_mtp_generation(model,
             *mtp,
             input,

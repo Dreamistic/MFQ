@@ -931,6 +931,7 @@ public:
             {"expert_native_dma_fallbacks",double(stats_.pipeline_native_dma_fallbacks)},
             {"expert_direct_cache_capacity_bytes",double(tensor_nbytes(pipeline_direct_cache_storage_))},
             {"expert_decode_stage_budget_bytes",double(pipeline_direct_cache_budget_)},
+            {"expert_transfer_wire_bytes",double(tensor_nbytes(pipeline_wire_gpu_))},
             {"expert_wire_fallback_cells",double(pipeline_wire_fallback_cells_)},
             {"expert_wire_fallback_bytes",double(pipeline_wire_fallback_bytes_)},
             {"expert_gu_build_overlap_serves",double(stats_.pipeline_gu_build_overlap_serves)},

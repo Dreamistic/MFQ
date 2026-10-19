@@ -1,5 +1,6 @@
 #include "nint_row_pipeline.h"
 #include "mfq/nint_row_cache.h"
+#include "mfq/mapped_prefetch_scope.h"
 #include "mfq_cuda_quant_ops.h"
 #include "mfq/host_parallel.h"
 #include "mfq_cuda_context.h"
@@ -195,6 +196,10 @@ struct NintRowPipeline::Impl {
         std::size_t missing_rows=0;
         for(const auto& shard:misses)missing_rows+=shard.size();
         const int threads=serial_small && missing_rows<=32?1:mfq_get_num_threads();
+        const auto fetch=[&](std::size_t shard) {
+            mfq::MappedPrefetchScope prefetch(misses[shard].size()>128);
+            tables[shard]->append_rows(misses[shard].data(),misses[shard].size(),fetched[shard],1);
+        };
         if(active_read_pool) {
             // Decode normally misses only a few of the 128 tables. Give each
             // active shard its own work item instead of partitioning empty
@@ -206,13 +211,13 @@ struct NintRowPipeline::Impl {
             read_pool.run(0,static_cast<int64_t>(active.size()),1,threads,[&](int64_t first,int64_t last) {
                 for(auto i=first;i<last;++i) {
                     const auto shard=active[i];
-                    tables[shard]->append_rows(misses[shard].data(),misses[shard].size(),fetched[shard],1);
+                    fetch(shard);
                 }
             });
         }else {
             mfq::host_parallel_for(0,static_cast<int64_t>(tables.size()),1,threads,[&](int64_t first,int64_t last) {
                 for(auto shard=first;shard<last;++shard)if(!misses[shard].empty())
-                    tables[shard]->append_rows(misses[shard].data(),misses[shard].size(),fetched[shard],1);
+                    fetch(shard);
             });
         }
         if(profile) {

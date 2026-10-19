@@ -293,6 +293,8 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
                 set_moe_kv_expert_loan(cache,loan);
             }
             for(int tokens:{1,2,3,4,5,6,1,11,143,1})for(auto& ffn:layers) {
+                if(ssd && tokens==11 && ffn.moe_layer==0)
+                    release_moe_decode_buffers(cache);
                 std::fprintf(stderr,"clipped_check format=%s ssd=%d limit=%g tokens=%d layer=%d phase=reference\n",
                     format,int(ssd),limit,tokens,ffn.moe_layer);
                 std::vector<float> input(tokens*width);
@@ -336,6 +338,9 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
             if(ssd && mixed && mfq::cuda::NativeDmaBatch::available()) {
                 check(cache->stats().pipeline_host_packet_serves>0,"private FFN graphs did not use host cache packets");
                 check(cache->stats().pipeline_kv_projection_hits>0,"private FFN graphs did not reuse borrowed GPU expert copies");
+                for(const auto& [name,bytes]:moe_expert_memory_metrics(cache))
+                    if(name=="expert_transfer_wire_bytes")
+                        check(bytes<=16384,"direct FFN packets retained an unused full payload wire");
             }
             release_moe_prefill_buffers(cache);
         }
