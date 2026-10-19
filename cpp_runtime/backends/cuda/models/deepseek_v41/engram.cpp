@@ -2,6 +2,8 @@
 #include "mfq_cuda_context.h"
 #include "mfq/host_parallel.h"
 #include "mfq/mapped_prefetch_scope.h"
+#include "mfq/nint_row_cache.h"
+#include "runtime/nint_row_pipeline.h"
 
 #include <condition_variable>
 #include <future>
@@ -61,15 +63,26 @@ struct EngramTable::Impl {
     std::thread worker;
     bool stopping = false;
     std::unique_ptr<RowStage> stage;
+    std::shared_ptr<NintRowPipeline> nint_pipeline;
+    std::shared_ptr<NintRowStage> nint_stage;
+    std::unique_ptr<mfq::cuda::Event> nint_done;
+    bool nint_pending=false;
+    std::size_t nint_stage_rows=0;
 
     Impl(const mfq::ModelSource& data, std::string tensor, std::uint64_t count,
-         int columns, std::uint64_t values, std::size_t cache_rows)
+         int columns, std::uint64_t values, std::size_t cache_rows,std::shared_ptr<mfq::NintRows> nint)
         : source(data), name(std::move(tensor)), rows(count), value_bytes(values),
           width(columns), capacity(cache_rows), row_bytes(columns + columns / 32) {
+        if(nint) {
+            nint_pipeline=std::make_shared<NintRowPipeline>(std::vector{std::move(nint)},
+                std::make_shared<mfq::NintRowCache>(cache_rows));
+            return;
+        }
         read_batch = source.mapped_tensor_batch_reader(name);
         if (!read_batch) read_batch = source.tensor_batch_reader(name);
     }
     ~Impl() {
+        if(nint_pending)try {nint_done->synchronize();}catch(...) {}
         {
             std::lock_guard<std::mutex> lock(mutex);
             stopping = true;
@@ -178,11 +191,18 @@ struct EngramTable::Impl {
 };
 
 EngramTable::EngramTable(const mfq::ModelSource& source, std::string name, std::uint64_t,
-    std::int64_t rows, int width, std::uint64_t values, std::size_t capacity)
-    : impl_(std::make_unique<Impl>(source, std::move(name), rows, width, values, capacity)) {}
+    std::int64_t rows, int width, std::uint64_t values, std::size_t capacity,std::shared_ptr<mfq::NintRows> nint)
+    : impl_(std::make_unique<Impl>(source, std::move(name), rows, width, values, capacity,std::move(nint))) {}
 EngramTable::~EngramTable() = default;
 
 void EngramTable::prefetch(const std::int64_t* rows, std::size_t count) const {
+    if(impl_->nint_pipeline) {
+        if(!rows || !count)throw std::invalid_argument("DeepSeek-V4.1 Engram lookup is empty");
+        for(std::size_t i=0;i<count;++i)if(rows[i]<0 || static_cast<std::uint64_t>(rows[i])>=impl_->rows)
+            throw std::out_of_range("DeepSeek-V4.1 Engram lookup row is outside the table");
+        impl_->nint_pipeline->issue(std::vector<int64_t>(rows,rows+count),{static_cast<int64_t>(count)});
+        return;
+    }
     impl_->issue(rows, count);
 }
 
@@ -192,6 +212,20 @@ EngramTensor EngramTable::gather(const std::int64_t* rows, int batch, int tokens
         throw std::invalid_argument("DeepSeek-V4.1 Engram lookup geometry disagrees");
     auto& s = *impl_;
     const auto count = std::size_t(batch) * tokens * columns;
+    if(s.nint_pipeline) {
+        if(!rows)throw std::invalid_argument("DeepSeek-V4.1 Engram row IDs are missing");
+        const MfqCudaGuard guard(device);
+        if(s.nint_pending) {s.nint_done->synchronize();s.nint_pending=false;}
+        const std::vector<int64_t> shape{static_cast<int64_t>(count)};
+        if(!s.nint_stage || s.nint_stage_rows!=count || s.nint_stage->output().device()!=device) {
+            s.nint_stage=s.nint_pipeline->make_stage(shape,device);s.nint_stage_rows=count;
+        }
+        if(!s.nint_done)s.nint_done=std::make_unique<mfq::cuda::Event>(cudaEventDisableTiming);
+        s.nint_pipeline->upload(*s.nint_stage,std::vector<int64_t>(rows,rows+count),shape);
+        s.nint_stage->decode();
+        s.nint_done->record(mfq_current_cuda_stream());s.nint_pending=true;
+        return s.nint_stage->output().reshape({batch,tokens,static_cast<int64_t>(columns)*s.width});
+    }
     s.issue(rows, count);
     if (s.pending.valid()) s.ready.emplace(s.pending.get());
     const auto& selected = *s.ready;
@@ -226,6 +260,15 @@ std::shared_ptr<EngramTable> EngramTable::load(const mfq::ModelSource &model, co
                                              std::int64_t expected_rows, int expected_width,
                                              std::size_t cache_capacity_rows) {
         const auto record = require_tensor(model, name);
+        if(record.dtype=="NINT") {
+            auto table=load_nint_row_table(model,name);
+            if(table->rows()!=expected_rows || table->width()!=expected_width)
+                throw std::runtime_error("DeepSeek-V4.1 Engram NINT table shape disagrees: "+name);
+            std::fprintf(stderr,"deepseek_v41_engram_dispatch format=NINT row_pipeline=ple rows=%lld width=%d\n",
+                static_cast<long long>(expected_rows),expected_width);
+            return std::shared_ptr<EngramTable>(new EngramTable(model,name,record.nbytes,expected_rows,
+                expected_width,0,cache_capacity_rows,std::move(table)));
+        }
         if (record.dtype != "MXFP8") {
             throw std::runtime_error("DeepSeek-V4.1 Engram table must use native MXFP8: " + name);
         }

@@ -297,7 +297,8 @@ class EngramTable {
                         const mfq_tensor_backend::Device& device) const;
   private:
     EngramTable(const mfq::ModelSource&, std::string, std::uint64_t nbytes,
-                std::int64_t rows, int width, std::uint64_t value_bytes, std::size_t capacity);
+                std::int64_t rows, int width, std::uint64_t value_bytes, std::size_t capacity,
+                std::shared_ptr<mfq::NintRows> nint={});
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -1,5 +1,6 @@
 #include "models/deepseek_v41/engram.h"
 #include "mfq_cuda_context.h"
+#include "../../../tests/nint_row_fixture.h"
 #include <atomic>
 #include <iostream>
 
@@ -17,8 +18,15 @@ class Rows final : public mfq::ModelSource {
     bool batched;
     std::vector<uint8_t> data;
     mutable std::atomic<int> reads{0};
+    std::vector<float> nint_reference;
     std::vector<mfq::TensorMetadata> records;
-    Rows(bool batch) : batched(batch), data(56 + count * (width + width / 32), 0) {
+    Rows(bool batch,bool nint=false) : batched(batch), data(56 + count * (width + width / 32), 0) {
+        if(nint) {
+            auto fixture=mfq::test::fixture(count,width,24,6);
+            data=std::move(fixture.blob);nint_reference=std::move(fixture.reference);
+            records.push_back({"table","NINT","NINT",{},data.size()});
+            return;
+        }
         std::memcpy(data.data(), "MXT1", 4); data[4] = 1; data[5] = 8;
         const uint64_t header[]{count, width, count, width, count, width / 32};
         std::memcpy(data.data() + 8, header, sizeof(header));
@@ -55,6 +63,11 @@ class Rows final : public mfq::ModelSource {
             for (auto span : spans) read_range_into("table",span.offset,span.destination,span.size);
         };
     }
+    TensorReader tensor_reader(std::string_view) const override {
+        return [this](uint64_t offset,std::byte* destination,std::size_t bytes) {
+            read_range_into("table",offset,destination,bytes);
+        };
+    }
     bool supports_parallel_tensor_reads() const noexcept override { return !batched; }
     const std::vector<std::string>& assets() const noexcept override {
         static const std::vector<std::string> names; return names;
@@ -63,14 +76,15 @@ class Rows final : public mfq::ModelSource {
     std::vector<std::byte> read_asset(std::string_view) const override { return {}; }
     std::optional<mfq::ModelGraph> model_graph() const override { return {}; }
     float decoded(int row, int col) const {
+        if(!nint_reference.empty())return float(mfq_half(nint_reference[row*width+col]));
         const auto value = engram_detail::decode_e4m3(data[56 + row * width + col]);
         const int scale = data[56 + count * width + row * (width / 32) + col / 32];
         return value * std::ldexp(1.f, scale - 127);
     }
 };
 
-void check_rows(bool batched, size_t capacity) {
-    Rows source(batched);
+void check_rows(bool batched, size_t capacity,bool nint=false) {
+    Rows source(batched,nint);
     auto table = EngramTable::load(source,"table", Rows::count, Rows::width, capacity);
     const auto device = tb::Device(tb::kCUDA, 0);
     const auto check = [&](const std::vector<int64_t>& ids, int batch, int tokens, int columns) {
@@ -167,6 +181,7 @@ int main(int argc,char** argv) try {
     if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
     if(argc==2 && std::string(argv[1])=="--bench") {benchmark_gate();return 0;}
     check_rows(true,64); check_rows(false,2); check_rows(false,0);
+    check_rows(true,64,true);check_rows(false,2,true);check_rows(false,0,true);
     check_bad_row(false); check_bad_row(true);
     check_gate(1,1,5120,false); check_gate(2,3,67,true); check_gate(1,128,5120,false);
     std::cout<<"DeepSeek-V4.1 Engram row pipeline and fused gate tests passed\n";

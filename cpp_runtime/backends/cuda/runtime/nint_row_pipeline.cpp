@@ -124,7 +124,8 @@ struct NintRowPipeline::Impl {
     std::condition_variable work_ready;
     std::packaged_task<Gathered()> work;
     std::thread worker;
-    explicit Impl(std::vector<std::shared_ptr<mfq::NintRows>> data):tables(std::move(data)) {
+    explicit Impl(std::vector<std::shared_ptr<mfq::NintRows>> data,std::shared_ptr<mfq::NintRowCache> rows_cache):tables(std::move(data)) {
+        if(rows_cache)cache=std::move(rows_cache);
         const auto* trace=std::getenv("MFQ_TRACE_PLE_TIMINGS");profile=trace && trace[0]=='1';
         const auto* serial_setting=std::getenv("MFQ_PLE_SERIAL_SMALL_GATHER");
         serial_small=serial_setting && serial_setting[0]=='1';
@@ -231,7 +232,8 @@ struct NintRowPipeline::Impl {
         return out;
     }
 };
-NintRowPipeline::NintRowPipeline(std::vector<std::shared_ptr<mfq::NintRows>> data):impl_(std::make_unique<Impl>(std::move(data))){}
+NintRowPipeline::NintRowPipeline(std::vector<std::shared_ptr<mfq::NintRows>> data,
+    std::shared_ptr<mfq::NintRowCache> cache):impl_(std::make_unique<Impl>(std::move(data),std::move(cache))){}
 NintRowPipeline::~NintRowPipeline()=default;
 void NintRowPipeline::issue(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,bool early_prefix) {
     auto& s=*impl_;if(s.current_ids==ids && s.current_shape==shape && (s.ready || s.pending.valid()))return;
