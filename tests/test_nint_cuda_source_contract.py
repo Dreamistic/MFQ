@@ -9,6 +9,12 @@ NINT = (ROOT / "mfq/kernels/cuda/nint_matmul.cu").read_text()
 BINDINGS = (ROOT / "mfq/kernels/cuda/mfq_cuda.cpp").read_text()
 EXTENSION = (ROOT / "mfq/kernels/cuda/_ext.py").read_text()
 CMAKE = (ROOT / "cpp_runtime/backends/cuda/CMakeLists.txt").read_text()
+QUANT_OPS = (
+    ROOT / "cpp_runtime/backends/cuda/include/mfq_cuda_quant_ops.h"
+).read_text()
+QUANT_LINEAR = (
+    ROOT / "cpp_runtime/backends/cuda/ops/quant_linear.cpp"
+).read_text()
 MOE = (ROOT / "mfq/kernels/cuda/moe.cu").read_text()
 MOE_PYTHON = (ROOT / "mfq/kernels/cuda/moe.py").read_text()
 CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
@@ -277,6 +283,20 @@ def test_python_ordinary_grouped_linear_keeps_nint_out_of_heterogeneous_kernel()
     assert "mfq_grouped_decode_weight" not in METAL_GROUPED_PYTHON
     assert '"nint_q"' not in METAL_GROUPED_PYTHON
     assert "_FAMILY_NINT," not in METAL_GROUPED_PYTHON
+
+
+def test_dense_nint_loader_decodes_directly_to_f32():
+    dense = QUANT_LINEAR.split(
+        "static mfq_tensor_backend::Tensor dequant_nint_dense_f32", 1
+    )[1].split("static mfq_tensor_backend::Tensor dequant_mxfp4_sq_cpu", 1)[0]
+    assert "nint_decode_f32_cuda(" in dense
+    assert "nint8_zero_dequant_f32_cuda(" in dense
+    assert "nint_decode_cuda(" not in dense
+    assert "nint8_zero_dequant_cuda(" not in dense
+    assert "nint_decode_f32_cuda(" in QUANT_OPS
+    assert "nint8_zero_dequant_f32_cuda(" in QUANT_OPS
+    assert "nint_decode_rows_kernel<Output>" in NINT
+    assert "nint8_zero_decode_rows_kernel<Output>" in NINT
 
 
 def test_metal_mfe_has_no_second_dense_nint_compute_kernel():
