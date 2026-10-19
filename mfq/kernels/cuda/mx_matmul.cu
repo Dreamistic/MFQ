@@ -275,49 +275,70 @@ __global__ void mxfp8_embedding_kernel(
     }
 }
 
+// Packed formats share one decoded Tensor Core tile. Padding rotates shared
+// banks; output fragments reuse weight storage after the last reader barrier.
+struct alignas(16) PackedPrefillStorage {
+    static constexpr int k=64,stride=k+8;
+    __align__(16) __half activation[16*stride];
+    __align__(16) unsigned char weights[64*stride*sizeof(__half)];
+    __device__ __forceinline__ __half* decoded() {return reinterpret_cast<__half*>(weights);}
+    __device__ __forceinline__ float* result() {return reinterpret_cast<float*>(weights);}
+    template<class Accumulator>
+    __device__ __forceinline__ void accumulate(Accumulator& acc,int warp) {
+        using namespace nvcuda;
+        __syncthreads();
+        #pragma unroll
+        for(int sub=0;sub<k;sub+=16) {
+            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+            wmma::load_matrix_sync(af,activation+sub,stride);
+            wmma::load_matrix_sync(bf,decoded()+warp*16*stride+sub,stride);
+            wmma::mma_sync(acc,af,bf,acc);
+        }
+        __syncthreads();
+    }
+};
+
 template <typename Output>
 __global__ void __launch_bounds__(128) mxfp8_matmul_kernel(
         const std::uint8_t* __restrict__ values,const std::uint8_t* __restrict__ scales,
         const __half* __restrict__ input,Output* __restrict__ output,
         int rows,int outputs,int width,int scale_row_shift,int scale_column_shift) {
     using namespace nvcuda;
-    __shared__ __align__(16) __half a[16*32];
-    __shared__ __align__(16) __half b[64*32];
-    __shared__ __align__(16) float c[4][16*16];
+    __shared__ PackedPrefillStorage tile;
+    constexpr int tile_k=PackedPrefillStorage::k,stride=PackedPrefillStorage::stride;
+    auto* a=tile.activation;auto* b=tile.decoded();auto* c=tile.result();
     const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
     const int first_row=blockIdx.y*16,first_output=blockIdx.x*64;
     const int scale_columns=width>>scale_column_shift;
     wmma::fragment<wmma::accumulator,16,16,16,float> acc;
     wmma::fill_fragment(acc,0.0f);
-    for(int k=0;k<width;k+=32) {
-        for(int i=threadIdx.x;i<16*32;i+=128) {
-            const int row=first_row+i/32,column=k+i%32;
-            a[i]=row<rows?input[std::size_t(row)*width+column]:__float2half_rn(0);
+    for(int k=0;k<width;k+=tile_k) {
+        for(int i=threadIdx.x;i<16*tile_k;i+=128) {
+            const int row=first_row+i/tile_k,column=k+i%tile_k;
+            a[(i/tile_k)*stride+i%tile_k]=row<rows && column<width?
+                input[std::size_t(row)*width+column]:__float2half_rn(0);
         }
-        for(int i=threadIdx.x;i<64*32;i+=128) {
-            const int neuron=first_output+i/32,column=k+i%32;
-            b[i]=neuron<outputs?__float2half_rn(decode_e4m3fn(values[std::size_t(neuron)*width+column])*
-                decode_e8m0(scales[std::size_t(neuron>>scale_row_shift)*scale_columns+(column>>scale_column_shift)])):
-                __float2half_rn(0);
+        for(int i=threadIdx.x;i<64*(tile_k/2);i+=128) {
+            const int neuron=first_output+i/(tile_k/2),column=k+2*(i%(tile_k/2));
+            float lo=0,hi=0;
+            if(neuron<outputs && column<width) {
+                const auto offset=std::size_t(neuron)*width+column;
+                const float scale=decode_e8m0(scales[std::size_t(neuron>>scale_row_shift)*scale_columns+(column>>scale_column_shift)]);
+                lo=decode_e4m3fn(values[offset])*scale;
+                hi=decode_e4m3fn(values[offset+1])*scale;
+            }
+            reinterpret_cast<__half2*>(b)[(i/(tile_k/2))*(stride/2)+i%(tile_k/2)]=__floats2half2_rn(lo,hi);
         }
-        __syncthreads();
-        #pragma unroll
-        for(int sub=0;sub<32;sub+=16) {
-            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
-            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
-            wmma::load_matrix_sync(af,a+sub,32);
-            wmma::load_matrix_sync(bf,b+warp*16*32+sub,32);
-            wmma::mma_sync(acc,af,bf,acc);
-        }
-        __syncthreads();
+        tile.accumulate(acc,warp);
     }
-    wmma::store_matrix_sync(c[warp],acc,16,wmma::mem_row_major);
+    wmma::store_matrix_sync(c+warp*16*16,acc,16,wmma::mem_row_major);
     __syncwarp();
     for(int i=lane;i<16*16;i+=32) {
         const int row=first_row+i/16,neuron=first_output+warp*16+i%16;
         if(row<rows && neuron<outputs) {
-            if constexpr(std::is_same_v<Output,float>)output[std::size_t(row)*outputs+neuron]=c[warp][i];
-            else output[std::size_t(row)*outputs+neuron]=__float2half_rn(c[warp][i]);
+            if constexpr(std::is_same_v<Output,float>)output[std::size_t(row)*outputs+neuron]=c[warp*16*16+i];
+            else output[std::size_t(row)*outputs+neuron]=__float2half_rn(c[warp*16*16+i]);
         }
     }
 }
@@ -842,14 +863,9 @@ __global__ void __launch_bounds__(128) mxfp4_moe_grouped_tensor_kernel(
         int routes,int global_experts,int pool_experts,
         int outputs,int width,int max_tiles,int output_tiles,bool routed_input) {
     using namespace nvcuda;
-    constexpr int tile_k=64;
-    constexpr int stride=tile_k+8; // Rotate shared-memory banks between rows.
-    __shared__ __align__(16) __half a[16*stride];
-    // The final accumulators are stored only after all weight readers finish.
-    // Reuse their storage to widen K without retaining another output tile.
-    __shared__ __align__(16) unsigned char tile_storage[64*stride*sizeof(__half)];
-    auto* b=reinterpret_cast<__half*>(tile_storage);
-    auto* c=reinterpret_cast<float*>(tile_storage);
+    __shared__ PackedPrefillStorage tile_storage;
+    constexpr int tile_k=PackedPrefillStorage::k,stride=PackedPrefillStorage::stride;
+    auto* a=tile_storage.activation;auto* b=tile_storage.decoded();auto* c=tile_storage.result();
     __shared__ int pair_ids[16];
     const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
     const int64_t tasks=int64_t(max_tiles)*output_tiles;
@@ -887,16 +903,7 @@ __global__ void __launch_bounds__(128) mxfp4_moe_grouped_tensor_kernel(
                 }
                 reinterpret_cast<__half2*>(b)[(i/(tile_k/2))*(stride/2)+i%(tile_k/2)]=__floats2half2_rn(lo,hi);
             }
-            __syncthreads();
-            #pragma unroll
-            for(int sub=0;sub<tile_k;sub+=16) {
-                wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
-                wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
-                wmma::load_matrix_sync(af,a+sub,stride);
-                wmma::load_matrix_sync(bf,b+warp*16*stride+sub,stride);
-                wmma::mma_sync(acc,af,bf,acc);
-            }
-            __syncthreads();
+            tile_storage.accumulate(acc,warp);
         }
         wmma::store_matrix_sync(c+warp*16*16,acc,16,wmma::mem_row_major);
         __syncwarp();

@@ -25,7 +25,7 @@ void verify(const tb::Tensor& value,const std::vector<float>& expected) {
             std::abs(actual.data_ptr<float>()[i]-expected[i])>2e-4f+1e-3f*std::abs(expected[i]))
             throw std::runtime_error("MXFP8 independent oracle mismatch at "+std::to_string(i));
 }
-void check(int block_rows,int block_columns,int outputs,int width,int groups=1) {
+void check(int block_rows,int block_columns,int outputs,int width,int groups=1,bool shifted=false) {
     std::vector<uint8_t> blob{'M','X','T','1',1,8,0,0};
     const int scale_rows=(outputs+block_rows-1)/block_rows,scale_columns=width/block_columns;
     for(uint64_t d:{uint64_t(outputs),uint64_t(width),uint64_t(outputs),uint64_t(width),
@@ -39,6 +39,11 @@ void check(int block_rows,int block_columns,int outputs,int width,int groups=1) 
     auto cpu=unpack_mxfp8(blob);
     require(cpu.block_rows==block_rows && cpu.block_columns==block_columns,"MXFP8 scale block was discarded");
     auto weight=to_device_mxfp8(cpu,true);
+    if(shifted) {
+        auto backing=tb::empty({weight.values.numel()+1},weight.values.options());
+        auto values=backing.narrow(0,1,weight.values.numel()).reshape(weight.values.sizes().vec());
+        values.copy_(weight.values);weight.values=std::move(values);
+    }
     std::vector<float> dense(outputs*width);
     for(int n=0;n<outputs;++n)for(int k=0;k<width;++k)
         dense[std::size_t(n)*width+k]=float(mfq_half(decode(cpu.values[std::size_t(n)*width+k])*
@@ -199,6 +204,9 @@ int main(int argc,char** argv) try {
     if(argc>=2 && std::string(argv[1])=="--bench-prefill") {benchmark_prefill(argc==3);return 0;}
     check(128,128,137,256);
     check(32,32,65,96);
+    check(128,128,137,256,1,true);
+    check(32,32,65,96,1,true);
+    check(1,32,65,96,1,true);
     check(1,32,65,96);
     check(32,32,96,96,3);
     check(1,32,96,96,3);
