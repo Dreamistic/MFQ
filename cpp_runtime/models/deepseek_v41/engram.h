@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -32,15 +33,19 @@ struct EngramHashBatch {
 };
 
 class EngramHashState {
+    struct Parameters {
+        std::vector<std::int64_t> layer_ids,table_rows,primes,offsets,multipliers;
+        std::vector<std::int32_t> token_map;
+    };
   public:
     EngramHashState(int vocabulary, int max_ngram_size, int heads, std::int64_t pad_id,
                     std::vector<std::int64_t> layer_ids, std::vector<std::int64_t> table_rows,
                     std::vector<std::int64_t> primes, std::vector<std::int64_t> offsets,
                     std::vector<std::int64_t> multipliers, std::vector<std::int32_t> token_map)
         : vocabulary_(vocabulary), max_ngram_size_(max_ngram_size), heads_(heads), pad_id_(pad_id),
-          layer_ids_(std::move(layer_ids)), table_rows_(std::move(table_rows)),
-          primes_(std::move(primes)), offsets_(std::move(offsets)),
-          multipliers_(std::move(multipliers)), token_map_(std::move(token_map)) {}
+          parameters_(std::make_shared<const Parameters>(Parameters{
+              std::move(layer_ids),std::move(table_rows),std::move(primes),std::move(offsets),
+              std::move(multipliers),std::move(token_map)})) {}
 
     void reset(int batch) {
         if (batch <= 0) {
@@ -90,6 +95,14 @@ class EngramHashState {
         commit_speculative();
     }
 
+    // Only the small rolling history is copied. Immutable hash tables and the
+    // vocabulary map are shared, so previews neither advance nor journal state.
+    EngramHashBatch preview(const int64_t* ids,int batch,int tokens,int64_t pos0) const {
+        auto next=*this;
+        next.commit_speculative();
+        return next.forward(ids,batch,tokens,pos0);
+    }
+
     EngramHashBatch forward(const int64_t *ids, int batch, int tokens, int64_t pos0) {
         if (!ids || batch <= 0 || tokens <= 0 || pos0 < 0)
             throw std::invalid_argument("invalid Engram hash input");
@@ -102,10 +115,10 @@ class EngramHashState {
         std::vector<std::int64_t> compressed(element_count);
         for (std::size_t index = 0; index < element_count; ++index) {
             const auto token = ids[index];
-            if (token < 0 || token >= static_cast<std::int64_t>(token_map_.size())) {
+            if (token < 0 || token >= static_cast<std::int64_t>(parameters_->token_map.size())) {
                 throw std::out_of_range("DeepSeek-V4.1 Engram token ID is outside the vocabulary");
             }
-            compressed[index] = token_map_[static_cast<std::size_t>(token)];
+            compressed[index] = parameters_->token_map[static_cast<std::size_t>(token)];
         }
 
         if(speculative_context_) {
@@ -123,7 +136,7 @@ class EngramHashState {
 
         const int prefix = max_ngram_size_ - 1;
         const int combined_length = prefix + tokens;
-        const int layers = static_cast<int>(layer_ids_.size());
+        const int layers = static_cast<int>(parameters_->layer_ids.size());
         const int columns = (max_ngram_size_ - 1) * heads_;
         EngramHashBatch result;
         result.batch = batch;
@@ -154,22 +167,22 @@ class EngramHashState {
                     const auto multiplier_base = static_cast<std::size_t>(layer * max_ngram_size_);
                     std::uint64_t rolling =
                         static_cast<std::uint64_t>(ngram_tokens[0]) *
-                        static_cast<std::uint64_t>(multipliers_[multiplier_base]);
+                        static_cast<std::uint64_t>(parameters_->multipliers[multiplier_base]);
                     for (int shift = 1; shift < max_ngram_size_; ++shift) {
                         rolling ^=
                             static_cast<std::uint64_t>(ngram_tokens[shift]) *
-                            static_cast<std::uint64_t>(multipliers_[multiplier_base + shift]);
+                            static_cast<std::uint64_t>(parameters_->multipliers[multiplier_base + shift]);
                         std::int64_t signed_hash = 0;
                         std::memcpy(&signed_hash, &rolling, sizeof(signed_hash));
                         for (int head = 0; head < heads_; ++head) {
                             const int column = (shift - 1) * heads_ + head;
                             const auto bucket = static_cast<std::size_t>(layer * columns + column);
-                            const auto prime = primes_[bucket];
+                            const auto prime = parameters_->primes[bucket];
                             auto remainder = signed_hash % prime;
                             if (remainder < 0)
                                 remainder += prime;
-                            const auto hash = remainder + offsets_[bucket];
-                            if (hash < 0 || hash >= table_rows_[layer]) {
+                            const auto hash = remainder + parameters_->offsets[bucket];
+                            if (hash < 0 || hash >= parameters_->table_rows[layer]) {
                                 throw std::runtime_error(
                                     "DeepSeek-V4.1 Engram hash exceeds table rows");
                             }
@@ -197,12 +210,7 @@ class EngramHashState {
     int max_ngram_size_ = 0;
     int heads_ = 0;
     std::int64_t pad_id_ = 0;
-    std::vector<std::int64_t> layer_ids_;
-    std::vector<std::int64_t> table_rows_;
-    std::vector<std::int64_t> primes_;
-    std::vector<std::int64_t> offsets_;
-    std::vector<std::int64_t> multipliers_;
-    std::vector<std::int32_t> token_map_;
+    std::shared_ptr<const Parameters> parameters_;
     int batch_ = 0;
     std::int64_t position_ = 0;
     std::vector<std::int64_t> context_;

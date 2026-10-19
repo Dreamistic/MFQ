@@ -191,6 +191,17 @@ void DeepseekV41Model::adapter_prepare_blocks(const mfq::ModelSource &source) {
     shared = deepseek_v41_runtime::load_shared_state(source, config);
 }
 
+bool DeepseekV41Model::adapter_prefetch_token_rows(DeepseekV41CausalLm& model,
+        const mfq_tensor_backend::Tensor& ids) {
+    if(!shared || shared->batch!=1 || !shared->engram_hash || shared->engram_prefetch.empty())return false;
+    if(!ids.is_cpu() || ids.dim()!=2 || ids.size(0)!=1 || ids.size(1)<=0 ||
+            ids.size(1)>std::numeric_limits<int>::max() || ids.scalar_type()!=mfq_tensor_backend::kInt64 ||
+            !ids.is_contiguous())throw std::invalid_argument("Engram prefetch needs contiguous host token IDs");
+    const auto hashes=shared->engram_hash->preview(ids.data_ptr<int64_t>(),1,int(ids.size(1)),model.cache_pos);
+    for(const auto* memory:shared->engram_prefetch)memory->prefetch(hashes);
+    return true;
+}
+
 std::unique_ptr<Block> DeepseekV41Model::adapter_load_block(const mfq::ModelSource &source,
                                                             int layer, int,
                                                             const std::string &type) {

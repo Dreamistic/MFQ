@@ -1,5 +1,6 @@
 #include "generation.h"
 #include "generation_flow.h"
+#include "token_row_prefetch.h"
 #include "models/deepseek_v4/ops.h"
 #include "models/deepseek_v41/ops.h"
 #include "models/gemma4/ops.h"
@@ -336,18 +337,18 @@ template <typename Model> struct CudaGenerationOps {
         if (has_penalties && !graph_active) {
             sample_token_counts_add_cuda(counts, pending.contiguous());
         }
-        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+        if constexpr(requires {model.adapter_prefetch_token_rows(model,known_token_host);}) {
             const auto* option=std::getenv("MFQ_DECODE_EARLY_PLE");
-            if((option && option[0]=='0') || !model.reuse_decode_graphs || !model.graph_registry ||
-               (prepared && prepared->transformed()) || (output && output->stopped()))return;
+            if((option && option[0]=='0') || (prepared && prepared->transformed()) ||
+               (output && output->stopped()))return;
             if(!known_token_host.defined())known_token_host=mfq_tensor_backend::empty({1,1},
                 mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kInt64));
             known_token_host.template data_ptr<int64_t>()[0]=token;
-            if(qwen4_prefetch_decode_ple(model,known_token_host)) {
+            if(prefetch_token_rows(model,known_token_host)) {
                 static bool reported=false;
                 if(!reported) {
                     reported=true;
-                    std::cerr<<"runtime_decode_early_ple enabled=1 host_token_reuse=1\n";
+                    std::cerr<<"runtime_decode_early_token_rows enabled=1 host_token_reuse=1\n";
                 }
             }
         }

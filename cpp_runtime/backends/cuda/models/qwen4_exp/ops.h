@@ -90,6 +90,7 @@ mfq_tensor_backend::Tensor qwen4_layer_major_prefill_hidden(
     const std::function<void()>& computation_finished);
 
 struct Qwen4Model : CausalResources {
+    bool adapter_prefetch_token_rows(Qwen4CausalLm&,const mfq_tensor_backend::Tensor&);
     Qwen4Model();
     ~Qwen4Model();
     Qwen4Model(Qwen4Model&&) noexcept;

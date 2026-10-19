@@ -121,14 +121,25 @@ void check_retained_engram_history() {
     for(int batch:{1,2})for(int kept=0;kept<=5;++kept) {
         auto reference=make(),candidate=make();
         auto prompt=tokens(batch,3,0);
-        reference.forward(prompt.data(),batch,3,0);candidate.forward(prompt.data(),batch,3,0);
+        const auto prompt_preview=candidate.preview(prompt.data(),batch,3,0);
+        reference.forward(prompt.data(),batch,3,0);
+        require(candidate.forward(prompt.data(),batch,3,0).values==prompt_preview.values,
+                "Engram preview disagreed with fresh prompt hashes");
         candidate.begin_speculative();
         auto first=tokens(batch,2,3),second=tokens(batch,3,5);
-        candidate.forward(first.data(),batch,2,3);candidate.forward(second.data(),batch,3,5);
+        const auto first_preview=candidate.preview(first.data(),batch,2,3);
+        require(candidate.forward(first.data(),batch,2,3).values==first_preview.values,
+                "Engram preview changed a speculative token's hashes");
+        const auto second_preview=candidate.preview(second.data(),batch,3,5);
+        require(candidate.forward(second.data(),batch,3,5).values==second_preview.values,
+                "Engram preview changed multi-forward speculative history");
         if(kept) {auto accepted=tokens(batch,kept,3);reference.forward(accepted.data(),batch,kept,3);}
         candidate.rollback_speculative(3+kept);
         auto next=tokens(batch,2,7);
-        require(candidate.forward(next.data(),batch,2,3+kept).values==
+        auto alternative=tokens(batch,3,2);
+        candidate.preview(alternative.data(),batch,3,3+kept);
+        const auto preview=candidate.preview(next.data(),batch,2,3+kept);
+        require(candidate.forward(next.data(),batch,2,3+kept).values==preview.values && preview.values==
                     reference.forward(next.data(),batch,2,3+kept).values,
                 "partial Engram rollback changed batched/multi-forward ngram history");
     }

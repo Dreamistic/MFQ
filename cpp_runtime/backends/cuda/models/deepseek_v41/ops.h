@@ -874,6 +874,7 @@ inline int run_self_check() {
 namespace mfq::cuda {
 
 struct DeepseekV41Model : CausalResources {
+    bool adapter_prefetch_token_rows(DeepseekV41CausalLm&,const mfq_tensor_backend::Tensor&);
     template <class Backend> using CausalModel = mfq::models::deepseek_v41::CausalLm<Backend>;
     mfq::models::deepseek_v41::Config config;
     std::shared_ptr<deepseek_v41_runtime::SharedState> shared;

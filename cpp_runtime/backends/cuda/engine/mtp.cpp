@@ -1,4 +1,5 @@
 #include "generation.h"
+#include "token_row_prefetch.h"
 #include "speculative_sequence.h"
 
 #include "cuda_execution.h"
@@ -104,24 +105,24 @@ template <class Model> struct CudaMtpOps {
     return false;
   }
   bool prefetch_target_ids(int32_t token,const std::vector<int32_t>& drafts) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+    if constexpr(requires {model.adapter_prefetch_token_rows(model,early_ple_ids_host);}) {
       const auto* option=std::getenv("MFQ_MTP_EARLY_PLE");
-      if((option && option[0]=='0') || !model.reuse_decode_graphs || !model.graph_registry || drafts.size()>=8)return false;
-      if(!early_ple_ids_host.defined())early_ple_ids_host=mfq_tensor_backend::empty(
-          {1,8},options.device(mfq_tensor_backend::kCPU));
+      if(option && option[0]=='0')return false;
+      const int tokens=mtp.split_target_verification()?1:1+int(drafts.size());
+      if(!early_ple_ids_host.defined() || early_ple_ids_host.size(1)<tokens)
+        early_ple_ids_host=mfq_tensor_backend::empty({1,tokens},options.device(mfq_tensor_backend::kCPU));
       auto* ids=early_ple_ids_host.template data_ptr<int64_t>();ids[0]=token;
-      for(std::size_t i=0;i<drafts.size();++i)ids[i+1]=drafts[i];
-      const int tokens=1+int(drafts.size());
-      if(mfq::cuda::qwen4_prefetch_decode_ple(model,early_ple_ids_host.narrow(1,0,tokens))) {
+      for(int i=1;i<tokens;++i)ids[i]=drafts[std::size_t(i-1)];
+      if(mfq::cuda::internal::prefetch_token_rows(model,early_ple_ids_host.narrow(1,0,tokens))) {
         static bool reported=false;
         if(!reported) {
-          reported=true;std::cerr<<"runtime_mtp_early_ple enabled=1 prefix_tokens=1\n";
+          reported=true;std::cerr<<"runtime_mtp_early_token_rows enabled=1 prefix_tokens=1\n";
         }
-        if(tokens>1) {
-          static unsigned reported_prefixes=0;const auto bit=1u<<tokens;
+        if(tokens>1 && tokens<64) {
+          static uint64_t reported_prefixes=0;const auto bit=uint64_t(1)<<tokens;
           if(!(reported_prefixes&bit)) {
             reported_prefixes|=bit;
-            std::cerr<<"runtime_mtp_ple_draft_prefix enabled=1 prefix_tokens="<<tokens<<'\n';
+            std::cerr<<"runtime_mtp_token_row_draft_prefix enabled=1 prefix_tokens="<<tokens<<'\n';
           }
         }
         return true;
@@ -140,7 +141,7 @@ template <class Model> struct CudaMtpOps {
     if(prefetch_target_ids(token,{})) {
       static bool reported=false;
       if(!reported) {
-        reported=true;std::cerr<<"runtime_mtp_ple_publication enabled=1\n";
+        reported=true;std::cerr<<"runtime_mtp_token_row_publication enabled=1\n";
       }
     }
   }
