@@ -8,6 +8,18 @@ import pytest
 from mfq import cli
 
 
+def test_alphaq_keeps_text_only_defaults_and_allows_auxiliary_opt_in():
+    from mfq.commands.quantize import add_parser
+
+    parser = argparse.ArgumentParser()
+    add_parser(parser.add_subparsers())
+    command = ['quantize', 'input', 'output', '--target-bpw', '3']
+    default = parser.parse_args(command)
+    assert (default.alphaq_vision, default.alphaq_mtp) == ('exclude', 'exclude')
+    explicit = parser.parse_args(command + ['--alphaq-vision', 'native', '--alphaq-mtp', 'quantize'])
+    assert (explicit.alphaq_vision, explicit.alphaq_mtp) == ('native', 'quantize')
+
+
 def _hf_source(tmp_path: Path) -> Path:
     source = tmp_path / "hf-model"
     source.mkdir()
