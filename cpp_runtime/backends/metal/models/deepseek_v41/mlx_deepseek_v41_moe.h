@@ -36,12 +36,17 @@ public:
     MlxDeepseekV41MoeResult forward(
         const mlx::core::array& input,
         const std::optional<mlx::core::array>& image_mask = std::nullopt,
-        MlxSsdPrefetchedExpertLayer* prefetched = nullptr) const;
+        MlxSsdPrefetchedExpertLayer* prefetched = nullptr,
+        MlxMfeCachedRoute* deferred_route = nullptr) const;
 
     std::optional<MlxSsdPrefetchedExpertLayer> prefetch_routed(
         std::size_t rows) const;
 
     int recommended_prefill_chunk_size() const noexcept;
+    std::size_t resident_routed_bytes() const noexcept;
+    void validate_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) const;
+    void use_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache);
+    std::optional<MlxMfeCachedRoute> cached_route() const;
 
 private:
     MlxDeepseekV41Moe(

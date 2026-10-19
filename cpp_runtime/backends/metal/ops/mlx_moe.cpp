@@ -1,4 +1,5 @@
 #include "mlx_moe.h"
+#include "mlx_moe_ops.h"
 
 #include <coroutine>
 #include "mlx_kernel_prepare.h"
@@ -123,7 +124,7 @@ bool mixed_grouped_nax_enabled(int route_count) noexcept {
     // The heterogeneous NAX path is a large-M prefill kernel.  Keep small-M
     // and short-tail shapes on the compatibility kernel, whose boundary
     // handling is both cheaper and already exhaustive.
-    constexpr int kMinRoutes = 1024;
+    constexpr int kMinRoutes = 512;
     if (route_count < kMinRoutes) {
         return false;
     }
@@ -934,14 +935,15 @@ inline uint mfq_moe_vq_layout(device const int* descriptor) {
 
 template <uint INPUT_ROWS, uint MATRIX_ROWS, uint ROWS_PER_SIMD,
     uint K, uint K_LANES, uint OUT, uint MATRIX_OUT, uint PROJECTIONS,
-    uint ROUTES, uint PROFILE_MASK, bool SHARED_INPUT, bool SPLIT_SWIGLU, bool PACKED_SWIGLU,
+    uint ROUTES, uint PROFILE_MASK, bool SHARED_INPUT, bool SPLIT_SWIGLU, bool PACKED_SWIGLU, bool MXFP4,
     typename RouteStream, typename YStream, typename T>
-inline void mfq_moe_vq_rows(
+inline void mfq_moe_reused_rows(
     device const T* x, YStream y, device const int* d,
     device const uchar* indices, device const uchar* states,
     device const uchar* aux, device const float* anchors,
     device const int8_t* codebooks, device const float* scales,
     device const uchar* state_banks, device const float* parameters,
+    device const uchar* mx_values, device const uchar* mx_scales,
     RouteStream route_rows, threadgroup T* split_values,
     uint output_base, uint lane_group, uint k_lane, uint projection,
     uint variant_stride, float swiglu_limit
@@ -959,11 +961,36 @@ inline void mfq_moe_vq_rows(
         uint output = min(output_base + (PACKED_SWIGLU
             ? (row / ROWS_PER_SIMD) * OUT + row % ROWS_PER_SIMD : row), MATRIX_OUT - 1u);
         outputs[row] = uint(d[1]) * MATRIX_OUT + output;
-        row_anchors[row] = anchors[uint(d[21]) + outputs[row]];
+        row_anchors[row] = MXFP4 ? 0.0f : anchors[uint(d[21]) + outputs[row]];
     }
     float values[MATRIX_ROWS * INPUT_ROWS] = {0.0f};
     uint profile = uint(d[28]) & 255u;
-    if ((PROFILE_MASK & 8u) != 0u && profile == 3u) {
+    if constexpr (MXFP4) {
+        const uint groups = uint(d[4]);
+        for (uint group = k_lane; group < groups; group += K_LANES) {
+            for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+                const float scale = mfq_moe_e8m0(mx_scales[ulong(uint(d[6]))
+                    + ulong(outputs[row]) * groups + group]);
+                for (uint component = 0u; component < 32u; component += 16u) {
+                    const uint column = group * 32u + component;
+                    const ulong offset = ulong(uint(d[5])) + ulong(outputs[row]) * (K / 2u) + column / 2u;
+                    const uint2 packed = *reinterpret_cast<device const uint2*>(mx_values + offset);
+                    for (uint pair = 0u; pair < 8u; ++pair) {
+                        const uint word = pair < 4u ? packed.x : packed.y;
+                        const uchar code = uchar(word >> ((pair & 3u) * 8u));
+                        const float first = scale * mfq_moe_mxfp4_value(code & 15u);
+                        const float second = scale * mfq_moe_mxfp4_value(code >> 4u);
+                        for (uint input_row = 0u; input_row < INPUT_ROWS; ++input_row) {
+                            const uint xbase = input_offsets[input_row] + column + pair * 2u;
+                            const uint index = row * INPUT_ROWS + input_row;
+                            values[index] = fma(float(x[xbase]), first, values[index]);
+                            values[index] = fma(float(x[xbase + 1u]), second, values[index]);
+                        }
+                    }
+                }
+            }
+        }
+    } else if ((PROFILE_MASK & 8u) != 0u && profile == 3u) {
         mfq_nvq1_profile<MATRIX_ROWS, K, K_LANES, 11u, INPUT_ROWS>(
             inputs, indices, states, aux, scales, codebooks, outputs, row_anchors, values,
             parameters[uint(d[26])], 0u, uint(d[18]), uint(d[19]), uint(d[20]), uint(d[23]), uint(d[22]), k_lane);
@@ -1009,7 +1036,7 @@ inline void mfq_moe_vq_rows(
             }
         }
     }
-    if constexpr (SPLIT_SWIGLU) threadgroup_barrier(mem_flags::mem_threadgroup);
+    if constexpr (SPLIT_SWIGLU) return;
     for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
         uint output = output_base + row;
         for (uint input_row = 0u; input_row < INPUT_ROWS; ++input_row) {
@@ -1036,17 +1063,57 @@ inline void mfq_moe_vq_rows(
     }
 }
 
-#define MFQ_MOE_VQ_ROWS(N, LIMIT, ROWS) \
-    mfq_moe_vq_rows<N, MATRIX_ROWS, ROWS_PER_SIMD, uint(K), K_LANES, uint(OUT), \
+template <uint INPUT_ROWS, uint ROWS_PER_SIMD, uint K_LANES, uint OUT,
+    typename RouteStream, typename YStream, typename T>
+inline void mfq_moe_finish_reused_swiglu(
+    YStream y, RouteStream route_rows, threadgroup T* values,
+    uint output_base, uint lane_group, uint k_lane, uint projection, float limit
+) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    constexpr uint PHYSICAL_ROWS = (32u / K_LANES) * ROWS_PER_SIMD;
+    if (projection != 0u || k_lane != 0u) return;
+    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+        const uint output = output_base + row;
+        if (output >= OUT) continue;
+        const uint local = lane_group * ROWS_PER_SIMD + row;
+        for (uint input_row = 0u; input_row < INPUT_ROWS; ++input_row) {
+            float gate = float(values[input_row * 2u * PHYSICAL_ROWS + local]);
+            float up = float(values[(input_row * 2u + 1u) * PHYSICAL_ROWS + local]);
+            if (limit > 0.0f) {
+                gate = min(gate, limit);
+                up = clamp(up, -limit, limit);
+            }
+            y[route_rows[input_row] * OUT + output] = T(gate / (1.0f + exp(-gate)) * up);
+        }
+    }
+}
+
+#define MFQ_MOE_FORMAT_ROWS(N, LIMIT, ROWS, MX) \
+    mfq_moe_reused_rows<N, MATRIX_ROWS, ROWS_PER_SIMD, uint(K), K_LANES, uint(OUT), \
         uint(MATRIX_OUT), uint(PROJECTIONS), uint(ROUTES), uint(VQ_PROFILE_MASK), SHARED_INPUT != 0, \
-        SPLIT_SWIGLU, PACKED_SWIGLU>(x, y, descriptors + descriptor_base, \
+        SPLIT_SWIGLU, PACKED_SWIGLU, MX>(x, y, descriptors + descriptor_base, \
         vq_indices, vq_state, vq_aux, vq_anchors, vq_codebooks, vq_scales, \
-        vq_state_to_codebank, vq_parameters, ROWS, split_values, \
+        vq_state_to_codebank, vq_parameters, mx_values, mx_scales, ROWS, split_values, \
         output_base, lane_group, k_lane, projection, uint(VARIANT_STRIDE), LIMIT)
+
+#define MFQ_MOE_SHARED_ROWS(N, LIMIT, ROWS) \
+    do { \
+    if (family == 3u) { MFQ_MOE_FORMAT_ROWS(N, LIMIT, ROWS, true); } \
+    else { MFQ_MOE_FORMAT_ROWS(N, LIMIT, ROWS, false); } \
+    if constexpr (SPLIT_SWIGLU) mfq_moe_finish_reused_swiglu<N, ROWS_PER_SIMD, K_LANES, uint(OUT)>( \
+        y, ROWS, split_values, output_base, lane_group, k_lane, projection, LIMIT); \
+    } while (false)
 
 )METAL";
 
 constexpr const char* kMoeSource = R"METAL(
+#ifndef MFQ_MOE_DUAL_PAGES
+#define MFQ_MOE_DUAL_PAGES 0
+#endif
+#ifndef MFQ_MOE_OTHER_ROW
+#define MFQ_MOE_OTHER_ROW (uint(expert) * 2u + (projection ^ 1u))
+#define MFQ_MOE_OTHER_DESCRIPTORS descriptors
+#endif
     constexpr bool HAS_ROUTE_GROUPS = MFQ_MOE_ROUTE_GROUPS != 0;
 #if !MFQ_MOE_ROUTE_GROUPS
     device const int* route_groups = nullptr;
@@ -1106,6 +1173,17 @@ constexpr const char* kMoeSource = R"METAL(
         ? uint2(*(device const packed_uint2*)(route_groups + route_index * 8u))
         : uint2(uint(expert_ids[route_index]), 0u);
     int logical_expert = int(route_group.x);
+#if MFQ_MOE_DUAL_PAGES
+    const bool valid_id = logical_expert >= 0 && logical_expert < EXPERT_MAP_SIZE;
+    const int gate_expert = EXPERT_MAP_SIZE != 0
+        ? (valid_id ? gate_map[logical_expert] : -1) : logical_expert;
+    const int up_expert = EXPERT_MAP_SIZE != 0
+        ? (valid_id ? up_map[logical_expert] : -1) : logical_expert;
+    int expert = projection == 0u ? gate_expert : up_expert;
+    int other_expert = projection == 0u ? up_expert : gate_expert;
+    const bool invalid_expert = gate_expert < 0 || gate_expert >= EXPERTS
+        || up_expert < 0 || up_expert >= geometry[4];
+#else
     int expert = logical_expert;
     if (PACKED_EXPERT_IDS != 0) {
         expert = (logical_expert >> 8) - 1;
@@ -1115,7 +1193,9 @@ constexpr const char* kMoeSource = R"METAL(
             ? expert_map[logical_expert]
             : -1;
     }
-    if (expert < 0 || expert >= int(EXPERTS)) {
+    const bool invalid_expert = expert < 0 || expert >= int(EXPERTS);
+#endif
+    if (invalid_expert) {
         for (
             uint row = 0u;
             row < ROWS_PER_SIMD;
@@ -1169,9 +1249,9 @@ constexpr const char* kMoeSource = R"METAL(
         if (family == 0u && route_group.y > 1u && route_group.y <= 6u) {
             bool reusable = mfq_moe_nint_supported_gs(uint(descriptors[descriptor_base + 5u]));
             if constexpr (SPLIT_SWIGLU) {
-                const uint other = (uint(expert) * 2u + (projection ^ 1u)) * uint(DESCRIPTOR_SIZE);
-                reusable = reusable && descriptors[other] == 0
-                    && mfq_moe_nint_supported_gs(uint(descriptors[other + 5u]));
+                const uint other = MFQ_MOE_OTHER_ROW * uint(DESCRIPTOR_SIZE);
+                reusable = reusable && MFQ_MOE_OTHER_DESCRIPTORS[other] == 0
+                    && mfq_moe_nint_supported_gs(uint(MFQ_MOE_OTHER_DESCRIPTORS[other + 5u]));
             }
             if (reusable) {
                 device const int* rows = route_groups + route_index * 8u + 2u;
@@ -1190,10 +1270,10 @@ constexpr const char* kMoeSource = R"METAL(
             }
         }
     }
-    if ((uint(VQ_PROFILE_MASK) & 474u) != 0u
+    if (((uint(VQ_PROFILE_MASK) & 474u) != 0u || (uint(FAMILY_MASK) & 8u) != 0u)
             && (!HAS_ROUTE_GROUPS || route_group.y > 1u)
             && (HAS_ROUTE_GROUPS || (uint(TOKENS) > 1u && uint(TOKENS) <= 6u))
-            && family == 1u) {
+            && (family == 1u || family == 3u)) {
         uint route_count = uint(TOKENS) * uint(ROUTES);
         uint preceding = 0u;
         uint matches = 0u;
@@ -1209,23 +1289,24 @@ constexpr const char* kMoeSource = R"METAL(
             matches = simd_sum(matches);
         }
         if (matches > 1u) {
-            bool reusable_vq = mfq_moe_reusable_vq_profile(
+            bool reusable_vq = family == 3u || mfq_moe_reusable_vq_profile(
                 uint(descriptors[descriptor_base + 28u]) & 255u);
             if constexpr (SPLIT_SWIGLU) {
-                uint other = (uint(expert) * 2u + (projection ^ 1u)) * uint(DESCRIPTOR_SIZE);
-                reusable_vq = reusable_vq && descriptors[other] == 1
-                    && mfq_moe_reusable_vq_profile(uint(descriptors[other + 28u]) & 255u);
+                uint other = MFQ_MOE_OTHER_ROW * uint(DESCRIPTOR_SIZE);
+                const uint other_family = uint(MFQ_MOE_OTHER_DESCRIPTORS[other]);
+                reusable_vq = reusable_vq && (other_family == 3u
+                    || (other_family == 1u && mfq_moe_reusable_vq_profile(uint(MFQ_MOE_OTHER_DESCRIPTORS[other + 28u]) & 255u)));
             }
             if (reusable_vq) {
                 if constexpr (HAS_ROUTE_GROUPS) {
                     device const int* rows = route_groups + route_index * 8u + 2u;
                     if (uint(rows[0]) != route_index) return;
                     switch (matches) {
-                        case 2u: MFQ_MOE_VQ_ROWS(2u, params[0], rows); return;
-                        case 3u: MFQ_MOE_VQ_ROWS(3u, params[0], rows); return;
-                        case 4u: MFQ_MOE_VQ_ROWS(4u, params[0], rows); return;
-                        case 5u: MFQ_MOE_VQ_ROWS(5u, params[0], rows); return;
-                        case 6u: MFQ_MOE_VQ_ROWS(6u, params[0], rows); return;
+                        case 2u: MFQ_MOE_SHARED_ROWS(2u, params[0], rows); return;
+                        case 3u: MFQ_MOE_SHARED_ROWS(3u, params[0], rows); return;
+                        case 4u: MFQ_MOE_SHARED_ROWS(4u, params[0], rows); return;
+                        case 5u: MFQ_MOE_SHARED_ROWS(5u, params[0], rows); return;
+                        case 6u: MFQ_MOE_SHARED_ROWS(6u, params[0], rows); return;
                     }
                 } else {
                 if (preceding % 6u != 0u) return;
@@ -1242,11 +1323,11 @@ constexpr const char* kMoeSource = R"METAL(
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 switch (min(matches - preceding, 6u)) {
-                    case 2u: MFQ_MOE_VQ_ROWS(2u, params[0], grouped_route_rows); return;
-                    case 3u: MFQ_MOE_VQ_ROWS(3u, params[0], grouped_route_rows); return;
-                    case 4u: MFQ_MOE_VQ_ROWS(4u, params[0], grouped_route_rows); return;
-                    case 5u: MFQ_MOE_VQ_ROWS(5u, params[0], grouped_route_rows); return;
-                    case 6u: MFQ_MOE_VQ_ROWS(6u, params[0], grouped_route_rows); return;
+                    case 2u: MFQ_MOE_SHARED_ROWS(2u, params[0], grouped_route_rows); return;
+                    case 3u: MFQ_MOE_SHARED_ROWS(3u, params[0], grouped_route_rows); return;
+                    case 4u: MFQ_MOE_SHARED_ROWS(4u, params[0], grouped_route_rows); return;
+                    case 5u: MFQ_MOE_SHARED_ROWS(5u, params[0], grouped_route_rows); return;
+                    case 6u: MFQ_MOE_SHARED_ROWS(6u, params[0], grouped_route_rows); return;
                 }
                 }
             }
@@ -3012,8 +3093,13 @@ struct NativeMoeConfig {
     bool route_groups = false;
     bool nint_q_dispatch = false;
     bool indirect_pages = false;
+    bool dual_pages = false;
+    bool weighted_reduce = false;
+    int direct_page_mask = 0;
+    int other_experts = 0;
     int workgroups = 0;
     std::shared_ptr<const MfePageResources> page_resources;
+    std::shared_ptr<const MfePageResources> other_page_resources;
 };
 
 constexpr std::array<std::pair<const char*, const char*>, 21> kExpertStreams{{
@@ -3477,16 +3563,23 @@ std::string native_moe_kernel_name(
     name << "_rg" << config.route_groups;
     name << "_qd" << config.nint_q_dispatch;
     if (config.indirect_pages) name << "_page_addresses";
+    if (config.dual_pages) name << "_dual" << config.direct_page_mask;
+    if (config.weighted_reduce) name << "_reduce_v1";
+    if (config.projections == 2 && config.fused_swiglu
+        && (config.family_mask & (1 << kFamilyMxfp4)) && (config.family_mask & (1 << kFamilyVq)))
+        name << "_mixed_pair_v2";
     if (config.route_groups) name << "_pairq";
     name << "_ng";
     append_nint_group_key(name, config.nint_group_sizes);
     return name.str();
 }
 
+std::string make_mfe_reduce_body();
+
 std::string make_native_moe_source(
     const NativeMoeConfig& config,
     const std::string& kernel_name) {
-    const bool has_expert_map = config.expert_map_size != 0;
+    const bool has_expert_map = config.expert_map_size != 0 && !config.dual_pages;
     std::ostringstream source;
     source
         << "#include <metal_stdlib>\n"
@@ -3496,6 +3589,7 @@ std::string make_native_moe_source(
         << ";\n"
         << nint_group_specialization(config.nint_group_sizes)
         << "#define MFQ_MOE_ROUTE_GROUPS " << config.route_groups << "\n"
+        << "#define MFQ_MOE_DUAL_PAGES " << config.dual_pages << "\n"
         << "#define MFQ_NINT_Q_DISPATCH " << config.nint_q_dispatch << "\n"
         << "#define MFQ_MOE_VQ_LAYOUTS " << config.vq_layouts << "ul\n"
         << kMoeHeader;
@@ -3506,14 +3600,21 @@ std::string make_native_moe_source(
         source << "};\n";
     }
     source << "\nkernel void " << kernel_name << "(\n"
-        << "device const int* descriptors [[buffer(0)]],\n"
-        << (config.indirect_pages ? "device const MfqExpertStreams* expert_streams [[buffer(1)]],\n"
+        << (config.dual_pages ? "device const int* gate_descriptors [[buffer(0)]],\n"
+            : "device const int* descriptors [[buffer(0)]],\n")
+        << (config.dual_pages ? "device const MfqExpertStreams* gate_streams [[buffer(1)]],\n"
+            : config.indirect_pages ? "device const MfqExpertStreams* expert_streams [[buffer(1)]],\n"
             : "device const uchar* nint_q [[buffer(1)]],\n")
-        << "device const uchar* nint_sub_scale [[buffer(2)]],\n"
-        << "device const uchar* nint_sub_min [[buffer(3)]],\n"
-        << "device const float* nint_anchor_scale [[buffer(4)]],\n"
-        << "device const float* nint_anchor_min [[buffer(5)]],\n"
-        << "device const int8_t* q8_q [[buffer(6)]],\n"
+        << (config.dual_pages ? "device const int* up_descriptors [[buffer(2)]],\n"
+            : "device const uchar* nint_sub_scale [[buffer(2)]],\n")
+        << (config.dual_pages ? "device const MfqExpertStreams* up_streams [[buffer(3)]],\n"
+            : "device const uchar* nint_sub_min [[buffer(3)]],\n")
+        << (config.dual_pages ? "device const int* gate_map [[buffer(4)]],\n"
+            : "device const float* nint_anchor_scale [[buffer(4)]],\n")
+        << (config.dual_pages ? "device const int* up_map [[buffer(5)]],\n"
+            : "device const float* nint_anchor_min [[buffer(5)]],\n")
+        << (config.dual_pages ? "device const T* up_x [[buffer(6)]],\n"
+            : "device const int8_t* q8_q [[buffer(6)]],\n")
         << "device const half* q8_scales [[buffer(7)]],\n"
         << "device const uchar* vq_indices [[buffer(8)]],\n"
         << "device const uchar* vq_state [[buffer(9)]],\n"
@@ -3529,16 +3630,20 @@ std::string make_native_moe_source(
         << "device const short* vq_residual_second [[buffer(19)]],\n"
         << "device const uchar* mx_values [[buffer(20)]],\n"
         << "device const uchar* mx_scales [[buffer(21)]],\n"
-        << "device const T* x [[buffer(22)]],\n"
+        << (config.dual_pages ? "device const T* gate_x [[buffer(22)]],\n"
+            : "device const T* x [[buffer(22)]],\n")
         << "device const int* expert_ids [[buffer(23)]],\n"
         << "device const int* route_order [[buffer(24)]],\n"
         << "device const float* params [[buffer(25)]],\n";
     if (has_expert_map) {
         source << "device const int* expert_map [[buffer(26)]],\n";
     }
-    const int input_count = 26 + static_cast<int>(has_expert_map) + static_cast<int>(config.route_groups);
+    const int input_count = 26 + static_cast<int>(has_expert_map) + static_cast<int>(config.route_groups)
+        + static_cast<int>(config.weighted_reduce);
     if (config.route_groups)
         source << "device const int* route_groups [[buffer(" << input_count - 1 << ")]],\n";
+    if (config.weighted_reduce)
+        source << "device const float* route_weights [[buffer(" << input_count - 1 << ")]],\n";
     source
         << "device T* y [[buffer("
         << input_count
@@ -3591,15 +3696,33 @@ std::string make_native_moe_source(
         << "const int EXPERT_MAP_SIZE = geometry[3];\n"
         << "constexpr int PACKED_EXPERT_IDS = "
         << config.packed_expert_ids << ";\n";
+    source << "#define MFQ_MOE_OTHER_ROW "
+        << (config.dual_pages ? "uint(other_expert)" : "(uint(expert) * 2u + (projection ^ 1u))") << "\n"
+        << "#define MFQ_MOE_OTHER_DESCRIPTORS "
+        << (config.dual_pages ? "(projection == 0u ? up_descriptors : gate_descriptors)" : "descriptors") << "\n";
     if (!has_expert_map) {
         source << "device const int* expert_map = expert_ids;\n";
     }
-    std::string body(kMoeSource);
+    std::string body = config.weighted_reduce ? make_mfe_reduce_body() : kMoeSource;
     if (config.indirect_pages) {
-        const auto position = body.find("    uint descriptor_base = (\n");
+        const std::string marker = "    uint descriptor_base = (\n"
+            "        uint(expert) * uint(PROJECTIONS)\n"
+            "        + projection\n"
+            "    ) * uint(DESCRIPTOR_SIZE);";
+        const auto position = body.find(marker);
         if (position == std::string::npos) throw std::logic_error("MFE page binding marker is missing");
+        if (config.dual_pages) body.replace(position, marker.size(),
+            "    uint descriptor_base = uint(expert) * uint(DESCRIPTOR_SIZE);");
         std::ostringstream bindings;
-        for (const auto& [name, type] : kExpertStreams)
+        if (config.dual_pages) {
+            bindings << "device const int* descriptors = projection == 0u ? gate_descriptors : up_descriptors;\n"
+                << "device const T* x = projection == 0u ? gate_x : up_x;\n"
+                << "device const MfqExpertStreams* selected_stream = projection == 0u ? gate_streams + "
+                << ((config.direct_page_mask & 1) ? "0u" : "uint(expert)") << " : up_streams + "
+                << ((config.direct_page_mask & 2) ? "0u" : "uint(expert)") << ";\n";
+            for (const auto& [name, type] : kExpertStreams)
+                bindings << "#define " << name << " selected_stream->" << name << "\n";
+        } else for (const auto& [name, type] : kExpertStreams)
             bindings << "#define " << name << " expert_streams[uint(expert)]." << name << "\n";
         body.insert(position, bindings.str());
     }
@@ -3647,8 +3770,8 @@ public:
     void eval_gpu(
         const std::vector<array>& inputs,
         array& output) override {
-        const int input_count = 26 + static_cast<int>(config_.expert_map_size != 0)
-            + static_cast<int>(config_.route_groups);
+        const int input_count = 26 + static_cast<int>(config_.expert_map_size != 0 && !config_.dual_pages)
+            + static_cast<int>(config_.route_groups) + static_cast<int>(config_.weighted_reduce);
         if (inputs.size() < static_cast<std::size_t>(input_count)
             || (!config_.indirect_pages && inputs.size() != static_cast<std::size_t>(input_count))) {
             throw std::logic_error(
@@ -3663,10 +3786,14 @@ public:
                 selected_stream);
         encoder.set_compute_pipeline_state(kernel);
         if (config_.indirect_pages) {
-            if (config_.page_resources) {
+            if (config_.page_resources && (!config_.dual_pages || config_.other_page_resources)) {
                 auto* command = encoder.get_command_buffer();
                 command->useResidencySet(config_.page_resources->residency.get());
                 command->addCompletedHandler([resources = config_.page_resources](MTL::CommandBuffer*) {});
+                if (config_.other_page_resources) {
+                    command->useResidencySet(config_.other_page_resources->residency.get());
+                    command->addCompletedHandler([resources = config_.other_page_resources](MTL::CommandBuffer*) {});
+                }
             } else {
                 for (std::size_t index = input_count; index < inputs.size(); ++index)
                     encoder.set_input_array(inputs[index], 1);
@@ -3679,12 +3806,12 @@ public:
                 index);
         }
         encoder.set_output_array(output, input_count);
-        const std::array<int, 4> geometry{
-            config_.tokens, config_.variant_stride, config_.experts, config_.expert_map_size};
+        const std::array<int, 5> geometry{
+            config_.tokens, config_.variant_stride, config_.experts, config_.expert_map_size, config_.other_experts};
         encoder.set_bytes(geometry, input_count + 1);
         encoder.dispatch_threadgroups(
             MTL::Size(config_.workgroups, 1, 1),
-            MTL::Size(64, 1, 1));
+            MTL::Size(config_.weighted_reduce ? config_.routes * 32 : 64, 1, 1));
         if (config_.indirect_pages) indirect_expert_submissions.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -3701,9 +3828,11 @@ public:
             && primitive->config_.tokens == config_.tokens
             && primitive->config_.variant_stride == config_.variant_stride
             && primitive->config_.experts == config_.experts
+            && primitive->config_.other_experts == config_.other_experts
             && primitive->config_.expert_map_size == config_.expert_map_size
             && primitive->config_.workgroups == config_.workgroups
-            && primitive->config_.page_resources == config_.page_resources;
+            && primitive->config_.page_resources == config_.page_resources
+            && primitive->config_.other_page_resources == config_.other_page_resources;
     }
 
     std::vector<Shape> output_shapes(
@@ -3903,6 +4032,61 @@ std::string_view mfe_decode_body() {
         body.erase(routes_begin, routes_end - routes_begin);
         return body;
     }();
+    return body;
+}
+
+std::string make_mfe_reduce_body() {
+    std::string body = R"METAL(
+    constexpr uint K_LANES = uint(K_LANES_VALUE);
+    constexpr uint ROWS_PER_SIMD = uint(ROWS_PER_SIMD_VALUE);
+    constexpr uint LANE_GROUPS = 32u / K_LANES;
+    constexpr uint ROWS_PER_PHYSICAL_SIMD = LANE_GROUPS * ROWS_PER_SIMD;
+    constexpr uint MATRIX_ROWS = ROWS_PER_SIMD;
+    constexpr bool SPLIT_SWIGLU = false;
+    constexpr bool PACKED_SWIGLU = false;
+    constexpr uint OUTPUT_TILES = (uint(OUT) + ROWS_PER_PHYSICAL_SIMD - 1u) / ROWS_PER_PHYSICAL_SIMD;
+    const uint lane = thread_index_in_simdgroup;
+    const uint k_lane = lane & (K_LANES - 1u);
+    const uint lane_group = lane / K_LANES;
+    const uint simd_group = simdgroup_index_in_threadgroup;
+    const uint workgroup = threadgroup_position_in_grid.x;
+    const uint output_tile = workgroup % OUTPUT_TILES;
+    const uint token = workgroup / OUTPUT_TILES;
+    const uint route = simd_group;
+    const uint route_index = token * uint(ROUTES) + route;
+    const uint projection = 0u;
+    const uint output_base = output_tile * ROWS_PER_PHYSICAL_SIMD + lane_group * ROWS_PER_SIMD;
+    threadgroup T partials[uint(ROUTES) * ROWS_PER_PHYSICAL_SIMD];
+    const int logical_expert = expert_ids[route_index];
+    int expert = logical_expert;
+    if (PACKED_EXPERT_IDS != 0) expert = (logical_expert >> 8) - 1;
+    else if (EXPERT_MAP_SIZE != 0) expert = logical_expert >= 0 && logical_expert < EXPERT_MAP_SIZE
+        ? expert_map[logical_expert] : -1;
+    if (expert >= 0 && expert < EXPERTS) {
+)METAL";
+    body += mfe_decode_body();
+    body += R"METAL(
+        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+            float total = accumulators[row];
+            for (uint offset = K_LANES >> 1u; offset > 0u; offset >>= 1u)
+                total += simd_shuffle_down(total, offset);
+            if (k_lane == 0u) partials[route * ROWS_PER_PHYSICAL_SIMD
+                + lane_group * ROWS_PER_SIMD + row] = T(total);
+        }
+    } else if (k_lane == 0u) {
+        for (uint row = 0u; row < ROWS_PER_SIMD; ++row)
+            partials[route * ROWS_PER_PHYSICAL_SIMD + lane_group * ROWS_PER_SIMD + row] = T(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0u && lane < ROWS_PER_PHYSICAL_SIMD) {
+        float total = 0.0f;
+        for (uint selected = 0u; selected < uint(ROUTES); ++selected)
+            total += float(partials[selected * ROWS_PER_PHYSICAL_SIMD + lane])
+                * route_weights[token * uint(ROUTES) + selected];
+        const uint output = output_tile * ROWS_PER_PHYSICAL_SIMD + lane;
+        if (output < uint(OUT)) y[token * uint(OUT) + output] = T(total);
+    }
+)METAL";
     return body;
 }
 
@@ -4282,9 +4466,11 @@ std::string make_mfe_nint_gate_up_source(
             << "    threadgroup T grouped_values[12u * ROWS_PER_PHYSICAL_SIMD];\n"
             << "    switch (grouped_count) {\n";
         for (int rows = 2; rows <= 6; ++rows)
-            source << "      case " << rows << "u: mfq_moe_vq_rows<" << rows
-                << "u, 1u, 1u, uint(K), K_LANES, uint(OUT), uint(MATRIX_OUT), uint(PROJECTIONS), uint(ROUTES), uint(VQ_PROFILE_MASK), true, true, false>("
-                << "batch_x, targets, descriptors + grouped_descriptor, vq_indices, vq_state, vq_aux, vq_anchors, vq_codebooks, vq_scales, vq_state_to_codebank, vq_parameters, rows, grouped_values, output_base, lane_group, k_lane, simd_group, uint(VARIANT_STRIDE), 0.0f); return;\n";
+            source << "      case " << rows << "u: { mfq_moe_reused_rows<" << rows
+                << "u, 1u, 1u, uint(K), K_LANES, uint(OUT), uint(MATRIX_OUT), uint(PROJECTIONS), uint(ROUTES), uint(VQ_PROFILE_MASK), true, true, false, false>("
+                << "batch_x, targets, descriptors + grouped_descriptor, vq_indices, vq_state, vq_aux, vq_anchors, vq_codebooks, vq_scales, vq_state_to_codebank, vq_parameters, mx_values, mx_scales, rows, grouped_values, output_base, lane_group, k_lane, simd_group, uint(VARIANT_STRIDE), 0.0f);\n"
+                << "mfq_moe_finish_reused_swiglu<" << rows << "u, 1u, K_LANES, uint(OUT)>("
+                << "targets, rows, grouped_values, output_base, lane_group, k_lane, simd_group, 0.0f); return; }\n";
         source << "    }\n  }\n}\n";
     }
     source << mfe_decode_body();
@@ -8474,6 +8660,7 @@ struct MlxMfeOffloadCache::Impl {
             std::lock_guard lock(pin_mutex);
             pin_stopping = true;
             pin_queue.clear();
+            pin_pending.clear();
         }
         pin_ready.notify_one();
         if (pin_worker.joinable()) pin_worker.join();
@@ -8483,13 +8670,28 @@ struct MlxMfeOffloadCache::Impl {
         if (page->packed_nbytes < (std::size_t{64} << 10)) return true;
         try {
             std::lock_guard lock(pin_mutex);
-            if (pin_queue.size() >= 64 || pin_stopping) return false;
+            if (pin_stopping) return false;
+            if (pin_pending.contains(key)) return true;
             if (!pin_worker.joinable()) pin_worker = std::thread([this] { pin_loop(); });
             pin_queue.push_back({key, page});
+            try {
+                pin_pending.emplace(key, std::prev(pin_queue.end()));
+            } catch (...) {
+                pin_queue.pop_back();
+                throw;
+            }
             pin_ready.notify_one();
             return true;
         } catch (...) {
             return false;
+        }
+    }
+
+    void cancel_pin(const Key& key) {
+        std::lock_guard lock(pin_mutex);
+        if (const auto found = pin_pending.find(key); found != pin_pending.end()) {
+            pin_queue.erase(found->second);
+            pin_pending.erase(found);
         }
     }
 
@@ -8502,6 +8704,7 @@ struct MlxMfeOffloadCache::Impl {
                 if (pin_stopping) return;
                 request = std::move(pin_queue.front());
                 pin_queue.pop_front();
+                pin_pending.erase(request.key);
             }
             std::shared_ptr<const MfeCachedExpert> page;
             {
@@ -8859,6 +9062,7 @@ struct MlxMfeOffloadCache::Impl {
         std::shared_ptr<const MfeStreamProjection>> mfe_projections;
     MfeLru mfe_lru;
     MfeExpertCache mfe_cache;
+    std::unordered_set<std::string> prefill_priority;
     std::size_t resident_bytes = 0;
     std::unordered_map<std::string, std::size_t> backing_records;
     MlxResourceTelemetry resources;
@@ -8875,7 +9079,8 @@ struct MlxMfeOffloadCache::Impl {
     MlxMfeCacheReuseStats stats;
     std::mutex pin_mutex;
     std::condition_variable pin_ready;
-    std::deque<PinRequest> pin_queue;
+    std::list<PinRequest> pin_queue;
+    std::unordered_map<Key, std::list<PinRequest>::iterator, KeyHash> pin_pending;
     bool pin_stopping = false;
     std::thread pin_worker;
 
@@ -8908,6 +9113,7 @@ struct MlxMfeOffloadCache::Impl {
             resident_bytes -= victim->weight->packed_nbytes;
             resident_pages.at(victim->key.name)[victim->key.expert].reset();
             ++stats.evictions;
+            cancel_pin(victim->key);
             mfe_cache.erase(victim->key);
             mfe_lru.erase(victim);
         }
@@ -9050,6 +9256,43 @@ void MlxMfeOffloadCache::prepare_projection(
     });
 }
 
+void MlxMfeOffloadCache::prepare_swiglu_pair(
+    const std::string& gate, const std::string& up, int routes) {
+    auto* preparation = MlxKernelPreparation::current();
+    if (!preparation || routes <= 0 || routes > 16) return;
+    std::array<std::shared_ptr<const MfeStreamProjection>, 2> projections;
+    {
+        std::lock_guard lock(impl_->mutex);
+        projections = {impl_->mfe_projection_locked(gate), impl_->mfe_projection_locked(up)};
+    }
+    if (!uses_indirect_expert_pages(projections[0]->kernel_profile->family_mask
+            | projections[1]->kernel_profile->family_mask)) return;
+    preparation->collect([&] {
+        std::vector<MlxMfeWeight> weights;
+        for (std::size_t index = 0; index < projections.size(); ++index) {
+            const auto& projection = projections[index];
+            const auto blob = impl_->load_mfe_expert_blob(index == 0 ? gate : up,
+                *projection, *projection->experts_by_id.front());
+            const auto weight = MlxMfeWeight::from_blob(blob).with_kernel_profile(projection->kernel_profile);
+            weights.push_back(MlxMfeWeight::concatenate_expert_pages(
+                {weight, weight}, projection->kernel_profile).with_kernel_profile(projection->kernel_profile));
+        }
+        for (const int rows : {1, 2}) {
+            const auto input = mlx::core::zeros(Shape{rows, projections[0]->neuron_len}, mlx::core::float16);
+            const std::vector<std::int32_t> host_ids(static_cast<std::size_t>(rows) * routes, 0);
+            const auto ids = array(host_ids.begin(), Shape{rows, routes});
+            const auto groups = rows > 1 ? moe_route_groups_host(host_ids, rows, routes) : std::nullopt;
+            preparation->add(weights[0].routed_swiglu_pair(weights[1], input, ids, 0.0f,
+                groups ? &*groups : nullptr));
+            if (rows == 1) {
+                const auto map = array({0}, mlx::core::int32);
+                preparation->add(weights[0].routed_swiglu_pair(weights[1], input, ids,
+                    0.0f, nullptr, &map, &map));
+            }
+        }
+    });
+}
+
 std::size_t MlxMfeOffloadCache::backing_payload_bytes() const {
     std::lock_guard lock(impl_->mutex);
     std::size_t bytes = 0;
@@ -9121,7 +9364,7 @@ std::optional<std::vector<MlxMfeWeight>> MlxMfeOffloadCache::layer_mfe(
         if (!active_experts.empty() && missing_bytes < bytes / 2) return std::nullopt;
     }
     const auto staging = checked_add(checked_add(bytes, bytes, "MFE layer staging"),
-        dense_bytes, "MFE layer staging and execution");
+        mlx_reference_enabled() ? dense_bytes : 0, "MFE layer staging and execution");
     if (!MlxResidentBudgetScope::permits_optional(staging)) return std::nullopt;
     MlxResidentBudgetScope::reserve(staging);
     std::size_t epoch = 0;
@@ -9204,6 +9447,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
             protected_pages.reserve(std::min(active_experts.size(), static_cast<std::size_t>(projection->experts)));
             const bool indirect_pages = uses_indirect_expert_pages(projection->kernel_profile->family_mask);
             if (indirect_pages) working_bytes = std::size_t{3} * getpagesize();
+            std::size_t missing_bytes = 0, largest_missing = 0, missing_count = 0;
             std::unordered_set<std::int32_t> seen;
             for (const auto expert : active_experts) {
                 if (!seen.insert(expert).second) continue;
@@ -9216,9 +9460,26 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
                     ? streamed_expert_storage_bound(*projection, *projection->experts_by_id[expert])
                     : indirect_pages ? sizeof(std::int32_t) * (kDescriptorSize + 1)
                         + 21 * sizeof(std::uint64_t) : cached->second->weight->packed_nbytes;
-                const auto copies = missing ? std::size_t{5} : std::size_t{1};
+                const auto copies = missing && !indirect_pages ? std::size_t{5} : std::size_t{1};
                 working_bytes = checked_add(working_bytes, checked_product(bytes, copies,
                     "expert packed staging"), "active expert working set");
+                if (missing && indirect_pages) {
+                    missing_bytes = checked_add(missing_bytes, bytes, "missing expert storage");
+                    largest_missing = std::max(largest_missing, bytes);
+                    ++missing_count;
+                }
+            }
+            if (missing_count) {
+                const auto workers = std::max(1u, std::thread::hardware_concurrency());
+                const auto concurrent = std::min(missing_count,
+                    std::size_t(prefill_scan ? workers : std::min(8u, workers)));
+                const auto batch_bytes = prefill_scan
+                    ? std::max(largest_missing, std::size_t{8} << 20) : largest_missing;
+                const auto in_flight = std::min(missing_bytes,
+                    checked_product(concurrent, batch_bytes, "expert reader working set"));
+                working_bytes = checked_add(working_bytes,
+                    checked_product(in_flight, std::size_t{3}, "expert reader staging"),
+                    "active expert working set");
             }
         }
         staging.emplace(working_bytes);
@@ -9263,16 +9524,14 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
 
     impl_->backing_records.emplace(name, impl_->model.record(name).nbytes);
 
+    const bool priority_scan = prefill_scan && impl_->prefill_priority.contains(name);
     const auto touch = [&](const Impl::Key& key, bool hit) {
-        if (prefill_scan) return;
+        if (prefill_scan && !priority_scan) return;
         const auto cached = impl_->mfe_cache.find(key);
         if (cached == impl_->mfe_cache.end()) return;
         auto& value = *cached->second;
         value.credit = static_cast<std::uint8_t>(std::min<unsigned>(3,
             value.credit + counts.at(key.expert) - (hit ? 0 : 1)));
-        if (hit && value.credit >= 2 && !value.pin_attempted) {
-            value.pin_attempted = impl_->enqueue_pin(key, value.weight);
-        }
         impl_->mfe_lru.splice(impl_->mfe_lru.end(), impl_->mfe_lru, cached->second);
     };
     const auto reuse_packed = [&](const Impl::PreparedProjection& packed)
@@ -9554,7 +9813,7 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
         if (by_id.empty()) by_id.resize(projection->experts);
         const auto bytes = checked_add(impl_->resident_bytes,
             page.value->packed_nbytes, "resident MFE expert bytes");
-        const auto inserted = prefill_scan
+        const auto inserted = prefill_scan && !priority_scan
             ? impl_->mfe_lru.insert(impl_->mfe_lru.begin(), {page.key, page.value})
             : impl_->mfe_lru.insert(impl_->mfe_lru.end(), {page.key, page.value});
         try {
@@ -9575,6 +9834,12 @@ MfeGroupTask MlxMfeOffloadCache::Impl::prepare_grouped(
         impl_->resident_bytes += bytes;
     }
     impl_->trim();
+    for (const auto& page : pages) {
+        const auto cached = impl_->mfe_cache.find(page.key);
+        if (cached == impl_->mfe_cache.end()) continue;
+        auto& value = *cached->second;
+        if (!value.pin_attempted) value.pin_attempted = impl_->enqueue_pin(page.key, value.weight);
+    }
     co_return result;
 }
 
@@ -9674,6 +9939,21 @@ std::size_t MlxMfeOffloadCache::set_cache_limit(std::size_t bytes) {
     return before - impl_->resident_bytes;
 }
 
+void MlxMfeOffloadCache::set_prefill_priority(std::span<const std::string> names) {
+    std::lock_guard lock(impl_->mutex);
+    std::unordered_set<std::string> priority(names.begin(), names.end());
+    if (priority == impl_->prefill_priority) return;
+    impl_->prefill_priority = std::move(priority);
+    if (impl_->prefill_priority.empty()) return;
+    auto item = impl_->mfe_lru.begin();
+    for (std::size_t count = impl_->mfe_lru.size(); count > 0; --count) {
+        const auto current = item++;
+        const bool preferred = impl_->prefill_priority.contains(current->key.name);
+        current->credit = preferred ? 3 : 0;
+        if (preferred) impl_->mfe_lru.splice(impl_->mfe_lru.end(), impl_->mfe_lru, current);
+    }
+}
+
 void MlxMfeOffloadCache::discard_record(
     const std::string& name) noexcept {
     std::lock_guard lock(impl_->mutex);
@@ -9688,6 +9968,7 @@ void MlxMfeOffloadCache::discard_record(
             continue;
         }
         impl_->resident_bytes -= item->weight->packed_nbytes;
+        impl_->cancel_pin(item->key);
         impl_->mfe_cache.erase(item->key);
         item = impl_->mfe_lru.erase(item);
     }
@@ -9704,6 +9985,11 @@ void MlxMfeOffloadCache::clear() {
     ++impl_->page_generation;
     impl_->route_confidence.clear();
     impl_->resident_pages.clear();
+    {
+        std::lock_guard pin_lock(impl_->pin_mutex);
+        impl_->pin_queue.clear();
+        impl_->pin_pending.clear();
+    }
     impl_->mfe_cache.clear();
     impl_->mfe_lru.clear();
     impl_->mfe_projections.clear();
@@ -11941,6 +12227,46 @@ bool MlxMfeOffloadCache::resolve_cached_projections(std::span<const std::shared_
     return true;
 }
 
+array MlxMfeCachedRoute::forward(const array& source, const array& routes, float swiglu_limit,
+    const array* reduce_weights) {
+    ids = routes;
+    const auto down = projections.size() - 1;
+    auto intermediate = [&]() {
+        if (projections.size() != 3)
+            return projections[0]->weight.routed_swiglu(source,
+                mlx::core::take(projections[0]->expert_map, routes), swiglu_limit);
+        return projections[0]->weight.routed_swiglu_pair(projections[1]->weight,
+            source, routes, swiglu_limit, nullptr, &projections[0]->expert_map, &projections[1]->expert_map);
+    }();
+    auto down_ids = mlx::core::take(projections[down]->expert_map, routes);
+    return reduce_weights ? projections[down]->weight.routed_matmul_reduce(intermediate, down_ids, *reduce_weights)
+        : projections[down]->weight.routed_matmul(intermediate, down_ids);
+}
+
+std::span<const std::int32_t> MlxMfeCachedRoute::host_ids() {
+    if (!ids) throw std::logic_error("cached route was not evaluated");
+    ids->eval();
+    if (ids->dtype() != mlx::core::int32 || !ids->flags().row_contiguous) {
+        ids = mlx::core::contiguous(mlx::core::astype(*ids, mlx::core::int32));
+        ids->eval();
+    }
+    return {ids->data<std::int32_t>(), ids->size()};
+}
+
+bool MlxMfeCachedRoute::all_resident() {
+    const auto routes = host_ids();
+    for (const auto& projection : projections) for (const auto expert : routes) {
+        if (expert < 0 || static_cast<std::size_t>(expert) >= projection->host_expert_map.size())
+            throw std::out_of_range("cached expert route is out of range");
+        if (projection->host_expert_map[expert] < 0) return false;
+    }
+    return true;
+}
+
+bool MlxMfeCachedRoute::resolve() {
+    return cache->resolve_cached_projections(projections, host_ids());
+}
+
 MlxMfeWeight MlxMfeWeight::with_automatic_mxfp4_nax_prefill(
     bool enabled) const {
     auto impl = std::make_shared<Impl>(*impl_);
@@ -12164,12 +12490,15 @@ array MlxMfeWeight::routed_swiglu_pair(
     const array& input,
     const array& expert_ids,
     float limit,
-    const array* route_groups) const {
+    const array* route_groups,
+    const array* gate_map,
+    const array* up_map) const {
     if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
             "paired MFE SwiGLU limit must be finite and non-negative");
     }
-    if (impl_->experts != up.impl_->experts
+    if ((gate_map == nullptr) != (up_map == nullptr)
+        || (!gate_map && impl_->experts != up.impl_->experts)
         || impl_->out_per_expert != up.impl_->out_per_expert
         || impl_->neuron_len != up.impl_->neuron_len
         || impl_->projections != 1
@@ -12177,9 +12506,22 @@ array MlxMfeWeight::routed_swiglu_pair(
         throw std::invalid_argument(
             "paired MFE Gate and Up weights are incompatible");
     }
+    if (gate_map && (gate_map->ndim() != 1 || up_map->ndim() != 1
+            || gate_map->size() != up_map->size() || gate_map->size() == 0
+            || gate_map->dtype() != mlx::core::int32 || up_map->dtype() != mlx::core::int32
+            || !gate_map->flags().row_contiguous || !up_map->flags().row_contiguous)) {
+        throw std::invalid_argument("paired MFE maps must be equal-sized contiguous int32 vectors");
+    }
+    if (route_groups && (expert_ids.ndim() != 2 || expert_ids.shape(0) < 2 || expert_ids.shape(0) > 24
+            || route_groups->dtype() != mlx::core::int32 || !route_groups->flags().row_contiguous
+            || route_groups->shape() != Shape{expert_ids.shape(0), expert_ids.shape(1), 8})) {
+        throw std::invalid_argument("paired MFE route groups must be contiguous int32 [tokens,routes,8]");
+    }
     const auto fallback = [&]() {
-        auto gate_output = routed_matmul(input, expert_ids, route_groups);
-        auto up_output = up.routed_matmul(input, expert_ids, route_groups);
+        auto gate_output = gate_map ? routed_matmul_mapped(input, expert_ids, *gate_map)
+            : routed_matmul(input, expert_ids, route_groups);
+        auto up_output = up_map ? up.routed_matmul_mapped(input, expert_ids, *up_map)
+            : up.routed_matmul(input, expert_ids, route_groups);
         if (limit > 0.0f) {
             return moe_limited_swiglu_pair(
                 std::move(gate_output),
@@ -12191,6 +12533,7 @@ array MlxMfeWeight::routed_swiglu_pair(
             -1));
     };
     const bool native_pair =
+        !gate_map &&
         !impl_->indirect_sources && !up.impl_->indirect_sources &&
         impl_->native_primitive
         && up.impl_->native_primitive
@@ -12222,6 +12565,160 @@ array MlxMfeWeight::routed_swiglu_pair(
             == static_cast<std::size_t>(up.impl_->experts)
                 * kDescriptorSize;
     if (!native_pair || mlx_reference_enabled()) {
+        bool reusable_routes = input.ndim() == 2 && input.shape(0) == 1;
+        if (!reusable_routes && route_groups && route_groups->is_available()) {
+            const auto* groups = route_groups->data<std::int32_t>();
+            reusable_routes = true;
+            bool any = false;
+            for (std::size_t index = 0; index < expert_ids.size(); ++index) {
+                if (groups[index * 8] < 0) continue;
+                any = true;
+                reusable_routes &= groups[index * 8 + 1] > 1;
+            }
+            reusable_routes &= any;
+        }
+        const auto eligible = [](const Impl& value) {
+            return value.native_primitive && value.reference_cohorts.empty()
+                && value.mxfp4_sq_cohorts.empty() && value.fp8_sq_cohorts.empty()
+                && !value.standalone_owner && value.k_lanes_override != 32;
+        };
+        if (reusable_routes && !mlx_reference_enabled() && mfe_split_swiglu_enabled()
+            && input.ndim() == 2 && input.shape(0) >= 1 && input.shape(0) <= 6
+            && expert_ids.ndim() == 2 && expert_ids.shape(0) == input.shape(0)
+            && expert_ids.shape(1) > 0 && expert_ids.shape(1) <= 16
+            && input.shape(1) == impl_->neuron_len
+            && eligible(*impl_) && eligible(*up.impl_)
+            && uses_indirect_expert_pages(impl_->compilation_profile().family_mask
+                | up.impl_->compilation_profile().family_mask)) {
+            const auto streams = [](const Impl& value) {
+                return std::array<const array*, 21>{&value.nint_q, &value.nint_sub_scale, &value.nint_sub_min,
+                    &value.nint_anchor_scale, &value.nint_anchor_min, &value.q8_q, &value.q8_scales,
+                    &value.vq_indices, &value.vq_state, &value.vq_aux, &value.vq_anchors,
+                    &value.vq_codebooks, &value.vq_scales, &value.vq_state_to_codebank, &value.vq_banks,
+                    &value.vq_parameters, &value.vq_residual_codebooks, &value.vq_residual_first,
+                    &value.vq_residual_second, &value.mx_values, &value.mx_scales};
+            };
+            const std::array sources{impl_, up.impl_};
+            bool available = true;
+            for (const auto& source : sources) {
+                available &= source->descriptor_values.size() == std::size_t(source->experts) * kDescriptorSize;
+                if (!source->indirect_addresses) for (const auto* value : streams(*source))
+                    available &= value->is_available() && value->flags().row_contiguous;
+            }
+            if (available && input.shape(0) > 1 && !gate_map) {
+                for (int expert = 0; expert < impl_->experts; ++expert) {
+                    const auto* gate = impl_->descriptor_values.data() + expert * kDescriptorSize;
+                    const auto* other = up.impl_->descriptor_values.data() + expert * kDescriptorSize;
+                    const auto reusable = [](const auto* descriptor) {
+                        const auto profile = descriptor[kVqProfile] & 255;
+                        return descriptor[kFamily] == kFamilyMxfp4
+                            || (descriptor[kFamily] == kFamilyVq
+                                && profile < 32 && (474u & (1u << profile)) != 0u);
+                    };
+                    if ((gate[kFamily] != kFamilyMxfp4 && gate[kFamily] != kFamilyVq)
+                        || (other[kFamily] != kFamilyMxfp4 && other[kFamily] != kFamilyVq)
+                        || reusable(gate) != reusable(other)) {
+                        available = false;
+                        break;
+                    }
+                }
+            }
+            if (available && gate_map && input.shape(0) > 1) {
+                for (const auto& source : sources) {
+                    const auto profile = source->compilation_profile();
+                    available &= (profile.family_mask & ~((1u << kFamilyMxfp4) | (1u << kFamilyVq))) == 0
+                        && (profile.vq_profile_mask & ~474u) == 0;
+                }
+            }
+            if (available) {
+                const auto page_addresses = [&](const auto& source) {
+                    if (source->indirect_addresses) return *source->indirect_addresses;
+                    std::vector<std::uint64_t> addresses;
+                    addresses.reserve(21);
+                    for (const auto* value : streams(*source)) {
+                        const auto* buffer = static_cast<const MTL::Buffer*>(value->buffer().ptr());
+                        addresses.push_back(buffer->gpuAddress() + value->offset());
+                    }
+                    return array(addresses.begin(), Shape{1, 21}, mlx::core::uint64);
+                };
+                auto source = mlx::core::contiguous(input.dtype() == mlx::core::float16
+                    || input.dtype() == mlx::core::float32 ? input : mlx::core::astype(input, mlx::core::float16));
+                const int tokens = input.shape(0), routes = expert_ids.shape(1);
+                const auto rotated_source = [&](const auto& weight) {
+                    if (weight->rotations.empty()) return source;
+                    std::vector<array> variants{source};
+                    for (const auto& rotation : weight->rotations)
+                        variants.push_back(apply_rotation(source, rotation, tokens, impl_->neuron_len));
+                    return mlx::core::contiguous(mlx::core::concatenate(variants, 0));
+                };
+                auto inputs = impl_->narrow_bindings;
+                inputs[1] = page_addresses(impl_);
+                inputs[2] = up.impl_->descriptors;
+                inputs[3] = page_addresses(up.impl_);
+                inputs[4] = gate_map ? *gate_map : empty_packed_array(mlx::core::int32);
+                inputs[5] = up_map ? *up_map : empty_packed_array(mlx::core::int32);
+                inputs[6] = rotated_source(up.impl_);
+                inputs.push_back(rotated_source(impl_));
+                inputs.push_back(mlx::core::contiguous(mlx::core::astype(expert_ids, mlx::core::int32)));
+                inputs.push_back(empty_packed_array(mlx::core::int32));
+                inputs.emplace_back(std::initializer_list<float>{limit}, mlx::core::float32);
+                if (route_groups) inputs.push_back(*route_groups);
+                const bool prepared = impl_->page_resources && up.impl_->page_resources;
+                if (!prepared) for (const auto& weight : sources) {
+                    if (weight->indirect_addresses)
+                        inputs.insert(inputs.end(), weight->indirect_owners.begin(), weight->indirect_owners.end());
+                    else for (const auto* value : streams(*weight)) inputs.push_back(*value);
+                }
+                const auto gate_profile = impl_->compilation_profile();
+                const auto up_profile = up.impl_->compilation_profile();
+                std::vector<int> groups = *gate_profile.nint_group_sizes;
+                groups.insert(groups.end(), up_profile.nint_group_sizes->begin(), up_profile.nint_group_sizes->end());
+                std::sort(groups.begin(), groups.end());
+                groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
+                const auto families = gate_profile.family_mask | up_profile.family_mask;
+                const int rows_per_simd = tokens == 1
+                    && (families & ~((1u << kFamilyMxfp4) | (1u << kFamilyVq))) == 0 ? 2 : 1;
+                const auto output_rows = std::size_t{2} * rows_per_simd;
+                const int workgroups = checked_int(checked_product(checked_product(tokens, routes, "paired MFE routes"),
+                    (std::size_t(impl_->out_per_expert) + output_rows - 1) / output_rows,
+                    "paired MFE workgroups"), "paired MFE workgroups");
+                detail::profile_marker("mfe.dispatch.indirect_pair_native");
+                return native_moe_dispatch(std::move(inputs), NativeMoeConfig{
+                    .dtype = source.dtype(),
+                    .output_shape = Shape{tokens, routes, impl_->out_per_expert},
+                    .tokens = tokens,
+                    .routes = routes,
+                    .experts = impl_->experts,
+                    .output_width = impl_->out_per_expert,
+                    .matrix_output_width = impl_->out_per_expert,
+                    .projections = 2,
+                    .fused_swiglu = 1,
+                    .input_width = impl_->neuron_len,
+                    .k_lanes = 16,
+                    .rows_per_simd = rows_per_simd,
+                    .nint_group_sizes = std::make_shared<const std::vector<int>>(std::move(groups)),
+                    .descriptor_size = kDescriptorSize,
+                    .variant_stride = tokens,
+                    .shared_input = 1,
+                    .vq_execution_layout = gate_profile.vq_execution_layout || up_profile.vq_execution_layout,
+                    .vq_layouts = gate_profile.vq_layouts | up_profile.vq_layouts,
+                    .family_mask = static_cast<int>(gate_profile.family_mask | up_profile.family_mask),
+                    .vq_profile_mask = static_cast<int>(gate_profile.vq_profile_mask | up_profile.vq_profile_mask),
+                    .has_nepq_residual = impl_->has_nepq_residual || up.impl_->has_nepq_residual,
+                    .npq_grouped_indices = impl_->npq_grouped_indices && up.impl_->npq_grouped_indices,
+                    .expert_map_size = gate_map ? checked_int(gate_map->size(), "paired MFE expert map") : 0,
+                    .route_groups = route_groups != nullptr,
+                    .nint_q_dispatch = gate_profile.nint_q_dispatch && up_profile.nint_q_dispatch,
+                    .indirect_pages = true,
+                    .dual_pages = true,
+                    .direct_page_mask = (impl_->indirect_addresses ? 0 : 1) | (up.impl_->indirect_addresses ? 0 : 2),
+                    .other_experts = up.impl_->experts,
+                    .workgroups = workgroups,
+                    .page_resources = prepared ? impl_->page_resources : nullptr,
+                    .other_page_resources = prepared ? up.impl_->page_resources : nullptr,
+                });
+            }
+        }
         detail::profile_marker("mfe.dispatch.mxfp4_pair_fallback");
         return fallback();
     }
@@ -12508,14 +13005,22 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
     return std::move(outputs.front());
 }
 
-bool MlxMfeWeight::supports_fused_routed_reduce() const noexcept {
+bool MlxMfeWeight::supports_fused_routed_reduce(const array* route_groups) const noexcept {
+    if (route_groups && (impl_->indirect_sources || impl_->rotations.size()
+            || impl_->family_mask != (std::uint32_t{1} << kFamilyMxfp4))) {
+        if (!route_groups->is_available() || route_groups->dtype() != mlx::core::int32
+            || !route_groups->flags().row_contiguous || route_groups->ndim() != 3
+            || route_groups->shape(2) != 8) return false;
+        const auto* groups = route_groups->data<std::int32_t>();
+        for (std::size_t index = 0; index < route_groups->size() / 8; ++index)
+            if (groups[index * 8 + 1] > 1) return false;
+    }
     return mxfp4_decode_down_reduce_enabled()
-        && !impl_->indirect_sources
         && !mlx_reference_enabled()
         && impl_->native_primitive
-        && impl_->family_mask == (std::uint32_t{1} << kFamilyMxfp4)
         && impl_->projections == 1
-        && impl_->rotations.empty()
+        && impl_->reference_cohorts.empty() && impl_->mxfp4_sq_cohorts.empty()
+        && impl_->fp8_sq_cohorts.empty() && !impl_->standalone_owner
         && (impl_->k_lanes_override == 0 || impl_->k_lanes_override == 16)
         && impl_->out_per_expert > 0
         && impl_->neuron_len > 0
@@ -12527,10 +13032,11 @@ bool MlxMfeWeight::supports_fused_routed_reduce() const noexcept {
 array MlxMfeWeight::routed_matmul_reduce(
     const array& input,
     const array& expert_ids,
-    const array& route_weights) const {
+    const array& route_weights,
+    const array* route_groups) const {
     const auto fallback = [&]() {
         return moe_weighted_reduce(
-            routed_matmul(input, expert_ids),
+            routed_matmul(input, expert_ids, route_groups),
             route_weights);
     };
     if (!supports_fused_routed_reduce()
@@ -12548,6 +13054,23 @@ array MlxMfeWeight::routed_matmul_reduce(
         || expert_ids.shape(1) > 16) {
         detail::profile_marker("mfe.dispatch.mxfp4_down_reduce_fallback");
         return fallback();
+    }
+
+    const bool pure_mxfp4 = !impl_->indirect_sources && impl_->rotations.empty()
+        && impl_->family_mask == (std::uint32_t{1} << kFamilyMxfp4);
+    if (!pure_mxfp4) {
+        if (route_groups) {
+            if (route_groups->dtype() != mlx::core::int32
+                || route_groups->shape() != Shape{input.shape(0), expert_ids.shape(1), 8}
+                || !route_groups->flags().row_contiguous)
+                throw std::invalid_argument("Down route groups must be contiguous int32 [tokens,routes,8]");
+            if (!route_groups->is_available()) return fallback();
+            const auto* groups = route_groups->data<std::int32_t>();
+            for (std::size_t index = 0; index < expert_ids.size(); ++index)
+                if (groups[index * 8 + 1] > 1) return fallback();
+        }
+        detail::profile_marker("mfe.dispatch.mixed_down_reduce_native");
+        return routed_matmul_impl(input, expert_ids, false, 0.0f, nullptr, false, nullptr, &route_weights);
     }
 
     detail::profile_marker("mfe.dispatch.mxfp4_down_reduce_native");
@@ -13363,7 +13886,8 @@ array MlxMfeWeight::routed_matmul_impl(
     float swiglu_limit,
     const array* expert_map,
     bool packed_expert_ids,
-    const array* route_groups) const {
+    const array* route_groups,
+    const array* reduce_weights) const {
     if (impl_->indirect_sources && mlx_reference_enabled())
         return concatenate_experts(*impl_->indirect_sources).with_kernel_profile(impl_->kernel_profile)
             .routed_matmul_impl(input, expert_ids, fused_swiglu, swiglu_limit, expert_map, packed_expert_ids, route_groups);
@@ -13497,7 +14021,7 @@ array MlxMfeWeight::routed_matmul_impl(
               static_cast<std::size_t>(impl_->projections),
               static_cast<std::size_t>(impl_->out_per_expert),
               "routed output width");
-    const Shape output_shape{
+    const Shape output_shape = reduce_weights ? Shape{tokens, impl_->out_per_expert} : Shape{
         tokens,
         routes,
         checked_int(
@@ -13668,17 +14192,18 @@ array MlxMfeWeight::routed_matmul_impl(
         compilation.family_mask == ((std::uint32_t{1} << kFamilyNint) |
                                (std::uint32_t{1} << kFamilyVq));
     const int automatic_rows = mixed_decode_two_rows ||
+        (reduce_weights && impl_->out_per_expert > impl_->neuron_len) ||
         (impl_->projections == 1 && compilation.family_mask ==
             (std::uint32_t{1} << kFamilyMxfp4)) ? 2 : 1;
     const int rows_per_simd =
         split_fused_swiglu
         ? 1
         : (tokens == 1 || (tokens <= 6 && mixed_decode_two_rows))
-            && impl_->rotations.empty()
+            && (impl_->rotations.empty() || reduce_weights)
         ? mfe_decode_rows_per_simd(automatic_rows)
         : 1;
     const auto rows_per_workgroup = static_cast<std::size_t>(
-        (split_fused_swiglu ? 32 : 64)
+        (split_fused_swiglu || reduce_weights ? 32 : 64)
         / k_lanes * rows_per_simd);
     const auto output_tiles =
         (
@@ -13686,7 +14211,7 @@ array MlxMfeWeight::routed_matmul_impl(
                 logical_output_width)
             + rows_per_workgroup - 1
         ) / rows_per_workgroup;
-    auto workgroups = route_count_size;
+    auto workgroups = reduce_weights ? static_cast<std::size_t>(tokens) : route_count_size;
     workgroups = checked_product(
         workgroups,
         static_cast<std::size_t>(
@@ -13806,30 +14331,16 @@ array MlxMfeWeight::routed_matmul_impl(
                 .indirect_pages = impl_->indirect_addresses.has_value(),
                 .swiglu_limit = swiglu_limit,
             });
-        auto inverse_order = moe_inverse_permutation(route_order);
-        auto restored = mlx::core::take(
-            std::move(sorted_outputs),
-            inverse_order,
-            0);
-        auto valid = mlx::core::expand_dims(
-            mlx::core::greater_equal(
-                ids,
-                array(0, mlx::core::int32)),
-            -1);
-        return merge_standalone(mlx::core::where(
-            valid,
-            mlx::core::reshape(
-                std::move(restored),
-                output_shape),
-            mlx::core::zeros(
-                output_shape,
-                source.dtype())));
+        auto restored = moe_restore_routed_rows(sorted_outputs,route_order,ids);
+        return merge_standalone(mlx::core::reshape(std::move(restored),output_shape));
     }
     if (impl_->native_primitive) {
         if (expert_map != nullptr) {
             kernel_inputs.push_back(map);
         }
         if (route_groups != nullptr) kernel_inputs.push_back(*route_groups);
+        if (reduce_weights) kernel_inputs.push_back(mlx::core::contiguous(
+            mlx::core::astype(*reduce_weights, mlx::core::float32)));
         if (impl_->indirect_addresses) {
             kernel_inputs[1] = *impl_->indirect_addresses;
             if (!impl_->page_resources)
@@ -13870,6 +14381,7 @@ array MlxMfeWeight::routed_matmul_impl(
                 .route_groups = route_groups != nullptr,
                 .nint_q_dispatch = compilation.nint_q_dispatch,
                 .indirect_pages = impl_->indirect_addresses.has_value(),
+                .weighted_reduce = reduce_weights != nullptr,
                 .workgroups = static_cast<int>(workgroups),
                 .page_resources = impl_->page_resources,
             }));

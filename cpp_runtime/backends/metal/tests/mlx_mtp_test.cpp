@@ -544,6 +544,7 @@ int main() {
         {
             int target_position = 0;
             int resolved_cycles = 0;
+            int maximum_seen_depth = 0;
             bool delayed_preparation = false;
             std::vector<std::int64_t> emitted;
             mfq::metal::MlxMtpEngineCallbacks callbacks;
@@ -569,6 +570,7 @@ int main() {
                 std::int32_t,
                 const mlx::core::array&,
                 int draft_count) {
+                maximum_seen_depth = std::max(maximum_seen_depth, draft_count);
                 target_position += draft_count + 1;
                 return mfq::metal::MlxMtpTargetBatch{
                     mlx::core::broadcast_to(
@@ -618,6 +620,42 @@ int main() {
             target_position = 0;
             resolved_cycles = 0;
             emitted.clear();
+            const std::array<std::int64_t, 1> eos{0};
+            for (const bool warmup : {false, true}) {
+                sampling.warmup = warmup;
+                const auto count = mfq::metal::run_mlx_mtp_generation(
+                    mfq::metal::MlxMtpEngineRequest{
+                        3, 5, 32,
+                        mlx::core::array({10.0f, 0.0f, 0.0f}, mlx::core::Shape{1, 3}),
+                        sampling, std::nullopt, eos,
+                        [&](std::int64_t token) { emitted.push_back(token); return true; },
+                    }, callbacks, stats);
+                if (count != (warmup ? 5 : 1)
+                    || emitted != std::vector<std::int64_t>(warmup ? 5 : 1, 0)
+                    || (warmup && stats.drafted_tokens == 0)) {
+                    throw std::runtime_error("MTP warmup EOS override changed normal stopping or skipped verification");
+                }
+                target_position = resolved_cycles = 0;
+                emitted.clear();
+            }
+            callbacks.predictor = mfq::metal::MlxMtpPredictorDescriptor::recurrent(5);
+            sampling.warmup = true;
+            for (int depth = 1; depth <= 5; ++depth) {
+                sampling.mtp_max_draft_tokens = depth;
+                maximum_seen_depth = 0;
+                const auto count = mfq::metal::run_mlx_mtp_generation(
+                    mfq::metal::MlxMtpEngineRequest{
+                        3, depth + 2, 32,
+                        mlx::core::array({10.0f, 0.0f, 0.0f}, mlx::core::Shape{1, 3}),
+                        sampling, std::nullopt, eos, [](std::int64_t) { return true; },
+                    }, callbacks, stats);
+                if (count != depth + 2 || maximum_seen_depth != depth)
+                    throw std::runtime_error("MTP warmup did not execute the requested verification width");
+                target_position = resolved_cycles = 0;
+            }
+            callbacks.predictor = mfq::metal::MlxMtpPredictorDescriptor::recurrent(2);
+            sampling.mtp_max_draft_tokens = 2;
+            sampling.warmup = false;
             delayed_preparation = true;
             const auto timed_generated = mfq::metal::run_mlx_mtp_generation(
                 mfq::metal::MlxMtpEngineRequest{
