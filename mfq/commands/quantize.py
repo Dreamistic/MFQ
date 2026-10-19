@@ -13,19 +13,10 @@ import re
 from pathlib import Path
 
 from mfq.formats.shards import parse_size
+from mfq.calibration.ud_recipes import UD_TIERS
 
 QUANT_BACKENDS = ("auto", "cuda", "metal", "cpu")
-_UD_TIER_CHOICES = (
-    "IQ1_S",
-    "IQ1_M",
-    "Q2_K_XL",
-    "IQ3_XXS",
-    "Q3_K_XL",
-    "IQ4_XS",
-    "Q4_K_XL",
-    "Q5_K_XL",
-    "Q6_K_XL",
-)
+_UD_TIER_CHOICES = UD_TIERS
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -94,8 +85,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     ceiling.add_argument('--ud-tier', choices=_UD_TIER_CHOICES, default='',
         help='pinned UD nonexpert recipe and exact main-text whole-file byte ceiling')
     precision.add_argument('--alphaq-allocator', choices=('alphaq', 'natscale'), default='alphaq')
-    precision.add_argument('--alphaq-vision', choices=('native', 'NINT8', 'exclude'), default='native')
-    precision.add_argument('--alphaq-mtp', choices=('quantize', 'exclude'), default='quantize')
+    precision.add_argument('--alphaq-vision', choices=('native', 'NINT8', 'exclude'), default='exclude')
+    precision.add_argument('--alphaq-mtp', choices=('quantize', 'exclude'), default='exclude')
     precision.add_argument('--natscale-tau', type=float, default=1.0)
     precision.add_argument('--natscale-sensitivity', default='uniform',
         help='uniform, imatrix-energy, or gradient:PATH')

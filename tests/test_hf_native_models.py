@@ -26,6 +26,7 @@ from mfq.server.state.catalog import ModelCatalog
 from mfq.server.runtime.hf_tokenizer import (
     DEEPSEEK_V4_CHAT_TEMPLATE,
     DEEPSEEK_V41_CHAT_TEMPLATE,
+    HfTokenizerError,
     ensure_hf_tokenizer_gguf,
     ensure_mfq_tokenizer_gguf,
     native_hf_asset_environment,
@@ -386,6 +387,15 @@ def test_native_hf_source_view_is_not_metal_specific(tmp_path: Path) -> None:
     assert (
         asset_root / HF_SOURCE_MAP_ASSET.removeprefix("__mfq_asset__/")
     ).is_file()
+
+
+@pytest.mark.parametrize('eos_ids', [[-1, 4], [4, 99]])
+def test_hf_tokenizer_rejects_out_of_range_eos_ids(tmp_path, eos_ids):
+    model = tmp_path / 'invalid-eos'
+    _hf_fixture(model)
+    (model / 'generation_config.json').write_text(json.dumps({'eos_token_id': eos_ids}))
+    with pytest.raises(HfTokenizerError, match='outside the tokenizer vocabulary'):
+        ensure_hf_tokenizer_gguf(model, tmp_path / 'cache')
 
 
 def test_hf_tokenizer_cache_is_reusable_and_runtime_selected(

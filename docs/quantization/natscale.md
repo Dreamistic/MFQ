@@ -34,7 +34,8 @@ During the same weight pass as the AlphaQ spectra, collection saves
 `column_energy[i,p,j] = sum_o W[i,p,o,j]^2` in checksummed `.npy` sidecars
 under `column-energies/`, referenced from `statistics.json`. These arrays are
 imatrix independent. Complete banks survive interruption. Older banks
-lacking energies are recollected; complete new banks remain reusable.
+lacking energies gain column energies without repeating their spectral analysis.
+Ordinary AlphaQ runs keep using spectral-only caches and do not collect energies.
 Allocation computes `P[i,p] = sum_j s[i,p,j] * column_energy[i,p,j]`.
 
 Measured relative error is `rho = sum(s*(W_c-W)^2) / sum(s*W^2)`. By default,

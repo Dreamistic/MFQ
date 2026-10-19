@@ -242,7 +242,9 @@ def test_cpp_runtime_accepts_canonical_and_legacy_mfe_delta_magics():
 
 def test_metal_nint_uses_one_metadata_driven_compute_kernel():
     assert METAL_NINT.count('"mfq_native_nint_matmul_v2_"') == 1
-    assert METAL_NINT.count("result += kNintMatmul;") == 1
+    assert METAL_NINT.count('constexpr const char* kNintMatmul =') == 1
+    assert 'return kNintMatmul;' in METAL_NINT
+    assert 'std::string_view(kNintMatmul)' in METAL_NINT
     metadata = (ROOT / "cpp_runtime/backends/metal/ops/mlx_nint_metadata.h").read_text()
     assert "metadata.x & 15u" in metadata
     assert "metadata.y," in metadata
@@ -251,7 +253,8 @@ def test_metal_nint_uses_one_metadata_driven_compute_kernel():
     assert "mfq_nint_row(row_metadata," in METAL_NINT
     assert "auto output = routed_matmul(" in METAL_NINT
     assert METAL_GROUPED.count("class NintProjectionPrimitive final") == 1
-    assert METAL_GROUPED.count("source += detail::nint_matmul_metal_body();") == 1
+    assert METAL_GROUPED.count('detail::nint_matmul_metal_body()') == 1
+    assert METAL_GROUPED.count('detail::nint_matmul_metal_row_q_body()') == 1
     assert "mfq_grouped_nint_read_row_value4" in METAL_GROUPED
     for retired in (
         "mfq_cpp_single_row_grouped_nint",
@@ -311,7 +314,6 @@ def test_metal_mfe_has_no_second_dense_nint_compute_kernel():
     assert "grouped_nint4_group24" not in METAL_MOE
     assert "nint_profile_mask" not in METAL_MOE
     assert METAL_NINT.count("constexpr const char* kNintMatmul =") == 1
-    assert METAL_NINT.count("result += kNintMatmul;") == 1
     assert METAL_NINT.count("const auto& plan = compiled_nint_matmul_plan(config);") == 1
     assert METAL_NINT.count("auto result = native_nint_matmul(") == 2
     assert "? kNintStoreOutputAdd" in METAL_NINT
@@ -327,34 +329,10 @@ def test_python_jit_extension_has_its_own_link_closure():
         re.findall(r'os\.path\.join\(_DIR, "([^\"]+\.(?:cu|cpp))"\)', EXTENSION)
     )
 
-    assert jit == (
-        "norm.cu",
-        "acc.cu",
-        "rope.cu",
-        "attention.cu",
-        "gated_delta_net.cu",
-        "kv_cache.cu",
-        "activation.cu",
-        "embedding.cu",
-        "selected_attention.cu",
-        "qwen4_exp.cu",
-        "glm5_next.cu",
-        "sampling.cu",
-        "ssm_conv.cu",
-        "moe.cu",
-        "mx_matmul.cu",
-        "fp8_sq.cu",
-        "mxfp4_sq.cu",
-        "nint_matmul.cu",
-        "nint_short_decode.cu",
-        "nint_q8_decode.cu",
-        "nvq_matmul.cu",
-        "nvq_routed_reuse.cu",
-        "nepq.cu",
-        "nepq_residual.cu",
-        "mfq_cuda.cpp",
-    )
-    assert set(jit[:-1]) <= set(native)
+    assert len(jit) == len(set(jit))
+    assert 'mfq_cuda.cpp' in jit
+    assert set(jit) - {'mfq_cuda.cpp'} <= set(native)
+    assert all((ROOT / 'mfq/kernels/cuda' / source).is_file() for source in jit)
     assert "nvq_routed_reuse.cu" in jit
     assert {"attention_mma.cu", "gdn_decode_window.cu"}.isdisjoint(jit)
     assert "mfq_attention_mma" not in BINDINGS

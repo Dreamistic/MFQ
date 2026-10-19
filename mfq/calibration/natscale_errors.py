@@ -185,28 +185,10 @@ def run(args):
     backend = resolve_quant_backend(args.backend, args.device)
     with cache_lock(cache/'.quantize.lock'):
         if args.calibration_stage == 'natscale-statistics':
-            collect_statistics(root, scope.experts, cache, backend.device)
+            collect_statistics(root, scope.experts, cache, backend.device, column_energy=True)
         else:
             measure_errors(root, scope, imatrix, cache, backend,
                 profiles=tuple(args.profiles.split(',')) if args.profiles else ALPHAQ_PROFILES,
                 sample_layers=args.sample_layers, sample_experts=args.sample_experts,
                 row_chunk=args.row_chunk, output=args.output or None)
     return 0
-
-
-def add_parsers(stages):
-    for name, help_text in (('natscale-errors', 'measure imatrix-weighted format errors with export codecs'),
-                            ('natscale-statistics', 'collect weight spectra and column energies in one pass')):
-        parser = stages.add_parser(name, help=help_text)
-        parser.add_argument('--model', required=True)
-        parser.add_argument('--imatrix', required=True)
-        parser.add_argument('--cache', required=True)
-        parser.add_argument('--backend', choices=('auto', 'cpu', 'cuda', 'metal'), default='auto')
-        parser.add_argument('--device', default='')
-        if name == 'natscale-errors':
-            parser.add_argument('--profiles', default='')
-            parser.add_argument('--sample-layers', type=int, default=6)
-            parser.add_argument('--sample-experts', type=int, default=3)
-            parser.add_argument('--row-chunk', type=int, default=0)
-            parser.add_argument('--output', default='')
-        parser.set_defaults(_impl=run)

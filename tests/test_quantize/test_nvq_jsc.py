@@ -629,3 +629,23 @@ def test_nvq3j_weighted_fixed_quantizer_uses_native_assignment(
 
     assert calls == [((8, 72), (8, 72))]
     assert np.isfinite(dequantize_nvq_jsc(tensor)).all()
+
+
+@pytest.mark.parametrize('missing', ['triton', 'mfq.quantize.cuda.nvq_sse'])
+def test_optional_cuda_sse_only_ignores_missing_triton(monkeypatch, missing):
+    import builtins
+    from mfq.quantize.nvq_jsc import _load_cuda_row_sse
+
+    original = builtins.__import__
+
+    def import_module(name, *args, **kwargs):
+        if name == 'mfq.quantize.cuda.nvq_sse':
+            raise ModuleNotFoundError('missing dependency', name=missing)
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', import_module)
+    if missing == 'triton':
+        assert _load_cuda_row_sse() is None
+    else:
+        with pytest.raises(ModuleNotFoundError):
+            _load_cuda_row_sse()

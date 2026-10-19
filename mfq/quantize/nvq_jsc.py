@@ -754,6 +754,16 @@ def _validate_tables(
 
 
 @torch.inference_mode()
+def _load_cuda_row_sse():
+    try:
+        from mfq.quantize.cuda.nvq_sse import jsc_row_sse
+    except ModuleNotFoundError as error:
+        if error.name != 'triton':
+            raise
+        return None
+    return jsc_row_sse
+
+
 def quantize_nvq_jsc_fixed(
     weight: torch.Tensor,
     tables: NvqJscTables,
@@ -791,6 +801,7 @@ def quantize_nvq_jsc_fixed(
     ).contiguous()
     alpha = torch.as_tensor(alpha_np, device=value.device, dtype=torch.float32)
     bank_for_state = torch.as_tensor(bank_np, device=value.device, dtype=torch.int64)
+    cuda_row_sse = _load_cuda_row_sse() if target.is_cuda else None
     def packed_sse(anchor, state, indices):
         from mfq.quantize.cuda.packed_result import jsc
         error = row_sse(anchor, state, indices)
@@ -799,14 +810,9 @@ def quantize_nvq_jsc_fixed(
     def row_sse(anchor, state, indices):
         # target equals original weights times the encoded even-parity signs.
         # Comparing it with unsigned codewords retains sign-flip error exactly.
-        if target.is_cuda:
-            try:
-                from mfq.quantize.cuda.nvq_sse import jsc_row_sse
-            except ImportError:  # e.g. Windows without Triton: same sum in torch
-                jsc_row_sse = None
-            if jsc_row_sse is not None:
-                return jsc_row_sse(target, objective_weight, anchor, state, indices,
-                                   alpha, bank_for_state, codebooks, spec.vector_size)
+        if cuda_row_sse is not None:
+            return cuda_row_sse(target, objective_weight, anchor, state, indices,
+                                alpha, bank_for_state, codebooks, spec.vector_size)
         states = state.reshape(out, ng).long()
         banks = bank_for_state[states].repeat_interleave(_GROUP_SIZE // spec.vector_size, 1)
         codes = codebooks[banks, indices.reshape(out, -1).long()].float().reshape_as(target)

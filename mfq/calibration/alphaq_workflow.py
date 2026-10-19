@@ -139,6 +139,8 @@ def _quantize(args, resources):
     if args.ud_tier:
         doc = json.loads(recipe_path.read_text())
         model = registered_model(config)
+        if model is None or args.ud_tier not in model['caps']:
+            raise ValueError('--ud-tier requires a registered model configuration and tier')
         ceiling = doc.get('ud_file_bytes', model['caps'][args.ud_tier])
     target_bpw = args.target_bpw or '1'  # Exact UD byte ceiling overrides BPW below.
     mode = args.alphaq_dense
@@ -266,7 +268,8 @@ def _quantize(args, resources):
                              args.natscale_sample_layers, args.natscale_sample_experts)
     allocated_dense = scope.dense if mode == 'joint' else ()
     statistics = collect_statistics(root, (*scope.experts, *allocated_dense), cache, backend.device,
-                                    mapper=workers.map if workers else None)
+                                    mapper=workers.map if workers else None,
+                                    column_energy=args.alphaq_allocator == 'natscale')
     experts, dense = statistics[:len(scope.experts)], statistics[len(scope.experts):]
     signature = allocation_signature(allocation_key, cache, budget)
     previous = saved_allocation(allocation_root, signature)

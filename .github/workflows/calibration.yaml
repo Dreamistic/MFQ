@@ -39,5 +39,7 @@ jobs:
           tests/test_alphaq_output.py tests/test_alphaq_parallel.py
           tests/test_alphaq_payloads.py tests/test_alphaq_spectrum.py
           tests/test_alphaq_workflow.py tests/test_candidate_streams.py
+          tests/test_alphaq_cache.py tests/test_natscale.py tests/test_natscale_workflow.py
+          tests/test_quantize/test_imatrix.py
           tests/test_dense_scheme.py tests/test_weighted_nint_scheme.py
           tests/test_quantize/test_nvq_jsc.py tests/test_quantize_package_data.py -q
