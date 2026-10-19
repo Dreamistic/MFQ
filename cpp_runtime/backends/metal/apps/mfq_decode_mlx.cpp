@@ -2488,8 +2488,9 @@ private:
                 const auto available = runtime.reclaimable_expert_bytes();
                 if (!available) break;
                 const auto excess = observed - target;
-                runtime.set_expert_cache_limit(available > excess ? available - excess : 0);
-                weight_residency.reset();
+                const auto full = runtime.resident_full_expert_bytes();
+                mfq::metal::mlx_trim_expert_residency(runtime, available > excess ? available - excess : 0);
+                if (runtime.resident_full_expert_bytes() != full) weight_residency.reset();
                 resident_weight_baseline = resident_dense_weight_baseline + runtime.resident_full_expert_bytes();
                 mlx::core::clear_cache();
                 release_host_allocator_cache();

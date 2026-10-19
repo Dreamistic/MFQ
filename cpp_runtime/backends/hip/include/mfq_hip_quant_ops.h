@@ -50,6 +50,20 @@ mfq_tensor_backend::Tensor nint_matmul_ws_cuda(
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
     mfq_tensor_backend::Tensor x, int64_t gs,
     mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+// Single-row decode over the fused slot layout built by to_device_nint:
+// rows grouped into uniform-bit segments, one 4-byte-aligned slot per group
+// holding [weight bits | pad | u16 scale/minimum]. Segment tables come from
+// the host because the kernel template is selected per segment bit width.
+mfq_tensor_backend::Tensor nint_matmul_fused_decode_cuda(
+    mfq_tensor_backend::Tensor fused_q, mfq_tensor_backend::Tensor row_ids,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor x, int64_t gs,
+    const std::vector<int64_t>& segment_bits,
+    const std::vector<int64_t>& segment_row_offsets,
+    const std::vector<int64_t>& segment_byte_offsets,
+    const std::vector<int64_t>& segment_slots,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 // Caller proves every row is q8 with a 32-bit-aligned row bit offset.
 // Misaligned storage or a non-four-element group uses the generic kernel.
 mfq_tensor_backend::Tensor nint_matmul_q8_ws_cuda(

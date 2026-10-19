@@ -349,10 +349,11 @@ public:
     array routed_matmul_reduce(
         const array& input,
         const array& expert_ids,
-        const array& route_weights) const {
+        const array& route_weights,
+        const array* route_groups = nullptr) const {
         if (packed_) {
             return packed_->routed_matmul_reduce(
-                input, expert_ids, route_weights);
+                input, expert_ids, route_weights, route_groups);
         }
         return moe_weighted_reduce(
             dense_matmul(input, expert_ids), route_weights);
@@ -370,8 +371,8 @@ public:
         return packed_ && packed_->supports_grouped_mmq();
     }
 
-    bool supports_fused_routed_reduce() const noexcept {
-        return packed_ && packed_->supports_fused_routed_reduce();
+    bool supports_fused_routed_reduce(const array* route_groups = nullptr) const noexcept {
+        return packed_ && packed_->supports_fused_routed_reduce(route_groups);
     }
 
     int recommended_grouped_mmq_block_rows(
@@ -715,47 +716,7 @@ private:
     std::optional<MlxNintSwiGluPair> nint_gate_up_;
 };
 
-struct Qwen4CachedRoute {
-    std::shared_ptr<MlxMfeOffloadCache> cache;
-    std::vector<std::shared_ptr<const MlxMfeCachedProjection>> projections;
-    std::optional<array> ids;
-
-    array forward(const array& source, const array& routes) {
-        ids = routes;
-        auto gate_ids = mlx::core::take(projections[0]->expert_map, routes);
-        const auto down = projections.size() - 1;
-        auto intermediate = projections.size() == 3
-            ? moe_swiglu_split(mlx::core::concatenate({
-                projections[0]->weight.routed_matmul(source, gate_ids),
-                projections[1]->weight.routed_matmul(source,
-                    mlx::core::take(projections[1]->expert_map, routes))}, -1))
-            : projections[0]->weight.routed_swiglu(source, gate_ids);
-        return projections[down]->weight.routed_matmul(intermediate,
-            mlx::core::take(projections[down]->expert_map, routes));
-    }
-
-    std::span<const std::int32_t> host_ids() {
-        if (!ids) throw std::logic_error("cached route was not evaluated");
-        ids->eval();
-        if (ids->dtype() != mlx::core::int32 || !ids->flags().row_contiguous) {
-            ids = mlx::core::contiguous(mlx::core::astype(*ids, mlx::core::int32));
-            ids->eval();
-        }
-        return {ids->data<std::int32_t>(), ids->size()};
-    }
-
-    bool all_resident() {
-        const auto routes = host_ids();
-        for (const auto& projection : projections) for (const auto expert : routes) {
-            if (expert < 0 || static_cast<std::size_t>(expert) >= projection->host_expert_map.size())
-                throw std::out_of_range("cached expert route is out of range");
-            if (projection->host_expert_map[expert] < 0) return false;
-        }
-        return true;
-    }
-
-    bool resolve() { return cache->resolve_cached_projections(projections, host_ids()); }
-};
+using Qwen4CachedRoute = MlxMfeCachedRoute;
 
 class Qwen4Moe {
 public:
@@ -1147,12 +1108,12 @@ public:
                     intermediate, moe_inverse_permutation(*sorted_routes), 0),
                     Shape{tokens, global_ids.shape(1), down.neuron_len()});
                 const bool combine_routes = tokens <= 6 &&
-                    down.supports_fused_routed_reduce();
+                    down.supports_fused_routed_reduce(local_groups);
                 auto output = combine_routes
                     ? down.routed_matmul_reduce(
                           intermediate,
                           local_ids,
-                          routes.weights)
+                          routes.weights, local_groups)
                     : down.routed_matmul(intermediate, local_ids, local_groups);
                 routed_is_reduced = combine_routes;
                 if (detail::component_profile_active()) {
@@ -1238,12 +1199,12 @@ public:
             // reduce/shared-gate epilogue instead of separate reduction and
             // shared-gate launches.
             const bool combine_routes = tokens <= 6 &&
-                down_->supports_fused_routed_reduce();
+                down_->supports_fused_routed_reduce(route_groups);
             auto output = combine_routes
                 ? down_->routed_matmul_reduce(
                       intermediate,
                       routes.ids,
-                      routes.weights)
+                      routes.weights, route_groups)
                 : down_->routed_matmul(intermediate, routes.ids, route_groups);
             routed_is_reduced = combine_routes;
             if (detail::component_profile_active()) {
@@ -1345,6 +1306,8 @@ private:
             mfe_offload_cache_->prepare_projection(gate_name_, true, !up_name_);
             if (up_name_) mfe_offload_cache_->prepare_projection(*up_name_, true);
             mfe_offload_cache_->prepare_projection(down_name_, false);
+            if (up_name_) mfe_offload_cache_->prepare_swiglu_pair(
+                gate_name_, *up_name_, static_cast<int>(config_.num_experts_per_tok));
         }
         if (auto* preparation = MlxKernelPreparation::current(); preparation && cached) {
             preparation->collect([&] {

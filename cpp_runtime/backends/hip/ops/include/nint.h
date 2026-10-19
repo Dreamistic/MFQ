@@ -47,6 +47,15 @@ struct NintWeight {
     bool q8_zero = false;
     // Proven once from CPU row metadata; false for unclassified/grouped weights.
     bool aligned_q8 = false;
+    // Fused decode layout: uniform-bit row segments with per-group slots
+    // [weight bits | pad | u16 scale/minimum]. Empty when not buildable.
+    bool fused_ok = false;
+    mfq_tensor_backend::Tensor fused_q;
+    mfq_tensor_backend::Tensor fused_row_ids;
+    std::vector<int64_t> fused_segment_bits;
+    std::vector<int64_t> fused_segment_row_offsets;
+    std::vector<int64_t> fused_segment_byte_offsets;
+    std::vector<int64_t> fused_segment_slots;
     std::vector<int64_t> shape;
     mutable std::unordered_map<int, Workspace> workspaces;
 

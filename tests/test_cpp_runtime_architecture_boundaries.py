@@ -44,8 +44,8 @@ DSV41_MOE = (
 DSV41_ENGRAM = (
     MODELS / "deepseek_v41" / "mlx_deepseek_v41_engram.cpp"
 ).read_text(encoding="utf-8")
-MXFP8_ROW_STORE = (
-    METAL / "storage" / "mlx_mxfp8_row_store.cpp"
+QUANTIZED_ROW_STORE = (
+    METAL / "storage" / "mlx_quantized_row_store.cpp"
 ).read_text(encoding="utf-8")
 SERVER_COMPONENTS = (
     METAL / "runtime" / "mlx_server_components.cpp"
@@ -708,10 +708,13 @@ def test_native_mx_activation_boundaries_are_operator_owned() -> None:
     assert "mlx_apple_chip_is(\"Apple M3 Ultra\")" in MX_OPERATOR
 
 
-def test_engram_streaming_reuses_the_generic_mxfp8_row_store() -> None:
-    assert "MlxMxfp8RowStore" in DSV41_ENGRAM
-    assert "WorkerPool" in MXFP8_ROW_STORE
-    assert "DeepSeek" not in MXFP8_ROW_STORE
+def test_engram_streaming_reuses_the_generic_quantized_row_store() -> None:
+    assert "MlxQuantizedRowStore" in DSV41_ENGRAM
+    assert "WorkerPool" in QUANTIZED_ROW_STORE
+    assert "mfq::NintRows" in QUANTIZED_ROW_STORE
+    assert "MlxQuantizedRowBatch::decode" in QUANTIZED_ROW_STORE
+    assert "table->prepare_rows(rows)" in DSV41_ENGRAM
+    assert "DeepSeek" not in QUANTIZED_ROW_STORE
     assert "prefetched_rows" in DSV41_ENGRAM
     assert not (METAL / "storage" / "deepseek_v41_engram_store.cpp").exists()
     assert not (METAL / "storage" / "deepseek_v41_engram_store.h").exists()
@@ -765,8 +768,8 @@ def test_qwen4_uses_the_shared_ssd_expert_cache() -> None:
 def test_qwen4_small_m_down_reduce_is_format_neutral() -> None:
     moe = QWEN4[QWEN4.index("class Qwen4Moe") :]
     assert moe.count("const bool combine_routes = tokens <= 6 &&") == 2
-    assert "down.supports_fused_routed_reduce()" in moe
-    assert "down_->supports_fused_routed_reduce()" in moe
+    assert "down.supports_fused_routed_reduce(local_groups)" in moe
+    assert "down_->supports_fused_routed_reduce(route_groups)" in moe
     assert moe.count("routed_matmul_reduce(") >= 2
     assert "supports_mxfp4_blocks" not in moe
 
