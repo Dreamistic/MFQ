@@ -79,10 +79,8 @@ __global__ void __launch_bounds__(512,2) mfe_ffn_gu_prequantized_kernel(MfeFfnBa
     if(base+lane<end) {
         const int pair=lane/2,row=lane&1;
         const auto gate=projected[pair][row],up=projected[pair+team][row];
-        const auto sigmoid=table[__half_as_ushort(gate)];
-        const auto activated=__float2half_rn(__half2float(gate)*__half2float(sigmoid));
         b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=
-            __float2half_rn(__half2float(activated)*__half2float(up));
+            mfe_ffn_swiglu(b,gate,up,table);
     }
 }
 }

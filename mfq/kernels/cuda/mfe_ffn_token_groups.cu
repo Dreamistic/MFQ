@@ -330,8 +330,7 @@ __global__ void __launch_bounds__(256,Capacity<=2?4:Capacity<=4?3:2) token_gate_
         const int slot=slots[k];
         if(base+lane<end) {
             const auto gate=projected[lane/2][k][lane&1],up=projected[lane/2+team][k][lane&1];
-            const auto activated=__float2half_rn(__half2float(gate)*__half2float(table[__half_as_ushort(gate)]));
-            b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=__float2half_rn(__half2float(activated)*__half2float(up));
+            b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=mfe_ffn_swiglu(b,gate,up,table);
             if(b.completion)__threadfence();
         }
         if(!b.completion)continue;
@@ -379,8 +378,7 @@ __device__ __forceinline__ void token_aligned_pair(const MfeFfnBatch& b,
                 gate[k][0]=values[k][0];gate[k][1]=values[k][1];
             }else if(lane<2 && first+lane<width) {
                 const auto g=gate[k][lane],u=values[k][lane];
-                const auto activated=__float2half_rn(__half2float(g)*__half2float(table[__half_as_ushort(g)]));
-                b.hidden[int64_t(slots[k])*b.hidden_stride+first+lane]=__float2half_rn(__half2float(activated)*__half2float(u));
+                b.hidden[int64_t(slots[k])*b.hidden_stride+first+lane]=mfe_ffn_swiglu(b,g,u,table);
             }
         }
     }
@@ -461,8 +459,7 @@ __global__ void __launch_bounds__(256,4) shared_token_gate_up(MfeFfnBatch b,int 
         const int slot=slots[k];
         if(base+lane<end) {
             const auto gate=projected[lane][k],up=projected[lane+team][k];
-            const auto activated=__float2half_rn(__half2float(gate)*__half2float(b.sigmoid_table[__half_as_ushort(gate)]));
-            b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=__float2half_rn(__half2float(activated)*__half2float(up));
+            b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=mfe_ffn_swiglu(b,gate,up,b.sigmoid_table);
             if(b.completion)__threadfence();
         }
         if(!b.completion)continue;

@@ -75,6 +75,7 @@ struct MfeFfnBatch {
     void* output=nullptr;
     int tokens=0,routes=0,experts=0,input_width=0,output_width=0;
     int intermediate=0,shared_intermediate=0;
+    float swiglu_limit=0;
     // Immutable family metadata across resident/transfer views. Raw callers
     // default to the complete decoder; the runtime computes its actual mask.
     std::uint32_t nvq_format_mask=0x3fffeu;
@@ -96,6 +97,18 @@ struct MfeFfnBatch {
     // compact expert-local address bounds; raw callers retain the wide path.
     bool token_group_compact=false;
 };
+#ifdef __CUDACC__
+__device__ __forceinline__ __half mfe_ffn_swiglu(const MfeFfnBatch& b,__half gate,__half up,
+        const __half* table) {
+    if(b.swiglu_limit>0) {
+        const float g=fminf(__half2float(gate),b.swiglu_limit);
+        const float u=fminf(fmaxf(__half2float(up),-b.swiglu_limit),b.swiglu_limit);
+        return __float2half_rn((g/(1.0f+expf(-g)))*u);
+    }
+    const auto activated=__float2half_rn(__half2float(gate)*__half2float(table[__half_as_ushort(gate)]));
+    return __float2half_rn(__half2float(activated)*__half2float(up));
+}
+#endif
 inline int mfe_token_group_bound(const MfeFfnBatch& b,int capacity) {
     return b.token_group_buckets ?
         std::min(b.token_groups,b.tokens*(b.routes+int(b.shared!=nullptr))/(capacity==1?1:capacity/2+1)):

@@ -1021,10 +1021,8 @@ __global__ void __launch_bounds__(128) mfe_ffn_gate_up_kernel(MfeFfnBatch b,int 
     if(lane==0) {
 #pragma unroll
         for(int row=0;row<2;++row)if(first+row<width) {
-            const auto sigmoid=table[__half_as_ushort(gate[row])];
-            const auto activated=__float2half_rn(__half2float(gate[row])*__half2float(sigmoid));
             b.hidden[int64_t(slot)*b.hidden_stride+first+row]=
-                __float2half_rn(__half2float(activated)*__half2float(up[row]));
+                mfe_ffn_swiglu(b,gate[row],up[row],table);
         }
         if(b.completion)__threadfence();
     }
@@ -1107,10 +1105,8 @@ __global__ void __launch_bounds__(512,MinimumBlocks) mfe_ffn_parallel_gate_up_ke
     if(base+lane<end) {
         const int pair=lane/2,row=lane&1;
         const auto gate=projected[pair][row],up=projected[pair+team][row];
-        const auto sigmoid=table[__half_as_ushort(gate)];
-        const auto activated=__float2half_rn(__half2float(gate)*__half2float(sigmoid));
         b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=
-            __float2half_rn(__half2float(activated)*__half2float(up));
+            mfe_ffn_swiglu(b,gate,up,table);
         if(b.completion)__threadfence();
     }
     __syncwarp();

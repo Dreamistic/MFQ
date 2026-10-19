@@ -81,7 +81,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         const tb::Tensor& input,const tb::Tensor& ids,const tb::Tensor& weights,const tb::Tensor& sigmoid,
         const std::array<const NintWeight*,3>& shared,const tb::Tensor& shared_gate,
         int output_columns,int intermediate_columns,const std::array<std::vector<int32_t>,3>* cohort_by_expert,bool output_pairs,
-        bool combined_gate_up,int token_group_capacity_hint)
+        bool combined_gate_up,int token_group_capacity_hint,double swiglu_limit)
         :sigmoid_(sigmoid),input_(input),ids_(ids),weights_(weights),combined_gate_up_(combined_gate_up) {
     if(!projections[0] || !projections[1] || !projections[2] || !input.is_cuda() || input.dim()!=2 ||
         input.scalar_type()!=tb::kFloat16 || !input.is_contiguous() || ids.dim()!=2 || ids.scalar_type()!=tb::kInt32 ||
@@ -91,6 +91,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         sigmoid.get_device()!=input.get_device() || !sigmoid.is_contiguous() ||
         sigmoid.scalar_type()!=tb::kFloat16 || sigmoid.dim()!=2 || sigmoid.size(0)!=2 || sigmoid.size(1)!=65536)
         throw std::invalid_argument("two-stage MFE tensor contract mismatch");
+    batch_.swiglu_limit=float(swiglu_limit);
     batch_.tokens=int(input.size(0));batch_.routes=int(ids.size(1));batch_.experts=projections[0]->n_experts;
     batch_.input_width=int(input.size(1));
     batch_.warp_multi_sum=mfq::cuda::runtime_options::warp_multi_sum();

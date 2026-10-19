@@ -309,6 +309,10 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
                 std::fprintf(stderr,"clipped_check phase=pipeline\n");
                 check_output(ffn.forward(execution,x,tb::zeros({tokens},options.dtype(tb::kInt64))),references.at(key));++cases;
             }
+            if(std::string(format)!="mxfp4") {
+                check(cache->stats().pipeline_two_stage_serves>=4,
+                    "clipped FFN did not execute its two-stage kernels");
+            }
             release_moe_prefill_buffers(cache);
         }
     }

@@ -1479,6 +1479,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     arena->slot_bytes=std::max(arena->slot_bytes,moe_packed_slot_bytes(c.bytes_per_expert));
             }
             arena->slots=std::min(arena->slots,requested_slots);
+            cache_->reserve_workspace(std::size_t(arena->slots)*arena->slot_bytes+(std::size_t(64)<<20));
             arena->packed=tb::empty({arena->slots*arena->slot_bytes},
                 tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
             arena->book=std::make_unique<mfq::MoeCacheSlotBook>(arena->slots);
@@ -1528,7 +1529,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             cell.x.borrow(workspace->x);cell.host_ids.borrow(workspace->ids);cell.cpu.borrow(workspace->cpu);
         }
         cell.ready_writer=window?stream_flag_writer():nullptr;
-        cell.two_stage=swiglu_limit_<=0 && execution.config.moe_two_stage_ffn && cell.batch_decode && cell.routes+(shared_?1:0)<=32 &&
+        cell.two_stage=execution.config.moe_two_stage_ffn && cell.batch_decode && cell.routes+(shared_?1:0)<=32 &&
             execution.kl_mmq.mode==KlMmqMode::Default;
         for(const auto& source:sources_)for(const auto& cohort:source->cohorts_)
             cell.two_stage=cell.two_stage && (cohort.active.family==MixedMoeFamily::Nint || cohort.active.family==MixedMoeFamily::Nvq);
@@ -1587,7 +1588,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             cell.fused=std::make_unique<MfeFfnRuntime>(std::array<MixedMoeRuntime*,3>{&cell.fused_projections[0],
                 &cell.fused_projections[1],&cell.fused_projections[2]},cell.input,cell.ids,cell.weights,
                 cache_->pipeline_sigmoid_table_,shared,cell.shared_gate,width_,ff_,&mapping,!shared_,combined_gate_up_,
-                execution.continuous_batch_cache_serial && cell.tokens==8?8:0);
+                execution.continuous_batch_cache_serial && cell.tokens==8?8:0,swiglu_limit_);
             const auto* nint_gate=std::getenv("MFQ_SHARED_GATE_NINT");
             const auto* reuse_gate=std::getenv("MFQ_SHARED_GATE_REUSE");
             const auto fused_gate=mfq::cuda::runtime_options::shared_gate_fused();
