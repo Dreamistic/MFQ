@@ -381,16 +381,28 @@ public:
         std::future<void> ready;
         std::mutex mutex;
         std::condition_variable changed;
-        std::size_t gate_up_requests=0,gate_up_remaining=0;
-        std::vector<std::size_t> gate_up_ready;
+        std::size_t gate_up_requests=0,gate_up_remaining=0,down_remaining=0;
+        std::vector<std::size_t> gate_up_ready,down_ready;
+        bool publish_progress=false;
         std::exception_ptr failed;
         ~SsdExpertReads(){if(ready.valid())ready.wait();}
         void wait(){if(ready.valid())ready.get();}
-        bool next_gate_up_batch(std::vector<std::size_t>& batch) {
+        void publish_read(std::size_t index) {
+            {
+                std::lock_guard lock(mutex);
+                const bool down=index>=gate_up_requests;
+                (down?down_ready:gate_up_ready).push_back(index);
+                --(down?down_remaining:gate_up_remaining);
+            }
+            changed.notify_one();
+        }
+        bool next_projection_batch(std::vector<std::size_t>& batch,bool down) {
             std::unique_lock lock(mutex);
-            changed.wait(lock,[&]{return !gate_up_ready.empty() || !gate_up_remaining || failed;});
+            auto& queue=down?down_ready:gate_up_ready;
+            const auto& remaining=down?down_remaining:gate_up_remaining;
+            changed.wait(lock,[&]{return !queue.empty() || !remaining || failed;});
             if(failed)std::rethrow_exception(failed);
-            batch.clear();batch.swap(gate_up_ready);
+            batch.clear();batch.swap(queue);
             return !batch.empty();
         }
     };
@@ -714,6 +726,8 @@ public:
                << " pipeline_ssd_gu_overlap_bytes=" << stats_.pipeline_ssd_gu_overlap_bytes
                << " pipeline_ssd_gu_staged_bytes=" << stats_.pipeline_ssd_gu_staged_bytes
                << " pipeline_ssd_gu_upload_batches=" << stats_.pipeline_ssd_gu_upload_batches
+               << " pipeline_ssd_down_overlap_bytes=" << stats_.pipeline_ssd_down_overlap_bytes
+               << " pipeline_ssd_down_upload_batches=" << stats_.pipeline_ssd_down_upload_batches
                << " pipeline_ssd_gu_compute_serves=" << stats_.pipeline_ssd_gu_compute_serves
                << " pipeline_native_dma_batches=" << stats_.pipeline_native_dma_batches
                << " pipeline_native_dma_copies=" << stats_.pipeline_native_dma_copies
@@ -953,6 +967,9 @@ public:
             {"ssd_gu_io_overlap_bytes",double(stats_.pipeline_ssd_gu_overlap_bytes)},
             {"ssd_gu_staged_upload_bytes",double(stats_.pipeline_ssd_gu_staged_bytes)},
             {"ssd_gu_upload_batches",double(stats_.pipeline_ssd_gu_upload_batches)},
+            {"ssd_down_io_overlap_bytes",double(stats_.pipeline_ssd_down_overlap_bytes)},
+            {"ssd_down_staged_upload_bytes",double(stats_.pipeline_ssd_down_staged_bytes)},
+            {"ssd_down_upload_batches",double(stats_.pipeline_ssd_down_upload_batches)},
             {"ssd_gu_compute_overlap_serves",double(stats_.pipeline_ssd_gu_compute_serves)},
             {"ssd_gate_up_read_wait_ms",double(stats_.pipeline_ssd_gate_up_wait_ns)/1e6},
             {"ssd_down_read_wait_ms",double(stats_.pipeline_ssd_down_wait_ns)/1e6},

@@ -277,6 +277,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         bool fused_transfer_copy=false;
         bool host_cache_packet=false;
         bool ssd_gate_up_submitted=false;
+        bool ssd_down_submitted=false;
         bool ssd_gate_up_ready=false;
         int64_t ssd_gate_up_host_tail=0;
         bool direct_packet=false;
@@ -3219,7 +3220,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                         std::size_t(bytes),cudaMemcpyHostToDevice,cache_->weight_stream_));
                     ++copies;wire_bytes+=bytes;
                 }
-                no_dma[phase]=cell.host_cache_packet && batched && batches[phase].empty() && (phase || !early_gu_submitted);
+                // An early Down upload remains in flight even when lookup
+                // now finds every projection in the GPU cache. Its existing
+                // DMA completion event must precede the Down-ready flag.
+                no_dma[phase]=cell.host_cache_packet && batched && batches[phase].empty() &&
+                    (phase || !early_gu_submitted) && !(phase && cell.ssd_down_submitted);
                 if(no_dma[phase]) {
                     publish(cell.flags.h<uint32_t>()+(phase?80:32));
                     ++cache_->stats_.pipeline_cached_phase_publishes;
@@ -3327,7 +3332,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         finish_transfer(cell,true);
         rollback.published=true;
     }
-    void upload_ssd_gate_up(Cell& cell,const MoeExpertCache::SsdExpertReads& reads,
+    void upload_ssd_projections(Cell& cell,const MoeExpertCache::SsdExpertReads& reads,
             const std::vector<std::size_t>& ready) {
         auto& loan=*cache_->kv_expert_loan_;
         // Reserve every routed hit before GU allocations can evict a Down
@@ -3361,11 +3366,15 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         };
         std::vector<mfq::cuda::DmaCopy> copies;
         std::size_t bytes=0,staged_bytes=0;
+        const bool down=!ready.empty() && ready.front()>=reads.gate_up_requests;
         for(const auto i:ready) {
-            if(i>=reads.gate_up_requests || !reads.leases[i])
-                throw std::logic_error("SSD GU batch preceded its read completion");
+            if(i>=reads.requests.size() || !reads.leases[i] ||
+                    (i>=reads.gate_up_requests)!=down)
+                throw std::logic_error("SSD projection batch preceded its read completion");
             const auto& [quant,expert]=reads.requests[i];
-            const int p=quant==sources_[0]->quant_source_.get()?0:1;
+            const int p=down?2:quant==sources_[0]->quant_source_.get()?0:1;
+            if(quant!=sources_[p]->quant_source_.get())
+                throw std::logic_error("SSD projection read lost its source");
             const auto& source=*sources_[p];
             const auto& sizes=source.cohorts_[source.expert_to_cohort_[expert]].bytes_per_expert;
             std::size_t total=0;for(const auto size:sizes)total=((total+15)&~std::size_t(15))+std::size_t(size);
@@ -3379,8 +3388,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 if(!ram_alias(fields[f].data_ptr(),std::size_t(sizes[f])))
                     staging_bytes+=((std::size_t(sizes[f])+15)&~std::size_t(15));
             }
-            // Early GU uploads own the tail of the existing pinned packet.
-            // Later Down/header preparation uses its prefix until the same
+            // Completed projections own the existing pinned packet's tail.
+            // Remaining payload/header preparation uses its prefix until the same
             // completion fence, without another allocation or source lifetime.
             if(staging_bytes>std::size_t(cell.ssd_gate_up_host_tail-cell.wire_header_bytes))continue;
             bool hit=false;
@@ -3426,20 +3435,27 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         MFQ_CUDA_CHECK(cudaEventRecord(cache_->transfer_ready_,cache_->weight_stream_));
         cache_->transfer_ready_recorded_=true;
         const bool first_upload=!cell.ssd_gate_up_submitted;
-        cell.ssd_gate_up_submitted=true;
+        if(down)cell.ssd_down_submitted=true;else cell.ssd_gate_up_submitted=true;
         mfq::cuda::check_stream_progress(cache_->weight_stream_);
         auto& stats=cache_->stats_;
         stats.ram_pcie_bytes+=bytes;stats.pipeline_direct_ram_bytes+=bytes-staged_bytes;
-        stats.pipeline_staged_ram_bytes+=staged_bytes;stats.pipeline_ssd_gu_staged_bytes+=staged_bytes;
+        stats.pipeline_staged_ram_bytes+=staged_bytes;
+        (down?stats.pipeline_ssd_down_staged_bytes:stats.pipeline_ssd_gu_staged_bytes)+=staged_bytes;
         // fetch_registered counts these projections once when it builds the
         // phase packet. Keep its payload/copy accounting independent of which
         // subset was submitted early; native DMA tracks actual submissions.
         stats.pipeline_direct_ram_copies+=copies.size();
-        stats.pipeline_ssd_gu_overlap_bytes+=bytes;
-        ++stats.pipeline_ssd_gu_upload_batches;
-        if(first_upload && ++stats.pipeline_ssd_gu_overlap_serves==1)
+        if(down) {
+            stats.pipeline_ssd_down_overlap_bytes+=bytes;
+            if(!stats.pipeline_ssd_down_upload_batches++)std::fprintf(stderr,
+                "moe_ssd_down_io_overlap scope=first_upload enabled=1 copies=%zu bytes=%zu\n",copies.size(),bytes);
+        } else {
+            stats.pipeline_ssd_gu_overlap_bytes+=bytes;
+            ++stats.pipeline_ssd_gu_upload_batches;
+        }
+        if(!down && first_upload && ++stats.pipeline_ssd_gu_overlap_serves==1)
             std::fprintf(stderr,"moe_ssd_gu_io_overlap scope=first_upload enabled=1 copies=%zu bytes=%zu\n",copies.size(),bytes);
-        if(staged_bytes && stats.pipeline_ssd_gu_staged_bytes==int64_t(staged_bytes))
+        if(!down && staged_bytes && stats.pipeline_ssd_gu_staged_bytes==int64_t(staged_bytes))
             std::fprintf(stderr,"moe_ssd_gu_pageable_overlap scope=first_upload enabled=1 staged_bytes=%zu extra_pinned_bytes=0\n",staged_bytes);
         const auto* compute=std::getenv("MFQ_MOE_SSD_PHASED_COMPUTE");
         if(cell.ssd_gate_up_ready || !cell.ssd_gate_up_descriptors || (compute && compute[0]=='0'))return;
@@ -3477,6 +3493,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     }
     void fetch(Cell& cell,MoeExpertCache::SsdExpertReads* ssd_reads=nullptr) {
         cell.ssd_gate_up_submitted=false;
+        cell.ssd_down_submitted=false;
         cell.ssd_gate_up_ready=false;
         cell.ssd_gate_up_host_tail=cache_->pipeline_host_stage_.numel()&~int64_t(15);
         struct ClearPrefetchKeys {
@@ -3586,7 +3603,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 const auto wait=[&](bool gate_up,std::vector<std::size_t>& batch) {
                     const auto started=std::chrono::steady_clock::now();
                     bool ready=false;
-                    if(gate_up)ready=ssd_reads->next_gate_up_batch(batch);else ssd_reads->wait();
+                    ready=ssd_reads->next_projection_batch(batch,!gate_up);
                     const auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now()-started).count();
                     cache_->stats_.pipeline_ssd_read_ns+=elapsed;
@@ -3597,9 +3614,17 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 if(ssd_reads->ready.valid() && ssd_reads->ready.wait_for(std::chrono::seconds(0))!=std::future_status::ready &&
                         std::any_of(ssd_reads->missing.begin(),ssd_reads->missing.end(),
                         [&](auto index){return index>=ssd_reads->gate_up_requests;})) {
-                    while(wait(true,batch))upload_ssd_gate_up(cell,*ssd_reads,batch);
+                    while(wait(true,batch))upload_ssd_projections(cell,*ssd_reads,batch);
+                    // Keep GU first; completed Down projections can upload
+                    // while the remaining Down file reads are still running.
+                    while(wait(false,batch))upload_ssd_projections(cell,*ssd_reads,batch);
                 }
-                wait(false,batch);
+                const auto joined=std::chrono::steady_clock::now();
+                ssd_reads->wait();
+                const auto join_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-joined).count();
+                cache_->stats_.pipeline_ssd_read_ns+=join_ns;
+                cache_->stats_.pipeline_ssd_down_wait_ns+=join_ns;
             }
             fetch_registered(cell,ssd_reads);return;
         }

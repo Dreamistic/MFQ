@@ -405,6 +405,7 @@ struct MoeCacheStats {
     int64_t pipeline_ssd_gu_overlap_serves=0,pipeline_ssd_gu_overlap_bytes=0;
     int64_t pipeline_ssd_gu_staged_bytes=0;
     int64_t pipeline_ssd_gu_upload_batches=0;
+    int64_t pipeline_ssd_down_overlap_bytes=0,pipeline_ssd_down_upload_batches=0,pipeline_ssd_down_staged_bytes=0;
     int64_t pipeline_ssd_gu_compute_serves=0,pipeline_ssd_gate_up_wait_ns=0,pipeline_ssd_down_wait_ns=0;
     int64_t pipeline_kv_projection_hits=0,pipeline_kv_projection_misses=0,pipeline_kv_projection_fallbacks=0;
     int64_t pipeline_kv_projection_small_hit_bytes=0;

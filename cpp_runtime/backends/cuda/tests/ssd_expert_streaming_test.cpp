@@ -19,12 +19,45 @@
 #include <cmath>
 #include <filesystem>
 #include <exception>
+#include <future>
 #include <iostream>
 #include <map>
 #include <mutex>
 
 namespace tb=mfq_tensor_backend;
 struct MoeResidencyTestAccess {
+    static void progressive_read_batches() {
+        MoeExpertCache::SsdExpertReads reads;
+        reads.gate_up_requests=2;reads.gate_up_remaining=2;reads.down_remaining=2;
+        std::promise<void> finish_down;
+        auto release=finish_down.get_future();
+        reads.ready=std::async(std::launch::async,[&] {
+            reads.publish_read(0);reads.publish_read(2);reads.publish_read(1);
+            release.wait_for(std::chrono::seconds(2));
+            reads.publish_read(3);
+        });
+        std::vector<std::size_t> batch,gate_up,down;
+        while(reads.next_projection_batch(batch,false))gate_up.insert(gate_up.end(),batch.begin(),batch.end());
+        const bool first=reads.next_projection_batch(batch,true);
+        down.insert(down.end(),batch.begin(),batch.end());
+        const bool overlapped=reads.ready.wait_for(std::chrono::seconds(0))!=std::future_status::ready;
+        finish_down.set_value();
+        while(reads.next_projection_batch(batch,true))down.insert(down.end(),batch.begin(),batch.end());
+        reads.wait();
+        if(!first || !overlapped || gate_up!=std::vector<std::size_t>{0,1} || down!=std::vector<std::size_t>{2,3})
+            throw std::runtime_error("Down batches did not publish before the complete SSD read joined");
+        MoeExpertCache::SsdExpertReads failed;
+        failed.down_remaining=1;
+        failed.ready=std::async(std::launch::async,[&] {
+            {std::lock_guard lock(failed.mutex);
+             failed.failed=std::make_exception_ptr(std::runtime_error("controlled Down failure"));}
+            failed.changed.notify_all();
+        });
+        bool caught=false;
+        try{failed.next_projection_batch(batch,true);}catch(const std::runtime_error&){caught=true;}
+        failed.wait();
+        if(!caught)throw std::runtime_error("failed Down read did not release its batch waiter");
+    }
     static tb::Tensor direct_cache(const std::shared_ptr<MoeExpertCache>& cache) {
         return cache->pipeline_direct_cache_storage_;
     }
@@ -623,6 +656,7 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
 }
 }
 int main(int argc,char** argv)try {
+    MoeResidencyTestAccess::progressive_read_batches();
     if(argc==3 && std::string(argv[2])=="--mxfp4-token-reuse") {
         check_token_reuse(argv[1],"mx4");return 0;
     }
@@ -670,13 +704,14 @@ int main(int argc,char** argv)try {
                 after.at("ssd_ram_read_fast_hits")==before.at("ssd_ram_read_fast_hits")+2 &&
                 after.at("ssd_scheduled_read_jobs")==before.at("ssd_scheduled_read_jobs"),
                 "RAM hits launched SSD worker jobs or lost their shared lease");
-            {
-                auto ready=candidate.cache->begin_ssd_expert_reads({{quant,31},{quant,31}},1);
+            for(std::size_t gate_up_count:{0,1,2}) {
+                auto ready=candidate.cache->begin_ssd_expert_reads({{quant,31},{quant,31}},gate_up_count);
                 check(!ready->ready.valid(),"RAM-only phase batch launched a coordinator job");
-                std::vector<std::size_t> batch;
-                check(ready->next_gate_up_batch(batch) && batch==std::vector<std::size_t>{0},
-                    "RAM GU hit was not published exactly once");
-                check(!ready->next_gate_up_batch(batch),"finished RAM GU batch was published twice");
+                std::vector<std::size_t> batch,gu,down;
+                while(ready->next_projection_batch(batch,false))gu.insert(gu.end(),batch.begin(),batch.end());
+                while(ready->next_projection_batch(batch,true))down.insert(down.end(),batch.begin(),batch.end());
+                check(gu.size()==gate_up_count && down.size()==2-gate_up_count,
+                    "RAM projection phase hit was not published exactly once");
                 ready->wait();
                 check(ready->leases[0]==held && ready->leases[1]==held,"phase batch changed a RAM hit's lease");
             }
@@ -685,11 +720,14 @@ int main(int argc,char** argv)try {
                 auto reads=candidate.cache->begin_ssd_expert_reads({{quant,45},{quant,46},{quant,47}},2);
                 check(reads->ready.valid(),"cold phase batch did not start asynchronous reads");
                 std::vector<std::size_t> batch;std::array<int,2> publications{};
-                while(reads->next_gate_up_batch(batch))for(const auto i:batch) {
+                while(reads->next_projection_batch(batch,false))for(const auto i:batch) {
                     check(i<2 && ++publications.at(i)==1 && bool(reads->leases[i]),
                         "GU batch duplicated a row or preceded its lease publication");
                 }
                 check(publications==std::array<int,2>{1,1},"GU batch omitted a completed read");
+                std::vector<std::size_t> down;
+                while(reads->next_projection_batch(batch,true))down.insert(down.end(),batch.begin(),batch.end());
+                check(down==std::vector<std::size_t>{2},"Down batch omitted or duplicated a completed read");
                 reads->wait();check(bool(reads->leases[2]),"Down read lost its lease");
                 for(int i=0;i<3;++i) {
                     const auto expected=moe_cache_fields(quant->read_expert(45+i));
@@ -702,7 +740,7 @@ int main(int argc,char** argv)try {
             try {
                 auto reads=candidate.cache->begin_ssd_expert_reads({{quant,experts+1},{quant,47}},1);
                 std::vector<std::size_t> batch;
-                while(reads->next_gate_up_batch(batch)){}
+                while(reads->next_projection_batch(batch,false)){}
                 reads->wait();
             }catch(const std::exception&){failed=true;}
             check(failed,"failed asynchronous SSD GU read did not release its waiter");
