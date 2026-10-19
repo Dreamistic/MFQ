@@ -1,11 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="760" viewBox="0 0 1600 760" role="img" aria-labelledby="title desc" xml:lang="en">
-<title id="title">Expert × projection precision</title>
-<desc id="desc">Qwen3.8-Flash-Next, layer 0, experts 0–11. This packed GGUF recipe uses one format per projection tensor; MFQ selects profiles per expert projection. Colors distinguish profiles. GGUF block-level parameters can still vary.</desc>
-<metadata>{&quot;model&quot;:&quot;Qwen3.8-Flash-Next&quot;,&quot;layer&quot;:0,&quot;expert_ids&quot;:[0,1,2,3,4,5,6,7,8,9,10,11],&quot;mfq_revision&quot;:&quot;3cdfba425c44177019d3fdac94fbfa5d17379505&quot;,&quot;gguf_revision&quot;:&quot;38bb39ee97821de2c9009abb7e93950eec396e66&quot;,&quot;repository&quot;:&quot;https://github.com/Tylogi/MFQ&quot;,&quot;source&quot;:&quot;data/qwen38-flash-next-layer0-allocation.json&quot;,&quot;theme&quot;:&quot;studio-figure-theme.json&quot;}</metadata>
-<rect x="0" y="0" width="1600" height="760" rx="0" fill="#f6f7f9" stroke="none"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1280" viewBox="0 0 1600 1280" role="img" aria-labelledby="title desc" xml:lang="en">
+<title id="title">Fine-grained precision &amp; format fidelity</title>
+<desc id="desc">Qwen3.8-Flash-Next, layer 0. The allocation panels show experts 0–11: this packed GGUF recipe uses one format per projection tensor; MFQ selects profiles per expert projection. Colors distinguish profiles. GGUF block-level parameters can still vary. The base-format panel shows mean reconstruction SSE reductions over all 512 experts, with actual bpw for each of seven format pairs.</desc>
+<metadata>{&quot;model&quot;:&quot;Qwen3.8-Flash-Next&quot;,&quot;layer&quot;:0,&quot;expert_ids&quot;:[0,1,2,3,4,5,6,7,8,9,10,11],&quot;mfq_revision&quot;:&quot;3cdfba425c44177019d3fdac94fbfa5d17379505&quot;,&quot;gguf_revision&quot;:&quot;38bb39ee97821de2c9009abb7e93950eec396e66&quot;,&quot;repository&quot;:&quot;https://github.com/Tylogi/MFQ&quot;,&quot;source&quot;:&quot;data/qwen38-flash-next-layer0-allocation.json&quot;,&quot;base_format_source&quot;:&quot;data/qwen38-flash-next-base-format-sse.json&quot;,&quot;base_format_evaluation&quot;:{&quot;layer&quot;:0,&quot;experts&quot;:512,&quot;projections&quot;:[&quot;Gate&quot;,&quot;Up&quot;,&quot;Down&quot;],&quot;matrices&quot;:1536,&quot;metric&quot;:&quot;reconstruction_sse&quot;,&quot;aggregation&quot;:&quot;Equally weighted mean of per-matrix SSE&quot;,&quot;lower_is_better&quot;:true,&quot;bpw&quot;:&quot;Actual bits per weight as reported in the supplied table&quot;,&quot;reduction_formula&quot;:&quot;100 * (1 - mfq_sse / gguf_sse)&quot;,&quot;note&quot;:&quot;Each row compares the listed formats at their reported actual bpw. The bpw values are similar, not identical. This is a layer-0 reconstruction comparison, not a whole-model KLD or Top-1 measurement.&quot;},&quot;theme&quot;:&quot;studio-figure-theme.json&quot;}</metadata>
+<rect x="0" y="0" width="1600" height="1280" rx="0" fill="#f6f7f9" stroke="none"/>
 <g font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Noto Sans CJK SC, Helvetica Neue, Arial, sans-serif">
-<text x="48" y="63" font-size="30" font-weight="700" fill="#111213" text-anchor="start">Expert × projection precision</text>
-<text x="48" y="96" font-size="17" font-weight="400" fill="#5f6264" text-anchor="start">Qwen3.8-Flash-Next · Layer 0 · Experts 0–11 / 512</text>
+<text x="48" y="63" font-size="30" font-weight="700" fill="#111213" text-anchor="start">Fine-grained precision &amp; format fidelity</text>
+<text x="48" y="96" font-size="17" font-weight="400" fill="#5f6264" text-anchor="start">Qwen3.8-Flash-Next · Layer 0 · 512 experts</text>
 <g transform="translate(1434 38) scale(0.5)">
 <rect x="1" y="1" width="62" height="62" rx="17" fill="#0e1010" stroke="none"/>
 <path d="M16 44V20L32 37 48 20V44" fill="none" stroke="#f1f2ef" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -208,6 +208,84 @@
 <rect x="1380" y="638" width="103" height="36" rx="4" fill="#c9cdd2" stroke="none"/>
 <text x="1432" y="663" font-size="14.5" font-weight="500" fill="#35383c" text-anchor="middle">NVQ2J</text>
 </g>
+<rect x="48" y="716" width="1504" height="496" rx="12" fill="#ffffff" stroke="#e4e4e5"/>
+<text x="76" y="760" font-size="25" font-weight="700" fill="#111213" text-anchor="start">Base-format reconstruction</text>
+<text x="1524" y="760" font-size="23" font-weight="700" fill="#8e5427" text-anchor="end">Up to 25.16% lower SSE</text>
+<text x="76" y="790" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">Layer 0 · 512 experts × Gate / Up / Down · 1,536 matrices · equal matrix weighting</text>
+<text x="76" y="828" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">MFQ format · actual bpw</text>
+<text x="430" y="828" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">GGUF format · actual bpw</text>
+<text x="800" y="828" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">SSE reduction</text>
+<path d="M800 842V1152" fill="none" stroke="#ededed"/>
+<text x="800" y="1186" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="middle">0%</text>
+<path d="M1013.3333333333333 842V1152" fill="none" stroke="#ededed"/>
+<text x="1013.3333333333333" y="1186" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="middle">10%</text>
+<path d="M1226.6666666666665 842V1152" fill="none" stroke="#ededed"/>
+<text x="1226.6666666666665" y="1186" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="middle">20%</text>
+<path d="M1440 842V1152" fill="none" stroke="#ededed"/>
+<text x="1440" y="1186" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="middle">30%</text>
+<text x="76" y="861" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NVQ2J</text>
+<text x="76" y="881" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">2.0535</text>
+<text x="430" y="861" font-size="19" font-weight="400" fill="#454748" text-anchor="start">IQ2_XXS</text>
+<text x="430" y="881" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">2.0625</text>
+<g id="base-format-sse-IQ2_XXS" data-reduction-percent="25.16" data-mfq-bpw="2.0535" data-gguf-bpw="2.0625" data-mfq-sse="25.6356" data-gguf-sse="34.2542">
+<title>NVQ2J (2.0535 bpw), SSE 25.6356; IQ2_XXS (2.0625 bpw), SSE 34.2542; reduction 25.16%</title>
+<rect x="800" y="855" width="536.7466666666667" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="1344.7466666666667" y="870" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">25.16%</text>
+</g>
+<text x="76" y="905" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NVQ3J</text>
+<text x="76" y="925" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">3.0498</text>
+<text x="430" y="905" font-size="19" font-weight="400" fill="#454748" text-anchor="start">IQ3_XXS</text>
+<text x="430" y="925" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">3.0625</text>
+<g id="base-format-sse-IQ3_XXS" data-reduction-percent="20.55" data-mfq-bpw="3.0498" data-gguf-bpw="3.0625" data-mfq-sse="7.52099" data-gguf-sse="9.46618">
+<title>NVQ3J (3.0498 bpw), SSE 7.52099; IQ3_XXS (3.0625 bpw), SSE 9.46618; reduction 20.55%</title>
+<rect x="800" y="899" width="438.40000000000003" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="1246.4" y="914" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">20.55%</text>
+</g>
+<text x="76" y="949" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NVQ3J-L</text>
+<text x="76" y="969" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">3.5535</text>
+<text x="430" y="949" font-size="19" font-weight="400" fill="#454748" text-anchor="start">IQ3_S</text>
+<text x="430" y="969" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">3.4375</text>
+<g id="base-format-sse-IQ3_S" data-reduction-percent="20.61" data-mfq-bpw="3.5535" data-gguf-bpw="3.4375" data-mfq-sse="4.39932" data-gguf-sse="5.54164">
+<title>NVQ3J-L (3.5535 bpw), SSE 4.39932; IQ3_S (3.4375 bpw), SSE 5.54164; reduction 20.61%</title>
+<rect x="800" y="943" width="439.67999999999995" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="1247.6799999999998" y="958" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">20.61%</text>
+</g>
+<text x="76" y="993" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NINT4 GS24/k6</text>
+<text x="76" y="1013" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">4.5285</text>
+<text x="430" y="993" font-size="19" font-weight="400" fill="#454748" text-anchor="start">Q4_K</text>
+<text x="430" y="1013" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">4.5000</text>
+<g id="base-format-sse-Q4_K" data-reduction-percent="10.68" data-mfq-bpw="4.5285" data-gguf-bpw="4.5" data-mfq-sse="1.35714" data-gguf-sse="1.51948">
+<title>NINT4 GS24/k6 (4.5285 bpw), SSE 1.35714; Q4_K (4.5000 bpw), SSE 1.51948; reduction 10.68%</title>
+<rect x="800" y="987" width="227.83999999999997" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="1035.84" y="1002" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">10.68%</text>
+</g>
+<text x="76" y="1037" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NINT4 GS24/k6</text>
+<text x="76" y="1057" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">4.5285</text>
+<text x="430" y="1037" font-size="19" font-weight="400" fill="#454748" text-anchor="start">IQ4_NL</text>
+<text x="430" y="1057" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">4.5000</text>
+<g id="base-format-sse-IQ4_NL" data-reduction-percent="19.5" data-mfq-bpw="4.5285" data-gguf-bpw="4.5" data-mfq-sse="1.35714" data-gguf-sse="1.68599">
+<title>NINT4 GS24/k6 (4.5285 bpw), SSE 1.35714; IQ4_NL (4.5000 bpw), SSE 1.68599; reduction 19.50%</title>
+<rect x="800" y="1031" width="416" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="1224" y="1046" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">19.50%</text>
+</g>
+<text x="76" y="1081" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NINT5 GS28/k7</text>
+<text x="76" y="1101" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">5.5489</text>
+<text x="430" y="1081" font-size="19" font-weight="400" fill="#454748" text-anchor="start">Q5_K</text>
+<text x="430" y="1101" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">5.5000</text>
+<g id="base-format-sse-Q5_K" data-reduction-percent="6.72" data-mfq-bpw="5.5489" data-gguf-bpw="5.5" data-mfq-sse="0.355366" data-gguf-sse="0.380979">
+<title>NINT5 GS28/k7 (5.5489 bpw), SSE 0.355366; Q5_K (5.5000 bpw), SSE 0.380979; reduction 6.72%</title>
+<rect x="800" y="1075" width="143.36" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="951.36" y="1090" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">6.72%</text>
+</g>
+<text x="76" y="1125" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">NINT6 GS24/k7</text>
+<text x="76" y="1145" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">6.6184</text>
+<text x="430" y="1125" font-size="19" font-weight="400" fill="#454748" text-anchor="start">Q6_K</text>
+<text x="430" y="1145" font-size="16" font-weight="400" fill="#5f6264" text-anchor="start">6.5625</text>
+<g id="base-format-sse-Q6_K" data-reduction-percent="4.04" data-mfq-bpw="6.6184" data-gguf-bpw="6.5625" data-mfq-sse="0.089583" data-gguf-sse="0.0933589">
+<title>NINT6 GS24/k7 (6.6184 bpw), SSE 0.089583; Q6_K (6.5625 bpw), SSE 0.0933589; reduction 4.04%</title>
+<rect x="800" y="1119" width="86.18666666666667" height="18" rx="3" fill="#9f6232" stroke="none"/>
+<text x="894.1866666666667" y="1134" font-size="19" font-weight="700" fill="#8e5427" text-anchor="start">4.04%</text>
+</g>
 <a id="repository-url" href="https://github.com/Tylogi/MFQ">
-<text x="1552" y="734" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="end">https://github.com/Tylogi/MFQ</text>
+<text x="1552" y="1254" font-size="14" font-weight="400" fill="#6c6f71" text-anchor="end">https://github.com/Tylogi/MFQ</text>
 </a></g></svg>

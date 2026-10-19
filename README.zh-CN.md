@@ -73,19 +73,27 @@ MFQ 按专家、投影、Chunk 或神经元分配精度，让敏感权重保留�
 同一层内可以混用 NINT 标量与 NVQ 向量格式，每个专家的 Gate、Up、Down
 投影都能独立选择格式和精度，并由原生运行时直接执行。
 
+MFQ 的基础格式也能降低重构误差：在图中列出的 7 组 MFQ/GGUF 格式对比中，
+第 0 层专家矩阵的**平均 SSE 降低 4.04%–25.16%**。各组的实际 bpw 均在图中列出。
+
 以 **Qwen3.8-Flash-Next** 为例，Unsloth UD `IQ3_XXS` 配方为每层的
 Gate、Up、Down 打包专家张量各选择一种 GGUF 格式；MFQ `V3-XXS` 则为
 **每个专家的每个投影**独立选择档位，每层有 **1,536 个分配位置**，
 对应上述 GGUF 配方的 **3 个**。
 
 <p align="center">
-  <img src="./docs/figures/qwen38-flash-next-allocation-comparison.zh-CN.svg" alt="第 0 层真实分配对比：Unsloth UD IQ3_XXS 在每个打包专家投影内共用一种格式，MFQ V3-XXS 则为每个专家的 Gate、Up、Down 独立分配档位" width="1100">
+  <img src="./docs/figures/qwen38-flash-next-allocation-comparison.zh-CN.svg" alt="Qwen3.8-Flash-Next 第 0 层：GGUF 与 MFQ 的专家投影精度分配，以及 7 组基础格式的实际 bpw 与 MFQ 平均重构 SSE 降低 4.04%–25.16% 的对比" width="1100">
 </p>
 
-图中展示 **Qwen3.8-Flash-Next 第 0 层、专家 0–11** 的真实档位，颜色用于
+分配面板展示 **Qwen3.8-Flash-Next 第 0 层、专家 0–11** 的真实档位，颜色用于
 区分所选格式。专家 9 的 **Gate、Up 使用
 NVQ3J-L，Down 使用 NINT4**。**512 倍**指上述打包张量配方的分配位置之比，
 GGUF 的块内量化参数仍可变化。具体分配与来源见[数据记录](./docs/figures/data/qwen38-flash-next-layer0-allocation.json)。
+
+下方基础格式面板的 SSE 为**第 0 层全部 1,536 个矩阵的等权平均值**，覆盖
+512 个专家的 Gate、Up、Down 投影。各对比格式的实际 bpw 相近，但存在差异。
+完整 SSE 表格见[格式基准说明](./docs/benchmarks/qwen38-flash-next-base-format-sse.md)，
+原始数值与来源见[格式数据](./docs/figures/data/qwen38-flash-next-base-format-sse.json)。
 
 <details>
 <summary>查看全模型精度热力图</summary>
@@ -110,16 +118,28 @@ BibTeX 格式见[引用](#引用)。
 **M5 Max 上的 105.4 tok/s**，以及 **RTX 3090 Ti + 32 GiB RAM 上的
 61.0 tok/s**。
 
+下图对比 MFQ、Strata、llama.cpp 与 oMLX，均使用同一台 **M5 Max（40 核 GPU、128 GB）**，
+运行 **Qwen3.8-Flash-Next**，输入为同一份 **4,096 tokens 的 Python 代码**。
+各运行时按实际测试的量化档位分别展示。
+
 <p align="center">
-  <img src="./docs/figures/qwen38-flash-next-inference-speed.zh-CN.svg" alt="MFQ Qwen3.8-Flash-Next 推理速度横向柱状图：Apple Metal 与 NVIDIA CUDA 的 MTP 开关生成速度和提示词处理速度，底纹突出 V3-XXS" width="1100">
+  <img src="./docs/figures/qwen38-flash-next-metal-runtime-comparison.zh-CN.svg" alt="M5 Max 上的 Qwen3.8-Flash-Next：MFQ、Strata、llama.cpp 与 oMLX 共 17 个运行时和检查点配置的提示词处理速度及 MTP 开关生成速度" width="1100">
 </p>
 
-全部结果均使用 **Qwen3.8-Flash-Next，输入长度为 4,096 tokens**。
-Metal 平台为 **M5 Max（40 核 GPU、128 GB）**。CUDA 平台为 **RTX 3090 Ti**，
-其中 V1-S、V1-M、S2-L、V3-XXS 配备 **32 GiB RAM**，S3-L、V4-XS 配备
-**64 GiB RAM**。浅色底纹标出 `V3-XXS`，生成速度的两根柱分别对应 MTP 关闭和开启。
-完整表格见[性能与质量](#性能与质量)，
-绘图数值见[图表数据](./docs/figures/data/qwen38-flash-next-inference-speed.json)。
+浅色底纹和加粗标注突出 **MFQ V3-XXS（82.0 GB）**，以及选作对比的
+**GSQ-RCO IQ3_S（83.6 GB）** 和 **Jundot oQ3.5e（约 93.9 GB）**。
+IQ3_S 与 V3-XXS 体积相近，oQ3.5e 更大；大小均不含视觉编码器与 MTP 层。
+开启 MTP 时，V3-XXS 的生成速度为 **105.4 tok/s**，IQ3_S 在 Strata 和
+llama.cpp 中分别为 **99.6 tok/s** 和 **59.3 tok/s**。
+oQ3.5e 在 oMLX 中使用自适应 MTP，生成速度为 **111.0 tok/s**。
+
+MFQ 来源表每档只给出一组提示词处理值，其余运行时的提示词处理柱均使用 MTP 关闭值。
+oMLX 使用官方 macOS 26/27 DMG 内的原生 NAX 内核与自适应 MTP，
+其提示词处理计时包含首 token 开销。
+各组的量化档位、草稿配置和测量次数不同，完整条件与表格见
+[基准说明](./docs/benchmarks/qwen38-flash-next-metal-comparison.md)，
+全部已发布数值及来源见[对比数据](./docs/figures/data/qwen38-flash-next-metal-runtime-comparison.json)。
+CUDA 结果与 MFQ 的完整速度表格见[性能与质量](#性能与质量)。
 
 MFQ 的 Apple Metal 后端基于 [MLX](https://github.com/ml-explore/mlx)，
 采用原生 C++ 运行时，并针对 MFQ 量化格式实现自定义 Metal 内核。
@@ -148,8 +168,19 @@ ROCm/HIP 支持仍在开发中，优化的 CPU 后端正在规划中。
    `.mfq` 检查点。
 3. 在本地使用已加载的模型，或通过兼容 API 接入应用，全程无需从源码构建。
 
+**服务概览**
+
 <p align="center">
   <img src="./docs/figures/mfq-studio-overview-zh.png" alt="MFQ Studio：本地模型服务、实时性能与资源概览" width="1100">
+</p>
+
+**量化分析**
+
+MFQ Studio 原生集成量化可视化功能，可直观、详细地查看任意 MoE 检查点的
+精度分配，从各层、各专家一直细化到 Gate、Up、Down 投影。
+
+<p align="center">
+  <img src="./docs/figures/mfq-studio-analysis-zh.png" alt="MFQ Studio 分析：检查点架构、模型结构与投影级精度分配明细" width="1100">
 </p>
 
 ### 从源码构建

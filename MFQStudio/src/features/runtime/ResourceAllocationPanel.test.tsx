@@ -25,6 +25,18 @@ it('uses the live shared memory budget and headroom rather than total physical m
   expect(screen.getByText('Automatic · current usable budget')).toBeInTheDocument();
 });
 
+it('does not subtract raw available memory again from the backend unified budget', async () => {
+  const GiB = 2 ** 30;
+  state.runtime = { memory_architecture: 'unified', host_memory_available_bytes: 3 * GiB,
+    runtime_memory_effective_budget_bytes: 5 * GiB, runtime_memory_headroom_bytes: 5 * GiB,
+    runtime_memory_committed_bytes: 0, runtime_memory_budget_mode: 'automatic' };
+  const { container } = render(<ResourceAllocationPanel />);
+  await act(async () => {});
+  expect(within(container.querySelector('.resource-budget-summary')!).getAllByText('5 GiB')).toHaveLength(2);
+  expect(container.querySelector('[data-tier="weights"] .memory-tier-heading')).toHaveTextContent('0 B / 5 GiB');
+  state.runtime = null;
+});
+
 it('keeps the summary and bars within actual free VRAM even when a manual budget has more headroom', async () => {
   const GiB = 2 ** 30;
   state.runtime = { memory_architecture: 'discrete', device_memory_total_bytes: 24 * GiB,

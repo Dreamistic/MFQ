@@ -24,7 +24,11 @@ class NativeDmaBatch {
         static const auto function=[]() -> Function {
             void* raw=nullptr;
             cudaDriverEntryPointQueryResult query=cudaDriverEntryPointSymbolNotFound;
+#if CUDART_VERSION >= 12050
+            const auto result=cudaGetDriverEntryPointByVersion("cuGetProcAddress",&raw,12000,cudaEnableDefault,&query);
+#else   // the versioned query arrived in CUDA 12.5
             const auto result=cudaGetDriverEntryPoint("cuGetProcAddress",&raw,cudaEnableDefault,&query);
+#endif
             if(result==cudaErrorNotSupported){cudaGetLastError();return nullptr;}
             if(result!=cudaSuccess)throw std::runtime_error("CUDA driver entry query failed: "+std::to_string(result));
             if(query!=cudaDriverEntryPointSuccess || !raw)return nullptr;
@@ -45,7 +49,7 @@ public:
     // base to the device-visible alias once, before the consumer graph starts.
     template<class Alias>
     static bool submit(const std::vector<DmaCopy>& copies,cudaStream_t stream,int mode,Alias&& alias) {
-        if(!mode || copies.size()<2 || !entry())return false;
+        if(!mode || copies.empty() || !entry())return false;
         constexpr std::size_t capacity=128;
         if(copies.size()>capacity) {
             const auto* multiple=std::getenv("MFQ_MOE_NATIVE_DMA_MULTI_BATCH");

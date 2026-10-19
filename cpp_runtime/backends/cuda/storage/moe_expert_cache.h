@@ -56,6 +56,8 @@ bool moe_expert_cache_has_sources(
 bool moe_expert_cache_finalized(
     const std::shared_ptr<MoeExpertCache>& cache);
 bool moe_expert_cache_layer_prefill_ready(const std::shared_ptr<MoeExpertCache>& cache);
+bool moe_expert_cache_ssd_experts(const std::shared_ptr<MoeExpertCache>& cache);
+bool moe_expert_cache_ssd_router_prefetch(const std::shared_ptr<MoeExpertCache>& cache);
 std::vector<std::pair<std::string, double>> moe_expert_memory_metrics(
     const std::shared_ptr<MoeExpertCache>& cache);
 void finalize_moe_expert_cache(
@@ -66,6 +68,7 @@ void resize_moe_expert_cache(const std::shared_ptr<MoeExpertCache>& cache, std::
 // Reclaim lower-priority cache storage before reducing prefill transfer overlap.
 void set_moe_workspace_reservation(const std::shared_ptr<MoeExpertCache>& cache,
     std::function<void(std::size_t)> reserve,std::function<void(std::size_t)> reserve_ram={});
+void reserve_moe_workspace(const std::shared_ptr<MoeExpertCache>& cache,std::size_t bytes);
 std::size_t reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cache,
     std::size_t allocation_bytes=0);
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);
@@ -82,6 +85,8 @@ bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
 // Request boundary only, after target/predictor graphs have been destroyed.
 // Lend decode staging/workspace capacity to the upcoming long prefill.
 void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);
+bool suspend_moe_residency(const std::shared_ptr<MoeExpertCache>& cache,bool suspended);
+bool set_moe_reuse_learning(const std::shared_ptr<MoeExpertCache>& cache,bool enabled);
 // Return prompt-only ring and workspace storage before preparing decode graphs.
 void release_moe_prefill_buffers(MoeExpertCache* cache);
 void release_moe_prefill_buffers(const std::shared_ptr<MoeExpertCache>& cache);

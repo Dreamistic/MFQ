@@ -1207,6 +1207,36 @@ static void check_kv_projection_loan() {
     std::cout<<"KV compact projection bytes, metadata hits, geometry, packet protection, LRU, retirement and KV growth PASS\n";
 }
 
+static void check_reused_projection_observer() {
+    namespace tb=mfq_tensor_backend;
+    auto storage=tb::empty({4*int64_t(KvExpertLoan::page)},tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8));
+    KvExpertLoan loan;loan.set_reuse_priority(true);
+    const auto region=loan.add(storage,4,KvExpertLoan::page,true);
+    std::map<int64_t,bool> reusable;int publications=0;
+    loan.observe_projections(3,[&](int64_t,const void* base,const auto&){if(base)++publications;});
+    loan.observe_projections(3,[&](int64_t expert,const void* base,const auto&){reusable[expert]=base!=nullptr;},{},true);
+    const std::vector<int64_t> sizes={int64_t(KvExpertLoan::page)};
+    std::array<std::size_t,8> offsets{};std::size_t logical=0;bool hit=false;
+    const auto stream=mfq_current_cuda_stream();
+    for(int64_t expert=0;expert<4;++expert) {
+        check(loan.pin_projection(3,expert,sizes,stream,hit,[&](void* base,const auto&) {
+            MFQ_NATIVE_CUDA_CHECK(cudaMemsetAsync(base,int(expert),KvExpertLoan::page,stream));
+        }) && !hit,"reusable projection fixture failed to allocate");
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream));loan.next_packet();
+        check(!reusable.at(expert),"one-use GPU projection displaced a protected RAM image");
+        check(loan.pin_existing_projection(3,expert,sizes,offsets,logical)!=nullptr && reusable.at(expert),
+            "repeated GPU projection was not offered as a RAM eviction candidate");
+        check(publications==expert+1,"reuse notifications changed ordinary projection publication");
+    }
+    check(!reusable.at(0),"GPU reuse quota demotion retained a RAM eviction hint");
+    loan.retire_expert(3,3,1);
+    check(!reusable.at(3),"retired GPU projection retained a RAM eviction hint");
+    loan.set_reuse_priority(false);
+    for(const auto& [expert,valid]:reusable)check(!valid,"disabled GPU protection retained an eviction hint");
+    loan.remove(region);
+    std::cout<<"GPU projection reuse eligibility, quota demotion and retirement observers PASS\n";
+}
+
 static void check_workspace_loan() {
     using namespace mfq_tensor_backend;
     const auto context=mfq::cuda::default_context();
@@ -1389,7 +1419,7 @@ int main(int argc, char** argv) try {
         std::cout<<"CUDA workspace loan ranges and graph reuse checks passed\n";return 0;
     }
     if(argc==2 && std::string(argv[1])=="--kv-expert-loan-check") {
-        const auto context=default_context();check_kv_expert_loan();check_kv_projection_loan();return 0;
+        const auto context=default_context();check_kv_expert_loan();check_kv_projection_loan();check_reused_projection_observer();return 0;
     }
     if(argc==2 && std::string(argv[1])=="--kv-speculative-lru-check") {
         const auto context=default_context();check_kv_speculative_lru();return 0;
@@ -1423,6 +1453,7 @@ int main(int argc, char** argv) try {
     check_decode_kv_append();
     check_kv_expert_loan();
     check_kv_projection_loan();
+    check_reused_projection_observer();
     check_graph_workspace_reuse();
     check_gelu_approximations();
     check_streamed_graph_segments();

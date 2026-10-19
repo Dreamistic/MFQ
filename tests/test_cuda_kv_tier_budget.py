@@ -91,6 +91,33 @@ def test_placement_allocation_and_precision_budget(monkeypatch, placement, alloc
         assert plan.ram_required_bytes == 0
 
 
+@pytest.mark.parametrize('cache_gib,available_gib,ram_limit_gib,expected_gib', [
+    (None, 28, None, 26), (0, 28, None, 26), (20, 28, None, 10),
+    (40, 28, None, 26), (None, 28, 6, 6), (20, 28, 6, 6),
+    (None, None, None, None), (20, None, 6, 6), (20, 10, None, 0),
+])
+def test_ram_kv_budget_subtracts_only_nonresident_experts(
+    tmp_path, monkeypatch, cache_gib, available_gib, ram_limit_gib, expected_gib,
+):
+    from mfq.server.protocol.models import ModelLoadRequest
+    from mfq.server.runtime.runtime_pool import RuntimePool
+    from mfq.server.state.catalog import ModelCatalog
+
+    def gib(value):
+        return None if value is None else value << 30
+
+    monkeypatch.setattr('mfq.server.runtime.runtime_pool.host_memory_capacity',
+                        lambda: (32 << 30, gib(available_gib)))
+    monkeypatch.setattr('mfq.server.runtime.runtime_pool.supports_cuda_ram_expert_pipeline', lambda path: False)
+    artifact = SimpleNamespace(resource=SimpleNamespace(total_bytes=70 << 30, format='mfq'),
+                               always_streamed_bytes=30 << 30, routed_expert_bytes=36 << 30,
+                               path=tmp_path / 'fixture.mfq')
+    pool = RuntimePool(ModelCatalog([]), tmp_path / 'runtime', backend='cuda')
+    request = ModelLoadRequest(model='fixture', moe_gpu_cache_gb=cache_gib,
+                               kv_memory=dict(ram_budget_bytes=gib(ram_limit_gib)))
+    assert pool._kv_ram_limit(artifact, request) == gib(expected_gib)
+
+
 @pytest.mark.parametrize('preallocated,ram_limit,expected_ssd', [(True, None, 64 << 20), (True, 0, 72 << 20),
     (True, 2 << 20, 70 << 20), (False, None, 72 << 20), (False, 0, 72 << 20)])
 def test_ssd_admission_uses_ram_preallocation(tmp_path, monkeypatch, preallocated, ram_limit, expected_ssd):

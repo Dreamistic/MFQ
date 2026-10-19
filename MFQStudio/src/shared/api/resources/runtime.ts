@@ -11,6 +11,7 @@ import type {
   RealtimeCapabilities,
   VoiceOutputComponentStatus,
   JobResource,
+  ServingStatistics,
 } from '../types';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
@@ -132,6 +133,9 @@ export interface PrefixCacheText {
 }
 
 export const runtimeApi = {
+  servingStatistics(scope: 'session' | 'alltime', signal?: AbortSignal): Promise<ServingStatistics> {
+    return request(`/api/v1/runtime/serving?scope=${scope}`, { signal });
+  },
   authenticationPolicy(): Promise<RuntimeAuthenticationPolicy> {
     return request('/api/v1/auth/policy');
   },

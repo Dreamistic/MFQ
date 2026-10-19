@@ -368,7 +368,7 @@ static void check_speculative(MlxQwen4CausalLm& runtime, int batch) {
         std::vector<MlxQwen4TextSessionState> committed;
         std::vector<array> expected;
         for (int row = 0; row < batch; ++row) {
-            auto history = prompt(33 + row * 64, row + depth);
+            auto history = prompt(batch == 8 ? 17 + row : 33 + row * 64, row + depth);
             auto window = prompt(depth + 1, row + 3);
             history[history.size() - 2] = runtime.config().eos_token_id;
             window[depth / 2] = runtime.config().eos_token_id;
@@ -427,6 +427,41 @@ static void check_speculative(MlxQwen4CausalLm& runtime, int batch) {
     }
     runtime.clear_cache();
     require(runtime.kv_cache_bytes() == 0, "speculative request retirement leaked KV");
+}
+static void check_mtp_depth_metrics(MlxQwen4CausalLm& runtime) {
+    ContinuousBatch<MlxQwen4BatchOperations> batch(64, 64, runtime, MlxQwen4BatchOperations::Hooks{});
+    InferenceRequest input;
+    input.chat = false;
+    input.prompt = prompt(33, 1);
+    input.sampling.enable_mtp = true;
+    input.sampling.mtp_max_draft_tokens = 3;
+    input.sampling.max_tokens = 96;
+    input.sampling.temperature = 0;
+    input.sampling.seed = 42;
+    InferenceOutput output(input, nullptr, "depth-metrics");
+    auto generation = batch.generate("depth-metrics", input, output);
+    bool done = false;
+    for (int iteration = 0; iteration < 1024; ++iteration) {
+        batch.step({"depth-metrics"});
+        if (!generation.next()) { done = true; break; }
+        if (iteration == 12) {
+            const auto bytes = runtime.kv_cache_bytes();
+            batch.invalidate_runtime_policy();
+            require(runtime.kv_cache_bytes() == bytes, "policy invalidation discarded active KV");
+        }
+    }
+    require(done && batch.empty() && output.metrics.mtp.cycles > 0,
+        "single-request MTP depth metric regression did not finish verification");
+    std::array<std::uint64_t, 6> actual{};
+    for (const auto& [name, value] : batch.metrics()) for (int depth = 0; depth <= 5; ++depth)
+        if (name == "continuous_batching_mtp_depth_" + std::to_string(depth) + "_cycles")
+            actual[depth] = static_cast<std::uint64_t>(value);
+    require(actual[0] == output.metrics.mtp.standard_tokens,
+        "ordinary MTP rounds were attributed to a selected speculative depth");
+    for (int depth = 1; depth <= 5; ++depth)
+        require(actual[depth] == output.metrics.mtp.depth_cycles[depth],
+            "batch depth metrics disagree with the actually verified draft windows");
+    std::cout << "MTP batch depth metrics match actual verified windows\n";
 }
 static void check_ragged_speculative(MlxQwen4CausalLm& runtime) {
     for (const auto lengths : {std::array{1, 2, 2}, std::array{2, 1, 2}, std::array{1, 2, 6},
@@ -686,6 +721,8 @@ int main(int argc, char** argv) {
         std::cout << "Independent request state comparison passed\n";
         check_speculative(runtime, 1);
         check_speculative(runtime, 3);
+        check_speculative(runtime, 8);
+        check_mtp_depth_metrics(runtime);
         check_ragged_speculative(runtime);
         std::cout << "Independent speculative verification and rollback passed\n";
         check_penalties(runtime);

@@ -209,7 +209,7 @@ class RuntimeIdentity(ProtocolModel):
 
 
 class CreateSessionRequest(ProtocolModel):
-    model: str = Field(min_length=1, max_length=255)
+    model: str = Field(default="", max_length=255, json_schema_extra={"deprecated": True})
     mode: SessionMode = SessionMode.TEXT
     title: str | None = Field(default=None, max_length=512)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -416,6 +416,7 @@ class ResponsePerformance(ProtocolModel):
 
 class CreateResponseRequest(ProtocolModel):
     request_id: UUID
+    model: str | None = Field(default=None, min_length=1, max_length=255)
     expected_revision: int = Field(ge=0)
     input: list[ContentPart] = Field(min_length=1)
     input_role: Literal["user", "tool"] = "user"
@@ -447,6 +448,7 @@ class CreateResponseRequest(ProtocolModel):
 
 class ResponseRequestSettings(ProtocolModel):
     sampling: SamplingParams
+    model: str | None = Field(default=None, min_length=1, max_length=255)
     system_prompt: str | None = None
     include_reasoning_history: bool = True
     input_role: Literal["user", "tool"] = "user"
@@ -938,6 +940,18 @@ class ModelArtifactResource(ProtocolModel):
 
 class ModelArtifactList(ProtocolModel):
     data: list[ModelArtifactResource]
+
+
+class ModelDeletionPlan(ProtocolModel):
+    model_id: str
+    name: str
+    files: list[str]
+    total_bytes: int = Field(ge=0)
+    token: str = Field(pattern=SHA256_PATTERN)
+
+
+class DeleteModelRequest(ProtocolModel):
+    token: str = Field(pattern=SHA256_PATTERN)
 
 
 class ModelDirectoryEntry(ProtocolModel):

@@ -11,7 +11,7 @@
 namespace mfq::cuda {
 namespace {
 template<int Format,int Lanes>
-__device__ __forceinline__ void nvq_compact32_e8_dot(const MfePackedProjection& d,int expert,
+__device__ __forceinline__ void nvq_compact32_e8_dot_original(const MfePackedProjection& d,int expert,
         int first,const int8_t* input,const float* scales,float* result) {
     constexpr int bits=packed_nvq::format_index_bits(Format);
     const int lane=threadIdx.x&(Lanes-1),row=threadIdx.x/Lanes;
@@ -48,7 +48,8 @@ __device__ __forceinline__ void nvq_compact32_e8_dot(const MfePackedProjection& 
 #else
             const float weight_scale=packed_nvq::format_scale<Format>(anchor,state,codebook);
 #endif
-            int dot=0;
+            // 24 int8 products fit in int32; independent chains retain the exact sum.
+            int dot_low=0,dot_high=0;
 #pragma unroll
             for(int segment=0;segment<3;++segment) {
                 int2 value{};
@@ -61,15 +62,24 @@ __device__ __forceinline__ void nvq_compact32_e8_dot(const MfePackedProjection& 
                 if(segment==1)value=packed_nvq::decode_dense_e8_vector<1>(packed,bank,d.sign_mode);
                 if(segment==2)value=packed_nvq::decode_dense_e8_vector<2>(packed,bank,d.sign_mode);
 #endif
-                dot=__dp4a(value.y,activation[segment].y,__dp4a(value.x,activation[segment].x,dot));
+                dot_low=__dp4a(value.x,activation[segment].x,dot_low);
+                dot_high=__dp4a(value.y,activation[segment].y,dot_high);
             }
-            partial=fmaf(weight_scale*input_scale,float(dot),partial);
+            partial=fmaf(weight_scale*input_scale,float(dot_low+dot_high),partial);
         }
     }
 #pragma unroll
     for(int offset=Lanes/2;offset>0;offset>>=1)partial+=__shfl_xor_sync(0xffffffffu,partial,offset,Lanes);
 #pragma unroll
     for(int row=0;row<32/Lanes;++row)result[row]=__shfl_sync(0xffffffffu,partial,row*Lanes);
+}
+
+// The per-group LUT read keeps the packed decoder's control flow compact.
+// Real-weight resident GU measurements favor it over a warp LUT shuffle.
+template<int Format,int Lanes>
+__device__ __forceinline__ void nvq_compact32_e8_dot(const MfePackedProjection& d,int expert,
+        int first,const int8_t* input,const float* scales,float* result) {
+    nvq_compact32_e8_dot_original<Format,Lanes>(d,expert,first,input,scales,result);
 }
 
 template<int Format,int Lanes>
@@ -108,7 +118,8 @@ __device__ __forceinline__ void nvq_compact32_d4_dot(const MfePackedProjection& 
 #else
             const float weight_scale=analytic_scale?anchor*float((state>>1)+1):packed_nvq::format_scale<Format>(anchor,state,codebook);
 #endif
-            int dot=0;
+            // 24 int8 products fit in int32; independent chains retain the exact sum.
+            int dot_low=0,dot_high=0;
 #pragma unroll
             for(int segment=0;segment<3;++segment) {
                 int2 value{};
@@ -121,9 +132,10 @@ __device__ __forceinline__ void nvq_compact32_d4_dot(const MfePackedProjection& 
                 if(segment==1)value=packed_nvq::decode_dense_d4_vector<1>(packed,bank);
                 if(segment==2)value=packed_nvq::decode_dense_d4_vector<2>(packed,bank);
 #endif
-                dot=__dp4a(value.y,activation[segment].y,__dp4a(value.x,activation[segment].x,dot));
+                dot_low=__dp4a(value.x,activation[segment].x,dot_low);
+                dot_high=__dp4a(value.y,activation[segment].y,dot_high);
             }
-            partial=fmaf(weight_scale*input_scale,float(dot),partial);
+            partial=fmaf(weight_scale*input_scale,float(dot_low+dot_high),partial);
         }
     }
 #pragma unroll

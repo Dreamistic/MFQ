@@ -178,7 +178,33 @@ void test_probability_contract() {
     assert(result["log_base"] == "e" && result["scores"][0]["log_likelihood"] == -3);
 }
 
+void test_live_request_metrics() {
+    using namespace mfq::transport_detail;
+    RuntimeRequestMetrics store;
+    {
+        ActiveRequest first(store), second(store);
+        first.progress("one", {{"generated_tokens", 6}});
+        second.progress("two", {{"processed_tokens", 2048}});
+        auto value = store.snapshot({}, 512, false);
+        assert(value["live_requests"].size() == 2);
+        assert(value["live_requests"]["one"]["generated_tokens"] == 6);
+        first.complete("one", true, true, 10, {}, {});
+        value = store.snapshot({}, 512, false);
+        assert(value["live_requests"].size() == 1);
+        assert(value["live_requests"].contains("two"));
+    }
+    assert(store.snapshot({}, 512, false)["live_requests"].empty());
+    FakeEngine engine;
+    MfqScheduler scheduler(engine);
+    RequestWork work;
+    work.sampling.max_tokens = 2;
+    CompletionStream completion(scheduler, work, "0");
+    while (completion.next()) {}
+    assert(completion.progress()["generated_tokens"] == 6);
+}
+
 int main() {
+    test_live_request_metrics();
     test_probability_contract();
     test_benchmark_input_contract();
     test_decode_timing();

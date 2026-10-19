@@ -2,6 +2,8 @@
 #include "mfq/hf_model_source.h"
 #include "mfq/hf_safetensors_source.h"
 #include "mfq/mfq_model_source.h"
+#include "mfq/mapped_tensor_pages.h"
+#include "mfq/mapped_prefetch_scope.h"
 
 #include <algorithm>
 #include <array>
@@ -244,6 +246,10 @@ int main() {
                 ordinary(offset,expected.data(),count);mapped(offset,actual.data(),count);
                 require(actual==expected,"mapped tensor crossing page/granularity boundary differs");
             }
+            require(mfq::release_mapped_tensor_pages()>0,"mapped source trim did not retain any live reader");
+            std::vector<std::byte> expected(8197),actual(8197);
+            ordinary(65521,expected.data(),expected.size());mapped(65521,actual.data(),actual.size());
+            require(actual==expected,"mapped reader changed after releasing clean source pages");
         }
 
         {
@@ -253,7 +259,10 @@ int main() {
             }();
             require(bool(batch),"retained mapped batch reader missing");
             std::vector<std::byte> actual(14);
-            batch({{8,actual.data()+8,6},{0,actual.data(),5},{5,actual.data()+5,3},{14,nullptr,0}});
+            {
+                mfq::MappedPrefetchScope prefetch(true);
+                batch({{8,actual.data()+8,6},{0,actual.data(),5},{5,actual.data()+5,3},{14,nullptr,0}});
+            }
             require_bytes(actual);batch({});
             for(const auto bad:std::vector<mfq::ReadSpan>{{13,actual.data(),2},{UINT64_MAX,actual.data(),0},{0,nullptr,1}}) {
                 std::fill(actual.begin(),actual.end(),std::byte{0x7f});
@@ -281,6 +290,8 @@ int main() {
             std::vector<mfq::ReadSpan> spans;
             for(size_t i=0;i<count;++i)spans.push_back({(i*4093)%(expected.size()-width+1),received.data()+i*width,width});
             large_batch(spans);
+            require(mfq::release_mapped_tensor_pages()>0,"mapped batch trim lost its independent owner");
+            std::fill(received.begin(),received.end(),std::byte{0});large_batch(spans);
             for(const auto& span:spans)require(std::equal(span.destination,span.destination+span.size,expected.begin()+span.offset),
                     "mapped batch across pages/prefetch chunks differs");
         }

@@ -45,6 +45,13 @@ export function errorMessage(error: unknown, tr?: (chinese: string, english: str
         qsa_kv_offload_unsupported: ['当前模型不支持流式稀疏注意力，请关闭该选项。', 'This model does not support streaming sparse attention. Disable this option.'],
         runtime_busy: ['运行时正在处理请求或设置，请稍后重试。', 'The runtime is handling requests or settings. Try again shortly.'],
         model_not_loaded: ['模型尚未加载，请先加载模型。', 'The model is not loaded. Load it first.'],
+        model_delete_busy: ['模型正在加载或使用中，请先卸载再删除。', 'The model is loading or in use. Unload it before deleting.'],
+        model_delete_downloading: ['此模型仍在下载，请等待完成或先取消下载。', 'This model is still downloading. Wait for it to finish or cancel the download first.'],
+        model_delete_changed: ['模型文件已发生变化，请关闭确认框并刷新列表后重试。', 'The model files changed. Close the dialog, refresh the list and try again.'],
+        model_delete_unsafe: ['无法安全确定此模型的文件范围，未执行删除。', 'The model files could not be safely identified. Nothing was deleted.'],
+        model_delete_failed: ['部分文件未能删除，请检查文件权限并刷新列表。', 'Some files could not be deleted. Check file permissions and refresh the list.'],
+        model_artifact_not_found: ['此模型已不存在，请刷新列表。', 'This model no longer exists. Refresh the list.'],
+        model_delete_unavailable: ['当前服务不支持安全删除模型，请更新后端后重试。', 'This server does not support safe model deletion. Update the backend and retry.'],
         model_not_ready: ['模型尚未就绪，请等待加载完成。', 'The model is not ready. Wait for loading to finish.'],
         invalid_request: ['输入值不符合要求，请检查数值范围和格式。', 'Some input values are invalid. Check their ranges and format.'],
       };
@@ -59,6 +66,8 @@ export function errorMessage(error: unknown, tr?: (chinese: string, english: str
     return `${error.code}: ${error.message}`;
   }
   if (error instanceof Error) return error.message;
+  if (typeof error === 'string' && error.trim()) return error;
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string' && error.message.trim()) return error.message;
   return "Unknown error";
 }
 

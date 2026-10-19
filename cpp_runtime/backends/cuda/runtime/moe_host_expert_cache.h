@@ -26,6 +26,17 @@ struct MoeHostExpertCacheStats {
     std::size_t transient_bytes=0, transient_peak_bytes=0;
     std::uint64_t hits=0, misses=0, coalesced=0, evictions=0;
     std::uint64_t promotions=0, gpu_demotions=0, bypasses=0;
+    bool reuse_priority=false;
+    std::size_t reuse_protected_bytes=0;
+    std::uint64_t reuse_promotions=0;
+    std::uint64_t scan_admissions=0,scan_admitted_bytes=0;
+    std::uint64_t device_duplicate_evictions=0,device_duplicate_evicted_bytes=0;
+    std::uint64_t device_reuse_promotions=0;
+    std::uint64_t speculative_windows=0,speculative_accepted_keys=0,speculative_cancels=0;
+    std::uint64_t prediction_used_jobs=0,prediction_used_bytes=0;
+    std::uint64_t prediction_started_jobs=0,prediction_started_bytes=0;
+    std::size_t ghost_entries=0,ghost_bytes=0;
+    std::uint64_t ghost_promotions=0;
 };
 
 // Engine-wide, byte-bounded LRU for immutable CPU expert fields. CPU leases
@@ -41,7 +52,12 @@ public:
     ~MoeHostExpertCache();
     MoeHostExpertCache(const MoeHostExpertCache&)=delete;
     MoeHostExpertCache& operator=(const MoeHostExpertCache&)=delete;
-    Lease acquire(mfq::MoeCacheKey key,std::size_t bytes,const Load& load,bool retain=true);
+    // An unconfirmed prediction (touch=false) cannot evict reused images.
+    // A later demand can admit that same payload without reading it again.
+    Lease acquire(mfq::MoeCacheKey key,std::size_t bytes,const Load& load,bool retain=true,bool touch=true);
+    // A prefill scan may fill unused capacity, without evicting existing
+    // experts or promoting scan hits. Returns empty without loading if full.
+    Lease acquire_scan(mfq::MoeCacheKey key,std::size_t bytes,const Load& load);
     // Returns false without invoking copy when the managed budget cannot fit.
     bool demote(mfq::MoeCacheKey key,std::size_t bytes,const Load& copy);
     void promote(mfq::MoeCacheKey key);
@@ -51,10 +67,39 @@ public:
     std::size_t reclaim_optional(std::size_t bytes);
     bool contains(mfq::MoeCacheKey key) const;
     // Read an already cached immutable image without invoking a loader.
-    Lease find(mfq::MoeCacheKey key);
+    Lease find(mfq::MoeCacheKey key,bool touch=true);
+    // A dispatch preflight must not wait for another key's RAM publication.
+    // Busy keys remain eligible for the normal parallel acquisition path.
+    Lease try_find(mfq::MoeCacheKey key,bool touch=true,bool consume=true);
     MoeHostExpertCacheStats stats() const;
+    // A streaming scan must not evict repeatedly consumed decoded images.
+    void enable_reuse_priority();
+    void set_reuse_learning(bool enabled);
+    // Verification can read rejected draft rows. Keep their immutable images,
+    // but learn recency/reuse only from the accepted route prefix.
+    void begin_speculative_learning();
+    void commit_speculative_learning(const std::vector<mfq::MoeCacheKey>& accepted);
+    void discard_speculative_learning() noexcept;
     // Complete-residency mode cannot evict the last copy of an expert.
     void preserve_resident_experts();
+    // Notifications take a separate lock and never call back into a device
+    // cache. Each registered key has one bounded, coalesced pending update.
+    class DeviceCacheHints {
+    public:
+        // Reuse-only GPU observers also confirm reuse of an existing RAM
+        // backup, even when GPU hits never read that backup directly.
+        explicit DeviceCacheHints(std::vector<mfq::MoeCacheKey> keys,bool confirmed_reuse=false);
+        ~DeviceCacheHints();
+        void publish(std::size_t index,bool resident);
+    private:
+        friend class MoeHostExpertCache;
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
+    };
+    // Under RAM pressure, discard idle one-use duplicates before unique
+    // one-use images. Keep repeatedly consumed RAM backups of revocable GPU
+    // storage. Hints affect placement only; the checkpoint is authoritative.
+    void set_device_cache_hints(std::shared_ptr<DeviceCacheHints> hints);
     bool exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey outgoing,
         const Lease& expected,const std::function<MixedMoePool(const MixedMoePool&)>& copy);
     struct Exchange {
@@ -73,6 +118,7 @@ public:
                         const std::function<void()>& publish = {},
                         const std::function<void()>& prepare = {},bool independent_readers=false);
 private:
+    Lease load(mfq::MoeCacheKey key,std::size_t bytes,const Load& loader,bool retain,bool scan,bool touch);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -21,6 +21,14 @@ export interface ModelArtifact {
   error?: string | null;
 }
 
+export interface ModelDeletionPlan {
+  model_id: string;
+  name: string;
+  files: string[];
+  total_bytes: number;
+  token: string;
+}
+
 export interface AnalysisProjection {
   name: string;
   category: string;

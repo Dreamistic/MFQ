@@ -247,6 +247,7 @@ class NativeRuntime:
         )
         self.process = subprocess.Popen(
             command,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             stdin=subprocess.DEVNULL,
             env=native_runtime_environment(
                 self.executable,

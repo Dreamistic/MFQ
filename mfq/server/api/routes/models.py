@@ -19,6 +19,8 @@ from mfq.server.protocol.models import (
     DatasetList,
     DatasetResource,
     DeleteWorkspaceArtifactRequest,
+    DeleteModelRequest,
+    ModelDeletionPlan,
     EvaluationComparisonResource,
     EvaluationKind,
     EvaluationResultList,
@@ -206,6 +208,16 @@ async def register_model_directory(
 )
 async def model_artifact_directory(service: ServiceDependency, model_id: str) -> ModelDirectoryList:
     return await service.model_artifact_directory(model_id)
+
+
+@router.get("/api/v1/models/{model_id}/deletion", response_model=ModelDeletionPlan, responses=ERROR_RESPONSES, tags=["models"])
+async def model_deletion_plan(service: ServiceDependency, model_id: str) -> ModelDeletionPlan:
+    return await service.model_deletion_plan(model_id)
+
+
+@router.post("/api/v1/models/{model_id}/delete", responses=ERROR_RESPONSES, tags=["models"])
+async def delete_model_artifact(service: ServiceDependency, model_id: str, body: DeleteModelRequest) -> dict[str, int]:
+    return await service.delete_model_artifact(model_id, body.token)
 
 
 @router.get("/api/v1/models/{model_id}/cache-profile", response_model=ModelCacheProfile | None,

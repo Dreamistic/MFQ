@@ -237,6 +237,7 @@ void test_minicpmo45_qwen3_cache_equivalence();
 void test_minicpmo45_chunked_prefill_generation();
 void test_minicpmo45_qk_norm_rope();
 void test_minicpmo45_gqa_attention();
+void test_minicpmo45_gqa_reduction();
 
 } // namespace detail
 

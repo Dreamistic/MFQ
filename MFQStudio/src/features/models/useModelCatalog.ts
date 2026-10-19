@@ -1,7 +1,8 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { modelsApi } from '../../shared/api/resources/models';
-import type { ModelArtifact, ModelDirectoryList } from '../../shared/api/types';
+import { ApiError } from '../../shared/api/client';
+import type { ModelArtifact, ModelDeletionPlan, ModelDirectoryList } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { useSettings } from '../settings/SettingsProvider';
@@ -32,6 +33,8 @@ export function useModelCatalog() {
   const [artifacts, setArtifacts] = useState<ModelArtifact[]>([]);
   const artifactRequest = useRef(0);
   const [busy, setBusy] = useState(false);
+  const [modelDeletion, setModelDeletion] = useState<ModelDeletionPlan | null>(null);
+  const deletionTriggerRef = useRef<HTMLElement | null>(null);
   const observedActiveLoadJobIds = useRef(new Set<string>());
   const reportedFailedJobIds = useRef(new Set<string>());
   const reportError = (cause: unknown) => {
@@ -82,6 +85,7 @@ export function useModelCatalog() {
     setArtifacts([]);
     updateModelBrowserOpen(false);
     setBusy(false);
+    setModelDeletion(null);
     setLoadDeviceIds([]);
     updateLoadContext(readLoadContext());
   }, [connectionRevision]);
@@ -146,10 +150,13 @@ export function useModelCatalog() {
         observedActiveLoadJobIds.current.add(job.id);
         continue;
       }
+      if (job.status === 'failed' && !job.error?.message) continue;
       const wasActive = observedActiveLoadJobIds.current.delete(job.id);
-      if (wasActive && job.status === 'failed' && job.error?.message && !reportedFailedJobIds.current.has(job.id)) {
+      if (wasActive && (job.status === 'failed' || job.status === 'interrupted') && !reportedFailedJobIds.current.has(job.id)) {
         reportedFailedJobIds.current.add(job.id);
-        toast.error(`${job.error.code}: ${job.error.message}`);
+        toast.error(job.status === 'interrupted'
+          ? tr('模型加载已中断，请重新加载。', 'Model loading was interrupted. Please load the model again.')
+          : errorMessage(new ApiError(400, { error: job.error! }), tr));
       }
     }
   }, [jobs]);
@@ -339,6 +346,47 @@ export function useModelCatalog() {
     }
   }
 
+  async function prepareModelDeletion(modelId: string) {
+    const current = connectionScope();
+    if (busy) return;
+    deletionTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setBusy(true);
+    try {
+      const plan = await modelsApi.modelDeletionPlan(modelId);
+      if (current()) setModelDeletion(plan);
+    } catch (cause) {
+      if (current()) reportError(cause);
+    } finally {
+      if (current()) setBusy(false);
+    }
+  }
+
+  function cancelModelDeletion() {
+    if (!busy) setModelDeletion(null);
+  }
+
+  async function confirmModelDeletion() {
+    const current = connectionScope();
+    if (busy || !modelDeletion) return;
+    const plan = modelDeletion;
+    setBusy(true);
+    ++artifactRequest.current;
+    try {
+      await modelsApi.deleteModel(plan.model_id, plan.token);
+      if (!current()) return;
+      ++artifactRequest.current;
+      setArtifacts(items => items.filter(item => item.id !== plan.model_id));
+      setModelDeletion(null);
+      const request = ++artifactRequest.current;
+      const next = await modelsApi.modelArtifacts(true);
+      if (current() && request === artifactRequest.current) setArtifacts(next);
+    } catch (cause) {
+      if (current()) reportError(cause);
+    } finally {
+      if (current()) setBusy(false);
+    }
+  }
+
   async function unloadInstance(id: string) {
     const current = connectionScope();
     if (busy) return;
@@ -394,5 +442,10 @@ export function useModelCatalog() {
     registerCurrentModelDirectory,
     unloadInstance,
     loadArtifact,
+    modelDeletion,
+    deletionTriggerRef,
+    prepareModelDeletion,
+    cancelModelDeletion,
+    confirmModelDeletion,
   };
 }

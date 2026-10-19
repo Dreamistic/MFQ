@@ -261,7 +261,9 @@ void NintRowPipeline::issue(const std::vector<int64_t>& ids,const std::vector<in
     s.pending=s.submit(ids,sequence,issued,carried);
 }
 tb::Tensor NintRowPipeline::collect(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,const tb::Device& device) {
-    auto& s=*impl_;issue(ids,shape);
+    auto& s=*impl_;
+    const auto started=s.profile?RowClock::now():RowClock::time_point{};
+    issue(ids,shape);
     if(s.pending.valid())s.ready.emplace(s.pending.get());
     s.early_prefix=false;
     const auto& result=*s.ready;auto out_shape=shape;out_shape.push_back(s.width);
@@ -272,6 +274,11 @@ tb::Tensor NintRowPipeline::collect(const std::vector<int64_t>& ids,const std::v
     result.batch.validate();auto packed=tb::tensor(result.batch.packed()).to(device);
     std::vector<int32_t> words(result.batch.descriptors().size());std::memcpy(words.data(),result.batch.descriptors().data(),words.size()*4);
     auto descriptors=tb::tensor(words).reshape({static_cast<int64_t>(result.batch.rows()),6}).to(device);
+    if(s.profile && ids.size()>128)std::fprintf(stderr,
+        "ple_prefill_rows rows=%zu unique_rows=%zu misses=%llu source_bytes=%llu packed_bytes=%zu queue_ms=%.3f gather_ms=%.3f read_ms=%.3f collect_ms=%.3f\n",
+        ids.size(),result.batch.rows(),static_cast<unsigned long long>(result.misses),
+        static_cast<unsigned long long>(result.source_bytes),result.batch.packed_nbytes(),
+        result.queue_ns/1e6,result.gather_ns/1e6,result.read_ns/1e6,row_elapsed(started)/1e6);
     return nint_selected_rows_cuda(packed,descriptors,s.width).index_select(0,tb::tensor(result.inverse).to(device)).reshape(out_shape);
 }
 std::shared_ptr<NintRowStage> NintRowPipeline::make_stage(const std::vector<int64_t>& shape,const tb::Device& device) {

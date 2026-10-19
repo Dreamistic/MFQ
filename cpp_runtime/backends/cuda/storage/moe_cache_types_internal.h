@@ -370,6 +370,7 @@ struct MoeCacheStats {
     int64_t pipeline_two_stage_serves=0;
     int64_t pipeline_transfer_cache_hits=0,pipeline_transfer_cache_misses=0,pipeline_transfer_cache_saved_bytes=0;
     int64_t pipeline_fetch_ns=0,pipeline_cpu_ns=0;
+    int64_t pipeline_ssd_read_ns=0,pipeline_window_ssd_read_ns=0;
     int64_t pipeline_window_serves=0,pipeline_window_route_ns=0,pipeline_window_plan_ns=0;
     int64_t pipeline_window_fetch_ns=0,pipeline_window_cpu_ns=0,pipeline_window_gpu_ns=0;
     // Host dispatch plans for three/four-row windows; routed experts only.
@@ -396,6 +397,8 @@ struct MoeCacheStats {
     int64_t pipeline_kv_direct_read_bytes=0,pipeline_kv_direct_read_fields=0;
     int64_t pipeline_kv_early_gu_serves=0;
     int64_t pipeline_gu_build_overlap_serves=0,pipeline_gu_build_overlap_copies=0;
+    int64_t pipeline_ssd_gu_overlap_serves=0,pipeline_ssd_gu_overlap_bytes=0;
+    int64_t pipeline_ssd_gu_compute_serves=0,pipeline_ssd_gate_up_wait_ns=0,pipeline_ssd_down_wait_ns=0;
     int64_t pipeline_kv_projection_hits=0,pipeline_kv_projection_misses=0,pipeline_kv_projection_fallbacks=0;
     int64_t pipeline_kv_projection_small_hit_bytes=0;
     int64_t pipeline_kv_projection_early_hits=0;
@@ -405,6 +408,7 @@ struct MoeCacheStats {
     int64_t pipeline_host_packet_serves=0,pipeline_host_packet_descriptor_bytes=0,pipeline_cached_phase_publishes=0;
     int64_t pipeline_direct_packet_serves=0,pipeline_direct_packet_batch_serves=0;
     int64_t pipeline_native_dma_batches=0,pipeline_native_dma_copies=0,pipeline_native_dma_fallbacks=0;
+    int64_t pipeline_projection_dma_merges=0;
     int64_t pipeline_window_input_view_serves=0;
     int64_t pipeline_prefetch_experts=0,pipeline_prefetch_bytes=0,pipeline_prefetch_hit_bytes=0,pipeline_prefetch_busy_skips=0;
     int64_t pipeline_gpu_ns=0;

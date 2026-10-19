@@ -76,6 +76,62 @@ beforeEach(() => {
 });
 
 describe('useModelCatalog', () => {
+  it('prepares deletion without removing files and requires explicit confirmation', async () => {
+    state.ready = true;
+    const plan = { model_id: artifact.id, name: artifact.name, files: ['/models/model.mfq'], total_bytes: 128, token: 'a'.repeat(64) };
+    vi.spyOn(modelsApi, 'modelDeletionPlan').mockResolvedValue(plan);
+    const remove = vi.spyOn(modelsApi, 'deleteModel').mockResolvedValue({ files: 1, total_bytes: 128 });
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toEqual([artifact]));
+    await act(async () => result.current.prepareModelDeletion(artifact.id));
+    expect(result.current.modelDeletion).toEqual(plan);
+    expect(remove).not.toHaveBeenCalled();
+    act(() => result.current.cancelModelDeletion());
+    expect(result.current.modelDeletion).toBeNull();
+    expect(remove).not.toHaveBeenCalled();
+    await act(async () => result.current.prepareModelDeletion(artifact.id));
+    vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([]);
+    await act(async () => result.current.confirmModelDeletion());
+    expect(remove).toHaveBeenCalledExactlyOnceWith(artifact.id, plan.token);
+    expect(result.current.modelDeletion).toBeNull();
+    expect(result.current.artifacts).toEqual([]);
+  });
+
+  it('connection changes dismiss deletion confirmation and discard old previews', async () => {
+    state.ready = true;
+    let resolve!: (plan: Awaited<ReturnType<typeof modelsApi.modelDeletionPlan>>) => void;
+    vi.spyOn(modelsApi, 'modelDeletionPlan').mockReturnValue(new Promise(done => { resolve = done; }));
+    const remove = vi.spyOn(modelsApi, 'deleteModel');
+    const { result, rerender } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toEqual([artifact]));
+    let pending!: Promise<void>;
+    act(() => { pending = result.current.prepareModelDeletion(artifact.id); });
+    setApiBaseUrl('http://other-server:8090');
+    state.connectionRevision++;
+    rerender();
+    await act(async () => {
+      resolve({ model_id: artifact.id, name: artifact.name, files: ['/models/model.mfq'], total_bytes: 128, token: 'a'.repeat(64) });
+      await pending;
+    });
+    expect(result.current.modelDeletion).toBeNull();
+    await act(async () => result.current.confirmModelDeletion());
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('deletion failure preserves the model and confirmation for retry', async () => {
+    state.ready = true;
+    const plan = { model_id: artifact.id, name: artifact.name, files: ['/models/model.mfq'], total_bytes: 128, token: 'a'.repeat(64) };
+    vi.spyOn(modelsApi, 'modelDeletionPlan').mockResolvedValue(plan);
+    vi.spyOn(modelsApi, 'deleteModel').mockRejectedValue(new Error('permission denied'));
+    const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.artifacts).toEqual([artifact]));
+    await act(async () => result.current.prepareModelDeletion(artifact.id));
+    await act(async () => result.current.confirmModelDeletion());
+    expect(result.current.modelDeletion).toEqual(plan);
+    expect(result.current.artifacts).toEqual([artifact]);
+    expect(result.current.busy).toBe(false);
+  });
+
   it('removes deleted checkpoints on the next fresh scan without a job change', async () => {
     vi.useFakeTimers();
     try {
@@ -512,5 +568,31 @@ describe('useModelCatalog', () => {
     useToastStore.getState().clearToasts();
     renderHook(useModelCatalog, { wrapper: Wrapper });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('reports an interrupted load without requiring an error in the first terminal SSE event', () => {
+    const job = { id: 'interrupted-load', kind: 'model.load', status: 'running', progress: .2,
+      cancel_requested: false, payload: { model: 'Local Model' },
+      created_at: '2026-09-23T10:00:00Z', updated_at: '2026-09-23T10:00:01Z' } as JobResource;
+    renderHook(useModelCatalog, { wrapper: Wrapper });
+    act(() => useJobStore.getState().setJobs([job]));
+    act(() => useJobStore.getState().updateJob(job.id, { status: 'interrupted' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('Model loading was interrupted. Please load the model again.');
+    act(() => useJobStore.getState().setJobs([{ ...job, status: 'interrupted' }]));
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+  });
+
+  it('waits for the failure detail instead of losing the error after a terminal state-only event', () => {
+    const job = { id: 'failed-load', kind: 'model.load', status: 'running', progress: .2,
+      cancel_requested: false, payload: { model: 'Local Model' },
+      created_at: '2026-09-23T10:00:00Z', updated_at: '2026-09-23T10:00:01Z' } as JobResource;
+    renderHook(useModelCatalog, { wrapper: Wrapper });
+    act(() => useJobStore.getState().setJobs([job]));
+    act(() => useJobStore.getState().updateJob(job.id, { status: 'failed' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    act(() => useJobStore.getState().updateJob(job.id, {
+      error: { code: 'LOAD_FAILED', message: 'load failed', retryable: false, details: {} },
+    }));
+    expect(screen.getByRole('alert')).toHaveTextContent('LOAD_FAILED: load failed');
   });
 });

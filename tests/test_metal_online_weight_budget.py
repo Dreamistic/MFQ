@@ -33,6 +33,7 @@ def test_native_online_weight_budget_preserves_streaming_kv_and_loaded_model(bat
                 before_output = await output()
                 before = await client.status()
                 assert before['resident_weight_dynamic_budget'] == 1
+                assert 0 < before['mlx_cache_limit_bytes'] <= (1 << 30) // 20
                 assert before['qsa_kv_offload_enabled'] == 1
                 dense = int(before['resident_weight_bytes'] - before['resident_reclaimable_weight_bytes'])
                 cap = dense + max(1024, int(before['resident_reclaimable_weight_bytes']) // 2)
@@ -41,6 +42,7 @@ def test_native_online_weight_budget_preserves_streaming_kv_and_loaded_model(bat
                 after = await client.status()
                 assert after['resident_weight_budget_bytes'] == cap
                 assert after['resident_weight_bytes'] <= cap
+                assert after['mlx_cache_limit_bytes'] == before['mlx_cache_limit_bytes']
                 assert after['qsa_kv_budget_bytes'] == before['qsa_kv_budget_bytes'] == 131072
                 assert after['kv_cache_contexts'] == before['kv_cache_contexts']
                 assert after['kv_cache_bytes'] == before['kv_cache_bytes']
@@ -51,6 +53,7 @@ def test_native_online_weight_budget_preserves_streaming_kv_and_loaded_model(bat
                     await client.set_resident_memory_budget(1 << 30, max(1, dense - 1))
                 assert rejected.value.code == 'resident_budget_exhausted'
                 assert (await client.status())['resident_weight_budget_bytes'] == cap
+                assert (await client.status())['mlx_cache_limit_bytes'] == before['mlx_cache_limit_bytes']
                 await client.set_resident_memory_budget(1 << 30)
                 assert (await client.status())['resident_weight_budget_bytes'] == cap
                 await client.set_resident_memory_budget(1 << 30, 0)
@@ -58,7 +61,9 @@ def test_native_online_weight_budget_preserves_streaming_kv_and_loaded_model(bat
                 await client.set_resident_memory_budget(0, cap)
                 assert (await client.status())['resident_weight_budget_bytes'] == cap
                 await client.set_resident_memory_budget(0, 0)
-                assert (await client.status())['resident_weight_budget_bytes'] == 0
+                unlimited = await client.status()
+                assert unlimited['resident_weight_budget_bytes'] == 0
+                assert unlimited['mlx_cache_limit_bytes'] > before['mlx_cache_limit_bytes']
             finally:
                 await client.aclose()
                 if process.returncode is None:

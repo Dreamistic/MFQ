@@ -317,14 +317,16 @@ test('注册资产显示文件总大小，已载入模型可在生成期间切�
     { id: 'instance-2', model: nextModel, state: 'ready', devices: ['cpu'] },
   ] } }));
   let forks = 0;
-  await page.route('**/api/v1/sessions/session-1/fork', (route) => {
-    forks += 1;
-    expect(route.request().postDataJSON().model).toBe(nextModel);
-    return route.fulfill({ json: { id: 'session-2', model: nextModel, mode: 'text', state: 'idle',
-      revision: 0, title: 'Regression conversation', created_at: '2026-01-01', updated_at: '2026-01-01', metadata: {} } });
+  const responseModels: string[] = [];
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/v1/sessions/session-1/responses') {
+      responseModels.push(request.postDataJSON().model);
+    }
   });
-  await page.route('**/api/v1/sessions/session-2/messages', (route) => route.fulfill({ json: { data: [] } }));
-  await page.route('**/api/v1/sessions/session-2/responses?*', (route) => route.fulfill({ json: { data: [] } }));
+  await page.route('**/api/v1/sessions/*/fork', (route) => {
+    forks += 1;
+    return route.abort();
+  });
   await page.goto('/models');
   await expect(page.locator('.model-workbench-summary > div').last()).toContainText('Registered model assets size');
   await expect(page.locator('.model-workbench-summary > div').last().locator('strong')).toHaveText('40 GiB');
@@ -342,10 +344,20 @@ test('注册资产显示文件总大小，已载入模型可在生成期间切�
   await expect(selector).toHaveValue(nextModel);
   expect(forks).toBe(0);
   state.releaseResponse();
-  await expect.poll(() => forks).toBe(1);
   await expect(input).toBeEnabled();
+  await expect(page.locator('.message-assistant')).toContainText('A streamed answer with formatted content.');
+  expect(forks).toBe(0);
   await expect(selector).toHaveValue(nextModel);
   expect(state.submissions).toBe(1);
+  expect(responseModels).toEqual(['Studio Test Model']);
+  await input.fill('Continue this conversation on the selected model');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect.poll(() => state.submissions).toBe(2);
+  expect(responseModels).toEqual(['Studio Test Model', nextModel]);
+  state.releaseResponse();
+  await expect(input).toBeEnabled();
+  expect(forks).toBe(0);
+  expect(state.requests.filter((request) => /^POST \/api\/v1\/sessions(?:\?|$)/.test(request))).toEqual([]);
   expect(state.requests.filter((request) => request.startsWith('POST /api/v1/models'))).toEqual([]);
   expect(state.unexpected).toEqual([]);
 });

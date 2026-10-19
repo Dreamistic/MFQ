@@ -42,6 +42,24 @@ void AsyncRangeReader::read(const std::vector<ReadSpan>& spans) const {
             merged.back().last = std::max(merged.back().last, interval.last);
         else merged.push_back(interval);
     }
+    if(alignment>1 && merged.size()>64) {
+        // Large sparse row gathers otherwise spend an IRP on nearly every
+        // sector. Read nearby sectors together, bounded to 64 KiB and twice
+        // the useful sector bytes. Small expert-field batches keep exact I/O.
+        std::vector<Interval> coalesced;coalesced.reserve(merged.size());
+        std::uint64_t useful=0;
+        for(const auto interval:merged) {
+            const auto size=interval.last-interval.first;
+            if(!coalesced.empty()) {
+                auto& previous=coalesced.back();const auto cover=interval.last-previous.first;
+                if(cover<=65536 && cover<=2*(useful+size)) {
+                    previous.last=interval.last;useful+=size;continue;
+                }
+            }
+            coalesced.push_back(interval);useful=size;
+        }
+        merged=std::move(coalesced);
+    }
     std::uint64_t bytes = 0;
     for (const auto interval : merged) {
         const auto count = interval.last - interval.first;
@@ -49,12 +67,17 @@ void AsyncRangeReader::read(const std::vector<ReadSpan>& spans) const {
             throw std::overflow_error("batched range storage exceeds address space");
         bytes += count;
     }
-    // Disjoint buffered ranges already accept the caller's exact destinations.
-    // Typical PLE misses are five disjoint streams: no aligned bounce storage
-    // or copy-back is needed. Retain coalescing for overlapping/adjacent ranges.
-    if(alignment==1 && merged.size()==intervals.size()) {
-        state.file.read_batch(spans);
-        state.logical.fetch_add(bytes,std::memory_order_relaxed);
+    // The file reader already supplies direct I/O's aligned storage. Disjoint
+    // ranges need no second buffer and copy-back in this batching wrapper.
+    // Keep sector coalescing when requests overlap or touch.
+    if(merged.size()==intervals.size()) {
+        if(alignment>1 && spans.size()>1) {
+            auto ordered=spans;
+            std::sort(ordered.begin(),ordered.end(),[](const ReadSpan& a,const ReadSpan& b){return a.offset<b.offset;});
+            state.file.read_batch(ordered);
+        }else state.file.read_batch(spans);
+        std::uint64_t logical=0;for(const auto& span:spans)logical+=span.size;
+        state.logical.fetch_add(logical,std::memory_order_relaxed);
         return;
     }
     std::vector<std::byte> storage(static_cast<std::size_t>(bytes));

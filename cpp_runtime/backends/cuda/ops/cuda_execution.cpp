@@ -150,6 +150,10 @@ int residency_interval() {
     return environment_int("MFQ_MOE_RESIDENCY_INTERVAL",1,1,1024);
 }
 bool router_lookahead() { return exact_one("MFQ_MOE_ROUTER_LOOKAHEAD"); }
+std::optional<bool> router_lookahead_override() {
+    const auto* value=std::getenv("MFQ_MOE_ROUTER_LOOKAHEAD");
+    return value?std::optional<bool>(std::string_view(value)=="1"):std::nullopt;
+}
 bool batch_attention_projections() {
     const auto* value=std::getenv("MFQ_BATCH_ATTENTION_PROJECTIONS");
     return !value || value[0]!='0';

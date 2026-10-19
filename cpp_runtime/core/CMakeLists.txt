@@ -5,6 +5,10 @@ add_library(mfq-host-parallel STATIC host_parallel.cpp include/mfq/host_parallel
     cpu_expert_pool.cpp include/mfq/cpu_expert_pool.h)
 target_include_directories(mfq-host-parallel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(mfq-host-parallel PUBLIC cxx_std_17)
+if(MSVC)
+    # Worker failures must unwind dispatch locks before the caller retries.
+    target_compile_options(mfq-host-parallel PRIVATE /EHsc)
+endif()
 target_link_libraries(mfq-host-parallel PUBLIC Threads::Threads)
 set_target_properties(mfq-host-parallel PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(mfq::host-parallel ALIAS mfq-host-parallel)
@@ -62,6 +66,9 @@ target_link_libraries(mfq-model-source PUBLIC mfq-model-graph)
 target_link_libraries(mfq-model-source PRIVATE mfq-host-parallel)
 target_link_libraries(mfq-model-source PRIVATE mfq-json)
 target_compile_features(mfq-model-source PUBLIC cxx_std_17)
+if(MSVC)
+    target_compile_options(mfq-model-source PRIVATE /EHsc)
+endif()
 set_target_properties(mfq-model-source PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )

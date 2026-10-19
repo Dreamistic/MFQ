@@ -35,8 +35,8 @@ export function ModelLoadMemoryEstimate({ models, runtime, deviceIds, value, val
     ? estimateLoadMemory(selected, data.profile, value) : null;
   const exceeded = estimate != null && available != null && estimate.total > available;
   return <div className="model-load-memory-estimate">
-    <p>{tr('不确定设备能否载入模型时，可在这里选择模型，结合当前可用空间查看预计占用。模型载入时可能释放部分系统占用，可用空间通常会略高于当前测量值，但增加有限。',
-      'If you are unsure whether your device can load a model, select it here to compare estimated usage with currently available memory. Loading may release some system memory, so available space is often slightly higher than measured, but the increase is limited.')}</p>
+    <p>{tr('选择模型，比较预计占用与剩余推理预算。自动预算已考虑系统预留和可回收内存。',
+      'Select a model to compare estimated usage with the remaining inference budget. The automatic budget accounts for system headroom and reclaimable memory.')}</p>
     <div className="model-load-estimate-row">
       <strong>{tr('预计总占用（显存 + 内存）', 'Estimated total (VRAM + RAM)')}</strong>
       <div className="model-load-estimate-values">

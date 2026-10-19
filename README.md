@@ -79,20 +79,30 @@ vector formats can coexist within the same layer, with independent choices for
 each expert's Gate, Up and Down projections. The native runtimes execute these
 mixed formats directly.
 
+MFQ's base formats also reduce reconstruction error. Across the seven listed
+MFQ/GGUF format pairs, mean SSE is **4.04%–25.16% lower** on the tested layer-0
+expert matrices. The figure shows the actual bpw for each pair.
+
 For **Qwen3.8-Flash-Next**, the packed expert tensors in the Unsloth UD
 `IQ3_XXS` recipe select one GGUF format for each layer's Gate, Up and Down
 projections. MFQ `V3-XXS` selects a profile for **each expert projection**:
 **1,536 allocation slots per layer**, compared with **3** in that recipe.
 
 <p align="center">
-  <img src="./docs/figures/qwen38-flash-next-allocation-comparison.svg" alt="Actual layer 0 allocation: Unsloth UD IQ3_XXS shares one format across each packed expert projection; MFQ V3-XXS assigns profiles independently to each expert's Gate, Up and Down" width="1100">
+  <img src="./docs/figures/qwen38-flash-next-allocation-comparison.svg" alt="Qwen3.8-Flash-Next layer 0: GGUF versus MFQ expert-projection precision allocation, plus seven base-format comparisons with actual bpw and 4.04%–25.16% lower mean reconstruction SSE for MFQ" width="1100">
 </p>
 
-The figure shows **Qwen3.8-Flash-Next, layer 0, experts 0–11**. Colors identify
+The allocation panels show **Qwen3.8-Flash-Next, layer 0, experts 0–11**. Colors identify
 the selected profiles. Expert 9 uses **NVQ3J-L for Gate and Up** and **NINT4 for
 Down**. The **512×** ratio compares allocation slots per layer for MFQ and this
 GGUF recipe; GGUF block-level quantization parameters can still vary. See the
 [allocation data and sources](./docs/figures/data/qwen38-flash-next-layer0-allocation.json).
+
+The lower panel's SSE is the equally weighted mean across **1,536 matrices in
+layer 0**: all 512 experts' Gate, Up and Down projections. Actual bpw differs
+within each format pair. See the [format benchmark notes](./docs/benchmarks/qwen38-flash-next-base-format-sse.md)
+for the complete SSE table and the [format data](./docs/figures/data/qwen38-flash-next-base-format-sse.json)
+for the supplied values and their source.
 
 <details>
 <summary>Full-model precision heatmaps</summary>
@@ -117,16 +127,31 @@ expert work while preserving each projection's selected format. The **V3-XXS**
 tier shown above reaches **105.4 tok/s on M5 Max** and **61.0 tok/s on
 RTX 3090 Ti + 32 GiB RAM**, with MTP enabled.
 
+The chart compares MFQ, Strata, llama.cpp and oMLX on the same **M5 Max (40-core GPU,
+128 GB)**, using **Qwen3.8-Flash-Next** and a **4,096-token Python-code input**.
+Each runtime's tested quantization tiers are shown separately.
+
 <p align="center">
-  <img src="./docs/figures/qwen38-flash-next-inference-speed.svg" alt="MFQ Qwen3.8-Flash-Next horizontal speed charts: Apple Metal and NVIDIA CUDA generation with MTP off and on, plus prompt processing; V3-XXS is highlighted" width="1100">
+  <img src="./docs/figures/qwen38-flash-next-metal-runtime-comparison.svg" alt="Qwen3.8-Flash-Next on M5 Max: MFQ, Strata, llama.cpp and oMLX prompt processing and generation with MTP off and on, across 17 runtime/checkpoint configurations" width="1100">
 </p>
 
-All measurements use **Qwen3.8-Flash-Next with 4,096-token inputs**. Metal runs
-on an **M5 Max (40-core GPU, 128 GB)**. CUDA runs on an **RTX 3090 Ti**, with
-**32 GiB RAM** for V1-S, V1-M, S2-L and V3-XXS, and **64 GiB RAM** for S3-L and
-V4-XS. Shading marks `V3-XXS`; paired generation bars compare MTP off and on.
-See [Benchmarks](#benchmarks) for the complete table and
-[chart data](./docs/figures/data/qwen38-flash-next-inference-speed.json) for the plotted values.
+Shading and bold labels mark **MFQ V3-XXS (82.0 GB)** and the selected
+comparison tiers: **GSQ-RCO IQ3_S (83.6 GB)** and **Jundot oQ3.5e (about 93.9 GB)**.
+IQ3_S has a similar weight size to V3-XXS; oQ3.5e is larger.
+These weight sizes exclude the vision encoder and MTP head.
+With MTP enabled, V3-XXS reaches **105.4 tok/s**, while IQ3_S reaches
+**99.6 tok/s** in Strata and **59.3 tok/s** in llama.cpp.
+oQ3.5e reaches **111.0 tok/s** in oMLX with adaptive MTP.
+
+The MFQ source gives one prefill value per tier; all other prefill bars use
+MTP-off measurements. oMLX uses the official macOS 26/27 DMG with native NAX
+kernels and adaptive MTP; its prefill timing includes first-token overhead.
+Quantization tiers, draft configurations and repeat counts differ. See the
+[benchmark notes](./docs/benchmarks/qwen38-flash-next-metal-comparison.md)
+for complete conditions and tables, and the
+[comparison data](./docs/figures/data/qwen38-flash-next-metal-runtime-comparison.json)
+for all published values and their sources.
+For CUDA results and complete MFQ speed tables, see [Benchmarks](#benchmarks).
 
 MFQ's Apple Metal backend is built on [MLX](https://github.com/ml-explore/mlx),
 with a native C++ runtime and custom Metal kernels for MFQ quantization formats.
@@ -159,8 +184,20 @@ Continuous batching is available on supported native paths.
 3. Use the loaded model locally or connect an application through the compatible
    APIs. No source build is needed.
 
+**Serving overview**
+
 <p align="center">
   <img src="./docs/figures/mfq-studio-overview-en.png" alt="MFQ Studio: local model serving, live performance and resource overview" width="1100">
+</p>
+
+**Quantization analysis**
+
+MFQ Studio's built-in quantization visualization makes it easy to explore
+the precision allocation of any MoE checkpoint, with detailed views across
+layers, experts, and individual Gate, Up and Down projections.
+
+<p align="center">
+  <img src="./docs/figures/mfq-studio-analysis-en.png" alt="MFQ Studio Analysis: checkpoint architecture, model structure and projection-level precision details" width="1100">
 </p>
 
 ### Build from source

@@ -16,6 +16,7 @@ namespace mfq::metal {
 
 class MfqContainer;
 class MlxMfeWeight;
+struct MlxMfeCachedProjection;
 class MlxNintSwiGluPair;
 class MlxNintWeight;
 
@@ -47,6 +48,8 @@ struct MlxMfeCacheReuseStats {
     double wait_seconds = 0;
     double prepare_seconds = 0;
     double view_seconds = 0;
+    std::size_t cached_route_hits = 0;
+    std::size_t cached_route_misses = 0;
 };
 
 // Optional bounded per-expert residency for MFE records.
@@ -95,16 +98,22 @@ public:
     MlxMfeWeight grouped_mfe(
         const std::string& name,
         const std::vector<std::int32_t>& active_experts,
-        std::span<const std::uint32_t> activation_counts = {});
+        std::span<const std::uint32_t> activation_counts = {},
+        bool prefill_scan = false);
 
     std::vector<MlxMfeWeight> grouped_mfe(
         std::span<const std::string> names,
         const std::vector<std::int32_t>& active_experts,
-        std::span<const std::uint32_t> activation_counts = {});
+        std::span<const std::uint32_t> activation_counts = {},
+        bool prefill_scan = false);
 
     std::optional<std::vector<MlxMfeWeight>> layer_mfe(
         std::span<const std::string> names,
         std::span<const std::int32_t> active_experts = {});
+
+    std::shared_ptr<const MlxMfeCachedProjection> cached_projection(const std::string& name);
+    bool resolve_cached_projections(std::span<const std::shared_ptr<const MlxMfeCachedProjection>> views,
+        std::span<const std::int32_t> experts);
 
     std::size_t cache_limit_bytes() const noexcept;
     std::size_t resident_packed_bytes() const;
@@ -156,6 +165,7 @@ public:
     static MlxMfeWeight from_blob(const mlx::core::array& blob);
     static MlxMfeWeight from_nint_blob(
         std::span<const std::uint8_t> blob);
+    static MlxMfeWeight from_nint_blob(const mlx::core::array& blob);
 
     // Load compatible packed projections into one final arena, without
     // separate Gate/Up arenas or model-sized staging vectors. Standalone
@@ -323,18 +333,29 @@ public:
     int neuron_len() const noexcept;
     int projections() const noexcept;
     std::size_t packed_nbytes() const noexcept;
+    static std::size_t packed_copy_count() noexcept;
+    static std::size_t indirect_dispatch_count() noexcept;
+    static std::size_t uncached_packed_bytes() noexcept;
+    static std::size_t pinned_packed_bytes() noexcept;
+    static std::size_t packed_pin_failures() noexcept;
+    static std::size_t pooled_staging_count() noexcept;
 
 private:
     struct Impl;
 
     friend class MlxMfeOffloadCache;
+    static MlxMfeWeight concatenate_expert_pages(const std::vector<MlxMfeWeight>& weights,
+        std::shared_ptr<const MlxMfeKernelProfile> profile = nullptr);
+    std::shared_ptr<void> pin_packed_storage() const noexcept;
     MlxMfeWeight with_kernel_profile(
         std::shared_ptr<const MlxMfeKernelProfile> profile) const;
+    MlxMfeWeight with_prepared_page_resources() const;
 
     static MlxMfeWeight from_projection_blobs_impl(
         std::span<const std::span<const std::uint8_t>> blobs,
         bool nint_tensor,
-        const mlx::core::array* storage = nullptr);
+        const mlx::core::array* storage = nullptr,
+        const mlx::core::array* destination = nullptr);
 
     explicit MlxMfeWeight(std::shared_ptr<const Impl> impl);
 
@@ -360,6 +381,14 @@ private:
 };
 
 using MlxMoeWeight = MlxMfeWeight;
+
+struct MlxMfeCachedProjection {
+    MlxMfeWeight weight;
+    mlx::core::array expert_map;
+    std::vector<std::int32_t> host_expert_map;
+    std::string name;
+    std::size_t metadata_bytes = 0;
+};
 
 // Resolve canonical split Gate/Up projections into one packed dispatch.
 // Legacy fused ``gate_up.weight`` remains a read-only compatibility input.

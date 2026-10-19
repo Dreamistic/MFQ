@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
 from mfq.server.state.catalog import DiscoveredModel, ModelArtifactNotFoundError, ModelCatalog
 from mfq.server.runtime.host_memory import (
+    MemoryReleaseCredit,
     automatic_memory_reserve,
     host_memory_snapshot,
     metal_allocation_limit,
@@ -143,6 +144,9 @@ class _Runtime(BaseModel):
     last_used_at: datetime | None = None
     active_requests: int = 0
     queued_requests: int = 0
+    serving_snapshot: dict[str, Any] = Field(default_factory=dict)
+    serving_sampled_at: float = 0.0
+    serving_refreshing: bool = False
     control_leases: int = 0
     read_control_leases: int = 0
     request_slots: asyncio.Semaphore | None = None
@@ -358,9 +362,11 @@ class RuntimePool:
         self._shared_cache_pressure_checked_at = 0.0
         self._host_vm_counters: tuple[int, int] | None = None
         self._host_vm_pressure_until = 0.0
+        self._memory_release_credit = MemoryReleaseCredit()
         self.store = None
         self._instances: dict[UUID, _Runtime] = {}
         self._loading_model_names: set[str] = set()
+        self._deleting_model_paths: set[Path] = set()
         self._load_events: dict[str, asyncio.Event] = {}
         self._load_errors: dict[str, ErrorDetail] = {}
         self._load_failures: dict[str, _CachedLoadFailure] = {}
@@ -549,6 +555,9 @@ class RuntimePool:
             raise _job_error(
                 "model_artifact_not_found", f"model artifact was not found: {error}"
             ) from error
+        async with self._lock:
+            if artifact.path.resolve() in self._deleting_model_paths:
+                raise _job_error("model_delete_busy", "Model files are being deleted; retry after deletion finishes")
         if not artifact.resource.loadable:
             raise _job_error(
                 (
@@ -700,6 +709,8 @@ class RuntimePool:
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
+            if artifact.path.resolve() in self._deleting_model_paths:
+                raise _job_error("model_delete_busy", "Model files are being deleted; retry after deletion finishes")
             existing = next(
                 (
                     item
@@ -853,6 +864,7 @@ class RuntimePool:
             await context.progress(0.02, message="Starting runtime process")
             process = await asyncio.create_subprocess_exec(
                 *command,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 stdin=(
                     asyncio.subprocess.PIPE
                     if self.transport == "stdio"
@@ -2058,6 +2070,23 @@ class RuntimePool:
             }
         )
 
+    @asynccontextmanager
+    async def model_deletion_guard(self, artifact: DiscoveredModel) -> AsyncIterator[None]:
+        path = artifact.path.resolve()
+        async with self._lock:
+            if path in self._deleting_model_paths or artifact.resource.name in self._loading_model_names or any(
+                (item.artifact.path.resolve() == path or item.artifact.resource.name == artifact.resource.name)
+                and item.state != RuntimeInstanceState.FAILED
+                for item in self._instances.values()
+            ):
+                raise BackendError("model_delete_busy", "Unload the model and wait for loading to finish before deleting it", status_code=409)
+            self._deleting_model_paths.add(path)
+        try:
+            yield
+        finally:
+            async with self._lock:
+                self._deleting_model_paths.discard(path)
+
     async def fork_session(self, source_session_id: UUID, target_session_id: UUID) -> bool:
         async with self._lock:
             instance_id = self._session_routes.get(source_session_id)
@@ -2137,6 +2166,32 @@ class RuntimePool:
             if backend is None:
                 raise BackendError("model_not_loaded", "no runtime is available")
             return await backend.capabilities()
+
+    async def serving_activity(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        async def refresh(item: _Runtime) -> None:
+            if not item.active_requests or item.serving_refreshing or now - item.serving_sampled_at < 0.45:
+                return
+            item.serving_refreshing = True
+            try:
+                status = await asyncio.wait_for(item.backend.runtime_status(), timeout=0.25)
+                live = status.get("live_requests")
+                if isinstance(live, dict):
+                    item.serving_snapshot = {key: value for key, value in live.items() if isinstance(value, dict)}
+                    item.serving_sampled_at = time.monotonic()
+            except Exception:
+                pass
+            finally:
+                item.serving_refreshing = False
+        await asyncio.gather(*(refresh(item) for item in tuple(self._instances.values())))
+        now = time.monotonic()
+        return [{"instance_id": str(item.id), "model": item.artifact.resource.name,
+            "state": item.state.value, "active_requests": item.active_requests,
+            "queued_requests": item.queued_requests,
+            "sample_age_seconds": now - item.serving_sampled_at if item.serving_sampled_at else None,
+            "requests": [{"id": key, **value} for key, value in item.serving_snapshot.items()]
+                if item.active_requests else []}
+            for item in self._instances.values() if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}]
 
     async def runtime_status(
         self,
@@ -3503,7 +3558,10 @@ class RuntimePool:
             return ceiling
         reserve = automatic_memory_reserve(snapshot.total)
         ceiling = min(ceiling, max(1, snapshot.total - reserve))
-        dynamic_ceiling = physical + snapshot.reclaimable(active_ratio=0.0) - reserve
+        own_cpu = cpu + (process_physical_footprint(os.getpid()) or 0)
+        reclaimable = snapshot.reclaimable(active_ratio=0.25, own_cpu_bytes=own_cpu)
+        released = self._memory_release_credit.update(physical, snapshot.reclaimable(active_ratio=0.0))
+        dynamic_ceiling = physical + reclaimable + released - reserve
         return max(1, min(ceiling, dynamic_ceiling))
 
     def _runtime_memory_pressure_locked(
@@ -4111,6 +4169,10 @@ class RuntimePool:
             if kv_bytes is not None:
                 instance.kv_bytes = kv_bytes
             if status is not None:
+                live = status.get("live_requests")
+                if isinstance(live, dict):
+                    instance.serving_snapshot = {key: value for key, value in live.items() if isinstance(value, dict)}
+                    instance.serving_sampled_at = time.monotonic()
                 instance.memory = self._memory_resources(status, instance.memory, device_ids=getattr(instance, "device_ids", ()))
                 instance.prefix_dynamic_budget = status.get("prefix_cache_dynamic_budget") == 1
                 instance.prefix_concurrent_maintenance = status.get("prefix_cache_concurrent_maintenance") == 1
@@ -4374,11 +4436,45 @@ class RuntimePool:
                 return port
         raise RuntimeManagementError("unable to reserve a unique runtime port")
 
+    def _cuda_expert_host_budget(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int:
+        total, available = host_memory_capacity()
+        budget = max(0, min(available or 0, max(0, (total or 0) - (4 << 30))) - (2 << 30))
+        # KV has priority over the evictable expert tier. Price the target KV
+        # before filling RAM, so SSD experts do not consume its reservation.
+        try:
+            plan = checkpoint_kv_budget(artifact,
+                self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled),
+                request.kv_memory, request.kv_quantization)
+        except ValueError:
+            # Missing/unsupported KV metadata is validated by its own path.
+            plan = None
+        if plan is not None:
+            reserve = plan.ram_required_bytes
+            if not request.kv_memory.ram_preallocated:
+                reserve = min(reserve, request.kv_memory.ram_budget_bytes or (4 << 30))
+            budget = max(0, budget - reserve)
+        if memory_topology()["memory_architecture"] == "unified":
+            budget = max(0, budget - self._estimated_load_bytes(artifact, request))
+        configured = self.runtime_environment.get("MFQ_MOE_HOST_CACHE_BYTES", os.environ.get("MFQ_MOE_HOST_CACHE_BYTES"))
+        if configured is not None:
+            try:
+                value = int(configured)
+            except ValueError as error:
+                raise _job_error("runtime_ram_expert_budget_invalid", "expert RAM cache budget must be a non-negative byte count") from error
+            if value < 0:
+                raise _job_error("runtime_ram_expert_budget_invalid", "expert RAM cache budget must be a non-negative byte count")
+            budget = min(budget, value)
+        return budget
+
     def _kv_ram_limit(self, artifact: DiscoveredModel, request: ModelLoadRequest) -> int | None:
         _, available = host_memory_capacity()
         limit = request.kv_memory.ram_budget_bytes
         if available is not None:
-            cold_experts = max(0, artifact.routed_expert_bytes - int((request.moe_gpu_cache_gb or 0) * (1 << 30)))
+            resident_weights = max(0, artifact.resource.total_bytes - artifact.always_streamed_bytes)
+            cold_experts = max(0, resident_weights - self._estimated_load_bytes(artifact, request))
+            if (self.backend == "cuda" and (request.moe_gpu_cache_gb or 0) > 0
+                    and supports_cuda_ram_expert_pipeline(artifact.path)):
+                cold_experts = min(cold_experts, self._cuda_expert_host_budget(artifact, request))
             available = max(0, available - cold_experts - (2 << 30))
             limit = available if limit is None else min(limit, available)
         return limit
@@ -4453,15 +4549,15 @@ class RuntimePool:
         if self.backend == "cuda":
             process_environment.setdefault("MFQ_MEMORY_ARCHITECTURE", memory_topology()["memory_architecture"])
         if (self.backend == "cuda" and artifact.resource.format == "mfq"
-                and request.moe_gpu_cache_gb is not None and request.moe_gpu_cache_gb > 0
-                and memory_topology()["memory_architecture"] == "discrete"):
-            total, available = host_memory_capacity()
-            host_budget = max(0, min(available or 0, (total or 0) - (4 << 30)) - (2 << 30))
+                and request.moe_gpu_cache_gb is not None and request.moe_gpu_cache_gb > 0):
+            host_budget = self._cuda_expert_host_budget(artifact, request)
             cold_bytes = max(0, artifact.routed_expert_bytes - int(request.moe_gpu_cache_gb * (1 << 30)))
-            if host_budget < cold_bytes:
-                raise _job_error("runtime_ram_expert_budget_exceeded",
-                    "remaining experts do not fit in available RAM; reduce the model size or free host memory")
             if supports_cuda_ram_expert_pipeline(artifact.path):
+                streaming = host_budget < cold_bytes or process_environment.get("MFQ_MOE_PRELOAD_ALL") == "0"
+                allow_ssd = process_environment.get("MFQ_MOE_SSD_EXPERTS", "1") != "0"
+                if streaming and not allow_ssd:
+                    raise _job_error("runtime_ram_expert_budget_exceeded",
+                        "remaining experts do not fit in RAM; enable SSD expert streaming or reduce the model size")
                 defaults = {
                     "MFQ_MOE_HOST_CACHE_BYTES": str(host_budget),
                     "MFQ_MOE_PIPELINE": "1",
@@ -4486,7 +4582,16 @@ class RuntimePool:
                     defaults["MFQ_CUDA_VRAM_LIMIT_GIB"] = str(device_limit / float(1 << 30))
                 for name, value in defaults.items():
                     process_environment.setdefault(name, value)
+                process_environment["MFQ_MOE_HOST_CACHE_BYTES"] = str(host_budget)
+                process_environment["MFQ_MOE_SSD_EXPERTS"] = "1" if allow_ssd else "0"
+                if streaming:
+                    process_environment["MFQ_MOE_PRELOAD_ALL"] = "0"
+                    process_environment["MFQ_MOE_ASSERT_RESIDENT"] = "0"
+                    process_environment["MFQ_MOE_NVQ_DENSE"] = "0"
             else:
+                if host_budget < cold_bytes:
+                    raise _job_error("runtime_ram_expert_budget_exceeded",
+                        "this expert container requires complete RAM residency; use a canonical MFQ checkpoint for SSD streaming")
                 # Older expert containers use the resident CPU loader, followed
                 # by the same bounded GPU cache; they must not read SSD per step.
                 process_environment.setdefault("MFQ_DISABLE_MOE_SSD_RANGES", "1")

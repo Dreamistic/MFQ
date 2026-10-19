@@ -715,6 +715,48 @@ private:
     std::optional<MlxNintSwiGluPair> nint_gate_up_;
 };
 
+struct Qwen4CachedRoute {
+    std::shared_ptr<MlxMfeOffloadCache> cache;
+    std::vector<std::shared_ptr<const MlxMfeCachedProjection>> projections;
+    std::optional<array> ids;
+
+    array forward(const array& source, const array& routes) {
+        ids = routes;
+        auto gate_ids = mlx::core::take(projections[0]->expert_map, routes);
+        const auto down = projections.size() - 1;
+        auto intermediate = projections.size() == 3
+            ? moe_swiglu_split(mlx::core::concatenate({
+                projections[0]->weight.routed_matmul(source, gate_ids),
+                projections[1]->weight.routed_matmul(source,
+                    mlx::core::take(projections[1]->expert_map, routes))}, -1))
+            : projections[0]->weight.routed_swiglu(source, gate_ids);
+        return projections[down]->weight.routed_matmul(intermediate,
+            mlx::core::take(projections[down]->expert_map, routes));
+    }
+
+    std::span<const std::int32_t> host_ids() {
+        if (!ids) throw std::logic_error("cached route was not evaluated");
+        ids->eval();
+        if (ids->dtype() != mlx::core::int32 || !ids->flags().row_contiguous) {
+            ids = mlx::core::contiguous(mlx::core::astype(*ids, mlx::core::int32));
+            ids->eval();
+        }
+        return {ids->data<std::int32_t>(), ids->size()};
+    }
+
+    bool all_resident() {
+        const auto routes = host_ids();
+        for (const auto& projection : projections) for (const auto expert : routes) {
+            if (expert < 0 || static_cast<std::size_t>(expert) >= projection->host_expert_map.size())
+                throw std::out_of_range("cached expert route is out of range");
+            if (projection->host_expert_map[expert] < 0) return false;
+        }
+        return true;
+    }
+
+    bool resolve() { return cache->resolve_cached_projections(projections, host_ids()); }
+};
+
 class Qwen4Moe {
 public:
     const std::optional<array>& training_routes() const { return training_routes_; }
@@ -841,10 +883,23 @@ public:
         return std::nullopt;
     }
 
+    std::optional<Qwen4CachedRoute> cached_route() const {
+        if (!mfe_offload_cache_) return std::nullopt;
+        Qwen4CachedRoute route{mfe_offload_cache_, {}, std::nullopt};
+        for (const auto& name : {gate_name_, up_name_.value_or(down_name_), down_name_}) {
+            if (route.projections.size() == 2 && !up_name_) break;
+            auto projection = mfe_offload_cache_->cached_projection(name);
+            if (!projection) return std::nullopt;
+            route.projections.push_back(std::move(projection));
+        }
+        return route;
+    }
+
     array operator()(
         const array& value,
         MlxSsdPrefetchedExpertLayer* prefetched = nullptr,
-        bool batched_decode = false) const {
+        bool batched_decode = false,
+        Qwen4CachedRoute* deferred_route = nullptr) const {
         auto source = mlx::core::reshape(
             value.dtype() == mlx::core::float16
                 ? value : mlx::core::astype(value, mlx::core::float16),
@@ -976,6 +1031,16 @@ public:
                 return output;
             }
             if (mfe_offload_cache_) {
+                if (tokens == 1 && !detail::component_profile_active()) {
+                    auto local_route = deferred_route ? std::nullopt : cached_route();
+                    auto* cached = deferred_route ? deferred_route : local_route ? &*local_route : nullptr;
+                    if (cached) {
+                        auto output = cached->forward(source, routes.ids);
+                        if (deferred_route) return output;
+                        mlx::core::async_eval({output});
+                        if (cached->resolve()) return output;
+                    }
+                }
                 auto global_ids = mlx::core::contiguous(
                     mlx::core::astype(routes.ids, mlx::core::int32));
                 global_ids.eval();
@@ -995,7 +1060,7 @@ public:
                     }
                     ++seen[static_cast<std::size_t>(expert)];
                 }
-                if (tokens > 6) {
+                if (tokens > 6 && !batched_decode) {
                     std::vector<std::string> names{gate_name_, down_name_};
                     if (up_name_) names.push_back(*up_name_);
                     if (auto layer = mfe_offload_cache_->layer_mfe(names, active)) {
@@ -1024,14 +1089,34 @@ public:
                 }
                 const auto* local_groups = groups ? &*groups : nullptr;
                 std::optional<MlxMfeWeight> up;
+                const bool prefill_scan = tokens > 6 && !batched_decode;
                 auto gate = [&] {
-                    if (!up_name_) return mfe_offload_cache_->grouped_mfe(gate_name_, active, activation_counts);
+                    if (!up_name_) return mfe_offload_cache_->grouped_mfe(gate_name_, active, activation_counts, prefill_scan);
                     const std::array names{gate_name_, *up_name_};
-                    auto weights = mfe_offload_cache_->grouped_mfe(names, active, activation_counts);
+                    auto weights = mfe_offload_cache_->grouped_mfe(names, active, activation_counts, prefill_scan);
                     up.emplace(std::move(weights[1]));
                     return std::move(weights[0]);
                 }();
+                std::optional<array> sorted_routes;
+                std::optional<MlxGroupedMmqPlan> gate_plan;
+                if (prefill_scan && tokens >= 32 && gate.supports_grouped_mmq()
+                    && (!up || up->supports_grouped_mmq())) {
+                    sorted_routes = mlx::core::contiguous(mlx::core::astype(
+                        mlx::core::argsort(mlx::core::reshape(local_ids, Shape{route_count})), mlx::core::int32));
+                    gate_plan = gate.build_grouped_mmq_plan(local_ids, *sorted_routes,
+                        gate.recommended_grouped_mmq_block_rows(route_count, !up));
+                }
                 auto intermediate = [&]() {
+                    if (sorted_routes) {
+                        auto result = gate.routed_matmul_sorted(source, local_ids,
+                            *sorted_routes, false, !up, 0.0f, &*gate_plan);
+                        if (!up) return result;
+                        const int rows = up->recommended_grouped_mmq_block_rows(route_count, false);
+                        const auto plan = rows == gate_plan->block_rows ? *gate_plan
+                            : up->build_grouped_mmq_plan(local_ids, *sorted_routes, rows);
+                        return moe_swiglu_pair(std::move(result), up->routed_matmul_sorted(
+                            source, local_ids, *sorted_routes, false, false, 0.0f, &plan));
+                    }
                     if (up) {
                         return gate.routed_swiglu_pair(
                             *up, source, local_ids, 0.0f, local_groups);
@@ -1042,12 +1127,25 @@ public:
                     detail::profile_eval(
                         "qwen4.moe.routed_gate_up", intermediate);
                 }
-                if ((tokens <= 6 || batched_decode) &&
-                    !detail::component_profile_active()) {
+                if ((tokens <= 6 || batched_decode || sorted_routes) && !detail::component_profile_active())
                     mlx::core::async_eval({intermediate});
-                }
                 auto down = mfe_offload_cache_->grouped_mfe(
-                    down_name_, active, activation_counts);
+                    down_name_, active, activation_counts, prefill_scan);
+                if (sorted_routes && down.supports_grouped_mmq()) {
+                    const int rows = down.recommended_grouped_mmq_block_rows(route_count, false);
+                    const auto plan = rows == gate_plan->block_rows ? *gate_plan
+                        : down.build_grouped_mmq_plan(local_ids, *sorted_routes, rows);
+                    auto output = down.routed_matmul_sorted(intermediate, local_ids,
+                        *sorted_routes, true, false, 0.0f, &plan);
+                    if (detail::component_profile_active())
+                        detail::profile_eval("qwen4.moe.routed_down", output);
+                    return mlx::core::reshape(mlx::core::take(output,
+                        moe_inverse_permutation(*sorted_routes), 0),
+                        Shape{tokens, global_ids.shape(1), down.out_per_expert()});
+                }
+                if (sorted_routes) intermediate = mlx::core::reshape(mlx::core::take(
+                    intermediate, moe_inverse_permutation(*sorted_routes), 0),
+                    Shape{tokens, global_ids.shape(1), down.neuron_len()});
                 const bool combine_routes = tokens <= 6 &&
                     down.supports_fused_routed_reduce();
                 auto output = combine_routes
@@ -2136,8 +2234,27 @@ public:
     }
 };
 
+struct Qwen4GdnRouteCheckpoint {
+    array convolution, recurrent;
+    int position, batch;
+};
+
 class Qwen4Gdn final : public Qwen4Attention {
 public:
+    bool can_defer_routes() const noexcept {
+        return batch_ == 1 && position_ > 0 && convolution_state_ && recurrent_state_ && !rollback_;
+    }
+    Qwen4GdnRouteCheckpoint route_checkpoint() const {
+        if (!can_defer_routes()) throw std::logic_error("GDN route checkpoint is unavailable");
+        return {*convolution_state_, *recurrent_state_, position_, batch_};
+    }
+    void restore_route_checkpoint(const Qwen4GdnRouteCheckpoint& state) {
+        convolution_state_ = state.convolution;
+        recurrent_state_ = state.recurrent;
+        position_ = state.position;
+        batch_ = state.batch;
+        rollback_.reset();
+    }
     array forward_requests(const array& hidden,
         const std::vector<Qwen4RequestLayerCache*>& caches,
         const std::vector<int>& positions, int confirmed = 0) override {
@@ -2707,6 +2824,25 @@ private:
 
 class Qwen4Qsa final : public Qwen4Attention {
 public:
+    void prepare_history_projections() const {
+        if (auto* preparation = MlxKernelPreparation::current()) {
+            preparation->collect([&] {
+                for (const int rows : preparation->row_buckets()) {
+                    const auto hidden = mlx::core::zeros(
+                        Shape{1, rows, static_cast<int>(config_.hidden_size)}, mlx::core::float16);
+                    for (const auto& output : cache_projections_(hidden)) preparation->add(output);
+                }
+            });
+        }
+    }
+    bool can_defer_routes() const noexcept {
+        return batch_ == 1 && cache_ && cache_->position() > 0 &&
+            index_position_ == cache_->position() && !speculative_trim_;
+    }
+    int route_checkpoint() const {
+        if (!can_defer_routes()) throw std::logic_error("QSA route checkpoint is unavailable");
+        return cache_->position();
+    }
     std::vector<array> decode_input_projections(const array& hidden) override {
         return input_projections_(hidden);
     }
@@ -3589,6 +3725,25 @@ private:
 
 class Qwen4Layer {
 public:
+    using RouteCheckpoint = std::variant<Qwen4GdnRouteCheckpoint, int>;
+
+    std::optional<Qwen4CachedRoute> cached_route() const {
+        if (ple_) return std::nullopt;
+        const auto* gdn = dynamic_cast<const Qwen4Gdn*>(attention_.get());
+        const auto* qsa = dynamic_cast<const Qwen4Qsa*>(attention_.get());
+        return (gdn && gdn->can_defer_routes()) || (qsa && qsa->can_defer_routes())
+            ? moe_.cached_route() : std::nullopt;
+    }
+    RouteCheckpoint route_checkpoint() const {
+        if (const auto* gdn = dynamic_cast<const Qwen4Gdn*>(attention_.get()))
+            return gdn->route_checkpoint();
+        return dynamic_cast<const Qwen4Qsa&>(*attention_).route_checkpoint();
+    }
+    void restore_route_checkpoint(const RouteCheckpoint& state) {
+        if (const auto* gdn = std::get_if<Qwen4GdnRouteCheckpoint>(&state))
+            dynamic_cast<Qwen4Gdn&>(*attention_).restore_route_checkpoint(*gdn);
+        else dynamic_cast<Qwen4Qsa&>(*attention_).trim_cache_to(std::get<int>(state));
+    }
     void exchange_cache(Qwen4RequestLayerCache& cache) {
         attention_->exchange_cache(cache);
         if (ple_) ple_->exchange_cache(cache);
@@ -3716,13 +3871,14 @@ public:
         std::size_t expert_cache_layer_base = 0) {
         const auto prefix =
             "predictor.block." + std::to_string(index);
+        auto attention = Qwen4Qsa::load(model, config, prefix + ".attention", maximum);
+        attention->prepare_history_projections();
         return Qwen4Layer(
             GatedResidual::load(
                 model, config, prefix + ".attention.mhc.pre"),
             GatedResidual::load(
                 model, config, prefix + ".mlp.mhc.pre"),
-            Qwen4Qsa::load(
-                model, config, prefix + ".attention", maximum),
+            std::move(attention),
             Qwen4Moe::load(
                 model,
                 config,
@@ -3796,7 +3952,8 @@ public:
         bool use_cache,
         int speculative_confirmed = 0,
         MlxSsdPrefetchedExpertLayer* prefetched = nullptr,
-        Qwen4NgramEmbedding::Prefetched* prefetched_ple = nullptr) {
+        Qwen4NgramEmbedding::Prefetched* prefetched_ple = nullptr,
+        Qwen4CachedRoute* deferred_route = nullptr) {
         auto* lora = MlxMtpLora::current();
         std::optional<array> training_root;
         if (lora && lora->collecting()) training_root = hidden_streams;
@@ -3826,7 +3983,7 @@ public:
             "qwen4.attention_mhc_post",
             ffn_values.residual);
         detail::profile_eval("qwen4.ffn_mhc_pre", ffn_values.branch);
-        branch = moe_(ffn_values.branch, prefetched);
+        branch = moe_(ffn_values.branch, prefetched, false, deferred_route);
         detail::profile_eval("qwen4.moe", branch);
         auto output = ffn_gr_.post(branch, ffn_values);
         if (lora) {
@@ -4738,6 +4895,46 @@ struct MlxQwen4CausalLm::Impl {
             }
         }
         for (std::size_t index = 0; index < layers.size(); ++index) {
+            if (use_cache && batch == 1 && tokens == 1 && !speculative_confirmed &&
+                !MlxMtpLora::current() && !detail::component_profile_active()) {
+                std::vector<Qwen4CachedRoute> routes;
+                std::vector<Qwen4Layer::RouteCheckpoint> states;
+                for (auto next = index; next < layers.size() && next < index + 4; ++next) {
+                    auto route = layers[next].cached_route();
+                    if (!route) break;
+                    routes.push_back(std::move(*route));
+                    states.push_back(layers[next].route_checkpoint());
+                }
+                if (routes.size() > 1) {
+                    auto trial = streams;
+                    const auto restore = [&] {
+                        for (std::size_t offset = 0; offset < states.size(); ++offset)
+                            layers[index + offset].restore_route_checkpoint(states[offset]);
+                    };
+                    try {
+                        for (std::size_t offset = 0; offset < routes.size(); ++offset)
+                            trial = layers[index + offset].forward(std::move(trial), ids,
+                                current_positions, full_positions, true, 0, nullptr, nullptr, &routes[offset]);
+                        mlx::core::async_eval({*routes.back().ids});
+                        mlx::core::async_eval({trial});
+                        std::vector<bool> hits;
+                        for (auto& route : routes) hits.push_back(route.all_resident());
+                        const bool all_hit = std::all_of(hits.begin(), hits.end(), [](bool hit) { return hit; });
+                        for (std::size_t offset = 0; offset < routes.size(); ++offset)
+                            if (all_hit || !hits[offset]) routes[offset].resolve();
+                        if (all_hit) {
+                            streams = std::move(trial);
+                            index += routes.size() - 1;
+                            continue;
+                        }
+                        trial.eval();
+                    } catch (...) {
+                        restore();
+                        throw;
+                    }
+                    restore();
+                }
+            }
             auto* prefetched = routed_pipeline[index % 2].has_value()
                 ? &*routed_pipeline[index % 2]
                 : nullptr;
@@ -6063,6 +6260,9 @@ MlxQwen4CausalLm::ssd_expert_cache_stats() const {
     stats.wait_seconds = reuse.wait_seconds;
     stats.prepare_seconds = reuse.prepare_seconds;
     stats.view_seconds = reuse.view_seconds;
+    stats.device_route_hits = reuse.cached_route_hits;
+    stats.device_route_misses = reuse.cached_route_misses;
+    stats.device_route_layers = reuse.cached_route_hits + reuse.cached_route_misses;
     stats.resident_experts =
         impl_->mfe_offload_cache->cached_expert_count();
     stats.resident_bytes =

@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -371,10 +372,15 @@ std::size_t server_cache_limit_bytes() {
     // GiB of dead activation buffers and push a fully resident model into
     // compression or swap. Keep enough scratch for reuse while scaling the
     // allowance to the host instead of assuming a 128-GiB development Mac.
-    return std::clamp(
+    static const auto limit = std::clamp(
         physical_memory_bytes() / 16,
         kMinimumServerCacheLimitBytes,
         kMaximumServerCacheLimitBytes);
+    return limit;
+}
+
+std::size_t resident_allocator_reserve_bytes(std::size_t budget) {
+    return std::min(server_cache_limit_bytes(), budget / 20);
 }
 
 std::size_t automatic_runtime_memory_budget_bytes() {
@@ -2302,6 +2308,8 @@ public:
                 enforce_memory_budget(0); apply_expert_budget();
             }
             catch (...) { resident_budget = previous; resident_weight_budget = previous_weights; throw; }
+            if (batching && (resident_budget.load() != previous || resident_weight_budget.load() != previous_weights))
+                batching->invalidate_runtime_policy();
             const auto after = mlx::core::get_active_memory();
             return {before > after ? before - after : 0, {}};
         }
@@ -2406,8 +2414,10 @@ private:
             if (total) {
                 const auto available = runtime.reclaimable_expert_bytes();
                 const auto used = resident_memory_used();
-                const auto fixed = used > available ? used - available : 0;
-                const auto reserve = std::min<std::size_t>(256 << 20, total / 20);
+                const auto cached = mlx::core::get_cache_memory();
+                const auto other = used > available ? used - available : 0;
+                const auto fixed = other - std::min(other, cached);
+                const auto reserve = std::max(resident_allocator_reserve_bytes(total), cached);
                 room = std::min(room, total > fixed + reserve ? total - fixed - reserve : 0);
             }
             if (room == std::numeric_limits<std::size_t>::max())
@@ -2430,17 +2440,36 @@ private:
         const auto budget = resident_budget.load();
         if (!budget || !runtime_holder->has_value()) return true;
         const auto used = resident_memory_used() + mfq::metal::MlxResidentBudgetScope::temporary_bytes();
-        const auto reserve = std::min<std::size_t>(std::size_t{256} << 20, budget / 20);
-        return used <= budget && reserve <= budget - used && allocation <= budget - used - reserve;
+        const auto reserve = resident_allocator_reserve_bytes(budget);
+        const auto cached = mlx::core::get_cache_memory();
+        const auto headroom = reserve > cached ? reserve - cached : 0;
+        return used <= budget && headroom <= budget - used && allocation <= budget - used - headroom;
     }
     void enforce_memory_budget(std::size_t allocation) {
         const auto budget = resident_budget.load();
+        const auto reserve = resident_allocator_reserve_bytes(budget);
+        struct RestoreAllocatorCache {
+            std::size_t& current;
+            std::size_t previous;
+            std::size_t target;
+            int exceptions = std::uncaught_exceptions();
+            ~RestoreAllocatorCache() {
+                const auto limit = std::uncaught_exceptions() > exceptions ? previous : target;
+                if (current == limit) return;
+                mlx::core::set_cache_limit(limit);
+                current = limit;
+            }
+        } restore_cache{allocator_cache_limit, allocator_cache_limit,
+            budget ? std::min(server_cache_limit_bytes(), reserve) : server_cache_limit_bytes()};
         if (!budget || !runtime_holder->has_value()) return;
-        auto used = [&] { return resident_memory_used() + mfq::metal::MlxResidentBudgetScope::temporary_bytes(); };
-        const auto reserve = std::min<std::size_t>(std::size_t{256} << 20, budget / 20);
+        auto used = [&] {
+            const auto actual = resident_memory_used() + mfq::metal::MlxResidentBudgetScope::temporary_bytes();
+            const auto cached = mlx::core::get_cache_memory();
+            return actual + (reserve > cached ? reserve - cached : 0);
+        };
         if (allocation > budget || reserve > budget - allocation)
             throw mfq::metal::MlxResidentBudgetExceeded("resident memory budget cannot accommodate this allocation");
-        const auto target = budget - allocation - reserve;
+        const auto target = budget - allocation;
         if (used() <= target) return;
         mfq::metal::drain_metal_work(runtime_stream);
         mlx::core::set_cache_limit(0);
@@ -2519,6 +2548,12 @@ private:
         }
         std::vector<std::pair<std::string, double>> metrics{
             {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
+            {"mfe_packed_copy_count", static_cast<double>(mfq::metal::MlxMfeWeight::packed_copy_count())},
+            {"ssd_expert_indirect_dispatch_count", static_cast<double>(mfq::metal::MlxMfeWeight::indirect_dispatch_count())},
+            {"mfe_uncached_packed_bytes", static_cast<double>(mfq::metal::MlxMfeWeight::uncached_packed_bytes())},
+            {"ssd_expert_pinned_bytes", static_cast<double>(mfq::metal::MlxMfeWeight::pinned_packed_bytes())},
+            {"ssd_expert_pin_failures", static_cast<double>(mfq::metal::MlxMfeWeight::packed_pin_failures())},
+            {"ssd_expert_pooled_staging_count", static_cast<double>(mfq::metal::MlxMfeWeight::pooled_staging_count())},
             {"qsa_kv_offload_supported", qsa_offload_supported},
             {"kv_quantization_supported", (std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm> ||
                 std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm>) ? 1.0 : 0.0},
@@ -2697,6 +2732,9 @@ private:
                     metrics.emplace_back("ssd_expert_read_calls", static_cast<double>(stats->read_calls));
                     metrics.emplace_back("ssd_expert_prepare_seconds", stats->prepare_seconds);
                     metrics.emplace_back("ssd_expert_view_seconds", stats->view_seconds);
+                    metrics.emplace_back("ssd_expert_device_route_layers", stats->device_route_layers);
+                    metrics.emplace_back("ssd_expert_device_route_hits", stats->device_route_hits);
+                    metrics.emplace_back("ssd_expert_device_route_misses", stats->device_route_misses);
                     metrics.emplace_back(
                         "ssd_expert_resident_bytes",
                         static_cast<double>(stats->resident_bytes));
@@ -2993,6 +3031,7 @@ int run_loaded_runtime(
     mfq::engine::EngineInfo info;
     info.max_context = transport_config.max_context;
     info.vocab_size = static_cast<std::int32_t>(vocabulary_size);
+    info.stop_token_ids = mfq::engine::model_stop_token_ids(model_config, info.vocab_size);
     info.model_type = transport_config.model_type;
     info.capabilities = *transport_config.model_capabilities;
     info.multimodal = static_cast<bool>(runtime_components.multimodal_generate);
