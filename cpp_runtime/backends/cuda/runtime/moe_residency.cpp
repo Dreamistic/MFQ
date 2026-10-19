@@ -701,7 +701,7 @@ void MoeResidencyManager::finish_window(int layer) {
 }
 void MoeResidencyManager::begin_speculative_routes(int rows) {
     auto& s=*impl_;
-    if(rows<2 || rows>32)throw std::invalid_argument("speculative route row count is out of range");
+    if(rows<1 || rows>32)throw std::invalid_argument("speculative route row count is out of range");
     if(s.speculative_rows)throw std::logic_error("speculative routes already pending");
     for(auto& row:s.speculative_routes){row.ids.clear();row.rows=0;}
     if(s.cache->ssd_experts())s.cache->host_experts_->begin_speculative_learning();
@@ -709,7 +709,7 @@ void MoeResidencyManager::begin_speculative_routes(int rows) {
 }
 void MoeResidencyManager::commit_speculative_routes(int rows) {
     auto& s=*impl_;if(!s.speculative_rows)return;
-    if(rows<1 || rows>s.speculative_rows)throw std::invalid_argument("committed route prefix is out of range");
+    if(rows<0 || rows>s.speculative_rows)throw std::invalid_argument("committed route prefix is out of range");
     // Validate the entire prefix before changing observations. Graph setup may
     // replay a layer more than once; only its latest route publication counts.
     for(const auto& record:s.speculative_routes)

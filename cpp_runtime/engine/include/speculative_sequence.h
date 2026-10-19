@@ -529,10 +529,15 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             std::vector<int64_t> verify_ids{pending};
             verify_ids.insert(verify_ids.end(), draft.tokens.begin(), draft.tokens.end());
             Tensor verified;
-            if (mtp.split_target_verification()) {
+            const bool split_target=mtp.split_target_verification();
+            if (split_target) {
                 Tensor pending_raw;
                 auto pending_hidden = ops.target_forward(ops.ids_for({pending}), &pending_raw);
                 if (draft_count > 0) {
+                    // The pending token is already committed. Journal only
+                    // the suffix, using the same hooks as joint verification.
+                    if constexpr(requires { ops.begin_target_routes(int{}); })
+                        ops.begin_target_routes(draft_count);
                     model.begin_speculative_suffix(draft_count);
                     std::vector<int64_t> draft_ids(draft.tokens.begin(), draft.tokens.end());
                     Tensor draft_raw;
@@ -680,7 +685,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             const int emitted_accepted = std::min<int>(accepted, delta.token_ids.size());
             const auto resolve_routes=[&](int rows) {
                 if constexpr(requires { ops.resolve_target_routes(int{},bool{}); })
-                    ops.resolve_target_routes(rows,output.result.cancelled);
+                    ops.resolve_target_routes(rows-int(split_target),output.result.cancelled);
             };
             if (draft_count > 0) {
                 if (emitted_accepted == draft_count) {

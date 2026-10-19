@@ -117,6 +117,9 @@ void check_reused_expert_pages() {
         loan.begin_speculative(2);
         const std::array<int32_t,2> cancelled{4,3};loan.next_packet({17,18,19},cancelled.data(),2,1,64);
         hit(4);hit(3);loan.discard_speculative();advance();
+        loan.begin_speculative(1);
+        const int32_t rejected=4;loan.next_packet({17,18,19},&rejected,1,1,64);
+        hit(4);loan.commit_speculative(0);advance();
         for(int expert=42;expert<74;++expert){put(expert,99);advance();}
         check(loan.find_for_exchange({17,3,0},KvExpertLoan::page) && !loan.find_for_exchange({17,4,0},KvExpertLoan::page),
             "rejected draft routes gained cache protection");
@@ -325,7 +328,13 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
                 }
                 execution.force_moe_materialized_swiglu=false;
                 std::fprintf(stderr,"clipped_check phase=pipeline\n");
+                const bool speculative=ssd && tokens<=6;
+                if(speculative && ffn.moe_layer==0)begin_moe_speculative_routes(cache,tokens);
                 check_output(ffn.forward(execution,x,tb::tensor(input_ids).to(tb::kCUDA)),references.at(key));++cases;
+                if(speculative && ffn.moe_layer==1) {
+                    if(tokens==6)discard_moe_speculative_routes(cache);
+                    else commit_moe_speculative_routes(cache,tokens-1);
+                }
                 if(tokens==143)saw_prefill=true;
                 if(loan && saw_prefill && tokens==1 && ffn.moe_layer==1 && !loan_revoked) {
                     // The final M=1 replay must refresh descriptors after KV
@@ -339,6 +348,9 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
             check(cache->stats().pipeline_two_stage_serves>=16,
                 "clipped FFN did not execute its two-stage kernels");
             if(ssd && mixed && mfq::cuda::NativeDmaBatch::available()) {
+                const auto spec=loan->speculative_stats();
+                check(spec.windows==9 && spec.cancels==1 && spec.disabled==0,
+                    "private FFN graphs lost speculative cache commit/cancel accounting");
                 check(cache->stats().pipeline_host_packet_serves>0,"private FFN graphs did not use host cache packets");
                 check(cache->stats().pipeline_kv_projection_hits>0,"private FFN graphs did not reuse borrowed GPU expert copies");
                 const auto* fallback=std::getenv("MFQ_MOE_WIRE_FALLBACK");

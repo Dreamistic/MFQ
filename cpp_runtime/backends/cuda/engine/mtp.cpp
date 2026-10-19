@@ -79,18 +79,14 @@ template <class Model> struct CudaMtpOps {
     if(target_route_cache)discard_moe_speculative_routes(target_route_cache);
   }
   void begin_target_routes(int rows) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
-      begin_moe_speculative_routes(model.execution->moe_expert_cache,rows);
-      target_route_cache=model.execution->moe_expert_cache;
-    }
+    begin_moe_speculative_routes(model.execution->moe_expert_cache,rows);
+    target_route_cache=model.execution->moe_expert_cache;
   }
   void resolve_target_routes(int rows,bool cancelled) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
-      if(!target_route_cache)return;
-      if(cancelled)discard_moe_speculative_routes(target_route_cache);
-      else commit_moe_speculative_routes(target_route_cache,rows);
-      target_route_cache.reset();
-    }
+    if(!target_route_cache)return;
+    if(cancelled)discard_moe_speculative_routes(target_route_cache);
+    else commit_moe_speculative_routes(target_route_cache,rows);
+    target_route_cache.reset();
   }
   bool take_target_maintenance() { return std::exchange(target_maintenance,false); }
   bool gradual_mtp_warmup() const {return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>;}

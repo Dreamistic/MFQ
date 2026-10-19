@@ -30,13 +30,14 @@ struct Predictor {
     int64_t position = 0;
     bool legacy = false;
     bool bootstrap = false;
+    bool split = false;
     int maximum_draft_depth() const { return 3; }
     bool dspark_policy() const { return legacy; }
     bool blockwise_drafting() const { return false; }
     bool supports_session_state() const { return true; }
     bool teacher_forced_prompt_prime() const { return true; }
     bool target_bootstrap_decode() const { return bootstrap; }
-    bool split_target_verification() const { return false; }
+    bool split_target_verification() const { return split; }
     bool retains_partial_target_prefix() const { return true; }
     int64_t cache_position() const { return position; }
     void trim_cache_to(int64_t value) { position = value; }
@@ -395,18 +396,19 @@ void run_batched_greedy(bool penalties) {
         throw std::runtime_error("batched greedy sampling changed rejection/cache/penalty behavior");
 }
 
-void run_committed_route_hooks(bool accept_all,bool cancel_during_target=false,bool partial=false,bool retain_prefix=true) {
+void run_committed_route_hooks(bool accept_all,bool cancel_during_target=false,bool partial=false,bool retain_prefix=true,
+        bool split=false,int depth=3) {
     struct Journal {int pending=0,begins=0,commits=0,cancels=0,rows=0;};
     struct JournalOps : Ops {
         Journal* journal;bool accept_all,cancel_target,partial,retain_prefix;InferenceOutput* output;
         bool retains_partial_target_prefix(int)const{return retain_prefix;}
         void begin_target_routes(int rows) {
-            if(journal->pending || rows<2)throw std::runtime_error("route journal nested or entered ordinary prefill");
+            if(journal->pending || rows<1)throw std::runtime_error("route journal nested or entered ordinary prefill");
             journal->pending=rows;++journal->begins;
         }
         void resolve_target_routes(int rows,bool cancelled) {
             if(!journal->pending)return;
-            if(rows<1 || rows>journal->pending)throw std::runtime_error("route journal committed an invalid prefix");
+            if(rows<0 || rows>journal->pending)throw std::runtime_error("route journal committed an invalid prefix");
             if(cancelled)++journal->cancels;
             else {++journal->commits;journal->rows+=rows;}
             journal->pending=0;
@@ -417,15 +419,21 @@ void run_committed_route_hooks(bool accept_all,bool cancel_during_target=false,b
             if(confirmed && cancel_target)output->result.cancelled=true;
             return result;
         }
+        Tensor target_suffix(Tensor ids,Tensor* raw) {
+            if(journal->pending!=size(ids,1))throw std::runtime_error("route journal missed split verification");
+            auto result=Ops::target_forward(ids,raw);
+            if(cancel_target)output->result.cancelled=true;
+            return result;
+        }
         std::vector<int32_t> greedy_tokens(Tensor logits) {
             std::vector<int32_t> tokens(size(logits,0),accept_all?1:0);
             if(partial)tokens.front()=1;
             return tokens;
         }
     };
-    Model model;Predictor mtp;mtp.legacy=true;Journal journal;
+    Model model;Predictor mtp;mtp.legacy=true;mtp.split=split;Journal journal;
     InferenceRequest request;request.chat=false;request.prompt={0,0,0};
-    request.sampling.max_tokens=9;request.sampling.mtp_max_draft_tokens=3;
+    request.sampling.max_tokens=9;request.sampling.mtp_max_draft_tokens=depth;
     InferenceOutput output(request,nullptr,"route-journal-hooks");
     auto generation=speculative_sequence(JournalOps{{model,mtp},&journal,accept_all,cancel_during_target,partial,retain_prefix,&output},
         request,output,512,0,Tensor{},nullptr);
@@ -433,8 +441,8 @@ void run_committed_route_hooks(bool accept_all,bool cancel_during_target=false,b
     if(journal.pending || !journal.begins || journal.begins!=journal.commits+journal.cancels)
         throw std::runtime_error("MTP route journal was left pending");
     if(cancel_during_target ? journal.cancels!=1 || journal.commits!=0 :
-            journal.cancels!=0 || (partial?journal.rows!=(retain_prefix?2:1)*journal.commits:
-                accept_all?journal.rows<=journal.commits:journal.rows!=journal.commits))
+            journal.cancels!=0 || (partial?journal.rows!=((retain_prefix?2:1)-int(split))*journal.commits:
+                accept_all?journal.rows<=(1-int(split))*journal.commits:journal.rows!=(1-int(split))*journal.commits))
         throw std::runtime_error("MTP route journal lost rejection/cancellation/truncated output semantics");
     if(!cancel_during_target && model.cache_pos!=int64_t(request.prompt.size())+request.sampling.max_tokens-1)
         throw std::runtime_error("route journal changed the committed model cache boundary");
@@ -715,6 +723,13 @@ int main() try {
     run_committed_route_hooks(false,true);
     run_committed_route_hooks(false,false,true);
     run_committed_route_hooks(false,false,true,false);
+    run_committed_route_hooks(false,false,false,true,true);
+    run_committed_route_hooks(true,false,false,true,true);
+    run_committed_route_hooks(false,true,false,true,true);
+    run_committed_route_hooks(false,false,true,true,true);
+    run_committed_route_hooks(false,false,true,false,true);
+    run_committed_route_hooks(false,false,false,true,true,1);
+    run_committed_route_hooks(true,false,false,true,true,1);
     early_target_prefetch();
     batch_policy();
     batch_policy_short_response();
