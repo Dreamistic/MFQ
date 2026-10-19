@@ -298,3 +298,48 @@ def test_metal_mfe_has_no_second_dense_nint_compute_kernel():
     assert ": kNintStoreOutput" in METAL_NINT
     assert "make_nint_matmul_kernel" not in METAL_NINT
     assert "make_nint_matmul_add_kernel" not in METAL_NINT
+
+
+def test_python_jit_extension_has_its_own_link_closure():
+    block = CMAKE.split("set(MFQ_CUDA_KERNEL_SOURCES", 1)[1].split(")", 1)[0]
+    native = re.findall(r"MFQ_CUDA_KERNEL_ROOT}/([^\s]+\.(?:cu|cpp))", block)
+    jit = tuple(
+        re.findall(r'os\.path\.join\(_DIR, "([^\"]+\.(?:cu|cpp))"\)', EXTENSION)
+    )
+
+    assert jit == (
+        "norm.cu",
+        "acc.cu",
+        "rope.cu",
+        "attention.cu",
+        "gated_delta_net.cu",
+        "kv_cache.cu",
+        "activation.cu",
+        "embedding.cu",
+        "selected_attention.cu",
+        "qwen4_exp.cu",
+        "glm5_next.cu",
+        "sampling.cu",
+        "ssm_conv.cu",
+        "moe.cu",
+        "mx_matmul.cu",
+        "fp8_sq.cu",
+        "mxfp4_sq.cu",
+        "nint_matmul.cu",
+        "nint_short_decode.cu",
+        "nint_q8_decode.cu",
+        "nvq_matmul.cu",
+        "nvq_routed_reuse.cu",
+        "nepq.cu",
+        "nepq_residual.cu",
+        "mfq_cuda.cpp",
+    )
+    assert set(jit[:-1]) <= set(native)
+    assert "nvq_routed_reuse.cu" in jit
+    assert {"attention_mma.cu", "gdn_decode_window.cu"}.isdisjoint(jit)
+    assert "mfq_attention_mma" not in BINDINGS
+    assert "gdn_decode_window_cuda" not in BINDINGS
+    assert not any(
+        "data_ptr<__half>" in (ROOT / "mfq/kernels/cuda" / source).read_text()
+        for source in jit
+    )

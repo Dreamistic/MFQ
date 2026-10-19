@@ -25,6 +25,11 @@ _GGML_ROOT = Path(_REPOSITORY_ROOT) / "cpp_runtime" / "components" / "ggml"
 _GGML_INCLUDE = str(_GGML_ROOT / "include")
 _GGML_SOURCE_INCLUDE = str(_GGML_ROOT / "src")
 _GGML_CUDA_INCLUDE = str(_GGML_ROOT / "src" / "ggml-cuda")
+# This is the closure of the functions bound by mfq_cuda.cpp, plus providers
+# called from those units.  It is deliberately not the native runtime's full
+# MFQ_CUDA_KERNEL_SOURCES list: attention_mma.cu requires ggml CUDA objects,
+# and gdn_decode_window.cu is a native-runtime-only decode path.  In contrast,
+# nvq_matmul.cu calls the provider in nvq_routed_reuse.cu, so both belong here.
 _SOURCES = [
     os.path.join(_DIR, "norm.cu"),
     os.path.join(_DIR, "acc.cu"),
@@ -47,6 +52,7 @@ _SOURCES = [
     os.path.join(_DIR, "nint_short_decode.cu"),
     os.path.join(_DIR, "nint_q8_decode.cu"),
     os.path.join(_DIR, "nvq_matmul.cu"),
+    os.path.join(_DIR, "nvq_routed_reuse.cu"),
     os.path.join(_DIR, "nepq.cu"),
     os.path.join(_DIR, "nepq_residual.cu"),
     os.path.join(_DIR, "mfq_cuda.cpp"),
@@ -112,8 +118,10 @@ def ext():
                 _GGML_SOURCE_INCLUDE,
                 _GGML_CUDA_INCLUDE,
             ],
-            extra_cflags=["/std:c++20"] if os.name == "nt" else ["-std=c++20"],
+            # CUDA 13 CCCL headers reject MSVC's traditional preprocessor.
+            extra_cflags=["/std:c++20", "/Zc:preprocessor"] if os.name == "nt" else ["-std=c++20"],
             extra_cuda_cflags=[
+                *(["-Xcompiler=/Zc:preprocessor"] if os.name == "nt" else []),
                 "-O3",
                 "--use_fast_math",
                 "--extended-lambda",
