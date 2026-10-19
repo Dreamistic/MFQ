@@ -221,7 +221,14 @@ string(REPLACE
     ""
     MFQ_SPARSE_BLOCK_GQA_SOURCE
     "${MFQ_SPARSE_BLOCK_GQA_SOURCE}")
+set(_MFQ_CSA2_PREFILL_METAL
+    "${MFQ_METAL_ROOT}/kernels/mfq_csa2_prefill.metal")
+file(READ "${_MFQ_CSA2_PREFILL_METAL}" MFQ_CSA2_PREFILL_SOURCE)
+string(REPLACE
+    "#include \"mlx/backend/metal/kernels/steel/attn/attn.h\"" ""
+    MFQ_CSA2_PREFILL_SOURCE "${MFQ_CSA2_PREFILL_SOURCE}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_MFQ_CSA2_PREFILL_METAL}"
     "${_MFQ_MFE_PREFILL_METAL}"
     "${_MFQ_NINT_PREFILL_METAL}"
     "${_MFQ_DSA_SPARSE_PREFILL_METAL}"
@@ -242,7 +249,7 @@ add_library(mfq-metal-runtime STATIC
     storage/hf_safetensors_store.cpp
     storage/mfq_container.cpp
     storage/mfe_expert_store.cpp
-    storage/mlx_mxfp8_row_store.cpp
+    storage/mlx_quantized_row_store.cpp
     storage/compat/mlx_legacy_tensor_compat.cpp
     runtime/mlx_axial_patch_vision.cpp
     runtime/mlx_grid_vision.cpp
@@ -273,6 +280,7 @@ add_library(mfq-metal-runtime STATIC
     ops/mlx_nint_rows.cpp
     ops/mlx_nint8_zero.cpp
     ops/mlx_sparse_attention.cpp
+    ops/mlx_csa2.cpp
     ops/mlx_vq.cpp
     models/deepseek_v4/deepseek_v4_model.cpp
     models/deepseek_v4/mlx_deepseek_v4_attention.cpp
@@ -793,20 +801,20 @@ add_executable(mfq-metal-hf-safetensors-store-test
     tests/hf_safetensors_store_test.cpp
 )
 
-add_executable(mfq-metal-mxfp8-row-store-test
-    tests/mlx_mxfp8_row_store_test.cpp
+add_executable(mfq-metal-quantized-row-store-test
+    tests/mlx_quantized_row_store_test.cpp
 )
-target_link_libraries(mfq-metal-mxfp8-row-store-test PRIVATE
+target_link_libraries(mfq-metal-quantized-row-store-test PRIVATE
     mfq-metal-runtime
 )
 target_compile_features(
-    mfq-metal-mxfp8-row-store-test PRIVATE cxx_std_20)
-set_target_properties(mfq-metal-mxfp8-row-store-test PROPERTIES
+    mfq-metal-quantized-row-store-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-quantized-row-store-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 add_test(
-    NAME mfq-metal-mxfp8-row-store-test
-    COMMAND mfq-metal-mxfp8-row-store-test
+    NAME mfq-metal-quantized-row-store-test
+    COMMAND mfq-metal-quantized-row-store-test
 )
 target_include_directories(mfq-metal-hf-safetensors-store-test PRIVATE
     ${MFQ_METAL_ROOT}/storage

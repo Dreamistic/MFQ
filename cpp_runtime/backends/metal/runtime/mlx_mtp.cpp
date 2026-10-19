@@ -799,6 +799,11 @@ MlxMtpGeneration mlx_mtp_generation(
         (callbacks.prepare_draft_history && !callbacks.draft_logits)) {
         throw std::invalid_argument("invalid MTP engine configuration");
     }
+    if (request.sampling.warmup) {
+        request.eos_token_ids = {};
+        callbacks.policy_state = nullptr;
+        callbacks.draft_depth = [depth = request.sampling.mtp_max_draft_tokens] { return depth; };
+    }
     mlx_validate_token_set(request.eos_token_ids, request.vocab);
 
     stats = {};

@@ -2666,7 +2666,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     token))) {
             break;
         }
-        if (mlx_token_in_set(eos, token) ||
+        if ((!sampling.warmup && mlx_token_in_set(eos, token)) ||
             generated == max_tokens) {
             report_components();
             break;

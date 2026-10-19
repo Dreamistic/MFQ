@@ -1,5 +1,6 @@
-#include "mlx_mxfp8_row_store.h"
+#include "mlx_quantized_row_store.h"
 #include "mlx_resource_telemetry.h"
+#include "mlx_nint_rows.h"
 
 #include <algorithm>
 #include <array>
@@ -137,16 +138,18 @@ private:
 
 } // namespace
 
-struct MlxMxfp8RowStore::Impl {
+struct MlxQuantizedRowStore::Impl {
     struct CacheEntry {
         std::vector<mlx::core::float16_t> values;
         std::list<std::int64_t>::iterator recency;
+        mfq::NintRowBatch packed;
     };
 
     struct RequestedRow {
         std::int64_t row = 0;
         std::vector<mlx::core::float16_t> values;
         bool cold = false;
+        mfq::NintRowBatch packed;
     };
 
     Impl(
@@ -161,11 +164,41 @@ struct MlxMxfp8RowStore::Impl {
           cache_capacity(selected_cache_rows),
           workers(io_workers) {
         const auto& entry = model.record(record);
-        if (entry.dtype != "MXFP8") {
+        if (entry.dtype == "NINT") {
+            nint = std::make_unique<mfq::NintRows>(
+                static_cast<std::size_t>(entry.nbytes),
+                [this](std::size_t offset, std::uint8_t* output, std::size_t count) {
+                    model.read_range_into(record, offset, std::as_writable_bytes(
+                        std::span(output, count)));
+                }, true);
+            if (nint->rows() != expected_rows || nint->width() != expected_width) {
+                throw std::runtime_error("NINT row-store geometry disagrees: " + record);
+            }
+            rows = expected_rows;
+            width = expected_width;
+            decoded_row_bytes = std::max(static_cast<std::size_t>(width) *
+                sizeof(mlx::core::float16_t), nint->selected_row_nbytes_bound() + 27);
+            index_bytes = nint->index_nbytes();
+        } else if (entry.dtype != "MXFP8") {
             throw std::runtime_error(
-                "native MXFP8 row store received non-MXFP8 record: " +
+                "quantized row store requires MXFP8 or NINT: " +
                 record);
+        } else {
+            initialize_mxfp8(entry, expected_rows, expected_width);
         }
+        if (cache_capacity != 0 && decoded_row_bytes >
+                std::numeric_limits<std::size_t>::max() / cache_capacity) {
+            throw std::overflow_error("quantized row-store cache size overflow");
+        }
+        resources.bind([this] {
+            std::lock_guard lock(mutex);
+            return MlxResourceUsage{0, 0, index_bytes + resident_cache_bytes, 0, 0};
+        });
+        model.record_prepared(record);
+    }
+
+    void initialize_mxfp8(const MfqRecord& entry, std::int64_t expected_rows,
+                          int expected_width) {
         const auto header = model.read_range(record, 0, kMxHeaderBytes);
         if (header.size() != kMxHeaderBytes ||
             std::memcmp(header.data(), "MXT1", 4) != 0 ||
@@ -210,12 +243,6 @@ struct MlxMxfp8RowStore::Impl {
         source_row_bytes = static_cast<std::size_t>(width + scale_columns);
         decoded_row_bytes = static_cast<std::size_t>(width) *
             sizeof(mlx::core::float16_t);
-        if (cache_capacity != 0 &&
-            decoded_row_bytes > std::numeric_limits<std::size_t>::max() /
-                cache_capacity) {
-            throw std::overflow_error(
-                "native MXFP8 row-store cache size overflow");
-        }
         for (std::size_t scale = 0; scale < 256; ++scale) {
             const auto scale_value = decode_e8m0(
                 static_cast<std::uint8_t>(scale));
@@ -226,16 +253,16 @@ struct MlxMxfp8RowStore::Impl {
                             static_cast<std::uint8_t>(value)));
             }
         }
-        resources.bind([this] {
-            std::lock_guard lock(mutex);
-            return MlxResourceUsage{0, 0, cache.size() * decoded_row_bytes, 0, 0};
-        });
-        model.record_prepared(record);
     }
 
     void read_decode(
         std::int64_t row,
-        std::vector<mlx::core::float16_t>& output) const {
+        RequestedRow& requested) const {
+        if (nint) {
+            nint->append_row(row, requested.packed);
+            return;
+        }
+        auto& output = requested.values;
         std::vector<std::uint8_t> raw(source_row_bytes);
         model.read_range_into(
             record,
@@ -288,19 +315,26 @@ struct MlxMxfp8RowStore::Impl {
         while (cache.size() >= cache_capacity) {
             const auto victim = recency.back();
             recency.pop_back();
+            const auto& entry = cache.at(victim);
+            resident_cache_bytes -= entry.values.size() * sizeof(mlx::core::float16_t)
+                + entry.packed.packed_nbytes() + entry.packed.descriptors().size() * 4;
             cache.erase(victim);
         }
         recency.push_front(row.row);
+        resident_cache_bytes += row.values.size() * sizeof(mlx::core::float16_t)
+            + row.packed.packed_nbytes() + row.packed.descriptors().size() * 4;
         cache.emplace(
             row.row,
-            CacheEntry{std::move(row.values), recency.begin()});
+            CacheEntry{std::move(row.values), recency.begin(), std::move(row.packed)});
     }
 
-    mlx::core::array gather(std::span<const std::int64_t> row_ids) const {
+    MlxQuantizedRowBatch prepare_rows(std::span<const std::int64_t> row_ids) const {
+        if (row_ids.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            row_ids.size() > std::numeric_limits<std::size_t>::max() / width) {
+            throw std::overflow_error("quantized row gather exceeds output limits");
+        }
         if (row_ids.empty()) {
-            std::vector<mlx::core::float16_t> empty;
-            return mlx::core::array(
-                empty.begin(), mlx::core::Shape{0, width});
+            return {width, {}, {}};
         }
         std::vector<std::size_t> request_sources;
         request_sources.reserve(row_ids.size());
@@ -315,7 +349,7 @@ struct MlxMxfp8RowStore::Impl {
             for (const auto row : row_ids) {
                 if (row < 0 || row >= rows) {
                     throw std::out_of_range(
-                        "native MXFP8 row index is outside the table");
+                        "quantized row index is outside the table");
                 }
                 const auto known = unique_index.find(row);
                 if (known != unique_index.end()) {
@@ -331,7 +365,7 @@ struct MlxMxfp8RowStore::Impl {
                     misses.push_back(index);
                 } else {
                     touch(found);
-                    requested.push_back({row, found->second.values, false});
+                    requested.push_back({row, found->second.values, false, found->second.packed});
                 }
             }
         }
@@ -341,7 +375,7 @@ struct MlxMxfp8RowStore::Impl {
         futures.reserve(misses.size());
         for (const auto index : misses) {
             futures.push_back(workers.submit([this, &requested, index] {
-                read_decode(requested[index].row, requested[index].values);
+                read_decode(requested[index].row, requested[index]);
             }));
         }
         std::exception_ptr failure;
@@ -356,11 +390,17 @@ struct MlxMxfp8RowStore::Impl {
         const auto io_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - io_begin).count();
 
-        std::vector<mlx::core::float16_t> output(
+        MlxNintRowBatch packed_output;
+        std::vector<mlx::core::float16_t> output(nint ? 0 :
             row_ids.size() * static_cast<std::size_t>(width));
         for (std::size_t request = 0; request < request_sources.size();
              ++request) {
-            const auto& source = requested[request_sources[request]].values;
+            const auto& selected = requested[request_sources[request]];
+            if (nint) {
+                packed_output.append_batch(selected.packed);
+                continue;
+            }
+            const auto& source = selected.values;
             std::copy_n(
                 source.data(),
                 width,
@@ -369,20 +409,18 @@ struct MlxMxfp8RowStore::Impl {
         {
             std::scoped_lock lock(mutex);
             for (const auto index : misses) {
+                counters.bytes_read += nint ? requested[index].packed.source_bytes_read()
+                    : source_row_bytes;
+                counters.read_calls += nint ? 5 : 2;
                 admit(std::move(requested[index]));
             }
             counters.row_requests += row_ids.size();
             counters.cache_misses += misses.size();
             counters.cache_hits += row_ids.size() - misses.size();
             counters.rows_loaded += misses.size();
-            counters.bytes_read += misses.size() * source_row_bytes;
-            counters.read_calls += misses.size() * 2;
             counters.io_seconds += io_seconds;
         }
-        return mlx::core::array(
-            output.begin(),
-            mlx::core::Shape{
-                static_cast<int>(row_ids.size()), width});
+        return {width, std::move(output), std::move(packed_output)};
     }
 
     MfqContainer model;
@@ -395,16 +433,19 @@ struct MlxMxfp8RowStore::Impl {
     std::size_t source_row_bytes = 0;
     std::size_t decoded_row_bytes = 0;
     std::size_t cache_capacity = 0;
+    std::size_t index_bytes = 0;
+    mutable std::size_t resident_cache_bytes = 0;
+    std::unique_ptr<mfq::NintRows> nint;
     std::array<mlx::core::float16_t, 1u << 16u> decode_lut{};
     mutable WorkerPool workers;
     mutable std::mutex mutex;
     mutable std::list<std::int64_t> recency;
     mutable std::unordered_map<std::int64_t, CacheEntry> cache;
-    mutable MlxMxfp8RowStoreStats counters;
+    mutable MlxQuantizedRowStoreStats counters;
     MlxResourceTelemetry resources;
 };
 
-MlxMxfp8RowStore::MlxMxfp8RowStore(
+MlxQuantizedRowStore::MlxQuantizedRowStore(
     const MfqContainer& model,
     std::string record,
     std::int64_t expected_rows,
@@ -419,41 +460,55 @@ MlxMxfp8RowStore::MlxMxfp8RowStore(
           cache_rows,
           io_workers)) {}
 
-MlxMxfp8RowStore::~MlxMxfp8RowStore() = default;
+MlxQuantizedRowStore::~MlxQuantizedRowStore() = default;
 
-mlx::core::array MlxMxfp8RowStore::gather(
+mlx::core::array MlxQuantizedRowStore::gather(
     std::span<const std::int64_t> row_ids) const {
-    return impl_->gather(row_ids);
+    return prepare_rows(row_ids).decode();
 }
 
-std::int64_t MlxMxfp8RowStore::rows() const noexcept {
+MlxQuantizedRowBatch MlxQuantizedRowStore::prepare_rows(
+    std::span<const std::int64_t> row_ids) const {
+    return impl_->prepare_rows(row_ids);
+}
+
+mlx::core::array MlxQuantizedRowBatch::decode() const {
+    if (packed.rows()) return packed.decode(mlx::core::float16);
+    if (width <= 0 || values.size() % static_cast<std::size_t>(width) != 0)
+        throw std::invalid_argument("invalid quantized row batch");
+    return mlx::core::array(values.begin(),
+        mlx::core::Shape{static_cast<int>(values.size() / width), width});
+}
+
+std::int64_t MlxQuantizedRowStore::rows() const noexcept {
     return impl_->rows;
 }
 
-int MlxMxfp8RowStore::width() const noexcept {
+int MlxQuantizedRowStore::width() const noexcept {
     return impl_->width;
 }
 
-std::size_t MlxMxfp8RowStore::cached_rows() const noexcept {
+std::size_t MlxQuantizedRowStore::cached_rows() const noexcept {
     std::scoped_lock lock(impl_->mutex);
     return impl_->cache.size();
 }
 
-MlxMxfp8RowStoreStats MlxMxfp8RowStore::stats() const {
+MlxQuantizedRowStoreStats MlxQuantizedRowStore::stats() const {
     std::scoped_lock lock(impl_->mutex);
     auto result = impl_->counters;
     result.resident_rows = impl_->cache.size();
     result.resident_payload_bytes =
-        impl_->cache.size() * impl_->decoded_row_bytes;
+        impl_->index_bytes + impl_->resident_cache_bytes;
     result.cache_limit_bytes =
-        impl_->cache_capacity * impl_->decoded_row_bytes;
+        impl_->index_bytes + impl_->cache_capacity * impl_->decoded_row_bytes;
     return result;
 }
 
-void MlxMxfp8RowStore::clear() {
+void MlxQuantizedRowStore::clear() {
     std::scoped_lock lock(impl_->mutex);
     impl_->cache.clear();
     impl_->recency.clear();
+    impl_->resident_cache_bytes = 0;
 }
 
 } // namespace mfq::metal

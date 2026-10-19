@@ -667,6 +667,36 @@ constexpr const char* kInversePermutationSource = R"METAL(
     }
 )METAL";
 
+constexpr const char* kRestoreRoutedRowsHeader = R"METAL(
+inline uint4 mfq_moe_load16(device const uchar* value) {
+    return *reinterpret_cast<device const uint4*>(value);
+}
+inline uint4 mfq_moe_load16(constant const uchar* value) {
+    return *reinterpret_cast<constant const uint4*>(value);
+}
+)METAL";
+
+constexpr const char* kRestoreRoutedRowsSource = R"METAL(
+    const uint width = uint(values_shape[1]);
+    const uint chunks = (width + 15u) / 16u;
+    const uint index = thread_position_in_grid.x;
+    const uint row = index / chunks;
+    if (row >= uint(values_shape[0])) return;
+    const uint column = (index - row * chunks) * 16u;
+    const int original = order[row];
+    if (original < 0 || original >= values_shape[0]) return;
+    const bool valid = ids[original] >= 0;
+    const ulong source = ulong(row) * width + column;
+    const ulong destination = ulong(original) * width + column;
+    if (width % 16u == 0u) {
+        const uint4 value = valid ? mfq_moe_load16(values + source) : uint4(0);
+        *reinterpret_cast<device uint4*>(output + destination) = value;
+    } else {
+        for (uint item = 0u; item < 16u && column + item < width; ++item)
+            output[destination + item] = valid ? values[source + item] : uchar(0);
+    }
+)METAL";
+
 constexpr const char* kGluSplitSource = R"METAL(
     const uint ROWS = uint(gate_up_shape[0]);
     uint index = thread_position_in_grid.x;
@@ -777,7 +807,8 @@ mlx::core::fast::CustomKernelFunction make_kernel(
     const char* name,
     std::vector<std::string> inputs,
     std::vector<std::string> outputs,
-    std::string source) {
+    std::string source,
+    std::string header = {}) {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
     return mlx::core::fast::metal_kernel(
@@ -785,7 +816,7 @@ mlx::core::fast::CustomKernelFunction make_kernel(
         std::move(inputs),
         std::move(outputs),
         std::move(source),
-        "",
+        std::move(header),
         true,
         false,
         options);
@@ -1011,6 +1042,13 @@ inverse_permutation_kernel() {
         {"order"},
         {"inverse"},
         kInversePermutationSource);
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& restore_routed_rows_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_moe_restore_routed_rows",
+        {"values", "order", "ids"}, {"output"}, kRestoreRoutedRowsSource, kRestoreRoutedRowsHeader);
     return kernel;
 }
 
@@ -1915,6 +1953,23 @@ array moe_inverse_permutation(const array& order) {
         false,
         {});
     return std::move(outputs.front());
+}
+
+array moe_restore_routed_rows(
+    const array& sorted_output, const array& route_order, const array& expert_ids) {
+    if (sorted_output.ndim() != 2 || route_order.ndim() != 1 ||
+        route_order.size() != static_cast<std::size_t>(sorted_output.shape(0)) ||
+        expert_ids.size() != route_order.size())
+        throw std::invalid_argument("MoE sorted output and route metadata do not match");
+    if (sorted_output.size() == 0) return sorted_output;
+    auto values = mlx::core::view(mlx::core::contiguous(sorted_output), mlx::core::uint8);
+    const int chunks = (values.shape(1) + 15) / 16;
+    const int size = checked_int(std::size_t(values.shape(0)) * chunks, "restore grid");
+    auto result = restore_routed_rows_kernel()(
+        {values, int32_contiguous(route_order), int32_contiguous(expert_ids)},
+        {values.shape()}, {mlx::core::uint8}, {size,1,1}, {std::min(kThreads,size),1,1},
+        {}, std::nullopt, false, {}).front();
+    return mlx::core::view(std::move(result),sorted_output.dtype());
 }
 
 array moe_swiglu_split(const array& gate_up) {

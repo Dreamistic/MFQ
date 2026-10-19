@@ -1,18 +1,27 @@
 #pragma once
 
 #include "mfq_container.h"
+#include "mlx_nint_rows.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 #include <mlx/mlx.h>
 
 namespace mfq::metal {
 
-struct MlxMxfp8RowStoreStats {
+struct MlxQuantizedRowBatch {
+    int width = 0;
+    std::vector<mlx::core::float16_t> values;
+    MlxNintRowBatch packed;
+    mlx::core::array decode() const;
+};
+
+struct MlxQuantizedRowStoreStats {
     std::uint64_t row_requests = 0;
     std::uint64_t cache_hits = 0;
     std::uint64_t cache_misses = 0;
@@ -32,32 +41,35 @@ struct MlxMxfp8RowStoreStats {
     }
 };
 
-// Architecture-neutral bounded row cache for row-scaled native MXFP8 tables.
+// Architecture-neutral bounded row cache for native MXFP8 and NINT tables.
 // Cold rows are read through MfqContainer, so the same implementation serves
 // regular MFQ artifacts and canonical virtual records over untouched HF
 // checkpoints. Persistent workers expose SSD queue depth without holding the
-// LRU lock across I/O.
-class MlxMxfp8RowStore {
+// LRU lock across I/O. NINT keeps only selectors, rank checkpoints and selected
+// packed rows; the common row kernel decodes the requested batch on the GPU.
+class MlxQuantizedRowStore {
 public:
-    MlxMxfp8RowStore(
+    MlxQuantizedRowStore(
         const MfqContainer& model,
         std::string record,
         std::int64_t expected_rows,
         int expected_width,
         std::size_t cache_rows,
         std::size_t io_workers = 8);
-    ~MlxMxfp8RowStore();
+    ~MlxQuantizedRowStore();
 
-    MlxMxfp8RowStore(const MlxMxfp8RowStore&) = delete;
-    MlxMxfp8RowStore& operator=(const MlxMxfp8RowStore&) = delete;
+    MlxQuantizedRowStore(const MlxQuantizedRowStore&) = delete;
+    MlxQuantizedRowStore& operator=(const MlxQuantizedRowStore&) = delete;
 
     // Returns decoded F16 rows in request order with shape [N,width].
     mlx::core::array gather(std::span<const std::int64_t> row_ids) const;
+    // Reader threads prepare CPU storage; decode belongs to the inference stream.
+    MlxQuantizedRowBatch prepare_rows(std::span<const std::int64_t> row_ids) const;
 
     std::int64_t rows() const noexcept;
     int width() const noexcept;
     std::size_t cached_rows() const noexcept;
-    MlxMxfp8RowStoreStats stats() const;
+    MlxQuantizedRowStoreStats stats() const;
     void clear();
 
 private:

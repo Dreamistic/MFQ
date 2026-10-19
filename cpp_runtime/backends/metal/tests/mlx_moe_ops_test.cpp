@@ -116,6 +116,8 @@ void test_runtime_row_kernel_reuse() {
         check("inverse permutation", inverse);
         const auto sorted_pairs = mlx::core::reshape(
             pairs, Shape{tokens * routes, width});
+        auto restored = mfq::metal::moe_restore_routed_rows(sorted_pairs,order,selected.ids);
+        check("restore routed rows", restored.inputs().front());
         check("sorted reduce", mfq::metal::moe_weighted_reduce_sorted(
             sorted_pairs, inverse, weights));
         check("sorted reduce shared gate" + gate_binding,
@@ -1416,6 +1418,24 @@ void test_glu_and_expert_scale() {
     }
 }
 
+void test_restore_routed_rows() {
+    using namespace mlx::core;
+    for (auto dtype : {float16,bfloat16,float32}) for (int rows : {1,7,257}) for (int width : {1,13,64,511}) {
+        auto values = contiguous(astype(reshape(sin(arange(rows*width,float32)),{rows,width}),dtype));
+        std::vector<std::int32_t> order_values(rows),ids_values(rows);
+        for (int row=0;row<rows;++row) {order_values[row]=(row*13+5)%rows;ids_values[row]=row%7==0?-1:row%5;}
+        auto order = array(order_values.begin(),Shape{rows});
+        auto ids = array(ids_values.begin(),Shape{rows});
+        auto expected = where(expand_dims(ids>=array(0,int32),-1),take(values,argsort(order),0),zeros({rows,width},dtype));
+        auto actual = mfq::metal::moe_restore_routed_rows(values,order,ids);
+        auto expected_bytes = view(contiguous(expected),uint8),actual_bytes=view(contiguous(actual),uint8);
+        eval(expected_bytes,actual_bytes);
+        require(expected.shape()==actual.shape()&&expected.dtype()==actual.dtype(),"restored route shape/dtype mismatch");
+        require(std::equal(expected_bytes.data<std::uint8_t>(),expected_bytes.data<std::uint8_t>()+expected_bytes.size(),
+            actual_bytes.data<std::uint8_t>()),"restored routes are not bit-exact");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1439,6 +1459,7 @@ int main() {
         test_reduce_and_shared_gate();
         test_glu_and_expert_scale();
         test_runtime_row_kernel_reuse();
+        test_restore_routed_rows();
         std::cout
             << "MFQ C++ routed MoE Metal primitive tests passed\n";
         return 0;
