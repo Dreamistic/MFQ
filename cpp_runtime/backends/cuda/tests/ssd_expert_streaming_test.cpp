@@ -23,6 +23,14 @@
 #include <mutex>
 
 namespace tb=mfq_tensor_backend;
+struct MoeResidencyTestAccess {
+    static tb::Tensor direct_cache(const std::shared_ptr<MoeExpertCache>& cache) {
+        return cache->pipeline_direct_cache_storage_;
+    }
+    static tb::Tensor wire(const std::shared_ptr<MoeExpertCache>& cache) {
+        return cache->pipeline_wire_gpu_;
+    }
+};
 namespace {
 void check(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 void check_packed_metadata() {
@@ -296,9 +304,30 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
                 set_moe_kv_expert_loan(cache,loan);
             }
             bool saw_prefill=false,loan_revoked=false;
+            bool retained=false,restored=false;
+            uint64_t retained_captures=0;
+            tb::Tensor old_direct_cache,old_wire;
             for(int tokens:{1,2,3,4,5,6,1,11,143,1,1})for(auto& ffn:layers) {
-                if(ssd && tokens==11 && ffn.moe_layer==0)
-                    release_moe_decode_buffers(cache);
+                if(ssd && tokens==11 && ffn.moe_layer==0) {
+                    old_direct_cache=MoeResidencyTestAccess::direct_cache(cache);
+                    old_wire=MoeResidencyTestAccess::wire(cache);
+                    retained_captures=moe_expert_graph_captures(cache);
+                    retained=lend_moe_decode_cache_for_prefill(cache,0);
+                    const auto* fallback=std::getenv("MFQ_MOE_WIRE_FALLBACK");
+                    const bool indirect=loan && mfq::cuda::NativeDmaBatch::available() &&
+                        (!fallback || fallback[0]!='0');
+                    check(retained==indirect,"private FFN graph lending capability mismatch");
+                    if(!retained)release_moe_decode_buffers(cache);
+                    if(retained) {
+                        check(old_direct_cache.defined(),"indirect FFN has no expert cache to return");
+                        // Hold the old allocation so restoring the cache must
+                        // choose another address, then poison every old page.
+                        MFQ_CUDA_CHECK(cudaMemsetAsync(old_direct_cache.data_ptr(),0xa5,
+                            old_direct_cache.numel(),mfq_current_cuda_stream()));
+                        MFQ_CUDA_CHECK(cudaMemsetAsync(old_wire.data_ptr(),0xa5,
+                            old_wire.numel(),mfq_current_cuda_stream()));
+                    } else {old_direct_cache={};old_wire={};}
+                }
                 std::fprintf(stderr,"clipped_check format=%s ssd=%d limit=%g tokens=%d layer=%d phase=reference\n",
                     format,int(ssd),limit,tokens,ffn.moe_layer);
                 std::vector<float> input(tokens*width);
@@ -331,6 +360,17 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
                 const bool speculative=ssd && tokens<=6;
                 if(speculative && ffn.moe_layer==0)begin_moe_speculative_routes(cache,tokens);
                 check_output(ffn.forward(execution,x,tb::tensor(input_ids).to(tb::kCUDA)),references.at(key));++cases;
+                if(retained && saw_prefill && tokens==1) {
+                    const auto cache_storage=MoeResidencyTestAccess::direct_cache(cache);
+                    check(cache_storage.defined() && cache_storage.data_ptr()!=old_direct_cache.data_ptr(),
+                        "retained FFN did not restore its returned cache at a new address");
+                    const auto wire=MoeResidencyTestAccess::wire(cache);
+                    check(wire.defined() && wire.data_ptr()!=old_wire.data_ptr(),
+                        "retained FFN did not restore its returned wire at a new address");
+                    check(moe_expert_graph_captures(cache)==retained_captures,
+                        "prefill recaptured an indirect private FFN graph");
+                    restored=true;
+                }
                 if(speculative && ffn.moe_layer==1) {
                     if(tokens==6)discard_moe_speculative_routes(cache);
                     else commit_moe_speculative_routes(cache,tokens-1);
@@ -347,6 +387,27 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
             }
             check(cache->stats().pipeline_two_stage_serves>=16,
                 "clipped FFN did not execute its two-stage kernels");
+            check(!retained || restored,"retained private FFN was not replayed after prefill");
+            if(retained) {
+                // A different loan owns different publication observers. Its
+                // first decode must rebuild graphs instead of reading the old
+                // mapped dispatch table retained by the previous loan.
+                auto replacement=std::make_shared<mfq::cuda::KvExpertLoan>();
+                auto storage=tb::empty({4<<20},options.dtype(tb::kUInt8));
+                replacement->add(storage,storage.numel(),1,true,1,true,true);
+                set_moe_kv_expert_loan(cache,replacement);
+                check(!MoeResidencyTestAccess::direct_cache(cache).defined(),
+                    "replacing the loan retained its old expert cache");
+                for(auto& ffn:layers) {
+                    std::vector<float> input(width);
+                    for(int i=0;i<width;++i)input[i]=std::sin(float(i)*.13f)*.003f;
+                    auto x=tb::tensor(input).reshape({1,width}).to(options);
+                    auto id=tb::tensor(std::vector<int64_t>{(1+ffn.moe_layer)%3}).to(tb::kCUDA);
+                    check_output(ffn.forward(execution,x,id),references.at({limit,1,ffn.moe_layer}));
+                }
+                check(moe_expert_graph_captures(cache)>retained_captures,
+                    "a replacement loan reused stale cached-dispatch observers");
+            }
             check(moe_expert_graph_captures(cache)>0,
                 "private FFN initialization was not visible to shared MTP policy");
             if(ssd && mixed && mfq::cuda::NativeDmaBatch::available()) {

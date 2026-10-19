@@ -424,12 +424,16 @@ template <class Model> struct CudaGenerationContext {
     }
     void prepare_prefill_workspace(std::size_t tokens) {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
+        const bool streamed=tokens>8 && moe_expert_cache_ssd_experts(model.execution->moe_expert_cache);
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)
+            if(streamed)graph.invalidate();
+        const bool retained=streamed && lend_moe_decode_cache_for_prefill(model.execution->moe_expert_cache,
+            mfq::cuda::runtime_options::workspace_reserve_bytes());
         if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
-            if(tokens>8 && moe_expert_cache_ssd_experts(model.execution->moe_expert_cache)) {
+            if(streamed && !retained) {
                 // Private FFN graphs retain their transfer arenas after a
                 // request. Retire consumers before a new grouped prefill;
                 // otherwise these arenas can reduce its ring to one expert.
-                graph.invalidate();
                 release_moe_decode_buffers(model.execution->moe_expert_cache);
                 mfq::cuda::default_context(mfq_current_cuda_device())->reclaim_idle_memory();
             }

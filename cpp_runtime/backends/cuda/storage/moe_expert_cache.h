@@ -100,6 +100,10 @@ bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
 // Request boundary only, after target/predictor graphs have been destroyed.
 // Lend decode staging/workspace capacity to the upcoming long prefill.
 void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);
+// Private graphs with indirect expert addresses can return cache pages while
+// retaining their captured kernels. False leaves full retirement to the caller.
+bool lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExpertCache>& cache,
+    std::size_t workspace_bytes);
 bool suspend_moe_residency(const std::shared_ptr<MoeExpertCache>& cache,bool suspended);
 bool set_moe_reuse_learning(const std::shared_ptr<MoeExpertCache>& cache,bool enabled);
 // Return prompt-only ring and workspace storage before preparing decode graphs.

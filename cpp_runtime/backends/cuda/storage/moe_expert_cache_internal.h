@@ -1167,6 +1167,7 @@ private:
     friend class MoeResidencyManager;
     friend void release_moe_prefill_buffers(MoeExpertCache* cache);
     friend void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);
+    friend bool lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExpertCache>&,std::size_t);
     friend void begin_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&,int);
     friend void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&,int);
     friend void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&) noexcept;
@@ -1184,6 +1185,7 @@ private:
     std::optional<std::size_t> pipeline_direct_cache_region_;
     uint64_t pipeline_wire_fallback_cells_=0,pipeline_wire_fallback_bytes_=0;
     std::vector<std::function<void()>> pipeline_decode_release_;
+    std::vector<std::function<bool()>> pipeline_decode_indirect_;
     // Eager prefill projections execute in order on pipeline_pool_stream_.
     // Their quantization scratch can be reused across projections and layers.
     std::shared_ptr<MixedMoeRuntime> pipeline_prefill_activations_;

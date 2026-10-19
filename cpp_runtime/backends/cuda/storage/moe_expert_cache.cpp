@@ -2546,7 +2546,10 @@ void MoeExpertCache::bind_host_device_cache_hints() {
 void set_moe_kv_expert_loan(const std::shared_ptr<MoeExpertCache>& cache,std::shared_ptr<mfq::cuda::KvExpertLoan> loan) {
     if(cache) {
         const bool changed=cache->kv_expert_loan_!=loan;
-        if(changed)cache->release_direct_transfer_cache();
+        // Cached-dispatch observers belong to the loan object. Retire their
+        // consumers before replacing it, even if the storage sizes match.
+        if(changed && cache->kv_expert_loan_)release_moe_decode_buffers(cache);
+        else if(changed)cache->release_direct_transfer_cache();
         if(loan && cache->ssd_experts())loan->set_reuse_priority(true);
         if(loan)loan->set_reuse_learning(cache->reuse_learning());
         cache->kv_expert_loan_=std::move(loan);
@@ -2586,6 +2589,32 @@ void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache,
 void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>& cache) noexcept {
     if(cache && cache->moe_residency_)cache->moe_residency_->discard_speculative_routes();
     if(cache && cache->kv_expert_loan_)cache->kv_expert_loan_->discard_speculative();
+}
+
+bool lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExpertCache>& cache,
+        std::size_t workspace_bytes) {
+    if(!cache || !cache->ssd_experts() || !cache->kv_expert_loan_)return false;
+    for(const auto& indirect:cache->pipeline_decode_indirect_)if(!indirect())return false;
+    for(const auto& [key,arena]:cache->pipeline_stages_)
+        if(!key.starts_with("prefill:"))return false;
+    for(const auto& batch:cache->pipeline_dma_batches_)if(batch)return false;
+    cache->finish_pipeline_exchanges();
+    MFQ_CUDA_CHECK(cudaDeviceSynchronize());
+    release_moe_prefill_buffers(cache);
+    for(const auto& held:cache->pipeline_transfer_slots_)
+        if(held.book->slot_for(held.key)==held.slot)held.book->clear_inflight(held.slot);
+    cache->pipeline_transfer_slots_.clear();cache->pipeline_dma_leases_.clear();
+    const auto returned=tensor_nbytes(cache->pipeline_direct_cache_storage_);
+    cache->release_direct_transfer_cache();
+    cache->pipeline_wire_gpu_={};
+    cache->transfer_ready_recorded_=false;
+    const auto context=mfq::cuda::default_context(mfq_current_cuda_device());
+    context->reclaim_idle_memory();
+    cache->reserve_workspace(workspace_bytes);
+    const bool retained=context->available_memory()+context->workspace_available()>=workspace_bytes;
+    if(returned)std::cerr<<"runtime_moe_prefill_graphs retained="<<retained
+        <<" returned_expert_bytes="<<returned<<" workspace_bytes="<<workspace_bytes<<'\n';
+    return retained;
 }
 
 void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache) {

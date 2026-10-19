@@ -281,6 +281,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         int64_t ssd_gate_up_host_tail=0;
         bool direct_packet=false;
         bool wire_fallback=false;
+        bool indirect_wire=false;
+        int64_t wire_capacity=0;
         bool cached_resident=false;
         bool reuse_plan=false;
         bool check_reused_views=false;
@@ -1511,6 +1513,17 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         }
         return *arena;
     }
+    void bind_wire(Cell& cell) {
+        if(!cache_->pipeline_wire_gpu_.defined() || cache_->pipeline_wire_gpu_.numel()<cell.wire_capacity) {
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream_));
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(cache_->weight_stream_));
+            cache_->pipeline_wire_gpu_={};
+            cache_->reserve_workspace(std::size_t(cell.wire_capacity)+(std::size_t(64)<<20));
+            cache_->pipeline_wire_gpu_=tb::empty({cell.wire_capacity},cell.input.options().dtype(tb::kUInt8));
+            MFQ_CUDA_CHECK(cudaMemsetAsync(cache_->pipeline_wire_gpu_.data_ptr(),0,32,stream_));
+        }
+        cell.wire=cache_->pipeline_wire_gpu_;
+    }
     void initialize(Cell& cell,CudaExecutionContext& execution,bool window=false) {
         cell.in_window=window;
         const auto prefill_graph=mfq::cuda::runtime_options::moe_prefill_graph();
@@ -1863,11 +1876,13 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             // The wire fallback still needs space for every routed payload.
             const auto capacity=cell.direct_packet && !cell.wire_fallback ? cell.wire_header_bytes :
                 ((32+24*routes*wire_geometry.second+15)&~int64_t(15))+routes*wire_geometry.first;
-            if(!cache_->pipeline_wire_gpu_.defined() || cache_->pipeline_wire_gpu_.numel()<capacity) {
-                cache_->reserve_workspace(std::size_t(capacity)+(std::size_t(64)<<20));
-                cache_->pipeline_wire_gpu_=tb::empty({capacity},cell.input.options().dtype(tb::kUInt8));
-            }
-            cell.wire=cache_->pipeline_wire_gpu_;
+            cell.wire_capacity=capacity;
+            // Direct packets publish payload destinations through the mapped
+            // descriptor table. Their captured kernels never embed the wire
+            // address; only the serialized host/DMA producer uses this buffer.
+            cell.indirect_wire=cell.two_stage && cell.direct_packet && cell.wire_fallback &&
+                !window && !mfq::cuda::runtime_options::dma_graph_batch();
+            bind_wire(cell);
             if(cell.wire_fallback && !cache_->pipeline_wire_fallback_cells_++)
                 std::fprintf(stderr,"moe_wire_fallback_dispatch scope=first_cell tokens=%d cache_bytes=%zu wire_bytes=%lld\n",
                     cell.tokens,std::size_t(tensor_nbytes(cache_->pipeline_direct_cache_storage_)),static_cast<long long>(cell.wire.numel()));
@@ -4180,7 +4195,17 @@ public:
         cache_->pipeline_decode_release_.push_back([owner=weak_from_this()] {
             if(auto pipeline=owner.lock()) {
                 pipeline->cells_.clear();pipeline->prediction_cells_.clear();pipeline->window_routes_.clear();
+                pipeline->cached_expert_fields_.reset();
             }
+        });
+        cache_->pipeline_decode_indirect_.push_back([owner=weak_from_this()] {
+            const auto pipeline=owner.lock();if(!pipeline)return true;
+            if(!pipeline->prediction_cells_.empty() || !pipeline->window_routes_.empty())return false;
+            for(const auto& [key,cell]:pipeline->cells_) {
+                if(std::get<2>(key) || !cell->graph_replay || !cell->wire_fallback ||
+                        !cell->indirect_wire || !cell->host_cache_packet || !cell->cached_resident)return false;
+            }
+            return true;
         });
     }
     ~MoeFfnPipeline() {
@@ -4262,6 +4287,14 @@ public:
             cell=std::make_unique<Cell>(tokens,routes,width_,experts_,stream_,eager);
             initialize(*cell,execution,window!=nullptr);
         }
+        // A prefill may have returned the revocable expert cache while keeping
+        // this graph. Its descriptors resolve the newly allocated pages.
+        if(cell->wire_fallback)cache_->prepare_direct_transfer_cache();
+        if(cell->indirect_wire)bind_wire(*cell);
+        struct WireLifetime {
+            Cell& cell;
+            ~WireLifetime(){if(cell.indirect_wire)cell.wire={};}
+        } wire_lifetime{*cell};
         if(window) {
             if(cache_->ssd_experts())if(const auto found=prediction_cells_.find(window);found!=prediction_cells_.end())
                 cell->router_hint=found->second;
