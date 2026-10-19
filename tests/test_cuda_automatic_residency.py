@@ -63,6 +63,8 @@ def test_cuda_auto_expert_budget_uses_selected_physical_device(tmp_path, monkeyp
 
 @pytest.mark.parametrize("available,enabled", [(52 * GIB, True), (8 * GIB, False)])
 def test_cuda_launch_selects_ram_or_ssd_expert_cache(tmp_path, monkeypatch, available, enabled):
+    monkeypatch.delenv("MFQ_MODEL_FILE_IO", raising=False)
+    monkeypatch.delenv("MFQ_PLE_FILE_MAP", raising=False)
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "discrete"})
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (64 * GIB, available))
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
@@ -82,6 +84,8 @@ def test_cuda_launch_selects_ram_or_ssd_expert_cache(tmp_path, monkeypatch, avai
     if not enabled:
         assert int(environment["MFQ_MOE_HOST_CACHE_BYTES"]) == 6 * GIB
         assert environment["MFQ_MOE_NVQ_DENSE"] == "0"
+        assert environment["MFQ_MODEL_FILE_IO"] == "direct"
+        assert environment["MFQ_PLE_FILE_MAP"] == "1"
     if enabled:
         assert environment["MFQ_MOE_PIPELINE"] == "1"
         assert environment["MFQ_MOE_TWO_STAGE_FFN"] == "1"
@@ -110,11 +114,14 @@ def test_cuda_ssd_experts_respect_explicit_ram_cache_limit(tmp_path, monkeypatch
         "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", 24 * GIB),)))
     pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda", automatic_memory_budget=False)
     pool.runtime_environment["MFQ_MOE_HOST_CACHE_BYTES"] = str(2 * GIB)
+    pool.runtime_environment.update(MFQ_MODEL_FILE_IO="buffered", MFQ_PLE_FILE_MAP="0")
     model = artifact(tmp_path)
     request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16, device_ids=["0"])
     _, environment = pool._launch_configuration(model, request, port=1234)
     assert environment["MFQ_MOE_HOST_CACHE_BYTES"] == str(2 * GIB)
     assert environment["MFQ_MOE_PRELOAD_ALL"] == "0"
+    assert environment["MFQ_MODEL_FILE_IO"] == "buffered"
+    assert environment["MFQ_PLE_FILE_MAP"] == "0"
     pool.runtime_environment["MFQ_MOE_SSD_EXPERTS"] = "0"
     with pytest.raises(JobExecutionError) as raised:
         pool._launch_configuration(model, request, port=1234)

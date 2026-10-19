@@ -4588,6 +4588,10 @@ class RuntimePool:
                     process_environment["MFQ_MOE_PRELOAD_ALL"] = "0"
                     process_environment["MFQ_MOE_ASSERT_RESIDENT"] = "0"
                     process_environment["MFQ_MOE_NVQ_DENSE"] = "0"
+                    # Bulk expert images bypass the OS cache; sparse PLE rows
+                    # retain batched mapped reads. Native LRUs own copied data.
+                    if process_environment.setdefault("MFQ_MODEL_FILE_IO", "direct") == "direct":
+                        process_environment.setdefault("MFQ_PLE_FILE_MAP", "1")
             else:
                 if host_budget < cold_bytes:
                     raise _job_error("runtime_ram_expert_budget_exceeded",
