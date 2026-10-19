@@ -675,7 +675,8 @@ void MoeExpertCache::execute_ssd_expert_reads(SsdExpertReads& reads,mfq::HostPar
                 const auto index=reads.missing[i];
                 reads.leases[index]=reads.requests[index].first->acquire_expert(reads.requests[index].second,touch);
                 if(index<reads.gate_up_requests) {
-                    {std::lock_guard lock(reads.mutex);--reads.gate_up_remaining;}
+                    {std::lock_guard lock(reads.mutex);
+                     reads.gate_up_ready.push_back(index);--reads.gate_up_remaining;}
                     reads.changed.notify_one();
                 }
             }
@@ -743,6 +744,8 @@ std::unique_ptr<MoeExpertCache::SsdExpertReads> MoeExpertCache::begin_ssd_expert
     auto reads=prepare_ssd_expert_reads(std::move(requests));
     if(gate_up_requests>reads->requests.size())throw std::logic_error("invalid SSD projection read boundary");
     reads->gate_up_requests=gate_up_requests;
+    reads->gate_up_ready.reserve(gate_up_requests);
+    for(std::size_t i=0;i<gate_up_requests;++i)if(reads->leases[i])reads->gate_up_ready.push_back(i);
     for(const auto index:reads->missing)reads->gate_up_remaining+=index<gate_up_requests;
     if(!reads->missing.empty()) {
         if(!ssd_prefill_reader_)throw std::logic_error("SSD expert read queue is not initialized");

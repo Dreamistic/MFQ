@@ -533,16 +533,25 @@ int main(int argc,char** argv)try {
             {
                 auto ready=candidate.cache->begin_ssd_expert_reads({{quant,31},{quant,31}},1);
                 check(!ready->ready.valid(),"RAM-only phase batch launched a coordinator job");
-                ready->wait_gate_up();ready->wait();
+                std::vector<std::size_t> batch;
+                check(ready->next_gate_up_batch(batch) && batch==std::vector<std::size_t>{0},
+                    "RAM GU hit was not published exactly once");
+                check(!ready->next_gate_up_batch(batch),"finished RAM GU batch was published twice");
+                ready->wait();
                 check(ready->leases[0]==held && ready->leases[1]==held,"phase batch changed a RAM hit's lease");
             }
-            for(int expert:{45,46})quant->host_cache()->erase(quant->host_key(expert));
+            for(int expert:{45,46,47})quant->host_cache()->erase(quant->host_key(expert));
             {
-                auto reads=candidate.cache->begin_ssd_expert_reads({{quant,45},{quant,46}},1);
+                auto reads=candidate.cache->begin_ssd_expert_reads({{quant,45},{quant,46},{quant,47}},2);
                 check(reads->ready.valid(),"cold phase batch did not start asynchronous reads");
-                reads->wait_gate_up();check(bool(reads->leases[0]),"GU release preceded its lease publication");
-                reads->wait();check(bool(reads->leases[1]),"Down read lost its lease");
-                for(int i=0;i<2;++i) {
+                std::vector<std::size_t> batch;std::array<int,2> publications{};
+                while(reads->next_gate_up_batch(batch))for(const auto i:batch) {
+                    check(i<2 && ++publications.at(i)==1 && bool(reads->leases[i]),
+                        "GU batch duplicated a row or preceded its lease publication");
+                }
+                check(publications==std::array<int,2>{1,1},"GU batch omitted a completed read");
+                reads->wait();check(bool(reads->leases[2]),"Down read lost its lease");
+                for(int i=0;i<3;++i) {
                     const auto expected=moe_cache_fields(quant->read_expert(45+i));
                     const auto actual=moe_cache_fields(reads->leases[i]->weights);
                     for(std::size_t f=0;f<expected.size();++f)check(std::memcmp(actual[f].data_ptr(),expected[f].data_ptr(),expected[f].nbytes())==0,
@@ -552,7 +561,9 @@ int main(int argc,char** argv)try {
             failed=false;
             try {
                 auto reads=candidate.cache->begin_ssd_expert_reads({{quant,experts+1},{quant,47}},1);
-                reads->wait_gate_up();reads->wait();
+                std::vector<std::size_t> batch;
+                while(reads->next_gate_up_batch(batch)){}
+                reads->wait();
             }catch(const std::exception&){failed=true;}
             check(failed,"failed asynchronous SSD GU read did not release its waiter");
             // Dropping a packet still drains its queued read before freeing
