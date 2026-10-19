@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 
 from mfq.formats.shards import parse_size
-from mfq.calibration.ud_recipes import UD_TIERS
+from mfq._alphaq_profiles import UD_TIERS
 
 QUANT_BACKENDS = ("auto", "cuda", "metal", "cpu")
 _UD_TIER_CHOICES = UD_TIERS

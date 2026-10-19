@@ -2,10 +2,34 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 from mfq import cli
+
+
+@pytest.mark.parametrize('arguments', [['--version'], ['serve', '--help']])
+def test_cli_starts_without_packaging_excluded_modules(arguments):
+    script = '''
+import importlib.abc
+import sys
+
+class PackagedModules(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        excluded = ('mfq.calibration', 'mfq.quantize', 'mfq.tools', 'torch', 'scipy')
+        if any(fullname == name or fullname.startswith(name + '.') for name in excluded):
+            raise ModuleNotFoundError('excluded from desktop package', name=fullname)
+
+sys.meta_path.insert(0, PackagedModules())
+from mfq.cli import main
+raise SystemExit(main(sys.argv[1:]))
+'''
+    result = subprocess.run([sys.executable, '-c', script, *arguments],
+                            cwd=Path(__file__).resolve().parents[1],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_alphaq_keeps_text_only_defaults_and_allows_auxiliary_opt_in():
