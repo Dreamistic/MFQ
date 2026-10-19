@@ -222,6 +222,45 @@ mfq::MfeQuantExpertStore memory_store(std::vector<std::uint8_t> blob,
 }
 void self_test() {
     {
+        std::vector<std::uint8_t> mx{'M','X','T','1',1,4,0,0};
+        for(std::uint64_t dimension:{6,64,6,32,6,2})mfq::test::append(mx,dimension);
+        for(int i=0;i<192;++i)mx.push_back(std::uint8_t(i));
+        for(int i=0;i<12;++i)mx.push_back(std::uint8_t(120+i));
+        std::vector<std::uint8_t> blob{'M','F','E','1'};
+        for(unsigned dimension:{3,3,64,2})mfq::test::append(blob,dimension);
+        append_pool(blob,{2,0},"MXFP4",mx);
+        append_pool(blob,{1},"NINT",mfq::test::fixture(3,64,16,6).blob);
+        auto bytes=std::make_shared<std::atomic<std::size_t>>(0);
+        auto store=memory_store(blob,bytes,true);
+        require(bytes->load()<blob.size(),"MXFP4 registration read payloads");
+        bytes->store(0);
+        const auto leaf=store.read_expert(0);
+        require(leaf.dtype=="MXFP4" && leaf.payload.size()==158 && bytes->load()==102,
+            "MXFP4 expert read expanded or scanned the pool");
+        require(std::memcmp(leaf.payload.data()+56,mx.data()+56+96,96)==0 &&
+            std::memcmp(leaf.payload.data()+152,mx.data()+248+6,6)==0,"MXFP4 ownership or scales changed");
+        std::array<std::vector<std::uint8_t>,2> fields{std::vector<std::uint8_t>(98,0xa5),
+            std::vector<std::uint8_t>(8,0xa5)};
+        std::array<mfq::QuantFieldTarget,2> targets{{{fields[0].data()+1,96},{fields[1].data()+1,6}}};
+        require(store.copy_mxfp4_fields(0,targets),"MXFP4 direct fields unavailable");
+        require(std::memcmp(targets[0].data,leaf.payload.data()+56,96)==0 &&
+            std::memcmp(targets[1].data,leaf.payload.data()+152,6)==0 &&
+            fields[0].front()==0xa5 && fields[0].back()==0xa5 &&
+            fields[1].front()==0xa5 && fields[1].back()==0xa5,"MXFP4 direct field bounds changed");
+        const auto untouched=fields;
+        require(!store.copy_mxfp4_fields(1,targets) && fields==untouched,"NINT source overwrote MXFP4 fields");
+        --targets[0].bytes;rejected([&]{store.copy_mxfp4_fields(0,targets);});
+        int visited=0;store.visit_pool_experts(0,[&](int id,mfq::MfeQuantExpert expert) {
+            require(expert.payload==store.read_expert(id).payload,"MXFP4 preload changed rows");++visited;
+        });
+        require(visited==2,"MXFP4 preload omitted experts");
+        mx.back()=255;
+        std::vector<std::uint8_t> bad{'M','F','E','1'};
+        for(unsigned dimension:{2,3,64,1})mfq::test::append(bad,dimension);
+        append_pool(bad,{0,1},"MXFP4",mx);
+        auto invalid=memory_store(bad);rejected([&]{invalid.read_expert(1);});
+    }
+    {
         const std::vector<int> ids{5,2,7,0,6,1,4,3};
         std::vector<std::uint8_t> blob{'M','F','E','1'};
         for(unsigned value:{8,8,53,1})mfq::test::append<std::uint32_t>(blob,value);

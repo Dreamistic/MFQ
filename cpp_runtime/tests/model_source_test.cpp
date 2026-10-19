@@ -273,6 +273,7 @@ int main() {
             }
             std::vector<std::future<void>> readers;
             for(int worker=0;worker<8;++worker)readers.push_back(std::async(std::launch::async,[batch] {
+                mfq::MappedPrefetchScope transient(false,true);
                 for(int i=0;i<32;++i) {
                     std::vector<std::byte> bytes(14);
                     batch({{7,bytes.data()+7,7},{0,bytes.data(),7}});require_bytes(bytes);
@@ -289,11 +290,26 @@ int main() {
             std::vector<std::byte> received(count*width);
             std::vector<mfq::ReadSpan> spans;
             for(size_t i=0;i<count;++i)spans.push_back({(i*4093)%(expected.size()-width+1),received.data()+i*width,width});
-            large_batch(spans);
+            {
+                mfq::MappedPrefetchScope transient(true,true);
+                large_batch(spans);
+            }
             require(mfq::release_mapped_tensor_pages()>0,"mapped batch trim lost its independent owner");
             std::fill(received.begin(),received.end(),std::byte{0});large_batch(spans);
             for(const auto& span:spans)require(std::equal(span.destination,span.destination+span.size,expected.begin()+span.offset),
                     "mapped batch across pages/prefetch chunks differs");
+            auto sparse=std::vector<mfq::ReadSpan>(spans.begin(),spans.begin()+64);
+            std::reverse(sparse.begin(),sparse.end());
+            sparse.push_back(sparse.front());
+            sparse.push_back({0,nullptr,0});
+            for(int repeat=0;repeat<2;++repeat) {
+                std::fill(received.begin(),received.end(),std::byte{0});
+                mfq::MappedPrefetchScope transient(false,true);
+                large_batch(sparse);
+                for(const auto& span:sparse)if(span.size)
+                    require(std::equal(span.destination,span.destination+span.size,expected.begin()+span.offset),
+                            "sparse mapped page release changed reread data");
+            }
         }
 
         {

@@ -26,7 +26,7 @@ struct MfeQuantExpert {
     std::vector<std::uint8_t> payload;
 };
 
-// Canonical mixed NINT/NVQ range source. Its index owns only selectors,
+// Canonical mixed NINT/NVQ/MXFP4 range source. Its index owns only selectors,
 // codebooks and expert ownership; no expert payload is retained implicitly.
 class MfeQuantExpertStore {
 public:
@@ -53,6 +53,8 @@ public:
                          std::size_t* source_bytes=nullptr) const;
     bool copy_nint_fields(int expert,const std::array<QuantFieldTarget,7>& targets,
                           std::size_t* source_bytes=nullptr) const;
+    bool copy_mxfp4_fields(int expert,const std::array<QuantFieldTarget,2>& targets,
+                          std::size_t* source_bytes=nullptr) const;
     // Startup-only sequential pool read; the temporary canonical pool is
     // released before advancing to the next pool. Visitors own each leaf.
     // An optional executor slices immutable pool bytes concurrently; callers
@@ -67,6 +69,8 @@ private:
         std::vector<std::int32_t> ids;
         std::shared_ptr<mfq::NintRows> nint;
         std::shared_ptr<mfq::NvqRows> nvq;
+        // MXT1 stores field-major rows; retain offsets, never pool payloads.
+        std::size_t mx_values=0, mx_scales=0;
         std::size_t offset=0, bytes=0;
     };
     struct Expert { int pool=-1,local=-1; };

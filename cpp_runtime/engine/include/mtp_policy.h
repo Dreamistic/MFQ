@@ -40,6 +40,11 @@ struct GenerationStats {
     uint64_t standard_tokens = 0;
     uint64_t park_count = 0;
     uint64_t reentry_probes = 0;
+    // Host wall time, including waits observed in each phase; no extra GPU
+    // synchronization is inserted for measurement.
+    double target_ms = 0;
+    double head_ms = 0;
+    double rollback_ms = 0;
 };
 
 inline ChainVerification verify_greedy(

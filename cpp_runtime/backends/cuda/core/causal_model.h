@@ -6,6 +6,7 @@
 #include "quant_linear.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -49,6 +50,7 @@ namespace mfq::cuda {
 struct CausalResources {
     mfq::models::CausalLmMetadata metadata;
     CudaExecutionContext *execution = nullptr;
+    std::function<void()> restore_decode_workspace;
     template<class Model> std::optional<mfq_tensor_backend::Tensor>
     adapter_graph_logits(Model&,mfq_tensor_backend::Tensor,int) {return {};}
 

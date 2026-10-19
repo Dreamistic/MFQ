@@ -346,6 +346,8 @@ endfunction()
 set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/deepseek_v4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/ops.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/engram.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/prefill.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
     ${MFQ_CUDA_ROOT}/models/qwen4_exp/ops.cpp
     ${MFQ_CUDA_ROOT}/runtime/kv_offload.cpp
@@ -608,6 +610,11 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-quant-range-cache-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-quant-range-cache-test PRIVATE mfq-cuda-runtime)
+    add_executable(mfq-mxfp8-layout-test ${MFQ_CUDA_ROOT}/tests/mxfp8_layout_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-mxfp8-layout-test)
+    target_compile_definitions(mfq-mxfp8-layout-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-mxfp8-layout-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-mxfp8-layout-test COMMAND mfq-mxfp8-layout-test)
     add_executable(mfq-moe-ffn-pipeline-test ${MFQ_CUDA_ROOT}/tests/moe_ffn_pipeline_test.cpp)
     mfq_configure_cuda_runtime_target(mfq-moe-ffn-pipeline-test)
     target_compile_definitions(mfq-moe-ffn-pipeline-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
@@ -664,6 +671,8 @@ if(BUILD_TESTING)
     if(MSVC)
         target_compile_options(mfq-ssd-expert-streaming-test PRIVATE /EHsc)
         target_compile_options(mfq-host-expert-cache-test PRIVATE /EHsc)
+        # Cancellation checks must unwind CUDA stream guards before recovery.
+        target_compile_options(mfq-nint-row-pipeline-test PRIVATE /EHsc)
     endif()
 
     add_executable(mfq-float-projection-test ${MFQ_CUDA_ROOT}/tests/float_projection_test.cpp)
@@ -672,6 +681,37 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-float-projection-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-float-projection-test COMMAND mfq-float-projection-test)
     add_test(NAME mfq-gr-prefill-blas-test COMMAND mfq-float-projection-test --prefill-blas-check)
+
+    add_executable(mfq-deepseek-v41-ced-test ${MFQ_CUDA_ROOT}/tests/deepseek_v41_ced_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-deepseek-v41-ced-test)
+    target_link_libraries(mfq-deepseek-v41-ced-test PRIVATE mfq-cuda-runtime)
+    target_compile_definitions(mfq-deepseek-v41-ced-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    add_test(NAME mfq-deepseek-v41-ced-test COMMAND mfq-deepseek-v41-ced-test)
+    set_tests_properties(mfq-deepseek-v41-ced-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-deepseek-v41-engram-test ${MFQ_CUDA_ROOT}/tests/deepseek_v41_engram_test.cpp)
+    target_link_libraries(mfq-deepseek-v41-engram-test PRIVATE mfq-cuda-runtime)
+    mfq_configure_cuda_runtime_target(mfq-deepseek-v41-engram-test)
+    target_compile_definitions(mfq-deepseek-v41-engram-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    add_test(NAME mfq-deepseek-v41-engram-test COMMAND mfq-deepseek-v41-engram-test)
+    set_tests_properties(mfq-deepseek-v41-engram-test PROPERTIES SKIP_RETURN_CODE 77)
+    if(MSVC)
+        target_compile_options(mfq-deepseek-v41-engram-test PRIVATE /EHsc)
+        target_compile_options(mfq-deepseek-v41-ced-test PRIVATE /EHsc)
+    endif()
+    add_executable(mfq-deepseek-v41-indexer-bench ${MFQ_REPOSITORY_ROOT}/bench/cuda_deepseek_v41_indexer_bench.cpp)
+    mfq_configure_cuda_runtime_target(mfq-deepseek-v41-indexer-bench)
+    target_compile_definitions(mfq-deepseek-v41-indexer-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-deepseek-v41-indexer-bench PRIVATE mfq-cuda-runtime)
+    if(MSVC)
+        target_compile_options(mfq-deepseek-v41-indexer-bench PRIVATE /EHsc)
+    endif()
+    add_executable(mfq-deepseek-v41-hc-bench ${MFQ_REPOSITORY_ROOT}/bench/cuda_deepseek_v41_hc_bench.cpp)
+    mfq_configure_cuda_runtime_target(mfq-deepseek-v41-hc-bench)
+    target_compile_definitions(mfq-deepseek-v41-hc-bench PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-deepseek-v41-hc-bench PRIVATE mfq-cuda-runtime)
+    if(MSVC)
+        target_compile_options(mfq-deepseek-v41-hc-bench PRIVATE /EHsc)
+    endif()
 endif()
 target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver

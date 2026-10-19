@@ -75,8 +75,13 @@ public:
     // A streaming scan must not evict repeatedly consumed decoded images.
     void enable_reuse_priority();
     void set_reuse_learning(bool enabled);
+    // A prefill scan may replace idle entries from inactive layers. Existing
+    // active-layer experts and live CPU/GPU leases remain protected.
+    std::vector<int> set_scan_low_priority_sources(std::vector<int> sources);
     // Verification can read rejected draft rows. Keep their immutable images,
-    // but learn recency/reuse only from the accepted route prefix.
+    // but learn recency/reuse only from the accepted route prefix. Entries
+    // are ordered by token and layer; repeated keys represent real reuse by
+    // separate accepted tokens and must not be deduplicated across tokens.
     void begin_speculative_learning();
     void commit_speculative_learning(const std::vector<mfq::MoeCacheKey>& accepted);
     void discard_speculative_learning() noexcept;

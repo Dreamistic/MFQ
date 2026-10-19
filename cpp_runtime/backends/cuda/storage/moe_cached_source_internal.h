@@ -28,6 +28,7 @@ public:
         return std::all_of(cohorts_.begin(),cohorts_.end(),[](const auto& cohort) {
             const auto& p=*cohort.cpu;
             if(p.family==MixedMoeFamily::Nint)return p.nint.gs>0 && p.nint.gs<=64;
+            if(p.family==MixedMoeFamily::Mxfp4)return p.mxfp4.neuron_len%32==0;
             return p.family==MixedMoeFamily::Nvq && p.nvq.gs==24 &&
                 p.nvq.kernel_format>=1 && p.nvq.kernel_format<=17;
         });
@@ -88,6 +89,8 @@ public:
                 if (pool.family==MixedMoeFamily::Nint) {
                     pool.nint.q_packed={}; pool.nint.row_q_bits={}; pool.nint.row_q_bit_offsets={};
                     pool.nint.sub_scale={}; pool.nint.sub_min={}; pool.nint.neuron_scale={}; pool.nint.neuron_min={};
+                } else if(pool.family==MixedMoeFamily::Mxfp4) {
+                    pool.mxfp4.values={};pool.mxfp4.scales={};
                 } else {
                     pool.nvq.indices_packed={}; pool.nvq.aux_packed={}; pool.nvq.sub_scale_packed={}; pool.nvq.neuron_scale={};
                 }

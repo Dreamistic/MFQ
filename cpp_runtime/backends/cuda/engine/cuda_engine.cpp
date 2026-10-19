@@ -112,12 +112,13 @@ struct CudaEngineState {
 
     void restore_graph_expert_space() {
         if(preparing_graph_depth)return;
-        release_moe_prefill_buffers(execution->moe_expert_cache);
+        prepare_moe_decode_residency(execution->moe_expert_cache);
         mfq::cuda::default_context(execution->layer_placement.primary_device())->reclaim_idle_memory();
         restore_mtp_expert_space();
         if(!graph_expert_loan)return;
         bool ssd=false;std::size_t transfer=0,streamed=0;
-        for(const auto& [name,value]:moe_expert_memory_metrics(execution->moe_expert_cache)) {
+        const auto expert_metrics=moe_expert_memory_metrics(execution->moe_expert_cache);
+        for(const auto& [name,value]:expert_metrics) {
             if(name=="ssd_expert_enabled")ssd=value!=0;
             if(name=="expert_decode_stage_budget_bytes")transfer=std::size_t(value);
             if(name=="ram_expert_payload_bytes" || name=="ssd_expert_payload_bytes")streamed+=std::size_t(value);
@@ -128,6 +129,12 @@ struct CudaEngineState {
             std::cerr<<"runtime_model_io_stats boundary=prefill_end calls="<<io.calls
                 <<" logical_bytes="<<io.logical_bytes<<" physical_bytes="<<io.physical_bytes
                 <<" read_ms="<<double(io.read_nanoseconds)/1e6<<'\n';
+            std::cerr<<"runtime_moe_pipeline_stats boundary=prefill_end";
+            for(const auto& [name,value]:expert_metrics)
+                if(name=="expert_route_wait_ms" || name=="expert_plan_ms" ||
+                   name=="expert_host_fetch_ms" || name=="expert_logical_transfer_bytes" ||
+                   name=="ssd_expert_read_wait_ms")std::cerr<<' '<<name<<'='<<value;
+            std::cerr<<'\n';
         }
         // Spare device memory can hold revocable copies of streamed experts.
         // Primary arenas retain their configured budget. Prefill, KV growth
@@ -253,9 +260,9 @@ struct CudaEngineState {
             else throw std::invalid_argument("continuous batching is unavailable for this model");
         }
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
+        if(execution->moe_expert_cache) {
             graph_expert_loan=execution->kv_memory?execution->kv_memory->expert_loan():nullptr;
-            if(!graph_expert_loan && components.mtp) {
+            if(!graph_expert_loan && (components.mtp || moe_expert_cache_ssd_experts(execution->moe_expert_cache))) {
                 graph_expert_loan=std::make_shared<KvExpertLoan>();
                 set_moe_kv_expert_loan(execution->moe_expert_cache,graph_expert_loan);
             }
@@ -265,6 +272,8 @@ struct CudaEngineState {
                 [this](std::size_t bytes) {
                     cache.reserve_ram(bytes);reclaim_moe_optional_host(execution->moe_expert_cache,bytes);
                 });
+        }
+        if constexpr (std::is_same_v<Model,Qwen4CausalLm>) {
             language.reserve_kv_workspace = [this](std::size_t bytes) {
                 const auto device = execution->layer_placement.primary_device();
                 auto context = mfq::cuda::default_context(device);
@@ -349,7 +358,7 @@ struct CudaEngineState {
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
     }
     ~CudaEngineState() {
-        if constexpr(std::is_same_v<Model,Qwen4CausalLm>)language.restore_decode_workspace={};
+        language.restore_decode_workspace={};
         try {release_graph_expert_space();}
         catch(const std::exception& error) {std::cerr<<"runtime_mtp_workspace_cache cleanup_error="<<error.what()<<'\n';}
         if(execution->kv_memory)execution->kv_memory->set_reservation({});

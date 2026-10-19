@@ -945,7 +945,7 @@ forward_tensor_parallel_output_projections(
 }
 
 static bool is_nint_linear_dtype(const std::string & dtype) {
-    return dtype == "NINT";
+    return dtype == "NINT" || dtype == "NINT8-0";
 }
 
 static bool is_nvq_linear_dtype(const std::string & dtype) {

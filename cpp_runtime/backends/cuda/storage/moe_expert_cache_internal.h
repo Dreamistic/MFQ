@@ -32,6 +32,11 @@ public:
     PrefillCopySubmission finish_prefill_copy(int slot);
     void finish_prefill_copies();
     std::shared_ptr<mfq::cuda::KvExpertLoan> kv_expert_loan_;
+    std::vector<int> set_prefill_low_priority_sources(std::vector<int>);
+    std::vector<int> prioritize_prefill_layers(int first,int last);
+    bool prefill_layer_active(int layer) const {
+        return !std::binary_search(prefill_low_priority_layers_.begin(),prefill_low_priority_layers_.end(),layer);
+    }
     void prepare_direct_transfer_cache();
     void release_direct_transfer_cache();
     std::size_t begin_prefill_loan(std::size_t workspace_bytes);
@@ -376,14 +381,29 @@ public:
         std::future<void> ready;
         std::mutex mutex;
         std::condition_variable changed;
-        std::size_t gate_up_requests=0,gate_up_remaining=0;
+        std::size_t gate_up_requests=0,gate_up_remaining=0,down_remaining=0;
+        std::vector<std::size_t> gate_up_ready,down_ready;
+        bool publish_progress=false;
         std::exception_ptr failed;
         ~SsdExpertReads(){if(ready.valid())ready.wait();}
         void wait(){if(ready.valid())ready.get();}
-        void wait_gate_up() {
+        void publish_read(std::size_t index) {
+            {
+                std::lock_guard lock(mutex);
+                const bool down=index>=gate_up_requests;
+                (down?down_ready:gate_up_ready).push_back(index);
+                --(down?down_remaining:gate_up_remaining);
+            }
+            changed.notify_one();
+        }
+        bool next_projection_batch(std::vector<std::size_t>& batch,bool down) {
             std::unique_lock lock(mutex);
-            changed.wait(lock,[&]{return !gate_up_remaining || failed;});
+            auto& queue=down?down_ready:gate_up_ready;
+            const auto& remaining=down?down_remaining:gate_up_remaining;
+            changed.wait(lock,[&]{return !queue.empty() || !remaining || failed;});
             if(failed)std::rethrow_exception(failed);
+            batch.clear();batch.swap(queue);
+            return !batch.empty();
         }
     };
     std::unique_ptr<SsdExpertReads> prepare_ssd_expert_reads(std::vector<SsdExpertRequest> requests,bool background=false,bool prediction=false);
@@ -704,6 +724,10 @@ public:
                << " pipeline_gu_build_overlap_copies=" << stats_.pipeline_gu_build_overlap_copies
                << " pipeline_ssd_gu_overlap_serves=" << stats_.pipeline_ssd_gu_overlap_serves
                << " pipeline_ssd_gu_overlap_bytes=" << stats_.pipeline_ssd_gu_overlap_bytes
+               << " pipeline_ssd_gu_staged_bytes=" << stats_.pipeline_ssd_gu_staged_bytes
+               << " pipeline_ssd_gu_upload_batches=" << stats_.pipeline_ssd_gu_upload_batches
+               << " pipeline_ssd_down_overlap_bytes=" << stats_.pipeline_ssd_down_overlap_bytes
+               << " pipeline_ssd_down_upload_batches=" << stats_.pipeline_ssd_down_upload_batches
                << " pipeline_ssd_gu_compute_serves=" << stats_.pipeline_ssd_gu_compute_serves
                << " pipeline_native_dma_batches=" << stats_.pipeline_native_dma_batches
                << " pipeline_native_dma_copies=" << stats_.pipeline_native_dma_copies
@@ -898,6 +922,15 @@ public:
             {"ssd_protected_cache_bytes",double(kv_reuse.protected_pages*mfq::cuda::KvExpertLoan::page)},
             {"ssd_decode_read_wait_ms",double(stats_.pipeline_window_ssd_read_ns)/1e6},
             {"ssd_expert_read_wait_ms",double(stats_.pipeline_ssd_read_ns)/1e6},
+            {"expert_route_wait_ms",double(stats_.pipeline_route_wait_ns)/1e6},
+            {"expert_plan_ms",double(stats_.pipeline_plan_ns)/1e6},
+            {"expert_host_fetch_ms",double(stats_.pipeline_fetch_ns)/1e6},
+            {"expert_graph_captures",double(stats_.pipeline_graph_captures)},
+            {"expert_target_multi_route_positions",double(stats_.pipeline_multi_route_positions[0])},
+            {"expert_target_multi_unique_routes",double(stats_.pipeline_multi_unique_routes[0])},
+            {"expert_predictor_multi_route_positions",double(stats_.pipeline_multi_route_positions[1])},
+            {"expert_predictor_multi_unique_routes",double(stats_.pipeline_multi_unique_routes[1])},
+            {"expert_logical_transfer_bytes",double(stats_.ram_pcie_bytes)},
             {"ssd_expert_encoded_ms",double(disk_times[0])/1e6},
             {"ssd_expert_materialize_ms",double(disk_times[1])/1e6},
             {"ssd_expert_nint_materialize_ms",double(disk_times[2])/1e6},
@@ -926,11 +959,17 @@ public:
             {"expert_native_dma_fallbacks",double(stats_.pipeline_native_dma_fallbacks)},
             {"expert_direct_cache_capacity_bytes",double(tensor_nbytes(pipeline_direct_cache_storage_))},
             {"expert_decode_stage_budget_bytes",double(pipeline_direct_cache_budget_)},
+            {"expert_transfer_wire_bytes",double(tensor_nbytes(pipeline_wire_gpu_))},
             {"expert_wire_fallback_cells",double(pipeline_wire_fallback_cells_)},
             {"expert_wire_fallback_bytes",double(pipeline_wire_fallback_bytes_)},
             {"expert_gu_build_overlap_serves",double(stats_.pipeline_gu_build_overlap_serves)},
             {"ssd_gu_io_overlap_serves",double(stats_.pipeline_ssd_gu_overlap_serves)},
             {"ssd_gu_io_overlap_bytes",double(stats_.pipeline_ssd_gu_overlap_bytes)},
+            {"ssd_gu_staged_upload_bytes",double(stats_.pipeline_ssd_gu_staged_bytes)},
+            {"ssd_gu_upload_batches",double(stats_.pipeline_ssd_gu_upload_batches)},
+            {"ssd_down_io_overlap_bytes",double(stats_.pipeline_ssd_down_overlap_bytes)},
+            {"ssd_down_staged_upload_bytes",double(stats_.pipeline_ssd_down_staged_bytes)},
+            {"ssd_down_upload_batches",double(stats_.pipeline_ssd_down_upload_batches)},
             {"ssd_gu_compute_overlap_serves",double(stats_.pipeline_ssd_gu_compute_serves)},
             {"ssd_gate_up_read_wait_ms",double(stats_.pipeline_ssd_gate_up_wait_ns)/1e6},
             {"ssd_down_read_wait_ms",double(stats_.pipeline_ssd_down_wait_ns)/1e6},
@@ -1149,6 +1188,7 @@ private:
     friend class MoeResidencyManager;
     friend void release_moe_prefill_buffers(MoeExpertCache* cache);
     friend void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);
+    friend bool lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExpertCache>&,std::size_t);
     friend void begin_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&,int);
     friend void commit_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&,int);
     friend void discard_moe_speculative_routes(const std::shared_ptr<MoeExpertCache>&) noexcept;
@@ -1166,6 +1206,7 @@ private:
     std::optional<std::size_t> pipeline_direct_cache_region_;
     uint64_t pipeline_wire_fallback_cells_=0,pipeline_wire_fallback_bytes_=0;
     std::vector<std::function<void()>> pipeline_decode_release_;
+    std::vector<std::function<bool()>> pipeline_decode_indirect_;
     // Eager prefill projections execute in order on pipeline_pool_stream_.
     // Their quantization scratch can be reused across projections and layers.
     std::shared_ptr<MixedMoeRuntime> pipeline_prefill_activations_;
@@ -1599,6 +1640,7 @@ private:
     size_t next_stage_ = 0;
     std::unordered_map<std::string, std::unique_ptr<MoeGpuArena>> arenas_;
     std::vector<std::shared_ptr<MoeCachedSource>> sources_;
+    std::vector<int> prefill_low_priority_layers_;
     std::optional<mfq::MoeCacheProfile> profile_;
     std::vector<mfq::MoeProfileCandidate> prewarm_selected_;
     MoeCacheStats stats_;

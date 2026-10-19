@@ -10,15 +10,61 @@ import pytest
 from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.formats.mfe import MfePool, MfeTensor
+from mfq.formats.mx import MxTensor
 from mfq.formats.nint import NintSpec
 from mfq.quantize.nint_quant import quantize
-from tests.mixed_family_fixtures import make_flat_family
+from mfq.formats.nvq import D4_256, NVQ3_D4, NvqJscTensor
+
+
+@pytest.mark.parametrize("wire_fallback", ["0", "1"])
+def test_clipped_generic_ssd_ffn(tmp_path, wire_fallback):
+    executable = os.environ.get("MFQ_CUDA_SSD_EXPERT_TEST")
+    if not executable:
+        pytest.skip("MFQ_CUDA_SSD_EXPERT_TEST required")
+    rng = np.random.default_rng(2038)
+    def packed(family, rows, width):
+        if family == "mxfp4":
+            return MxTensor("MXFP4", (rows, width),
+                rng.integers(0, 256, (rows, width // 2), dtype=np.uint8),
+                rng.integers(122, 128, (rows, width // 32), dtype=np.uint8))
+        if family == "nint":
+            return quantize(rng.normal(0, .03, (rows, width)).astype(np.float32), NintSpec(4, 24, 6))
+        books = np.stack((D4_256, np.roll(D4_256, 1, axis=0))).astype(np.int16) * 8
+        return NvqJscTensor((rows, width), 0, width,
+            rng.uniform(.005, .05, rows).astype(np.float32),
+            np.arange(16, dtype=np.float32), np.arange(16, dtype=np.uint8) & 1,
+            rng.integers(1, 16, (rows, width // 24), dtype=np.uint8),
+            rng.integers(0, 256, (rows, width // 4), dtype=np.uint8),
+            rng.integers(0, 128, (rows, width // 8), dtype=np.uint8),
+            books.astype(np.int8), base_spec=NVQ3_D4)
+
+    for family in ("nint", "nvq3j", "mxfp4", "mixed"):
+        experts, width = (12, 384) if family == "mixed" else (3, 128) if family == "mxfp4" else (64, 96)
+        families = ("nint", "nvq3j", "mxfp4") if family == "mixed" else (family,)
+        for projection in range(3):
+            pools = []
+            for cohort, kind in enumerate(families):
+                ids = (np.array([2, 0, 1], dtype=np.int32) if family == "mxfp4" else
+                       np.arange(cohort, experts, len(families), dtype=np.int32))
+                pools.append(MfePool(ids, packed(kind, len(ids) * width, width)))
+            save(tmp_path / f"{family}-{projection}.mfq", FileHeader(version=2, model_arch="deepseek_v41"),
+                 {"linear.weight": MfeTensor((experts, width, width), tuple(pools))})
+    env = dict(os.environ, MFQ_MOE_SSD_EXPERTS="1", MFQ_MOE_NVQ_DENSE="0",
+               MFQ_MOE_PREFILL_LAYER="0", MFQ_MOE_PREFILL_GROUPS="1",
+               MFQ_MOE_TRANSFER_CACHE="1", MFQ_MOE_RAM_PCIE_FRACTION="1",
+               MFQ_MOE_WIRE_FALLBACK=wire_fallback,
+               MFQ_MOE_NATIVE_DMA_BATCH="1", MFQ_MOE_KV_HOST_PACKET="1")
+    result = subprocess.run([executable, str(tmp_path), "--clipped-check"],
+                            env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "generic_clipped_ffn_cases=352" in result.stdout
 
 
 @pytest.mark.parametrize("pcie_fraction,read_mode,native_dma,ram_pin_bytes", [
     (1.0,"buffered","1","0"),(0.5,"buffered","1","0"),(1.0,"direct","1","0"),
     (1.0,"buffered","0","0"),(1.0,"buffered","1","16384")])
 def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma,ram_pin_bytes):
+    from tests.mixed_family_fixtures import make_flat_family
     executable = os.environ.get("MFQ_CUDA_SSD_EXPERT_TEST")
     if not executable:
         pytest.skip("MFQ_CUDA_SSD_EXPERT_TEST required")
@@ -62,6 +108,7 @@ def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma,ram_p
     if native_dma == "1" and pcie_fraction == 1 and ram_pin_bytes == "0":
         assert "moe_ssd_gu_io_overlap scope=first_upload enabled=1" in result.stderr
         assert "moe_ssd_gu_compute_overlap scope=first_ready enabled=1" in result.stderr
+        assert "moe_ssd_down_io_overlap scope=first_upload enabled=1" in result.stderr
     if os.name == "nt" and read_mode == "direct":
         assert "model_direct_staging_batch enabled=1" in result.stderr
 

@@ -2,6 +2,7 @@
 
 #include "prefill_activity.h"
 #include "mtp_batch_policy.h"
+#include "mtp_batch_policy_v1.h"
 
 #include <algorithm>
 #include <array>
@@ -426,11 +427,10 @@ public:
         return DepthController(maximum_depth, seed_ ? &*seed_ : nullptr, 7.0, margin,gradual_warmup,cold_window_ms);
     }
     void remember(const DepthController& controller) { seed_ = controller; }
-    void seed_batch(BatchDepthPolicy& policy) const { batch_memory_.seed(policy); }
+    void seed_batch(v1::BatchDepthPolicy& policy) const { batch_memory_.seed(policy); }
     void tick_batch() { batch_memory_.tick(); }
-    void park_batch(const BatchDepthPolicy& policy) { batch_memory_.parked(policy); }
-    void resume_batch(const BatchDepthPolicy& policy) { batch_memory_.resumed(policy); }
-    void retire_batch(const BatchDepthPolicy& policy) { batch_memory_.retired(policy); }
+    void park_batch(const v1::BatchDepthPolicy& policy) { batch_memory_.parked(policy); }
+    void retire_batch(const v1::BatchDepthPolicy& policy) { batch_memory_.retired(policy); }
     void record_loop_tax(double baseline_ms, const std::vector<double>& samples,bool periodic_mean=false) {
         if (baseline_ms <= 0.0 || samples.size() < 8 || PrefillActivity::recent()) return;
         double normal_ms=0.0;
@@ -462,7 +462,7 @@ public:
 private:
     using Clock = std::chrono::steady_clock;
     std::optional<DepthController> seed_;
-    BatchParkMemory batch_memory_;
+    v1::BatchParkMemory batch_memory_;
     std::optional<double> loop_tax_;
     bool periodic_reported_=false;
     Clock::time_point loop_tax_time_{};
@@ -517,7 +517,7 @@ public:
         else controller_.emplace(state_.begin(maximum_depth,gradual_warmup_,gradual_warmup_?60.0:0.0));
         if(gradual_warmup_ && !dspark)
             std::fprintf(stderr,"runtime_mtp_depth_policy name=%s maximum_depth=%d\n",
-                batch_?"metal_batch":"cuda_adaptive",maximum_depth);
+                batch_?"metal_batch_v1":"cuda_adaptive",maximum_depth);
     }
     ~GenerationPolicy() {
         if (controller_) state_.remember(*controller_);
@@ -588,9 +588,9 @@ private:
         const bool was_parked=batch_->remaining()!=0;
         const auto previous_parks=batch_->parks();
         state_.tick_batch();
-        const std::array<BatchAcceptance,1> counts{{{used,accepted}}};
-        batch_->observe(counts,started,finished,valid,false);
-        if(was_parked && !batch_->remaining()) { ++reentries_;state_.resume_batch(*batch_); }
+        const std::array<int,1> counts{accepted};
+        batch_->observe(used,counts,started,finished,valid,false);
+        if(was_parked && !batch_->remaining())++reentries_;
         if(batch_->parks()!=previous_parks)state_.park_batch(*batch_);
         if(trace_ && (depth()!=trace_depth_ || batch_->parks()!=previous_parks ||
                 (was_parked && !batch_->remaining()))) {
@@ -622,7 +622,7 @@ private:
     bool gradual_warmup_=false;
     std::optional<DepthController> controller_;
     std::optional<DsparkController> dspark_;
-    std::optional<BatchDepthPolicy> batch_;
+    std::optional<v1::BatchDepthPolicy> batch_;
     bool seeded_batch_park_=false;
     ParkState park_;
     std::uint64_t parks_ = 0;

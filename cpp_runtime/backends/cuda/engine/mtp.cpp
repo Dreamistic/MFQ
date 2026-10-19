@@ -1,4 +1,5 @@
 #include "generation.h"
+#include "token_row_prefetch.h"
 #include "speculative_sequence.h"
 
 #include "cuda_execution.h"
@@ -72,6 +73,7 @@ template <class Model> struct CudaMtpOps {
   std::optional<mfq::cuda::Sampler> sampler_;
   bool penalties = false;
   bool target_maintenance = false;
+  std::uint64_t target_graph_captures = 0;
   std::uint64_t target_transfer_bytes=0;
   std::shared_ptr<MoeExpertCache> target_route_cache;
   CudaMtpOps(CudaMtpOps&&)=default;
@@ -79,20 +81,21 @@ template <class Model> struct CudaMtpOps {
     if(target_route_cache)discard_moe_speculative_routes(target_route_cache);
   }
   void begin_target_routes(int rows) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
-      begin_moe_speculative_routes(model.execution->moe_expert_cache,rows);
-      target_route_cache=model.execution->moe_expert_cache;
-    }
+    begin_moe_speculative_routes(model.execution->moe_expert_cache,rows);
+    target_route_cache=model.execution->moe_expert_cache;
   }
   void resolve_target_routes(int rows,bool cancelled) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
-      if(!target_route_cache)return;
-      if(cancelled)discard_moe_speculative_routes(target_route_cache);
-      else commit_moe_speculative_routes(target_route_cache,rows);
-      target_route_cache.reset();
-    }
+    if(!target_route_cache)return;
+    if(cancelled)discard_moe_speculative_routes(target_route_cache);
+    else commit_moe_speculative_routes(target_route_cache,rows);
+    target_route_cache.reset();
   }
-  bool take_target_maintenance() { return std::exchange(target_maintenance,false); }
+  bool take_target_maintenance() {
+    const auto captures=moe_expert_graph_captures(model.execution->moe_expert_cache);
+    const bool initialized=captures!=target_graph_captures;
+    target_graph_captures=captures;
+    return std::exchange(target_maintenance,false) || initialized;
+  }
   bool gradual_mtp_warmup() const {return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>;}
   bool metal_mtp_policy() const {
     if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
@@ -102,24 +105,24 @@ template <class Model> struct CudaMtpOps {
     return false;
   }
   bool prefetch_target_ids(int32_t token,const std::vector<int32_t>& drafts) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+    if constexpr(requires {model.adapter_prefetch_token_rows(model,early_ple_ids_host);}) {
       const auto* option=std::getenv("MFQ_MTP_EARLY_PLE");
-      if((option && option[0]=='0') || !model.reuse_decode_graphs || !model.graph_registry || drafts.size()>=8)return false;
-      if(!early_ple_ids_host.defined())early_ple_ids_host=mfq_tensor_backend::empty(
-          {1,8},options.device(mfq_tensor_backend::kCPU));
+      if(option && option[0]=='0')return false;
+      const int tokens=mtp.split_target_verification()?1:1+int(drafts.size());
+      if(!early_ple_ids_host.defined() || early_ple_ids_host.size(1)<tokens)
+        early_ple_ids_host=mfq_tensor_backend::empty({1,tokens},options.device(mfq_tensor_backend::kCPU));
       auto* ids=early_ple_ids_host.template data_ptr<int64_t>();ids[0]=token;
-      for(std::size_t i=0;i<drafts.size();++i)ids[i+1]=drafts[i];
-      const int tokens=1+int(drafts.size());
-      if(mfq::cuda::qwen4_prefetch_decode_ple(model,early_ple_ids_host.narrow(1,0,tokens))) {
+      for(int i=1;i<tokens;++i)ids[i]=drafts[std::size_t(i-1)];
+      if(mfq::cuda::internal::prefetch_token_rows(model,early_ple_ids_host.narrow(1,0,tokens))) {
         static bool reported=false;
         if(!reported) {
-          reported=true;std::cerr<<"runtime_mtp_early_ple enabled=1 prefix_tokens=1\n";
+          reported=true;std::cerr<<"runtime_mtp_early_token_rows enabled=1 prefix_tokens=1\n";
         }
-        if(tokens>1) {
-          static unsigned reported_prefixes=0;const auto bit=1u<<tokens;
+        if(tokens>1 && tokens<64) {
+          static uint64_t reported_prefixes=0;const auto bit=uint64_t(1)<<tokens;
           if(!(reported_prefixes&bit)) {
             reported_prefixes|=bit;
-            std::cerr<<"runtime_mtp_ple_draft_prefix enabled=1 prefix_tokens="<<tokens<<'\n';
+            std::cerr<<"runtime_mtp_token_row_draft_prefix enabled=1 prefix_tokens="<<tokens<<'\n';
           }
         }
         return true;
@@ -138,7 +141,7 @@ template <class Model> struct CudaMtpOps {
     if(prefetch_target_ids(token,{})) {
       static bool reported=false;
       if(!reported) {
-        reported=true;std::cerr<<"runtime_mtp_ple_publication enabled=1\n";
+        reported=true;std::cerr<<"runtime_mtp_token_row_publication enabled=1\n";
       }
     }
   }
@@ -157,6 +160,10 @@ template <class Model> struct CudaMtpOps {
     return false;
   }
   void trace_prompt_prefill(double target_ms,double predictor_ms,double workspace_ms) const {
+    // Block predictors seed only their bounded target window and skip the
+    // teacher-forced priming hook that restores workspace for chain predictors.
+    if(!mtp.teacher_forced_prompt_prime() && model.restore_decode_workspace)
+      model.restore_decode_workspace();
     std::cerr<<"runtime_mtp_prefill target_ms="<<target_ms<<" predictor_ms="<<predictor_ms
         <<" predictor_workspace_ms="<<workspace_ms<<" streamed="<<stream_prompt_history(input_ids.size(1))<<std::endl;
   }
@@ -186,14 +193,12 @@ template <class Model> struct CudaMtpOps {
     return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm> && (!option || option[0]!='0')?16:512;
   }
   void trace_cycle(uint64_t cycle,int depth,int accepted,double draft_ms,double verify_ms,double commit_ms) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       const auto* option=std::getenv("MFQ_PROFILE_MTP");
       const bool profile=option && option[0]=='1';
       if(profile || (cycle<=32 && draft_ms+verify_ms+commit_ms>=55.0))
         std::cerr<<(profile?"runtime_mtp_cycle_profile cycle=":"runtime_mtp_slow_cycle cycle=")<<cycle<<" depth="<<depth<<" accepted="<<accepted
             <<" draft_ms="<<draft_ms<<" verify_ms="<<verify_ms<<" commit_ms="<<commit_ms
             <<" target_transfer_mb="<<target_transfer_bytes/1048576.0<<'\n';
-    }
   }
 
   CudaMtpOps(Model &model, MtpModule &mtp, const CudaPreparedPrompt *prepared,
@@ -203,7 +208,9 @@ template <class Model> struct CudaMtpOps {
         position_axes(transformed_prompt && prepared->positions.dim() == 2 &&
                               prepared->positions.size(0) == 3
                           ? 3
-                          : 1), prefill_compute_chunk(compute_chunk), output(output) {}
+                          : 1), prefill_compute_chunk(compute_chunk), output(output) {
+    target_graph_captures=moe_expert_graph_captures(model.execution->moe_expert_cache);
+  }
   void initialize(const std::vector<int64_t> &prompt,
                   const MfqSamplingParams &sampling) {
     input_ids = ids_for(prompt);
@@ -325,6 +332,14 @@ template <class Model> struct CudaMtpOps {
         const bool host_history=host_prompt_history(chunk.count);
         auto hidden=mfq::cuda::qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,true,
             [&] { return output && output->stopped(); }, &raw,host_history,finish_prefill);
+        finish_prefill();
+        return {std::move(hidden),std::move(raw),timer.elapsed_ms()};
+      }
+    }
+    if constexpr(std::is_same_v<Model,mfq::cuda::DeepseekV41CausalLm>) {
+      if(!transformed_prompt) {
+        auto hidden=mfq::cuda::deepseek_v41_prefill_hidden(model,ids,prefill_compute_chunk,
+            [&] {return output && output->stopped();},&raw);
         finish_prefill();
         return {std::move(hidden),std::move(raw),timer.elapsed_ms()};
       }
@@ -754,6 +769,9 @@ run_mtp_generation(Model &model, MtpModule &mtp, InferenceRequest &request,
     if(reused_tokens==0 && (!prepared || !prepared->transformed()) &&
         mfq::cuda::qwen4_layer_major_prefill_eligible(model,request.prompt.size()))
       logical_chunk=request.prompt.size();
+  }
+  if constexpr(std::is_same_v<Model,mfq::cuda::DeepseekV41CausalLm>) {
+    if(!prepared || !prepared->transformed())logical_chunk=request.prompt.size();
   }
   return mfq::engine::speculative_sequence(
       CudaMtpOps<Model>{model, mtp, prepared, prefill_chunk_size, &output}, request, output,

@@ -275,7 +275,7 @@ __global__ void __launch_bounds__(64) prepare_warp(MfeFfnBatch b,
                 if(!(refresh[pair]&(1<<p)))continue;
                 const int expert=b.ids[pair];
                 auto& d=cache.projections[b.projection_offsets[p]+cache.primary_counts[p]+expert];
-                const int fields=d.family==1?7:4;if(f>=fields)continue;
+                const int fields=d.family==1?7:d.family==3?2:4;if(f>=fields)continue;
                 const auto values=reinterpret_cast<const uint4*>(cache.mapped[expert].fields[p])[f/2];
                 d.fields[f]=reinterpret_cast<const void*>(uint64_t(values.x)|(uint64_t(values.y)<<32));
                 if(f+1<fields)d.fields[f+1]=reinterpret_cast<const void*>(uint64_t(values.z)|(uint64_t(values.w)<<32));

@@ -41,6 +41,19 @@ private:
     std::shared_ptr<MoeExpertCache> cache_;
     bool active_=false;
 };
+// A phase can prefer experts from [first,last). Scope exit restores normal
+// eviction on success, cancellation and exceptions, without moving weights.
+class MoePrefillLayerPriority {
+public:
+    MoePrefillLayerPriority(std::shared_ptr<MoeExpertCache> cache,int first,int last);
+    ~MoePrefillLayerPriority();
+    void finish();
+    MoePrefillLayerPriority(const MoePrefillLayerPriority&)=delete;
+    MoePrefillLayerPriority& operator=(const MoePrefillLayerPriority&)=delete;
+private:
+    std::shared_ptr<MoeExpertCache> cache_;
+    std::vector<int> previous_;
+};
 std::size_t moe_prefill_transfer_bytes(const std::shared_ptr<MoeExpertCache>& cache,bool predictor=false);
 class MoeQuantRangeSource;
 struct CudaExecutionConfig;
@@ -73,6 +86,8 @@ std::size_t reclaim_moe_optional_host(const std::shared_ptr<MoeExpertCache>& cac
     std::size_t allocation_bytes=0);
 double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);
 std::uint64_t moe_expert_streamed_bytes(const std::shared_ptr<MoeExpertCache>& cache);
+// Successful private FFN captures change this counter for every model family.
+std::uint64_t moe_expert_graph_captures(const std::shared_ptr<MoeExpertCache>& cache);
 // Finish the adaptive transaction before a session reset or a prefill loan.
 void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache);
 void prepare_moe_predictor_exchange(const std::shared_ptr<MoeExpertCache>& cache);
@@ -85,6 +100,10 @@ bool prepare_moe_graph_pool(const std::shared_ptr<MoeExpertCache>& cache);
 // Request boundary only, after target/predictor graphs have been destroyed.
 // Lend decode staging/workspace capacity to the upcoming long prefill.
 void release_moe_decode_buffers(const std::shared_ptr<MoeExpertCache>& cache);
+// Private graphs with indirect expert addresses can return cache pages while
+// retaining their captured kernels. False leaves full retirement to the caller.
+bool lend_moe_decode_cache_for_prefill(const std::shared_ptr<MoeExpertCache>& cache,
+    std::size_t workspace_bytes);
 bool suspend_moe_residency(const std::shared_ptr<MoeExpertCache>& cache,bool suspended);
 bool set_moe_reuse_learning(const std::shared_ptr<MoeExpertCache>& cache,bool enabled);
 // Return prompt-only ring and workspace storage before preparing decode graphs.

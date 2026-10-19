@@ -49,9 +49,11 @@ __global__ void __launch_bounds__(128,8) parity_single_down(MfeFfnBatch b,int pa
     int local;const auto* d=projection(b,2,expert,shared,local,b.plan_ready && kind==2);
     __half values[Rows];
     if constexpr(Rows==4)project_quad<true,Formats,true>(d,local,first,
-        b.hidden_quantized+int64_t(slot)*b.quantized_stride,b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum);
+        b.hidden_quantized+int64_t(slot)*b.quantized_stride,b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum,
+        false,b.hidden+int64_t(slot)*b.hidden_stride);
     else project_pair<true,Formats,true>(d,local,first,
-        b.hidden_quantized+int64_t(slot)*b.quantized_stride,b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum);
+        b.hidden_quantized+int64_t(slot)*b.quantized_stride,b.hidden_scales+int64_t(slot)*b.scale_stride,values,b.warp_multi_sum,
+        b.hidden+int64_t(slot)*b.hidden_stride);
 #pragma unroll
     for(int r=0;r<Rows;++r)if(threadIdx.x==r && first+r<b.output_width)
         b.resident_pairs[int64_t(slot)*b.output_width+first+r]=values[r];

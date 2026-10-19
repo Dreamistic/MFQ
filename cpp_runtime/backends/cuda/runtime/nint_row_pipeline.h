@@ -2,6 +2,7 @@
 #include "mfq_tensor_backend.h"
 #include "mfq/nint_rows.h"
 #include <memory>
+namespace mfq {class NintRowCache;}
 class NintRowStage {
 public:
     ~NintRowStage();
@@ -16,7 +17,8 @@ private:
 };
 class NintRowPipeline {
 public:
-    explicit NintRowPipeline(std::vector<std::shared_ptr<mfq::NintRows>>);
+    explicit NintRowPipeline(std::vector<std::shared_ptr<mfq::NintRows>>,
+        std::shared_ptr<mfq::NintRowCache> cache={});
     ~NintRowPipeline();
     void issue(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,bool early_prefix=false);
     mfq_tensor_backend::Tensor collect(const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,

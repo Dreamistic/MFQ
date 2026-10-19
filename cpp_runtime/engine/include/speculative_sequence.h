@@ -201,7 +201,9 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         require_execution(reused_tokens == 0 || !mtp.blockwise_drafting(),
             "blockwise MTP session restore is unsupported");
         if (mtp.blockwise_drafting()) {
-            mtp.append_target_context(raw, 0);
+            if constexpr (requires { mtp.seed_target_context(raw, ops.size(input_ids, 1)); })
+                mtp.seed_target_context(raw, ops.size(input_ids, 1));
+            else mtp.append_target_context(raw, 0);
         }
 
         if (mtp.teacher_forced_prompt_prime() && !stream_prompt_history) {
@@ -485,15 +487,18 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
         auto draft =
             prepare_draft(initial_hidden, {pending}, bounded_depth(depth_controller.depth()), true);
         double draft_ms=std::chrono::duration<double,std::milli>(Clock::now()-cycle_started).count();
+        mtp.last_stats.head_ms+=draft_ms;
         while (generated < limit) {
             if (output.stopped()) {
                 finish();
                 co_return;
             }
             if (depth_controller.parked()) {
+                const auto plain_started=Clock::now();
                 Tensor raw_step;
                 auto hidden_step = ops.target_forward(ops.ids_for({pending}), &raw_step);
                 const auto next = ops.sample_constrained(ops.logits_for(hidden_step), counts, constraint_cursor);
+                mtp.last_stats.target_ms+=std::chrono::duration<double,std::milli>(Clock::now()-plain_started).count();
                 if (constraint_cursor) constraint_cursor->accept(next);
                 committed_last_hidden = ops.slice(raw_step, 1, ops.size(raw_step, 1)-1, 1);
                 auto delta = output.append(std::vector<int64_t>{next});
@@ -517,6 +522,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 draft = prepare_draft(committed_last_hidden, {pending},
                     output.stopped()?0:bounded_depth(depth_controller.depth()), false);
                 draft_ms=std::chrono::duration<double,std::milli>(Clock::now()-cycle_started).count();
+                mtp.last_stats.head_ms+=draft_ms;
                 if(output.stopped()){finish();co_return;}
                 continue;
             }
@@ -527,10 +533,15 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             std::vector<int64_t> verify_ids{pending};
             verify_ids.insert(verify_ids.end(), draft.tokens.begin(), draft.tokens.end());
             Tensor verified;
-            if (mtp.split_target_verification()) {
+            const bool split_target=mtp.split_target_verification();
+            if (split_target) {
                 Tensor pending_raw;
                 auto pending_hidden = ops.target_forward(ops.ids_for({pending}), &pending_raw);
                 if (draft_count > 0) {
+                    // The pending token is already committed. Journal only
+                    // the suffix, using the same hooks as joint verification.
+                    if constexpr(requires { ops.begin_target_routes(int{}); })
+                        ops.begin_target_routes(draft_count);
                     model.begin_speculative_suffix(draft_count);
                     std::vector<int64_t> draft_ids(draft.tokens.begin(), draft.tokens.end());
                     Tensor draft_raw;
@@ -666,6 +677,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 constraint_cursor->accept(result.next_token);
                 result.accepted_drafts = static_cast<size_t>(accepted);
             }
+            mtp.last_stats.target_ms+=std::chrono::duration<double,std::milli>(Clock::now()-verify_started).count();
             mtp.last_stats.accepted_tokens += static_cast<uint64_t>(accepted);
             for (int position = 0; position < accepted; ++position) {
                 ++mtp.last_stats.position_accepted.at(static_cast<size_t>(position));
@@ -678,8 +690,9 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
             const int emitted_accepted = std::min<int>(accepted, delta.token_ids.size());
             const auto resolve_routes=[&](int rows) {
                 if constexpr(requires { ops.resolve_target_routes(int{},bool{}); })
-                    ops.resolve_target_routes(rows,output.result.cancelled);
+                    ops.resolve_target_routes(rows-int(split_target),output.result.cancelled);
             };
+            const auto resolve_started=Clock::now();
             if (draft_count > 0) {
                 if (emitted_accepted == draft_count) {
                     model.commit_speculative();
@@ -702,6 +715,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 }
             }else resolve_routes(1);
             committed_last_hidden = ops.slice(verified_raw, 1, emitted_accepted, 1);
+            mtp.last_stats.rollback_ms+=std::chrono::duration<double,std::milli>(Clock::now()-resolve_started).count();
             if (output.stopped()) {
                 if (mtp.teacher_forced_prompt_prime() && !delta.token_ids.empty()) {
                     std::vector<int32_t> committed_ids(
@@ -763,6 +777,7 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
                 output.stopped()?0:bounded_depth(depth_controller.depth()),
                 false);
             draft_ms=std::chrono::duration<double,std::milli>(Clock::now()-cycle_started).count();
+            mtp.last_stats.head_ms+=draft_ms;
             // Cancellation between yields still commits predictor history for
             // prefix restoration, without running another speculative chain.
             if(output.stopped()){finish();co_return;}

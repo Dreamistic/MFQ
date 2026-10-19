@@ -1186,6 +1186,9 @@ void Qwen4ExpMtp::restore_session_state(const MtpSessionState& state) {
 } // namespace mfq::cuda::qwen4_exp
 
 namespace mfq::cuda {
+bool Qwen4Model::adapter_prefetch_token_rows(Qwen4CausalLm& model,const mfq_tensor_backend::Tensor& ids) {
+    return reuse_decode_graphs && graph_registry && qwen4_prefetch_decode_ple(model,ids);
+}
 bool qwen4_prefetch_decode_ple(Qwen4CausalLm& model,const mfq_tensor_backend::Tensor& host_ids) {
     bool issued=false;
     for(const auto& block:model.blocks) {

@@ -19,7 +19,7 @@
 #include <atomic>
 
 std::shared_ptr<mfq::NintRows> load_nint_row_table(
-        const mfq::ModelSource& source, const std::string& name) {
+        const mfq::ModelSource& source, const std::string& name, bool prefer_mapping) {
     const auto& metadata = require_tensor(source, name);
     MFQ_RUNTIME_CHECK(metadata.dtype == "NINT", "NINT row table requires packed NINT");
     MFQ_RUNTIME_CHECK(metadata.nbytes <= std::numeric_limits<std::size_t>::max(),
@@ -30,7 +30,7 @@ std::shared_ptr<mfq::NintRows> load_nint_row_table(
     auto batch=(!batched || batched[0]!='0') ? source.tensor_batch_reader(name) : mfq::ModelSource::TensorBatchReader{};
     bool mapped_file=false;
     const auto mapped=mfq::cuda::runtime_options::ple_file_map();
-    if(mapped.value_or(false)) {
+    if(mapped.value_or(prefer_mapping && source.file_read_stats().mode!=mfq::FileReadMode::Direct)) {
         if(auto mapping=source.mapped_tensor_batch_reader(name)) {
             batch=std::move(mapping);
             read=[batch](uint64_t offset,std::byte* out,std::size_t count){batch({{offset,out,count}});};
@@ -106,44 +106,15 @@ MfeWeight load_mfe_gpu(
                     std::make_shared<MoeQuantRangeSource>(std::move(store)), minimum, layer_id, projection_role);
             }
             try {
-                auto store =
-                    std::make_shared<mfq::cuda::MfeMxfp4ExpertStore>(
-                        mfq::cuda::MfqRecordRange{
-                            name,
-                            record.dtype,
-                            {},
-                            0,
-                            record.nbytes,
-                            [reader](
-                                    std::uint64_t offset,
-                                    std::span<std::uint8_t> destination) {
-                                reader(offset,
-                                    reinterpret_cast<std::byte*>(destination.data()),
-                                    destination.size());
-                            },
-                        });
-                auto runtime = make_mxfp4_range_runtime(*store);
-                return cache_moe_weight(
-                    cache,
-                    name,
-                    runtime,
-                    std::min(
-                        execution.moe_cache_registration_min_slots,
-                        runtime->n_experts),
-                    layer_id,
-                    projection_role, std::move(store));
-            } catch (const mfq::cuda::MfeMxfp4Unsupported &) {
-                try {
-                    auto store=std::make_shared<mfq::MfeQuantExpertStore>(record.nbytes,
-                        [reader](std::size_t offset,std::uint8_t* output,std::size_t bytes) {
-                            reader(offset,reinterpret_cast<std::byte*>(output),bytes);
-                        },batch_reader);
-                    const int minimum=std::min(execution.moe_cache_registration_min_slots,store->num_experts());
-                    return cache_quant_moe_weight(cache,name,std::make_shared<MoeQuantRangeSource>(std::move(store)),
-                        minimum,layer_id,projection_role);
-                } catch (const mfq::MfeQuantRangeUnsupported&) {
-                    // Other canonical pool families retain the existing CPU path.
-                }
+                auto store=std::make_shared<mfq::MfeQuantExpertStore>(record.nbytes,
+                    [reader](std::size_t offset,std::uint8_t* output,std::size_t bytes) {
+                        reader(offset,reinterpret_cast<std::byte*>(output),bytes);
+                    },batch_reader);
+                const int minimum=std::min(execution.moe_cache_registration_min_slots,store->num_experts());
+                return cache_quant_moe_weight(cache,name,std::make_shared<MoeQuantRangeSource>(std::move(store)),
+                    minimum,layer_id,projection_role);
+            } catch (const mfq::MfeQuantRangeUnsupported&) {
+                // Other canonical pool families retain the existing CPU path.
             }
         }
     }

@@ -6,6 +6,7 @@
 #include "mfq_cuda_moe_ops.h"
 #include "mfq_cuda_norm_ops.h"
 #include "storage/moe_expert_cache.h"
+#include "storage/moe_ffn_pipeline.h"
 
 #include <algorithm>
 #include <array>
@@ -14,6 +15,20 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+void FFN::prepare_moe_pipeline(CudaExecutionContext& execution) const {
+    if(moe_pipeline_initialized || !uses_moe_expert_cache() || expert_parallel_moe_compatible() ||
+            cpu_moe_gate || cpu_moe_up || cpu_moe_gate_up || cpu_moe_down ||
+            !execution.config.moe_route_stats_path.empty())return;
+    std::vector<std::shared_ptr<MfeWeight>> gate_up;
+    if(moe_split_gate_up)gate_up={std::make_shared<MfeWeight>(moe_gate),std::make_shared<MfeWeight>(moe_up)};
+    else gate_up={std::make_shared<MfeWeight>(moe_gate_up)};
+    moe_pipeline_forward=make_moe_ffn_pipeline(gate_up,{std::make_shared<MfeWeight>(moe_down)},
+        {},{},{},nullptr,swiglu_limit);
+    moe_pipeline_initialized=true;
+    if(moe_pipeline_forward)std::fprintf(stderr,"moe_generic_pipeline_dispatch layer=%d clipped_swiglu=%g\n",
+        moe_layer,swiglu_limit);
+}
 
 bool FFN::uses_moe_expert_cache() const {
     if (!is_moe)
@@ -303,6 +318,8 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
         Tensor shared_gate_logits;
         bool projection_bundle_prefetched = false;
         const bool expert_parallel = expert_parallel_moe_compatible();
+        const bool use_pipeline=bool(moe_pipeline_forward) &&
+            execution.kl_mmq.mode==KlMmqMode::Default && !execution.force_moe_materialized_swiglu;
         struct ExpertOutput {
             Tensor values;
             bool reduced;
@@ -313,7 +330,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
         // forward below still performs the normal cache check and stream
         // wait, preserving the existing execution semantics.
         auto prefetch_projection_bundle = [&]() {
-            if (!execution.config.moe_projection_bundle_prefetch || cpu_moe_down ||
+            if (use_pipeline || !execution.config.moe_projection_bundle_prefetch || cpu_moe_down ||
                 execution.continuous_batch_cache_serial) {
                 return false;
             }
@@ -369,15 +386,17 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                             1e-20, moe_router_scale);
                     });
                 }
-                route = profiler.measure("moe.route_map", [&]() {
-                    return build_moe_route_plan(selected.at(0), moe_split_gate_up
-                                                                    ? moe_gate.n_experts
-                                                                    : moe_gate_up.n_experts);
-                });
+                if (!use_pipeline) {
+                    route = profiler.measure("moe.route_map", [&]() {
+                        return build_moe_route_plan(selected.at(0), moe_split_gate_up
+                                                                        ? moe_gate.n_experts
+                                                                        : moe_gate_up.n_experts);
+                    });
+                }
                 return selected;
             },
             [&](const auto &) {
-                if (!expert_parallel) {
+                if (!expert_parallel && !use_pipeline) {
                     if (moe_split_gate_up) {
                         if (execution.config.moe_delayed_route_readback) {
                             moe_gate.prefetch_begin(route);
@@ -406,7 +425,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                             .contiguous();
                     });
                 }
-                if (!expert_parallel && execution.config.moe_delayed_route_readback) {
+                if (!expert_parallel && !use_pipeline && execution.config.moe_delayed_route_readback) {
                     projection_bundle_prefetched = prefetch_projection_bundle();
                     if (!projection_bundle_prefetched) {
                         if (moe_split_gate_up) {
@@ -421,6 +440,11 @@ mfq_tensor_backend::Tensor FFN::forward_impl(CudaExecutionContext &execution,
                     .to(mfq_tensor_backend::kFloat16);
             },
             [&](const auto &selected) -> ExpertOutput {
+                if(use_pipeline) {
+                    auto result=moe_pipeline_forward(execution,xf,selected.at(0),selected.at(1));
+                    if(result.dim()==3)result=moe_weighted_reduce_cuda(result,selected.at(1));
+                    return {result,true};
+                }
                 if (expert_parallel)
                     return {profiler.measure("moe.expert_parallel",
                                              [&] {

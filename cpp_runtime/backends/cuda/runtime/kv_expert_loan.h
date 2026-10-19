@@ -74,7 +74,6 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if(speculative_rows_)throw std::logic_error("nested KV expert speculation");
         if(rows<1 || rows>32)throw std::invalid_argument("invalid KV expert speculative rows");
-        if(rows==1)return;
         speculative_keys_.clear();packet_sources_={};packet_masks_.clear();
         try {speculative_keys_.reserve(std::max(speculative_keys_.capacity(),lru_.size()+64));}
         catch(const std::bad_alloc&){++speculative_stats_.disabled;return;}

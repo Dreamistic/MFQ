@@ -69,7 +69,15 @@ View pool_view(const MixedMoePool& pool,int rows,std::vector<tb::Tensor>& owners
             result.fields[6]=w.decode_records.data_ptr();owners.push_back(w.decode_records);
             result.decode_record_bytes=w.decode_records.numel();
         }
-    } else throw std::invalid_argument("two-stage MFE requires native NINT/NVQ projections");
+    } else if(pool.family==MixedMoeFamily::Mxfp4) {
+        const auto& w=pool.mxfp4;
+        result.family=3;result.output_rows=rows;result.local_experts=pool.local_experts;
+        result.input_width=int(w.neuron_len);result.group_size=32;result.groups=result.input_width/32;
+        const std::array<tb::Tensor,2> fields{w.values,w.scales};
+        for(int i=0;i<2;++i) {
+            result.fields[i]=fields[i].data_ptr();result.sizes[i]=fields[i].nbytes();owners.push_back(fields[i]);
+        }
+    } else throw std::invalid_argument("two-stage MFE requires native NINT/NVQ/MXFP4 projections");
     if(result.group_size<1 || result.group_size>64 || result.groups<=0)
         throw std::invalid_argument("two-stage MFE input group geometry unsupported");
     if(pool.family==MixedMoeFamily::Nvq && (result.group_size!=24 || result.format<1 || result.format>17))
@@ -81,7 +89,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         const tb::Tensor& input,const tb::Tensor& ids,const tb::Tensor& weights,const tb::Tensor& sigmoid,
         const std::array<const NintWeight*,3>& shared,const tb::Tensor& shared_gate,
         int output_columns,int intermediate_columns,const std::array<std::vector<int32_t>,3>* cohort_by_expert,bool output_pairs,
-        bool combined_gate_up,int token_group_capacity_hint)
+        bool combined_gate_up,int token_group_capacity_hint,double swiglu_limit)
         :sigmoid_(sigmoid),input_(input),ids_(ids),weights_(weights),combined_gate_up_(combined_gate_up) {
     if(!projections[0] || !projections[1] || !projections[2] || !input.is_cuda() || input.dim()!=2 ||
         input.scalar_type()!=tb::kFloat16 || !input.is_contiguous() || ids.dim()!=2 || ids.scalar_type()!=tb::kInt32 ||
@@ -91,6 +99,7 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         sigmoid.get_device()!=input.get_device() || !sigmoid.is_contiguous() ||
         sigmoid.scalar_type()!=tb::kFloat16 || sigmoid.dim()!=2 || sigmoid.size(0)!=2 || sigmoid.size(1)!=65536)
         throw std::invalid_argument("two-stage MFE tensor contract mismatch");
+    batch_.swiglu_limit=float(swiglu_limit);
     batch_.tokens=int(input.size(0));batch_.routes=int(ids.size(1));batch_.experts=projections[0]->n_experts;
     batch_.input_width=int(input.size(1));
     batch_.warp_multi_sum=mfq::cuda::runtime_options::warp_multi_sum();
@@ -235,14 +244,15 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         }
     }
     constexpr uint32_t grouped_formats=0xfd22u;
-    batch_.token_group_compact=!combined_gate_up_ && batch_.default_math &&
+    const bool grouped_math=!combined_gate_up_ && batch_.default_math &&
         !batch_.shared_dense_math && !batch_.warp_multi_sum &&
         !(batch_.nvq_format_mask&~grouped_formats) &&
-        (!(batch_.nvq_format_mask&compact_formats) || batch_.compact_nvq) &&
         std::all_of(views.begin(),views.end(),[](const View& d) {
-            return d.family==2 || (d.family==1 &&
+            return d.family==2 || d.family==3 || (d.family==1 &&
                 (d.group_size==24 || d.group_size==28 || d.group_size==32));
         });
+    batch_.token_group_compact=grouped_math &&
+        (!(batch_.nvq_format_mask&compact_formats) || batch_.compact_nvq);
     descriptors_=upload(views);cohorts_=tb::tensor(mapping).to(tb::kCUDA);
     std::vector<mfq::cuda::MfeInputQuantization> quantization;
     for(const auto& entry:quantizers) {
@@ -272,12 +282,13 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
     batch_.output=output_.data_ptr();
     // Pure NINT speculative batches retain the measured faster routed kernels;
     // independent eight-row decode tiles may request expert reuse explicitly.
+    const bool has_mxfp4=std::any_of(views.begin(),views.end(),[](const View& view){return view.family==3;});
     if(batch_.tokens>=2 && batch_.tokens<=32 &&
-       (batch_.nvq_format_mask || batch_.tokens>8 || token_group_capacity_hint>=4)) {
+       (batch_.nvq_format_mask || has_mxfp4 || batch_.tokens>8 || token_group_capacity_hint>=4)) {
         // Three/four-row compact batches reuse decoded weights across the
         // complete small window. Other shapes retain their previous capacity.
         const auto* wide_compact=std::getenv("MFQ_MFE_TOKEN_WIDE_COMPACT");
-        const bool wide_default=(!wide_compact || wide_compact[0]!='0') && batch_.token_group_compact &&
+        const bool wide_default=(!wide_compact || wide_compact[0]!='0') && grouped_math &&
             (batch_.tokens==3 || batch_.tokens==4);
         batch_.token_group_capacity=batch_.tokens<=8?(wide_default?4:2):8;
         if(token_group_capacity_hint==4 || token_group_capacity_hint==8)
@@ -301,13 +312,13 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         batch_.token_group_counts=token_group_counts_.data_ptr<int32_t>();
         batch_.token_group_slots=token_group_slots_.data_ptr<int32_t>();
         const auto aligned_gu=mfq::cuda::runtime_options::mfe_token_aligned_gu();
-        // Short compact mixed batches are dominated by singleton/pair groups.
+        // Short grouped mixed batches are dominated by singleton/pair groups.
         // Their smaller independent Gate/Up CTAs outperform the aligned CTA,
         // including its fused quantizer. Keep the existing explicit override.
-        const bool short_compact=batch_.tokens==4 && batch_.token_group_compact && batch_.nvq_format_mask;
+        const bool short_grouped=batch_.tokens==4 && grouped_math && batch_.nvq_format_mask;
         batch_.token_group_aligned_gu=batch_.tokens<=8 &&
-            (aligned_gu?*aligned_gu:batch_.tokens==4 && !short_compact);
-        if(short_compact && !aligned_gu && !batch_.token_group_aligned_gu) {
+            (aligned_gu?*aligned_gu:batch_.tokens==4 && !short_grouped);
+        if(short_grouped && !aligned_gu && !batch_.token_group_aligned_gu) {
             static std::atomic<bool> reported{false};
             if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
                 "mfe_short_gu_dispatch scope=first_eligible_batch enabled=1 tokens=4 aligned=0 capacity=%d mask=%u\n",
@@ -335,6 +346,19 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         }
         resident_pairs_=tb::empty({batch_.tokens,batch_.routes+(shared[0]?1:0),batch_.output_width},input.options());
         batch_.resident_pairs=reinterpret_cast<__half*>(resident_pairs_.data_ptr());
+        const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");
+        const auto* enabled=std::getenv("MFQ_MFE_TOKEN_GROUPS");
+        const auto* group_dot=std::getenv("MFQ_MFE_GROUP_DOT");
+        if(profile && profile[0]=='1' && grouped_math && (!enabled || enabled[0]!='0') &&
+                (!group_dot || group_dot[0]!='0') && std::any_of(views.begin(),views.end(),[](const View& d) {
+                    return d.family==2 && (compact_formats&(1u<<d.format)) &&
+                        !d.e8_dense_groups && !d.d4_dense_groups;
+                })) {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                "mfe_raw_nvq_token_reuse_dispatch scope=first_eligible_batch enabled=1 tokens=%d capacity=%d mask=%u expanded=0\n",
+                batch_.tokens,batch_.token_group_capacity,batch_.nvq_format_mask);
+        }
     }
 }
 void MfeFfnRuntime::cpu_results(const tb::Tensor& kinds,const tb::Tensor& pairs,const uint32_t* ready) {
@@ -424,10 +448,11 @@ mfq::cuda::MfePackedProjection MfeFfnRuntime::expert_view(int p,int expert,
     // pools, so it does not select the single-pool late-scale hint. This
     // also applies to resident fields retained in a partially cold bundle.
     if(view.nint_late_bits>0)view.nint_late_bits=0;
-    if(bytes.size()!=std::size_t(view.family==1?7:4))throw std::invalid_argument("MFE transfer field count differs");
+    if(bytes.size()!=std::size_t(view.family==1?7:view.family==3?2:4))throw std::invalid_argument("MFE transfer field count differs");
     for(std::size_t f=0;f<bytes.size();++f)view.fields[f]=slot>=0?
         static_cast<const unsigned char*>(view.fields[f])+int64_t(slot)*bytes[f]:nullptr;
     if(view.family==2)for(int i=0;i<3;++i)view.sizes[i]=bytes[i];
+    if(view.family==3)for(int i=0;i<2;++i)view.sizes[i]=bytes[i];
     if(view.family==1) {
         view.sizes[0]=bytes[0];
         if(view.q_expert_stride>bytes[0])throw std::invalid_argument("MFE transferred NINT payload is shorter than its stride");

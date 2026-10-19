@@ -701,7 +701,7 @@ void MoeResidencyManager::finish_window(int layer) {
 }
 void MoeResidencyManager::begin_speculative_routes(int rows) {
     auto& s=*impl_;
-    if(rows<2 || rows>32)throw std::invalid_argument("speculative route row count is out of range");
+    if(rows<1 || rows>32)throw std::invalid_argument("speculative route row count is out of range");
     if(s.speculative_rows)throw std::logic_error("speculative routes already pending");
     for(auto& row:s.speculative_routes){row.ids.clear();row.rows=0;}
     if(s.cache->ssd_experts())s.cache->host_experts_->begin_speculative_learning();
@@ -709,7 +709,7 @@ void MoeResidencyManager::begin_speculative_routes(int rows) {
 }
 void MoeResidencyManager::commit_speculative_routes(int rows) {
     auto& s=*impl_;if(!s.speculative_rows)return;
-    if(rows<1 || rows>s.speculative_rows)throw std::invalid_argument("committed route prefix is out of range");
+    if(rows<0 || rows>s.speculative_rows)throw std::invalid_argument("committed route prefix is out of range");
     // Validate the entire prefix before changing observations. Graph setup may
     // replay a layer more than once; only its latest route publication counts.
     for(const auto& record:s.speculative_routes)
@@ -717,28 +717,21 @@ void MoeResidencyManager::commit_speculative_routes(int rows) {
             throw std::logic_error("speculative route publication lost row alignment");
     if(s.cache->ssd_experts()) {
         s.speculative_host_keys.clear();
-        for(std::size_t b=0;b<s.speculative_routes.size();++b) {
+        // Commit in ordinary decode order: each accepted token visits all
+        // layers. Frequency and recency must not depend on verify batch size.
+        for(int row=0;row<rows;++row)for(std::size_t b=0;b<s.speculative_routes.size();++b) {
             auto& record=s.speculative_routes[b];if(!record.rows)continue;
-            const auto count=std::size_t(rows)*(record.ids.size()/record.rows);
+            const auto routes=record.ids.size()/record.rows;
             const auto& bundle=s.cache->pipeline_bundles_[b];
-            std::fill(record.heat_seen.begin(),record.heat_seen.end(),uint64_t(0));
-            const auto first=s.speculative_host_keys.size();
-            // One verification window confirms one reuse per expert. Keep
-            // last-use order without repeatedly hashing/splicing identical
-            // rows. Primary GPU residents have no retained RAM image.
-            for(std::size_t i=count;i--;) {
-                const auto expert=record.ids[i];auto& word=record.heat_seen[unsigned(expert)/64];
-                const auto bit=uint64_t(1)<<(unsigned(expert)%64);
-                if(word&bit)continue;
-                word|=bit;
-                for(int p=2;p>=0;--p) {
+            for(std::size_t i=0;i<routes;++i) {
+                const auto expert=record.ids[std::size_t(row)*routes+i];
+                for(int p=0;p<3;++p) {
                     if(p && bundle[p]==bundle[p-1])continue;
                     const auto& source=*s.cache->sources_[bundle[p]];
                     if(source.quant_source_->gpu_resident(expert))continue;
                     s.speculative_host_keys.push_back({source.id_,source.expert_to_cohort_[expert],expert});
                 }
             }
-            std::reverse(s.speculative_host_keys.begin()+first,s.speculative_host_keys.end());
         }
         s.cache->host_experts_->commit_speculative_learning(s.speculative_host_keys);
     }

@@ -15,14 +15,22 @@ from mfq.server.runtime.runtime_pool import RuntimePool
 from mfq.server.services.hardware import GpuMemory, HardwareIdentity
 from mfq.server.state.catalog import DiscoveredModel, ModelCatalog
 from mfq.server.services.jobs import JobExecutionError
-from tests.mixed_family_fixtures import make_flat_family
+from mfq.formats.nvq import E8_256, NVQ2_E8, NvqJscTensor
+
+
+def make_nvq_fixture():
+    return NvqJscTensor((6, 96), 0, 96, np.ones(6, dtype=np.float32),
+        np.arange(16, dtype=np.float32), np.zeros(16, dtype=np.uint8),
+        np.ones((6, 4), dtype=np.uint8), np.zeros((6, 12), dtype=np.uint8),
+        np.zeros((6, 12), dtype=np.uint8), (E8_256[None].astype(np.int16) * 8).astype(np.int8),
+        base_spec=NVQ2_E8)
 
 GIB = 1 << 30
 
 
 def artifact(tmp_path):
     path = tmp_path / "model.mfq"
-    experts = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), make_flat_family("NVQ2J")),))
+    experts = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), make_nvq_fixture()),))
     save(path, FileHeader(version=2, model_arch="qwen4_exp"),
          {"model.block.0.mlp.experts.gate.weight": experts})
     resource = ModelArtifactResource(id="1" * 32, name="model", architecture="qwen4_exp",
@@ -55,6 +63,8 @@ def test_cuda_auto_expert_budget_uses_selected_physical_device(tmp_path, monkeyp
 
 @pytest.mark.parametrize("available,enabled", [(52 * GIB, True), (8 * GIB, False)])
 def test_cuda_launch_selects_ram_or_ssd_expert_cache(tmp_path, monkeypatch, available, enabled):
+    monkeypatch.delenv("MFQ_MODEL_FILE_IO", raising=False)
+    monkeypatch.delenv("MFQ_PLE_FILE_MAP", raising=False)
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "discrete"})
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (64 * GIB, available))
     monkeypatch.setattr("mfq.server.runtime.runtime_pool.hardware_identity", lambda: HardwareIdentity(
@@ -74,6 +84,8 @@ def test_cuda_launch_selects_ram_or_ssd_expert_cache(tmp_path, monkeypatch, avai
     if not enabled:
         assert int(environment["MFQ_MOE_HOST_CACHE_BYTES"]) == 6 * GIB
         assert environment["MFQ_MOE_NVQ_DENSE"] == "0"
+        assert environment["MFQ_MODEL_FILE_IO"] == "direct"
+        assert environment["MFQ_PLE_FILE_MAP"] == "1"
     if enabled:
         assert environment["MFQ_MOE_PIPELINE"] == "1"
         assert environment["MFQ_MOE_TWO_STAGE_FFN"] == "1"
@@ -102,11 +114,14 @@ def test_cuda_ssd_experts_respect_explicit_ram_cache_limit(tmp_path, monkeypatch
         "cpu", 8, gpu_memory=(GpuMemory("RTX GPU", 24 * GIB),)))
     pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime", backend="cuda", automatic_memory_budget=False)
     pool.runtime_environment["MFQ_MOE_HOST_CACHE_BYTES"] = str(2 * GIB)
+    pool.runtime_environment.update(MFQ_MODEL_FILE_IO="buffered", MFQ_PLE_FILE_MAP="0")
     model = artifact(tmp_path)
     request = ModelLoadRequest(model="model", moe_gpu_cache_gb=16, device_ids=["0"])
     _, environment = pool._launch_configuration(model, request, port=1234)
     assert environment["MFQ_MOE_HOST_CACHE_BYTES"] == str(2 * GIB)
     assert environment["MFQ_MOE_PRELOAD_ALL"] == "0"
+    assert environment["MFQ_MODEL_FILE_IO"] == "buffered"
+    assert environment["MFQ_PLE_FILE_MAP"] == "0"
     pool.runtime_environment["MFQ_MOE_SSD_EXPERTS"] = "0"
     with pytest.raises(JobExecutionError) as raised:
         pool._launch_configuration(model, request, port=1234)
@@ -130,4 +145,19 @@ def test_cuda_ram_pipeline_accepts_packed_nint_predictor_experts(tmp_path):
     packed = replace(quantize(np.ones((6, 96), dtype=np.float32), NintSpec(4, 24, 6), axis=0), shape=(2, 3, 96))
     save(model.path, FileHeader(version=2, model_arch="qwen4_exp"),
          {"predictor.block.0.mlp.experts.gate_up.weight": packed})
+    assert supports_cuda_ram_expert_pipeline(model.path)
+
+
+def test_cuda_ram_pipeline_accepts_mxfp4_predictor_with_quantized_target(tmp_path):
+    from mfq.formats.mx import MxTensor
+
+    model = artifact(tmp_path)
+    target = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), make_nvq_fixture()),))
+    mx = MxTensor("MXFP4", (6, 96), np.zeros((6, 48), dtype=np.uint8),
+                  np.full((6, 3), 127, dtype=np.uint8))
+    predictor = MfeTensor((2, 3, 96), (MfePool(np.arange(2, dtype=np.int32), mx),))
+    save(model.path, FileHeader(version=2, model_arch="deepseek_v41"), {
+        "model.block.0.mlp.experts.gate.weight": target,
+        "predictor.stage.0.mlp.experts.down.weight": predictor,
+    })
     assert supports_cuda_ram_expert_pipeline(model.path)

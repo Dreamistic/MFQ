@@ -19,6 +19,30 @@
 // Ordinary tanhf is rewritten to the lower-accuracy tanh.approx instruction.
 extern "C" __device__ float __nv_tanhf(float);
 
+__global__ void clipped_silu_mul_kernel(const half* gate,const half* up,half* output,
+        int64_t count,float limit) {
+    const auto i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<count) {
+        const float g=fminf(__half2float(gate[i]),limit);
+        const float u=fminf(fmaxf(__half2float(up[i]),-limit),limit);
+        output[i]=__float2half_rn((g/(1.0f+expf(-g)))*u);
+    }
+}
+
+mfq_tensor_backend::Tensor clipped_silu_mul_cuda(mfq_tensor_backend::Tensor gate,
+        mfq_tensor_backend::Tensor up,double limit) {
+    MFQ_RUNTIME_CHECK(gate.is_cuda() && up.device()==gate.device() &&
+        gate.scalar_type()==mfq_tensor_backend::kFloat16 && up.scalar_type()==mfq_tensor_backend::kFloat16 &&
+        gate.sizes()==up.sizes() && gate.is_contiguous() && up.is_contiguous() && limit>0,
+        "clipped SwiGLU requires matching contiguous CUDA FP16 tensors and a positive limit");
+    auto output=mfq_tensor_backend::empty(gate.sizes(),gate.options());
+    if(gate.numel())clipped_silu_mul_kernel<<<unsigned((gate.numel()+255)/256),256,0,mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half*>(gate.data_ptr<mfq_half>()),reinterpret_cast<const half*>(up.data_ptr<mfq_half>()),
+        reinterpret_cast<half*>(output.data_ptr<mfq_half>()),gate.numel(),float(limit));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
 template <typename T>
 __device__ __forceinline__ float activation_as_float(T value) {
     if constexpr (std::is_same_v<T, half>) return __half2float(value);

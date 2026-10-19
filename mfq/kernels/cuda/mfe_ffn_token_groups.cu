@@ -82,6 +82,8 @@ __device__ __forceinline__ void nvq_token_dot(const MfePackedProjection& d,int l
     constexpr int bits=packed_nvq::format_index_bits(Format);
     const int lane=threadIdx.x&(Lanes-1),row=threadIdx.x/Lanes;
     const auto* stream=static_cast<const uint8_t*>(d.fields[0]);
+    const auto* auxiliary=static_cast<const uint8_t*>(d.fields[1]);
+    const auto* states=static_cast<const uint8_t*>(d.fields[2]);
     const auto* anchors=static_cast<const float*>(d.fields[3]);
     const auto* codebook=static_cast<const int8_t*>(d.fields[4]);
     const int neuron=local*d.output_rows+first+row;
@@ -95,7 +97,25 @@ __device__ __forceinline__ void nvq_token_dot(const MfePackedProjection& d,int l
     for(int group=lane;group<d.groups;group+=Lanes) {
         int2 weight[3]{};float weight_scale=0.f;
         if(first+row<d.output_rows) {
-            if constexpr(d4) {
+            if(!Compact && !(d4?d.d4_dense_groups:d.e8_dense_groups)) {
+                // The source layout keeps indices, parity and joint states in
+                // separate packed streams. Decode the same register group as
+                // the scalar path, then reuse it for every routed token.
+                const auto state=packed_nvq::load_nvq_state<Format>(stream,d.sizes[0],states,d.sizes[2],
+                    int64_t(neuron)*d.groups+group,d.sub_bits,d.groups);
+                const auto* bank=packed_nvq::active_codebook<Format>(codebook,state);
+                const auto signs=packed_nvq::load_packed_group_window<21>(auxiliary,
+                    (int64_t(neuron)*d.nsign+group*3)*7,d.sizes[1]);
+                constexpr int vectors=d4?6:3;
+                const auto indices=packed_nvq::load_packed_group_window<bits*vectors>(stream,
+                    (int64_t(neuron)*d.nvec+group*vectors)*bits,d.sizes[0]);
+                weight_scale=packed_nvq::format_scale<Format>(anchor,state,codebook);
+#pragma unroll
+                for(int segment=0;segment<3;++segment)
+                    weight[segment]=packed_nvq::load_nvq_group_vec8<Format,true>(stream,d.sizes[0],
+                        auxiliary,d.sizes[1],codebook,bank,neuron,group,segment,d.groups,d.nvec,
+                        d.nsign,d.sign_mode,state,uint32_t(signs),indices,nullptr,0).values;
+            }else if constexpr(d4) {
                 packed_nvq::DenseD4Group<bits> packed;
                 if(Compact || narrow) {
                     const auto words=packed_nvq::load_dense_window32<4+3*(2*bits+7)>(local_stream,expert_bytes,
@@ -169,14 +189,31 @@ __device__ __forceinline__ void shared_nint_project(const MfePackedProjection& d
 template<int Capacity,int Rows,bool Compact=false>
 __device__ __forceinline__ void token_project(const MfePackedProjection* d,int local,int first,
         const int8_t* const* inputs,const float* const* scales,int count,
-        __half result[Capacity][4],bool multi_sum,bool canonical,bool narrow) {
+        __half result[Capacity][4],bool multi_sum,bool canonical,bool narrow,
+        const __half* original,int original_stride,const int* slots,int slot_divisor) {
     if(d && local>=0 && local<d->local_experts) {
+        if(d->family==3) {
+            if constexpr(Capacity==1) {
+                const auto* source=original?original+int64_t(slots[0]/slot_divisor)*original_stride:nullptr;
+#pragma unroll
+                for(int pair=0;pair<Rows/2;++pair)
+                    mfe_mxfp4_pair(*d,local,first+pair*2,source,result[0]+pair*2);
+                return;
+            }
+            const __half* sources[Capacity]{};
+#pragma unroll
+            for(int k=0;k<Capacity;++k)if(k<count) {
+                sources[k]=original?original+int64_t(slots[k]/slot_divisor)*original_stride:nullptr;
+            }
+            mfe_mxfp4_tokens<Capacity,Rows>(*d,local,first,sources,count,result);
+            return;
+        }
         if(d->family==2) {
             constexpr int lanes=Rows==4?8:16;
             if(Compact || !canonical || Rows==2) {
                 if(d->format==1){nvq1_token_dot<1,lanes,Capacity>(*d,local,first,inputs,scales,count,result);return;}
                 if(d->format==8){nvq1_token_dot<8,lanes,Capacity>(*d,local,first,inputs,scales,count,result);return;}
-#define MFQ_TOKEN_NVQ(F,DENSE) case F: if(Compact || d->DENSE) {nvq_token_dot<F,lanes,Capacity,Compact>(*d,local,first,inputs,scales,count,result,narrow);return;}break
+#define MFQ_TOKEN_NVQ(F,DENSE) case F: if(Capacity>1 || Compact || d->DENSE) {nvq_token_dot<F,lanes,Capacity,Compact>(*d,local,first,inputs,scales,count,result,narrow);return;}break
                 switch(d->format) {
                     MFQ_TOKEN_NVQ(5,e8_dense_groups);MFQ_TOKEN_NVQ(13,e8_dense_groups);MFQ_TOKEN_NVQ(14,e8_dense_groups);
                     MFQ_TOKEN_NVQ(10,d4_dense_groups);MFQ_TOKEN_NVQ(11,d4_dense_groups);
@@ -316,7 +353,8 @@ __global__ void __launch_bounds__(256,Capacity<=2?4:Capacity<=4?3:2) token_gate_
         scales[k]=static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups;
     }
     __half values[Capacity][4]{};
-    token_project<Capacity,2,Compact>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq);
+    token_project<Capacity,2,Compact>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq,
+        b.input,b.input_width,slots,all_routes);
     __shared__ __half projected[8][Capacity][2];
     if(lane==0) {
 #pragma unroll
@@ -330,8 +368,7 @@ __global__ void __launch_bounds__(256,Capacity<=2?4:Capacity<=4?3:2) token_gate_
         const int slot=slots[k];
         if(base+lane<end) {
             const auto gate=projected[lane/2][k][lane&1],up=projected[lane/2+team][k][lane&1];
-            const auto activated=__float2half_rn(__half2float(gate)*__half2float(table[__half_as_ushort(gate)]));
-            b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=__float2half_rn(__half2float(activated)*__half2float(up));
+            b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=mfe_ffn_swiglu(b,gate,up,table);
             if(b.completion)__threadfence();
         }
         if(!b.completion)continue;
@@ -372,15 +409,15 @@ __device__ __forceinline__ void token_aligned_pair(const MfeFfnBatch& b,
             scales[k]=static_cast<const float*>(d->fields[8])+int64_t(token)*d->groups;
         }
         __half values[Capacity][4]{};
-        token_project<Capacity,2,Compact>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq);
+        token_project<Capacity,2,Compact>(d,locals[p],first,inputs,scales,count,values,b.warp_multi_sum,false,b.compact_nvq,
+            b.input,b.input_width,slots,all_routes);
         #pragma unroll
         for(int k=0;k<Capacity;++k)if(k<count) {
             if(p==0) {
                 gate[k][0]=values[k][0];gate[k][1]=values[k][1];
             }else if(lane<2 && first+lane<width) {
                 const auto g=gate[k][lane],u=values[k][lane];
-                const auto activated=__float2half_rn(__half2float(g)*__half2float(table[__half_as_ushort(g)]));
-                b.hidden[int64_t(slots[k])*b.hidden_stride+first+lane]=__float2half_rn(__half2float(activated)*__half2float(u));
+                b.hidden[int64_t(slots[k])*b.hidden_stride+first+lane]=mfe_ffn_swiglu(b,g,u,table);
             }
         }
     }
@@ -461,8 +498,7 @@ __global__ void __launch_bounds__(256,4) shared_token_gate_up(MfeFfnBatch b,int 
         const int slot=slots[k];
         if(base+lane<end) {
             const auto gate=projected[lane][k],up=projected[lane+team][k];
-            const auto activated=__float2half_rn(__half2float(gate)*__half2float(b.sigmoid_table[__half_as_ushort(gate)]));
-            b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=__float2half_rn(__half2float(activated)*__half2float(up));
+            b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=mfe_ffn_swiglu(b,gate,up,b.sigmoid_table);
             if(b.completion)__threadfence();
         }
         if(!b.completion)continue;
@@ -522,7 +558,8 @@ __global__ void __launch_bounds__(128,Capacity<=2?8:Capacity<=4?6:4) token_down(
         scales[k]=b.hidden_scales+int64_t(slots[k])*b.scale_stride;
     }
     __half values[Capacity][4]{};
-    token_project<Capacity,Rows,Compact>(d,local,first,inputs,scales,count,values,b.warp_multi_sum,b.shared_dense_math,b.compact_nvq);
+    token_project<Capacity,Rows,Compact>(d,local,first,inputs,scales,count,values,b.warp_multi_sum,b.shared_dense_math,b.compact_nvq,
+        b.hidden,b.hidden_stride,slots,1);
 #pragma unroll
     for(int k=0;k<Capacity;++k)if(k<count) {
 #pragma unroll

@@ -9,6 +9,9 @@
 #include "mfq_cuda_context.h"
 #include "mfq/runtime.h"
 #include "nint_prefill_cache.h"
+#include "mfe_ffn_runtime.h"
+#include "core/ffn.h"
+#include "mfq_cuda_activation_ops.h"
 #include "format.h"
 #include <array>
 #include <chrono>
@@ -16,11 +19,52 @@
 #include <cmath>
 #include <filesystem>
 #include <exception>
+#include <future>
 #include <iostream>
 #include <map>
 #include <mutex>
 
 namespace tb=mfq_tensor_backend;
+struct MoeResidencyTestAccess {
+    static void progressive_read_batches() {
+        MoeExpertCache::SsdExpertReads reads;
+        reads.gate_up_requests=2;reads.gate_up_remaining=2;reads.down_remaining=2;
+        std::promise<void> finish_down;
+        auto release=finish_down.get_future();
+        reads.ready=std::async(std::launch::async,[&] {
+            reads.publish_read(0);reads.publish_read(2);reads.publish_read(1);
+            release.wait_for(std::chrono::seconds(2));
+            reads.publish_read(3);
+        });
+        std::vector<std::size_t> batch,gate_up,down;
+        while(reads.next_projection_batch(batch,false))gate_up.insert(gate_up.end(),batch.begin(),batch.end());
+        const bool first=reads.next_projection_batch(batch,true);
+        down.insert(down.end(),batch.begin(),batch.end());
+        const bool overlapped=reads.ready.wait_for(std::chrono::seconds(0))!=std::future_status::ready;
+        finish_down.set_value();
+        while(reads.next_projection_batch(batch,true))down.insert(down.end(),batch.begin(),batch.end());
+        reads.wait();
+        if(!first || !overlapped || gate_up!=std::vector<std::size_t>{0,1} || down!=std::vector<std::size_t>{2,3})
+            throw std::runtime_error("Down batches did not publish before the complete SSD read joined");
+        MoeExpertCache::SsdExpertReads failed;
+        failed.down_remaining=1;
+        failed.ready=std::async(std::launch::async,[&] {
+            {std::lock_guard lock(failed.mutex);
+             failed.failed=std::make_exception_ptr(std::runtime_error("controlled Down failure"));}
+            failed.changed.notify_all();
+        });
+        bool caught=false;
+        try{failed.next_projection_batch(batch,true);}catch(const std::runtime_error&){caught=true;}
+        failed.wait();
+        if(!caught)throw std::runtime_error("failed Down read did not release its batch waiter");
+    }
+    static tb::Tensor direct_cache(const std::shared_ptr<MoeExpertCache>& cache) {
+        return cache->pipeline_direct_cache_storage_;
+    }
+    static tb::Tensor wire(const std::shared_ptr<MoeExpertCache>& cache) {
+        return cache->pipeline_wire_gpu_;
+    }
+};
 namespace {
 void check(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 void check_packed_metadata() {
@@ -115,6 +159,9 @@ void check_reused_expert_pages() {
         loan.begin_speculative(2);
         const std::array<int32_t,2> cancelled{4,3};loan.next_packet({17,18,19},cancelled.data(),2,1,64);
         hit(4);hit(3);loan.discard_speculative();advance();
+        loan.begin_speculative(1);
+        const int32_t rejected=4;loan.next_packet({17,18,19},&rejected,1,1,64);
+        hit(4);loan.commit_speculative(0);advance();
         for(int expert=42;expert<74;++expert){put(expert,99);advance();}
         check(loan.find_for_exchange({17,3,0},KvExpertLoan::page) && !loan.find_for_exchange({17,4,0},KvExpertLoan::page),
             "rejected draft routes gained cache protection");
@@ -222,6 +269,269 @@ void check_output(const tb::Tensor& actual,const tb::Tensor& expected) {
             throw std::runtime_error("SSD expert result differs from full-RAM pipeline at "+std::to_string(i)+
                 " actual="+std::to_string(x)+" expected="+std::to_string(y));
     }
+}
+void check_token_reuse(const std::filesystem::path& root,const std::string& format) {
+    CudaExecutionContext execution;
+    std::array<std::shared_ptr<MixedMoeRuntime>,3> projections;
+    for(int p=0;p<3;++p) {
+        auto model=mfq::open_model_source((root/(format+"-"+std::to_string(p)+".mfq")).string());
+        projections[p]=make_mixed_moe_runtime(load_mfe_cpu(*model,"linear.weight"),true,execution.config);
+        if(format=="nvq")for(const auto& pool:projections[p]->pools)
+            check(!pool.nvq.dense_groups,"raw NVQ benchmark silently used a repacked layout");
+    }
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16);
+    const auto sigmoid=moe_swiglu_sigmoid_table_cuda();
+    const int width=projections[0]->neuron_len,experts=projections[0]->n_experts;
+    const auto* previous=std::getenv("MFQ_MFE_TOKEN_GROUPS");
+    const std::string old=previous?previous:"";
+    const auto select=[](const char* mode) {
+#ifdef _WIN32
+        _putenv_s("MFQ_MFE_TOKEN_GROUPS",mode);
+#else
+        if(*mode)setenv("MFQ_MFE_TOKEN_GROUPS",mode,1);else unsetenv("MFQ_MFE_TOKEN_GROUPS");
+#endif
+    };
+    int cases=0;
+    const auto* rows_option=std::getenv("MFQ_TOKEN_REUSE_TEST_ROWS");
+    const int only_rows=rows_option?std::atoi(rows_option):0;
+    for(int rows:{2,3,4,6,8,16,32})for(int sharing:{0,1,2}) {
+        if(only_rows && rows!=only_rows)continue;
+        std::vector<float> values(rows*width),weights(rows*3,1.f/3);
+        std::vector<int32_t> ids(rows*3);
+        for(std::size_t i=0;i<values.size();++i)values[i]=std::sin(float(i)*.017f)*.03f;
+        for(int t=0;t<rows;++t)for(int r=0;r<3;++r)
+            ids[t*3+r]=sharing==0?r:sharing==1?(t+r)%experts:(t*3+r)%experts;
+        if(sharing==2)ids.back()=-1;
+        auto x=tb::tensor(values).reshape({rows,width}).to(options);
+        auto routed=tb::tensor(ids).reshape({rows,3}).to(tb::kCUDA);
+        auto route_weights=tb::tensor(weights).reshape({rows,3}).to(tb::kCUDA);
+        MfeFfnRuntime runtime({projections[0].get(),projections[1].get(),projections[2].get()},x,routed,route_weights,sigmoid,
+            {},{},0,0,nullptr,false,false,0,10);
+        check(runtime.batch().token_group_counts!=nullptr,"packed expert format omitted token grouping");
+        if(!cases) {
+            select("1");for(int warm=0;warm<100;++warm)runtime.run();mfq_cuda_synchronize();
+        }
+        std::array<float,2> elapsed{};tb::Tensor expected;
+        for(int mode=0;mode<2;++mode) {
+            select(mode?"1":"0");runtime.run();mfq_cuda_synchronize();
+            if(!mode)expected=runtime.output().cpu().clone();else check_output(runtime.output(),expected);
+            cudaGraph_t graph;cudaGraphExec_t replay;
+            MFQ_CUDA_CHECK(cudaStreamBeginCapture(mfq_current_cuda_stream(),cudaStreamCaptureModeThreadLocal));
+            runtime.run();MFQ_CUDA_CHECK(cudaStreamEndCapture(mfq_current_cuda_stream(),&graph));
+            MFQ_CUDA_CHECK(cudaGraphInstantiate(&replay,graph,0));
+            for(int warm=0;warm<3;++warm)MFQ_CUDA_CHECK(cudaGraphLaunch(replay,mfq_current_cuda_stream()));
+            mfq_cuda_synchronize();
+            cudaEvent_t begin,end;
+            MFQ_CUDA_CHECK(cudaEventCreate(&begin));MFQ_CUDA_CHECK(cudaEventCreate(&end));
+            MFQ_CUDA_CHECK(cudaEventRecord(begin,mfq_current_cuda_stream()));
+            for(int repeat=0;repeat<20;++repeat)MFQ_CUDA_CHECK(cudaGraphLaunch(replay,mfq_current_cuda_stream()));
+            MFQ_CUDA_CHECK(cudaEventRecord(end,mfq_current_cuda_stream()));
+            MFQ_CUDA_CHECK(cudaEventSynchronize(end));
+            MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed[mode],begin,end));
+            cudaEventDestroy(begin);cudaEventDestroy(end);
+            cudaGraphExecDestroy(replay);cudaGraphDestroy(graph);
+            elapsed[mode]/=20;
+        }
+        std::cout<<format<<"_token_reuse M="<<rows<<" sharing="<<sharing
+            <<" ordinary_ms="<<elapsed[0]<<" grouped_ms="<<elapsed[1]
+            <<" speedup="<<elapsed[0]/elapsed[1]<<" graph_replay=1\n";++cases;
+    }
+    select(old.c_str());
+    std::cout<<format<<"_token_reuse_cases="<<cases<<" PASS\n";
+}
+void check_clipped_pipeline(const std::filesystem::path& root) {
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16);
+    std::vector<float> values{-65504,-100,-11,-10,-1,-0.0f,0,1,9.99f,10,11,100,65504};
+    auto gate=tb::tensor(values).to(options);
+    std::reverse(values.begin(),values.end());
+    auto up=tb::tensor(values).to(options);
+    auto expected_gate=tb::clamp_max(gate.to(tb::kFloat32),10);
+    auto expected_up=tb::clamp(up.to(tb::kFloat32),-10,10);
+    check_output(clipped_silu_mul_cuda(gate,up,10),
+        (tb::silu(expected_gate)*expected_up).to(tb::kFloat16));
+    int cases=0;
+    for(const char* format:{"nint","nvq3j","mxfp4","mixed"}) {
+        if(const auto* selected=std::getenv("MFQ_SSD_EXPERT_TEST_FORMAT");selected &&
+                std::string(selected).find(format)==std::string::npos)continue;
+        if(!std::filesystem::exists(root/(std::string(format)+"-0.mfq")))continue;
+        std::map<std::tuple<double,int,int>,tb::Tensor> references;
+        for(bool ssd:{false,true})for(double limit:{.01,10.}) {
+            CudaExecutionContext execution;auto& config=execution.config;
+            config.moe_pipeline=true;config.moe_two_stage_ffn=true;
+            config.moe_ram_pcie=true;config.moe_direct_ram=true;config.moe_ram_pcie_fraction=1.;
+            config.moe_preload_all=!ssd;config.moe_assert_resident=!ssd;
+            config.moe_residency_adapt=false;config.moe_residency_warm=false;
+            config.moe_host_cache_bytes=ssd?32768:16*1024*1024;
+            const bool mixed=std::string(format)=="mixed";
+            auto cache=make_moe_expert_cache(mixed?1<<20:32768,config);
+            std::array<MfeWeight,3> resident;
+            if(!ssd)for(int p=0;p<3;++p) {
+                auto model=mfq::open_model_source((root/(std::string(format)+"-"+std::to_string(p)+".mfq")).string());
+                resident[p]=load_mfe_gpu(execution,*model,"linear.weight");
+            }
+            std::array<FFN,2> layers;
+            int width=0,experts=0;
+            for(int layer=0;layer<2;++layer) {
+                auto& ffn=layers[layer];ffn.is_moe=true;ffn.moe_split_gate_up=true;
+                ffn.moe_layer=layer;ffn.moe_top_k=2;ffn.moe_normalize=true;ffn.moe_delayed_softmax=false;
+                ffn.moe_shared_ungated=true;ffn.swiglu_limit=limit;
+                for(int p=0;p<3;++p) {
+                    auto quant=source(root/(std::string(format)+"-"+std::to_string(p)+".mfq"));
+                    auto weight=cache_quant_moe_weight(cache,std::to_string(layer)+"/"+std::to_string(p),
+                        quant,1,layer,std::to_string(p));
+                    if(p==0){width=quant->metadata()->neuron_len;experts=quant->metadata()->n_experts;}
+                    (p==0?ffn.moe_gate:p==1?ffn.moe_up:ffn.moe_down)=std::move(weight);
+                }
+                ffn.moe_router=tb::zeros({experts,width},options.dtype(tb::kFloat32));
+                const int base=mixed?6:0;
+                ffn.moe_hash_ids=tb::tensor(std::vector<int32_t>{base,base+1,base+1,base+2,base+2,base}).reshape({3,2}).to(tb::kCUDA);
+                ffn.shared=std::make_unique<FFN>();ffn.shared->swiglu_limit=limit;
+                auto dense=[&](int out,int in) {
+                    QuantLinear value;value.kind=QuantLinearKind::Dense;
+                    value.logical_out=out;value.logical_neuron_len=in;
+                    value.dense=tb::full({out,in},.003,options);return value;
+                };
+                ffn.shared->gate_up.layers={dense(16,width),dense(16,width)};
+                ffn.shared->gate_up.outs={16,16};ffn.shared->down=dense(width,16);
+                ffn.prepare_moe_pipeline(execution);
+                check(bool(ffn.moe_pipeline_forward),"generic FFN did not register its SSD pipeline");
+            }
+            finalize_moe_expert_cache(cache);
+            std::shared_ptr<mfq::cuda::KvExpertLoan> loan;
+            tb::Tensor loan_storage;
+            uint64_t loan_region=0;
+            if(ssd && mixed) {
+                loan=std::make_shared<mfq::cuda::KvExpertLoan>();
+                loan_storage=tb::empty({4<<20},options.dtype(tb::kUInt8));
+                loan_region=loan->add(loan_storage,loan_storage.numel(),1,true,1,true,true);
+                set_moe_kv_expert_loan(cache,loan);
+            }
+            bool saw_prefill=false,loan_revoked=false;
+            bool retained=false,restored=false;
+            uint64_t retained_captures=0;
+            tb::Tensor old_direct_cache,old_wire;
+            for(int tokens:{1,2,3,4,5,6,1,11,143,1,1})for(auto& ffn:layers) {
+                if(ssd && tokens==11 && ffn.moe_layer==0) {
+                    old_direct_cache=MoeResidencyTestAccess::direct_cache(cache);
+                    old_wire=MoeResidencyTestAccess::wire(cache);
+                    retained_captures=moe_expert_graph_captures(cache);
+                    retained=lend_moe_decode_cache_for_prefill(cache,0);
+                    const auto* fallback=std::getenv("MFQ_MOE_WIRE_FALLBACK");
+                    const bool indirect=loan && mfq::cuda::NativeDmaBatch::available() &&
+                        (!fallback || fallback[0]!='0');
+                    check(retained==indirect,"private FFN graph lending capability mismatch");
+                    if(!retained)release_moe_decode_buffers(cache);
+                    if(retained) {
+                        check(old_direct_cache.defined(),"indirect FFN has no expert cache to return");
+                        // Hold the old allocation so restoring the cache must
+                        // choose another address, then poison every old page.
+                        MFQ_CUDA_CHECK(cudaMemsetAsync(old_direct_cache.data_ptr(),0xa5,
+                            old_direct_cache.numel(),mfq_current_cuda_stream()));
+                        MFQ_CUDA_CHECK(cudaMemsetAsync(old_wire.data_ptr(),0xa5,
+                            old_wire.numel(),mfq_current_cuda_stream()));
+                    } else {old_direct_cache={};old_wire={};}
+                }
+                std::fprintf(stderr,"clipped_check format=%s ssd=%d limit=%g tokens=%d layer=%d phase=reference\n",
+                    format,int(ssd),limit,tokens,ffn.moe_layer);
+                std::vector<float> input(tokens*width);
+                const float amplitude=std::string(format)=="nvq3j" || mixed?.003f:.3f;
+                for(std::size_t i=0;i<input.size();++i)input[i]=std::sin(float(i)*.13f)*amplitude;
+                auto x=tb::tensor(input).reshape({tokens,width}).to(options);
+                std::vector<int32_t> selected(tokens*2);
+                std::vector<int64_t> input_ids(tokens);
+                for(int t=0;t<tokens;++t) {
+                    input_ids[t]=(t+tokens+ffn.moe_layer)%3;
+                    for(int r=0;r<2;++r)selected[t*2+r]=(mixed?6:0)+int(input_ids[t]+r)%3;
+                }
+                const auto key=std::make_tuple(limit,tokens,ffn.moe_layer);
+                if(!ssd) {
+                    auto ids=tb::tensor(selected).reshape({tokens,2}).to(tb::kCUDA);
+                    auto route=build_moe_route_plan(ids,experts);
+                    auto weights=moe_sqrtsoftplus_weights_cuda(tb::zeros({tokens,experts},options.dtype(tb::kFloat32)),ids,1e-20,1);
+                    auto g=resident[0].forward(execution,x,route),u=resident[1].forward(execution,x,route);
+                    tb::Tensor hidden;
+                    if(limit>0) {
+                        g=tb::clamp_max(g.to(tb::kFloat32),limit);
+                        u=tb::clamp(u.to(tb::kFloat32),-limit,limit);
+                        hidden=(tb::silu(g)*u).to(tb::kFloat16).contiguous();
+                    } else hidden=moe_swiglu_split_cuda(tb::cat({g,u},-1).contiguous());
+                    auto routed=moe_weighted_reduce_cuda(resident[2].forward(execution,hidden,route),weights);
+                    references[key]=(routed+ffn.shared->forward(execution,x)).cpu().clone();
+                }
+                execution.force_moe_materialized_swiglu=false;
+                std::fprintf(stderr,"clipped_check phase=pipeline\n");
+                const bool speculative=ssd && tokens<=6;
+                if(speculative && ffn.moe_layer==0)begin_moe_speculative_routes(cache,tokens);
+                check_output(ffn.forward(execution,x,tb::tensor(input_ids).to(tb::kCUDA)),references.at(key));++cases;
+                if(retained && saw_prefill && tokens==1) {
+                    const auto cache_storage=MoeResidencyTestAccess::direct_cache(cache);
+                    check(cache_storage.defined() && cache_storage.data_ptr()!=old_direct_cache.data_ptr(),
+                        "retained FFN did not restore its returned cache at a new address");
+                    const auto wire=MoeResidencyTestAccess::wire(cache);
+                    check(wire.defined() && wire.data_ptr()!=old_wire.data_ptr(),
+                        "retained FFN did not restore its returned wire at a new address");
+                    check(moe_expert_graph_captures(cache)==retained_captures,
+                        "prefill recaptured an indirect private FFN graph");
+                    restored=true;
+                }
+                if(speculative && ffn.moe_layer==1) {
+                    if(tokens==6)discard_moe_speculative_routes(cache);
+                    else commit_moe_speculative_routes(cache,tokens-1);
+                }
+                if(tokens==143)saw_prefill=true;
+                if(loan && saw_prefill && tokens==1 && ffn.moe_layer==1 && !loan_revoked) {
+                    // The final M=1 replay must refresh descriptors after KV
+                    // growth revokes every borrowed expert page.
+                    loan->remove(loan_region);
+                    MFQ_CUDA_CHECK(cudaMemsetAsync(loan_storage.data_ptr(),0xa5,
+                        loan_storage.numel(),mfq_current_cuda_stream()));
+                    loan_revoked=true;
+                }
+            }
+            check(cache->stats().pipeline_two_stage_serves>=16,
+                "clipped FFN did not execute its two-stage kernels");
+            check(cache->stats().pipeline_multi_route_positions[0]>cache->stats().pipeline_multi_unique_routes[0] &&
+                    cache->stats().pipeline_multi_unique_routes[0]>0,
+                "multi-token route sharing was not measured");
+            check(!retained || restored,"retained private FFN was not replayed after prefill");
+            if(retained) {
+                // A different loan owns different publication observers. Its
+                // first decode must rebuild graphs instead of reading the old
+                // mapped dispatch table retained by the previous loan.
+                auto replacement=std::make_shared<mfq::cuda::KvExpertLoan>();
+                auto storage=tb::empty({4<<20},options.dtype(tb::kUInt8));
+                replacement->add(storage,storage.numel(),1,true,1,true,true);
+                set_moe_kv_expert_loan(cache,replacement);
+                check(!MoeResidencyTestAccess::direct_cache(cache).defined(),
+                    "replacing the loan retained its old expert cache");
+                for(auto& ffn:layers) {
+                    std::vector<float> input(width);
+                    for(int i=0;i<width;++i)input[i]=std::sin(float(i)*.13f)*.003f;
+                    auto x=tb::tensor(input).reshape({1,width}).to(options);
+                    auto id=tb::tensor(std::vector<int64_t>{(1+ffn.moe_layer)%3}).to(tb::kCUDA);
+                    check_output(ffn.forward(execution,x,id),references.at({limit,1,ffn.moe_layer}));
+                }
+                check(moe_expert_graph_captures(cache)>retained_captures,
+                    "a replacement loan reused stale cached-dispatch observers");
+            }
+            check(moe_expert_graph_captures(cache)>0,
+                "private FFN initialization was not visible to shared MTP policy");
+            if(ssd && mixed && mfq::cuda::NativeDmaBatch::available()) {
+                const auto spec=loan->speculative_stats();
+                check(spec.windows==9 && spec.cancels==1 && spec.disabled==0,
+                    "private FFN graphs lost speculative cache commit/cancel accounting");
+                check(cache->stats().pipeline_host_packet_serves>0,"private FFN graphs did not use host cache packets");
+                check(cache->stats().pipeline_kv_projection_hits>0,"private FFN graphs did not reuse borrowed GPU expert copies");
+                const auto* fallback=std::getenv("MFQ_MOE_WIRE_FALLBACK");
+                if(fallback && fallback[0]=='0')for(const auto& [name,bytes]:moe_expert_memory_metrics(cache))
+                    if(name=="expert_transfer_wire_bytes")
+                        check(bytes<=16384,"direct FFN packets retained an unused full payload wire");
+            }
+            release_moe_prefill_buffers(cache);
+        }
+    }
+    check(cases>0,"missing clipped FFN fixtures");
+    std::cout<<"generic_clipped_ffn_cases="<<cases<<" ordinary/pipeline RAM/SSD multi-layer PASS\n";
 }
 void check_ssd_predictor_overlap(const std::filesystem::path& root) {
     for(int variant:{0,1,2,3}) {
@@ -346,6 +656,16 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
 }
 }
 int main(int argc,char** argv)try {
+    MoeResidencyTestAccess::progressive_read_batches();
+    if(argc==3 && std::string(argv[2])=="--mxfp4-token-reuse") {
+        check_token_reuse(argv[1],"mx4");return 0;
+    }
+    if(argc==3 && std::string(argv[2])=="--nvq-token-reuse") {
+        check_token_reuse(argv[1],"nvq");return 0;
+    }
+    if(argc==3 && std::string(argv[2])=="--clipped-check") {
+        check_clipped_pipeline(argv[1]);return 0;
+    }
     std::set_terminate([] {
         if(auto error=std::current_exception())try {std::rethrow_exception(error);}
         catch(const std::exception& value){std::fprintf(stderr,"SSD test terminated: %s\n",value.what());}
@@ -384,19 +704,32 @@ int main(int argc,char** argv)try {
                 after.at("ssd_ram_read_fast_hits")==before.at("ssd_ram_read_fast_hits")+2 &&
                 after.at("ssd_scheduled_read_jobs")==before.at("ssd_scheduled_read_jobs"),
                 "RAM hits launched SSD worker jobs or lost their shared lease");
-            {
-                auto ready=candidate.cache->begin_ssd_expert_reads({{quant,31},{quant,31}},1);
+            for(std::size_t gate_up_count:{0,1,2}) {
+                auto ready=candidate.cache->begin_ssd_expert_reads({{quant,31},{quant,31}},gate_up_count);
                 check(!ready->ready.valid(),"RAM-only phase batch launched a coordinator job");
-                ready->wait_gate_up();ready->wait();
+                std::vector<std::size_t> batch,gu,down;
+                while(ready->next_projection_batch(batch,false))gu.insert(gu.end(),batch.begin(),batch.end());
+                while(ready->next_projection_batch(batch,true))down.insert(down.end(),batch.begin(),batch.end());
+                check(gu.size()==gate_up_count && down.size()==2-gate_up_count,
+                    "RAM projection phase hit was not published exactly once");
+                ready->wait();
                 check(ready->leases[0]==held && ready->leases[1]==held,"phase batch changed a RAM hit's lease");
             }
-            for(int expert:{45,46})quant->host_cache()->erase(quant->host_key(expert));
+            for(int expert:{45,46,47})quant->host_cache()->erase(quant->host_key(expert));
             {
-                auto reads=candidate.cache->begin_ssd_expert_reads({{quant,45},{quant,46}},1);
+                auto reads=candidate.cache->begin_ssd_expert_reads({{quant,45},{quant,46},{quant,47}},2);
                 check(reads->ready.valid(),"cold phase batch did not start asynchronous reads");
-                reads->wait_gate_up();check(bool(reads->leases[0]),"GU release preceded its lease publication");
-                reads->wait();check(bool(reads->leases[1]),"Down read lost its lease");
-                for(int i=0;i<2;++i) {
+                std::vector<std::size_t> batch;std::array<int,2> publications{};
+                while(reads->next_projection_batch(batch,false))for(const auto i:batch) {
+                    check(i<2 && ++publications.at(i)==1 && bool(reads->leases[i]),
+                        "GU batch duplicated a row or preceded its lease publication");
+                }
+                check(publications==std::array<int,2>{1,1},"GU batch omitted a completed read");
+                std::vector<std::size_t> down;
+                while(reads->next_projection_batch(batch,true))down.insert(down.end(),batch.begin(),batch.end());
+                check(down==std::vector<std::size_t>{2},"Down batch omitted or duplicated a completed read");
+                reads->wait();check(bool(reads->leases[2]),"Down read lost its lease");
+                for(int i=0;i<3;++i) {
                     const auto expected=moe_cache_fields(quant->read_expert(45+i));
                     const auto actual=moe_cache_fields(reads->leases[i]->weights);
                     for(std::size_t f=0;f<expected.size();++f)check(std::memcmp(actual[f].data_ptr(),expected[f].data_ptr(),expected[f].nbytes())==0,
@@ -406,7 +739,9 @@ int main(int argc,char** argv)try {
             failed=false;
             try {
                 auto reads=candidate.cache->begin_ssd_expert_reads({{quant,experts+1},{quant,47}},1);
-                reads->wait_gate_up();reads->wait();
+                std::vector<std::size_t> batch;
+                while(reads->next_projection_batch(batch,false)){}
+                reads->wait();
             }catch(const std::exception&){failed=true;}
             check(failed,"failed asynchronous SSD GU read did not release its waiter");
             // Dropping a packet still drains its queued read before freeing
@@ -463,6 +798,31 @@ int main(int argc,char** argv)try {
                     actual[f].scalar_type()==decoded[f].scalar_type() && (!actual[f].numel() ||
                     !std::memcmp(actual[f].data_ptr(),decoded[f].data_ptr(),actual[f].numel()*actual[f].element_size())),
                     "pageable expert fields changed when the pinned arena could not fit an expert");
+        }
+        {
+            auto partial=std::make_shared<MoeQuantRangeSource>(
+                std::make_shared<mfq::MfeQuantExpertStore>(candidate.sources[0]->store()));
+            const auto expert=31%experts;
+            const auto decoded=moe_cache_fields(partial->decode_expert(expert,partial->store().read_expert(expert)));
+            std::size_t largest=0;
+            for(const auto& field:decoded)largest=std::max(largest,std::size_t(field.nbytes()));
+            auto arena=std::make_shared<MoePinnedExpertArena>((largest+15)&~std::size_t(15));
+            partial->bind_pinned_arena(arena);
+            {
+                const auto actual=moe_cache_fields(partial->read_expert(expert));
+                check(actual.size()==decoded.size(),"partially pinned expert lost a field");
+                bool pinned=false,pageable=false;
+                for(std::size_t f=0;f<actual.size();++f) {
+                    if(!actual[f].nbytes())continue;
+                    pinned|=actual[f].options().pinned();pageable|=!actual[f].options().pinned();
+                    check(actual[f].nbytes()==decoded[f].nbytes() &&
+                          !std::memcmp(actual[f].data_ptr(),decoded[f].data_ptr(),actual[f].nbytes()),
+                          "partially pinned expert changed decoded field bytes");
+                }
+                check(pinned && pageable && arena->used_bytes()<=arena->bytes(),
+                      "fragmented expert allocation did not use bounded mixed storage");
+            }
+            check(arena->used_bytes()==0,"partially pinned expert leaked field leases");
         }
         if(candidate.hybrid)for(std::size_t p=0;p<candidate.sources.size();++p)for(const int e:{31%experts,32%experts}) {
             const auto& source=candidate.sources[p];

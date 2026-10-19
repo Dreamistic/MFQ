@@ -79,11 +79,9 @@ __global__ void __launch_bounds__(256,Capacity<=2?4:Capacity<=4?3:2) shared_gate
     if(lane<8 && base+lane<b.shared_intermediate)for(int k=0;k<count;++k) {
         const int pair=lane/2,row=lane&1;
         const auto gate=projected[pair][k][row],up=projected[pair+4][k][row];
-        const auto sigmoid=b.sigmoid_table[__half_as_ushort(gate)];
-        const auto activated=__float2half_rn(__half2float(gate)*__half2float(sigmoid));
         const int slot=shared_slot<Capacity>(b,group,k);
         b.hidden[int64_t(slot)*b.hidden_stride+base+lane]=
-            __float2half_rn(__half2float(activated)*__half2float(up));
+            mfe_ffn_swiglu(b,gate,up,b.sigmoid_table);
     }
 }
 __global__ void __launch_bounds__(128) shared_quantize(MfeFfnBatch b) {

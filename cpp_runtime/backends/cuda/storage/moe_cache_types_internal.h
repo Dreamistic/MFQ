@@ -170,6 +170,9 @@ static MixedMoePool moe_replace_quant_fields(MixedMoePool pool,const Fields& fie
     }else if(pool.family==MixedMoeFamily::Nvq) {
         if(fields.size()!=4)throw std::invalid_argument("NVQ RAM complement layout mismatch");
         pool.nvq.indices_packed=fields[0];pool.nvq.aux_packed=fields[1];pool.nvq.sub_scale_packed=fields[2];pool.nvq.neuron_scale=fields[3];
+    }else if(pool.family==MixedMoeFamily::Mxfp4) {
+        if(fields.size()!=2)throw std::invalid_argument("MXFP4 RAM complement layout mismatch");
+        pool.mxfp4.values=fields[0];pool.mxfp4.scales=fields[1];
     }else throw std::invalid_argument("unsupported canonical RAM complement format");
     return pool;
 }
@@ -368,6 +371,8 @@ struct MoeCacheStats {
     int64_t ram_pcie_experts=0,ram_pcie_bytes=0;
     int64_t pipeline_serves=0,pipeline_route_wait_ns=0,pipeline_plan_ns=0;
     int64_t pipeline_two_stage_serves=0;
+    std::uint64_t pipeline_graph_captures=0;
+    std::array<std::uint64_t,2> pipeline_multi_route_positions{},pipeline_multi_unique_routes{};
     int64_t pipeline_transfer_cache_hits=0,pipeline_transfer_cache_misses=0,pipeline_transfer_cache_saved_bytes=0;
     int64_t pipeline_fetch_ns=0,pipeline_cpu_ns=0;
     int64_t pipeline_ssd_read_ns=0,pipeline_window_ssd_read_ns=0;
@@ -398,6 +403,9 @@ struct MoeCacheStats {
     int64_t pipeline_kv_early_gu_serves=0;
     int64_t pipeline_gu_build_overlap_serves=0,pipeline_gu_build_overlap_copies=0;
     int64_t pipeline_ssd_gu_overlap_serves=0,pipeline_ssd_gu_overlap_bytes=0;
+    int64_t pipeline_ssd_gu_staged_bytes=0;
+    int64_t pipeline_ssd_gu_upload_batches=0;
+    int64_t pipeline_ssd_down_overlap_bytes=0,pipeline_ssd_down_upload_batches=0,pipeline_ssd_down_staged_bytes=0;
     int64_t pipeline_ssd_gu_compute_serves=0,pipeline_ssd_gate_up_wait_ns=0,pipeline_ssd_down_wait_ns=0;
     int64_t pipeline_kv_projection_hits=0,pipeline_kv_projection_misses=0,pipeline_kv_projection_fallbacks=0;
     int64_t pipeline_kv_projection_small_hit_bytes=0;

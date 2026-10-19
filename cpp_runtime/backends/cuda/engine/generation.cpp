@@ -1,5 +1,6 @@
 #include "generation.h"
 #include "generation_flow.h"
+#include "token_row_prefetch.h"
 #include "models/deepseek_v4/ops.h"
 #include "models/deepseek_v41/ops.h"
 #include "models/gemma4/ops.h"
@@ -26,12 +27,29 @@ template <typename Model>
 static mfq_tensor_backend::Tensor sample_token(Model &model, mfq_tensor_backend::Tensor ids,
     mfq::cuda::Sampler &sampler, mfq_tensor_backend::Tensor counts,
     const MfqTokenConstraintPtr &token_constraint) {
-    if (sampler.greedy() && !sampler.has_penalties() && !token_constraint) {
-        return model.next_token(ids);
-    }
+    const auto run = [&]() {
+        if (sampler.greedy() && !sampler.has_penalties() && !token_constraint) {
+            return model.next_token(ids);
+        }
 
-    auto logits = model.last_logits(ids).contiguous().view({1, -1});
-    return mfq::cuda::sample_logits(sampler, std::move(logits), counts, token_constraint);
+        auto logits = model.last_logits(ids).contiguous().view({1, -1});
+        return mfq::cuda::sample_logits(sampler, std::move(logits), counts, token_constraint);
+    };
+    const auto* setting = std::getenv("MFQ_PROFILE_DECODE");
+    if (!setting || setting[0] != '1' || ids.numel() > 8) return run();
+    auto& profiler = model.execution->profiler;
+    const bool previous = profiler.enabled;
+    profiler.reset();
+    profiler.enabled = true;
+    try {
+        auto next = profiler.measure("runtime.decode", run);
+        profiler.report("runtime.decode");
+        profiler.enabled = previous;
+        return next;
+    } catch (...) {
+        profiler.enabled = previous;
+        throw;
+    }
 }
 
 template <typename Model> struct CudaGenerationOps {
@@ -111,6 +129,11 @@ template <typename Model> struct CudaGenerationOps {
                     [&] {return output && output->stopped();},nullptr,false,finish_prefill);
             }
         }
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
+            if(!prepared || !prepared->transformed())
+                hidden=deepseek_v41_prefill_hidden(model,ids,prefill_compute_chunk,
+                    [&] {return output && output->stopped();});
+        }
         if(output && output->stopped()) {
             finish_prefill();
             return timer.elapsed_ms();
@@ -164,11 +187,9 @@ template <typename Model> struct CudaGenerationOps {
     }
     std::int64_t first_token() {
         const auto token=pending.template item<int64_t>();
-        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
-            // prefill()'s sequence-sized temporaries have now retired. Cache
-            // restoration remains before token publication, inside TTFT.
-            if(model.restore_decode_workspace)model.restore_decode_workspace();
-        }
+        // Prefill temporaries have retired; expert-cache maintenance remains
+        // before token publication, inside TTFT for every CUDA model family.
+        if(model.restore_decode_workspace)model.restore_decode_workspace();
         return token;
     }
 
@@ -316,18 +337,18 @@ template <typename Model> struct CudaGenerationOps {
         if (has_penalties && !graph_active) {
             sample_token_counts_add_cuda(counts, pending.contiguous());
         }
-        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+        if constexpr(requires {model.adapter_prefetch_token_rows(model,known_token_host);}) {
             const auto* option=std::getenv("MFQ_DECODE_EARLY_PLE");
-            if((option && option[0]=='0') || !model.reuse_decode_graphs || !model.graph_registry ||
-               (prepared && prepared->transformed()) || (output && output->stopped()))return;
+            if((option && option[0]=='0') || (prepared && prepared->transformed()) ||
+               (output && output->stopped()))return;
             if(!known_token_host.defined())known_token_host=mfq_tensor_backend::empty({1,1},
                 mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kInt64));
             known_token_host.template data_ptr<int64_t>()[0]=token;
-            if(qwen4_prefetch_decode_ple(model,known_token_host)) {
+            if(prefetch_token_rows(model,known_token_host)) {
                 static bool reported=false;
                 if(!reported) {
                     reported=true;
-                    std::cerr<<"runtime_decode_early_ple enabled=1 host_token_reuse=1\n";
+                    std::cerr<<"runtime_decode_early_token_rows enabled=1 host_token_reuse=1\n";
                 }
             }
         }
@@ -384,7 +405,7 @@ template <class Model> struct CudaGenerationContext {
     }
     void reserve_workspace(std::size_t bytes) {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+        {
             reserve_moe_workspace(model.execution->moe_expert_cache,bytes);
             auto context=mfq::cuda::default_context(mfq_current_cuda_device());
             auto available=context->available_memory();
@@ -400,6 +421,26 @@ template <class Model> struct CudaGenerationContext {
                 <<" prefix_released_bytes="<<released<<'\n';
         }
 #endif
+    }
+    void prepare_prefill_workspace(std::size_t tokens) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        const bool streamed=tokens>8 && moe_expert_cache_ssd_experts(model.execution->moe_expert_cache);
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>)
+            if(streamed)graph.invalidate();
+        const bool retained=streamed && lend_moe_decode_cache_for_prefill(model.execution->moe_expert_cache,
+            mfq::cuda::runtime_options::workspace_reserve_bytes());
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
+            if(streamed && !retained) {
+                // Private FFN graphs retain their transfer arenas after a
+                // request. Retire consumers before a new grouped prefill;
+                // otherwise these arenas can reduce its ring to one expert.
+                release_moe_decode_buffers(model.execution->moe_expert_cache);
+                mfq::cuda::default_context(mfq_current_cuda_device())->reclaim_idle_memory();
+            }
+        }
+#endif
+        if(tokens>1024 || moe_expert_cache_ssd_experts(model.execution->moe_expert_cache))
+            reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
     }
     bool prepare_snapshot() {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
@@ -449,8 +490,7 @@ template <class Model> struct CudaGenerationContext {
     Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
                      size_t reused, size_t stable) {
         if (batching) return batching->generate(request_id, input, output);
-        if(input.prompt.size()-reused>1024)
-            reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
+        prepare_prefill_workspace(input.prompt.size()-reused);
         auto logical_chunk=config.generation.prefill_chunk_size;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
             // Bound residual/FFN storage as well as projection tiles. Long
@@ -461,6 +501,9 @@ template <class Model> struct CudaGenerationContext {
                 qwen4_layer_major_prefill_eligible(model,input.prompt.size()))
                 logical_chunk=input.prompt.size();
         }
+        if constexpr(std::is_same_v<Model,DeepseekV41CausalLm>) {
+            if(!prepared || !prepared->transformed())logical_chunk=input.prompt.size();
+        }
         return mfq::engine::generate_sequence(
             CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr,
                 config.decode_graph,config.generation.prefill_chunk_size,&output),
@@ -468,8 +511,7 @@ template <class Model> struct CudaGenerationContext {
     }
     Generation speculate(mfq::engine::InferenceRequest &input, mfq::engine::InferenceOutput &output,
         size_t reused, Hidden restored, Hidden *committed) {
-        if(input.prompt.size()-reused>1024)
-            reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
+        prepare_prefill_workspace(input.prompt.size()-reused);
         return run_mtp_generation(model,
             *mtp,
             input,

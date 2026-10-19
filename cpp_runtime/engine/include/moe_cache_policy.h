@@ -88,6 +88,14 @@ public:
         return static_cast<int>(by_key_.size());
     }
 
+    // Phase hints affect victim selection only; keys, addresses and in-flight
+    // leases retain their normal lifetime and generation checks.
+    void set_low_priority_sources(std::vector<int> sources) {
+        std::sort(sources.begin(), sources.end());
+        sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
+        low_priority_sources_ = std::move(sources);
+    }
+
     int slot_for(const MoeCacheKey & key) const noexcept {
         const auto found = by_key_.find(key);
         return found == by_key_.end() ? -1 : found->second;
@@ -111,7 +119,16 @@ public:
             slot = free_.back();
             free_.pop_back();
         } else {
+            if (!low_priority_sources_.empty()) for (const int candidate : lru_) {
+                const auto& state = slots_[static_cast<size_t>(candidate)];
+                if (!state.inflight && state.key && std::binary_search(low_priority_sources_.begin(),
+                        low_priority_sources_.end(), state.key->source)) {
+                    slot = candidate;
+                    break;
+                }
+            }
             for (const int candidate : lru_) {
+                if (slot >= 0) break;
                 if (!slots_[static_cast<size_t>(candidate)].inflight) {
                     slot = candidate;
                     break;
@@ -273,6 +290,7 @@ private:
     }
 
     std::vector<Slot> slots_;
+    std::vector<int> low_priority_sources_;
     std::vector<int> free_;
     std::list<int> lru_;
     std::unordered_map<MoeCacheKey, int, MoeCacheKeyHash> by_key_;

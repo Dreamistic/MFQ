@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
@@ -40,6 +41,7 @@ std::vector<tb::Tensor> expert_field_tensors(const MixedMoePool& pool) {
     if (pool.family==MixedMoeFamily::Nint)
         fields={pool.nint.q_packed,pool.nint.row_q_bits,pool.nint.row_q_bit_offsets,
             pool.nint.sub_scale,pool.nint.sub_min,pool.nint.neuron_scale,pool.nint.neuron_min};
+    else if(pool.family==MixedMoeFamily::Mxfp4)fields={pool.mxfp4.values,pool.mxfp4.scales};
     else fields={pool.nvq.indices_packed,pool.nvq.aux_packed,pool.nvq.sub_scale_packed,pool.nvq.neuron_scale};
     return fields;
 }
@@ -114,23 +116,45 @@ MixedMoePool MoeQuantRangeSource::allocate_expert(int expert) const {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
     {
         auto block=pinned_arena_?pinned_arena_->allocate(arena_bytes_.at(index)):nullptr;
-        std::shared_ptr<void> owner;
-        std::uint8_t* base=nullptr;
-        if(block) {owner=block;base=block->data();}
-        else {
-            // A fragmented or leased interval must retain the same direct
-            // field codec. One pageable allocation avoids constructing and
-            // cloning a second complete set of runtime tensors on this miss.
-            auto storage=std::make_shared<tb::Tensor>(tb::empty({std::int64_t(arena_bytes_.at(index))},
+        const auto& layouts=field_layouts_.at(index);
+        std::vector<std::shared_ptr<MoePinnedExpertArena::Block>> pinned_fields;
+        std::vector<std::size_t> pageable_offsets;
+        std::shared_ptr<tb::Tensor> pageable;
+        if(!block) {
+            // Large expert images can fail despite smaller free intervals.
+            // Retain any fields that fit there; only the remaining fields
+            // need pageable storage and the later DMA staging copy.
+            pinned_fields.resize(layouts.size());pageable_offsets.resize(layouts.size());
+            std::size_t bytes=0,pinned_bytes=0;
+            for(std::size_t f=0;f<layouts.size();++f) {
+                if(pinned_arena_)pinned_fields[f]=pinned_arena_->allocate(layouts[f].bytes);
+                if(pinned_fields[f])pinned_bytes+=layouts[f].bytes;
+                else {
+                    bytes=(bytes+15)&~std::size_t(15);pageable_offsets[f]=bytes;bytes+=layouts[f].bytes;
+                }
+            }
+            pageable=std::make_shared<tb::Tensor>(tb::empty({std::int64_t(bytes)},
                 tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8)));
-            owner=storage;base=static_cast<std::uint8_t*>(storage->data_ptr());
+            if(pinned_bytes) {
+                static std::atomic<bool> reported{false};
+                if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                    "moe_partial_pinned_expert scope=first_fragmented_allocation enabled=1 pinned_bytes=%zu pageable_bytes=%zu\n",
+                    pinned_bytes,bytes);
+            }
         }
-        for(const auto& layout:field_layouts_.at(index)) {
+        for(std::size_t f=0;f<layouts.size();++f) {
+            const auto& layout=layouts[f];
             auto storage=std::make_shared<tb::TensorStorage>();
             const auto device=tb::Device{tb::kCPU,0};
-            auto* address=base+layout.offset;
-            storage->owner=owner;storage->base=address;storage->bytes=layout.bytes;
-            storage->device=device;storage->pinned=bool(block);
+            std::uint8_t* address=nullptr;
+            if(block){storage->owner=block;address=block->data()+layout.offset;}
+            else if(pinned_fields[f]){storage->owner=pinned_fields[f];address=pinned_fields[f]->data();}
+            else {
+                storage->owner=pageable;
+                if(layout.bytes)address=static_cast<std::uint8_t*>(pageable->data_ptr())+pageable_offsets[f];
+            }
+            storage->base=address;storage->bytes=layout.bytes;
+            storage->device=device;storage->pinned=bool(block) || bool(pinned_fields[f]);
             fields.emplace_back(storage,tb::make_contiguous_view(address,layout.shape,layout.dtype,device));
         }
     }
@@ -142,6 +166,8 @@ MixedMoePool MoeQuantRangeSource::allocate_expert(int expert) const {
     if(pool.family==MixedMoeFamily::Nvq) {
         auto& w=pool.nvq;w.workspaces.clear();
         w.indices_packed=fields[0];w.aux_packed=fields[1];w.sub_scale_packed=fields[2];w.neuron_scale=fields[3];
+    } else if(pool.family==MixedMoeFamily::Mxfp4) {
+        pool.mxfp4.values=fields[0];pool.mxfp4.scales=fields[1];
     } else {
         auto& w=pool.nint;w.workspaces.clear();
         w.q_packed=fields[0];w.row_q_bits=fields[1];w.row_q_bit_offsets=fields[2];
@@ -192,8 +218,9 @@ MixedMoePool MoeQuantRangeSource::read_expert_canonical(int expert) const {
         encoded_ns_.fetch_add(encoded_time,std::memory_order_relaxed);
         const auto materialize=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-read_done).count();
         materialize_ns_.fetch_add(materialize,std::memory_order_relaxed);
-        (result.family==MixedMoeFamily::Nint?nint_materialize_ns_:nvq_materialize_ns_).fetch_add(materialize,std::memory_order_relaxed);
-        record_format_io(result.family==MixedMoeFamily::Nint?0:result.nvq.kernel_format,
+        if(result.family!=MixedMoeFamily::Mxfp4)
+            (result.family==MixedMoeFamily::Nint?nint_materialize_ns_:nvq_materialize_ns_).fetch_add(materialize,std::memory_order_relaxed);
+        record_format_io(result.family==MixedMoeFamily::Nint?0:result.family==MixedMoeFamily::Nvq?result.nvq.kernel_format:-1,
             source_bytes,encoded_time,materialize);
     }
     return result;
@@ -227,6 +254,25 @@ void MoeQuantRangeSource::copy_expert_fields(int expert,const std::vector<tb::Te
         throw std::runtime_error("expert disk copy forbidden after complete residency preload");
     }
     const auto& prototype=metadata_->pools.at(index);
+    if(prototype.family==MixedMoeFamily::Mxfp4 && targets.size()==2) {
+        using Clock=std::chrono::steady_clock;
+        const bool profile=profile_ssd_ && preloaded_.load();
+        const auto begin=profile?Clock::now():Clock::time_point{};
+        std::array<mfq::QuantFieldTarget,2> fields;
+        for(std::size_t f=0;f<2;++f)fields[f]={static_cast<std::uint8_t*>(targets[f].data_ptr()),
+            std::size_t(targets[f].nbytes())};
+        std::size_t source_bytes=0;
+        if(!store_->copy_mxfp4_fields(expert,fields,&source_bytes))
+            throw std::logic_error("MXFP4 range source differs from prototype");
+        ++direct_field_reads_;++materializations_;
+        if(preloaded_.load()) {
+            ++disk_reads_after_preload_;
+            disk_bytes_after_preload_.fetch_add(source_bytes,std::memory_order_relaxed);
+        }
+        if(profile)encoded_ns_.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-begin).count(),std::memory_order_relaxed);
+        return;
+    }
     if(prototype.family==MixedMoeFamily::Nint && targets.size()==7) {
         using Clock=std::chrono::steady_clock;
         const bool profile=profile_ssd_ && preloaded_.load();
@@ -377,6 +423,9 @@ MixedMoePool MoeQuantRangeSource::decode_expert(int expert,const mfq::MfeQuantEx
             pool.nint.q_packed=std::move(padded);
             pool.nint.q_expert_stride=stride;
         }
+    } else if(encoded.dtype=="MXFP4") {
+        pool.family=MixedMoeFamily::Mxfp4;
+        pool.mxfp4=to_device_mxfp4(unpack_mxfp4(encoded.payload),false);
     } else {
         pool.family=MixedMoeFamily::Nvq;
         pool.nvq=to_cpu_nvq(unpack_nvq(encoded.payload,encoded.dtype));
@@ -470,7 +519,8 @@ tb::Tensor MoeQuantRangeSource::forward_cpu(CudaExecutionContext& execution,tb::
         if(positions.empty()) continue;
         auto lease=prepared ? prepared->at(expert) : acquire_expert(expert);
         const auto& pool=lease->weights;
-        auto projection=pool.family==MixedMoeFamily::Nint ? make_cpu_projection_rows(pool.nint) : make_cpu_projection_rows(pool.nvq);
+        auto projection=pool.family==MixedMoeFamily::Nint ? make_cpu_projection_rows(pool.nint) :
+            pool.family==MixedMoeFamily::Mxfp4 ? make_cpu_projection_rows(pool.mxfp4) : make_cpu_projection_rows(pool.nvq);
         for(std::size_t row=0;row<positions.size();++row) {
             const int source=input.dim()==2 ? positions[row]/routes : positions[row];
             std::memcpy(packed.data_ptr<float>()+std::size_t(offset+row)*width,
