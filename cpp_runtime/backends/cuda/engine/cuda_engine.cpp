@@ -117,7 +117,8 @@ struct CudaEngineState {
         restore_mtp_expert_space();
         if(!graph_expert_loan)return;
         bool ssd=false;std::size_t transfer=0,streamed=0;
-        for(const auto& [name,value]:moe_expert_memory_metrics(execution->moe_expert_cache)) {
+        const auto expert_metrics=moe_expert_memory_metrics(execution->moe_expert_cache);
+        for(const auto& [name,value]:expert_metrics) {
             if(name=="ssd_expert_enabled")ssd=value!=0;
             if(name=="expert_decode_stage_budget_bytes")transfer=std::size_t(value);
             if(name=="ram_expert_payload_bytes" || name=="ssd_expert_payload_bytes")streamed+=std::size_t(value);
@@ -128,6 +129,12 @@ struct CudaEngineState {
             std::cerr<<"runtime_model_io_stats boundary=prefill_end calls="<<io.calls
                 <<" logical_bytes="<<io.logical_bytes<<" physical_bytes="<<io.physical_bytes
                 <<" read_ms="<<double(io.read_nanoseconds)/1e6<<'\n';
+            std::cerr<<"runtime_moe_pipeline_stats boundary=prefill_end";
+            for(const auto& [name,value]:expert_metrics)
+                if(name=="expert_route_wait_ms" || name=="expert_plan_ms" ||
+                   name=="expert_host_fetch_ms" || name=="expert_logical_transfer_bytes" ||
+                   name=="ssd_expert_read_wait_ms")std::cerr<<' '<<name<<'='<<value;
+            std::cerr<<'\n';
         }
         // Spare device memory can hold revocable copies of streamed experts.
         // Primary arenas retain their configured budget. Prefill, KV growth
