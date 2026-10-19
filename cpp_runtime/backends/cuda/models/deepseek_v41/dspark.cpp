@@ -379,13 +379,16 @@ struct DeepseekV41Dspark final : MtpModule {
                 previous_pre.narrow(2, 0, 1).fill_(1.0);
                 return previous_pre;
             },
-            [&](size_t index, Tensor hidden, Tensor &previous_pre) {
+            [&](size_t index, Tensor hidden, Tensor &previous_pre, int64_t output_rows) {
                 auto &stage = *stages[index];
                 return mfq::models::deepseek_v41::mega_layer(
                     std::move(hidden), previous_pre,
                     [&](Tensor value, const Tensor &pre, int branch) {
+                        // The last attention still sees the complete block.
+                        // Its following FFN is independent for each token.
+                        const auto rows = branch == 0 ? physical_width : output_rows;
                         return stage.collapse(
-                            execution->profiler, value, pre,
+                            execution->profiler, value.narrow(1, 0, rows), pre.narrow(1, 0, rows),
                             branch == 0 ? stage.attention_mhc_function : stage.mlp_mhc_function,
                             branch == 0 ? stage.attention_mhc_scale : stage.mlp_mhc_scale,
                             branch == 0 ? stage.attention_mhc_base : stage.mlp_mhc_base,
@@ -395,14 +398,17 @@ struct DeepseekV41Dspark final : MtpModule {
                     },
                     [&](Tensor value) { return attention(value, stage, rings[index]); },
                     [&](Tensor value, Tensor residual, const auto &mix, int branch) {
-                        return stage.expand(execution->profiler, value, residual, mix,
+                        return stage.expand(execution->profiler, value,
+                                            residual.narrow(1, 0, value.size(1)), mix,
                                             branch == 0 ? "deepseek_v41.dspark.mhc.attention.expand"
                                                         : "deepseek_v41.dspark.mhc.mlp.expand");
                     },
                     [&](Tensor value) {
+                        const auto rows = value.size(1);
                         return stage.mlp
-                            .forward(*execution, value.reshape({-1, config.hidden}), draft_ids)
-                            .reshape({batch, physical_width, config.hidden});
+                            .forward(*execution, value.reshape({-1, config.hidden}),
+                                     draft_ids.narrow(1, 0, rows))
+                            .reshape({batch, rows, config.hidden});
                     });
             },
             [&](Tensor hidden, const Tensor &previous_pre) {

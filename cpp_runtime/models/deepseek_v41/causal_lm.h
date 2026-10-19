@@ -132,7 +132,8 @@ auto dspark_draft(int64_t width, int64_t requested, size_t stages, Embed embed, 
     auto hidden = expand(embedded);
     auto previous_pre = initial_pre(embedded);
     for (size_t index = 0; index < stages; ++index)
-        hidden = layer(index, std::move(hidden), previous_pre);
+        hidden = layer(index, std::move(hidden), previous_pre,
+                       index + 1 == stages ? requested : width);
     // Predictor stages attend across the full physical block. After their
     // final collapse, vocabulary projection is independent for each row;
     // discard unused rows before normalization and the large output head.

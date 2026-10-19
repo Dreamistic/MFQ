@@ -159,11 +159,11 @@ void check_dspark_requested_head() {
                 },
                 [](const auto& rows){return rows;},
                 [](const auto&){return 1;},
-                [&](std::size_t stage,auto rows,int& pre) {
+                [&](std::size_t stage,auto rows,int& pre,int64_t output_rows) {
                     require(rows.size()==std::size_t(width),"DSpark stage lost physical block rows");
                     int total=0;for(auto value:rows)total+=value;
                     for(auto& value:rows)value+=total+int(stage)+pre;
-                    ++pre;return rows;
+                    ++pre;rows.resize(output_rows);return rows;
                 },
                 [](auto rows,int pre){for(auto& value:rows)value*=pre;return rows;},
                 [&](auto rows) {
