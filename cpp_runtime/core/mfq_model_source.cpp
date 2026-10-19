@@ -51,6 +51,7 @@ constexpr std::string_view kAssetPrefix = "__mfq_asset__/";
 std::array<std::atomic<std::uint64_t>,5> mapped_read_totals{};
 using MappedClock=std::chrono::steady_clock;
 thread_local bool mapped_prefetch_context=false;
+thread_local bool mapped_release_context=false;
 
 class MappedTensorRange {
     void* view_=nullptr;
@@ -182,6 +183,10 @@ public:
             mapped_read_totals[4].fetch_add(1,std::memory_order_relaxed);
         }
         for(const auto& span:spans)if(span.size)read(span.offset,span.destination,span.size);
+        // Selected rows now belong to the bounded row cache/packet. Keeping
+        // a second working-set copy of sparse pages across all Engram tables
+        // can exhaust RAM despite a bounded expert cache.
+        if(mapped_release_context)release_pages();
     }
 };
 
@@ -511,10 +516,14 @@ std::size_t release_mapped_tensor_pages() {
     return views;
 }
 
-MappedPrefetchScope::MappedPrefetchScope(bool enabled):previous_(mapped_prefetch_context) {
+MappedPrefetchScope::MappedPrefetchScope(bool enabled,bool release_after_read)
+        :previous_(mapped_prefetch_context),previous_release_(mapped_release_context) {
     mapped_prefetch_context=enabled;
+    mapped_release_context=release_after_read;
 }
-MappedPrefetchScope::~MappedPrefetchScope(){mapped_prefetch_context=previous_;}
+MappedPrefetchScope::~MappedPrefetchScope(){
+    mapped_prefetch_context=previous_;mapped_release_context=previous_release_;
+}
 
 MfqModelSource::MfqModelSource(std::filesystem::path requested, FileReadMode mode)
     : impl_(std::make_unique<Impl>()) {

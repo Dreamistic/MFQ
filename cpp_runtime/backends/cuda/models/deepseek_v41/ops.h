@@ -144,12 +144,22 @@ struct SharedState {
                                   token_ids.size(1) == current_tokens,
                               "DeepSeek-V4.1 Engram token state is unavailable");
             engram_hashes = engram_hash->forward(token_ids, current_position);
-            for (const auto* memory : engram_prefetch) memory->prefetch(engram_hashes);
         }
         MFQ_RUNTIME_CHECK(layer == next_layer && layer >= 0 && layer < layer_count &&
                               current_batch == batch && current_tokens == tokens &&
                               current_position == cache_position && previous_pre.defined(),
-                          "DeepSeek-V4.1 layer execution order changed");
+                              "DeepSeek-V4.1 layer execution order changed");
+        // Keep current/next Engram reads ahead of attention without launching
+        // every layer's SSD scan together. During CED encoder prefill, decoder
+        // tables will later consume only the bounded replay's hash rows.
+        const auto prefetch_end=current_tokens>config.sliding_window && layer<config.causal_encoder_layers
+            ?config.causal_encoder_layers:layer_count;
+        int issued=0;
+        for(const auto* memory:engram_prefetch) {
+            if(memory->layer_id()<layer || memory->layer_id()>=prefetch_end)continue;
+            memory->prefetch(engram_hashes);
+            if(++issued==2)break;
+        }
         ++next_layer;
         if (!attention_meta.defined() || attention_meta.device() != device) {
             attention_meta = mfq_tensor_backend::empty(

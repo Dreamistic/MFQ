@@ -197,7 +197,7 @@ struct NintRowPipeline::Impl {
         for(const auto& shard:misses)missing_rows+=shard.size();
         const int threads=serial_small && missing_rows<=32?1:mfq_get_num_threads();
         const auto fetch=[&](std::size_t shard) {
-            mfq::MappedPrefetchScope prefetch(misses[shard].size()>128);
+            mfq::MappedPrefetchScope prefetch(misses[shard].size()>128,true);
             tables[shard]->append_rows(misses[shard].data(),misses[shard].size(),fetched[shard],1);
         };
         if(active_read_pool) {
@@ -300,8 +300,9 @@ std::shared_ptr<NintRowStage> NintRowPipeline::make_stage(const std::vector<int6
     // Small decode packets need only a few PCIe cache lines. Reading the
     // locked packet in the existing decoder avoids a separate DMA submission
     // and host completion callback. Large windows keep the device upload.
-    const bool small_decode=shape.size()==3 && shape[0]==1 && shape[1]<=6 &&
-        capacity+std::size_t(n)*32<=16u*1024;
+    const bool small_shape=shape.size()==1 ||
+        (shape.size()==3 && shape[0]==1 && shape[1]<=6);
+    const bool small_decode=small_shape && capacity+std::size_t(n)*32<=16u*1024;
     const bool mapped=setting?setting[0]=='1':small_decode;
     return std::shared_ptr<NintRowStage>(new NintRowStage(std::make_unique<NintRowStage::Impl>(
         s.source_id,n,s.width,capacity,shape,device,mapped)));

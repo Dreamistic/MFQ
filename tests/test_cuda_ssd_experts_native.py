@@ -16,7 +16,8 @@ from mfq.quantize.nint_quant import quantize
 from mfq.formats.nvq import D4_256, NVQ3_D4, NvqJscTensor
 
 
-def test_clipped_generic_ssd_ffn(tmp_path):
+@pytest.mark.parametrize("wire_fallback", ["0", "1"])
+def test_clipped_generic_ssd_ffn(tmp_path, wire_fallback):
     executable = os.environ.get("MFQ_CUDA_SSD_EXPERT_TEST")
     if not executable:
         pytest.skip("MFQ_CUDA_SSD_EXPERT_TEST required")
@@ -51,11 +52,12 @@ def test_clipped_generic_ssd_ffn(tmp_path):
     env = dict(os.environ, MFQ_MOE_SSD_EXPERTS="1", MFQ_MOE_NVQ_DENSE="0",
                MFQ_MOE_PREFILL_LAYER="0", MFQ_MOE_PREFILL_GROUPS="1",
                MFQ_MOE_TRANSFER_CACHE="1", MFQ_MOE_RAM_PCIE_FRACTION="1",
+               MFQ_MOE_WIRE_FALLBACK=wire_fallback,
                MFQ_MOE_NATIVE_DMA_BATCH="1", MFQ_MOE_KV_HOST_PACKET="1")
     result = subprocess.run([executable, str(tmp_path), "--clipped-check"],
                             env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "generic_clipped_ffn_cases=320" in result.stdout
+    assert "generic_clipped_ffn_cases=352" in result.stdout
 
 
 @pytest.mark.parametrize("pcie_fraction,read_mode,native_dma,ram_pin_bytes", [

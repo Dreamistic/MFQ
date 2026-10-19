@@ -1660,7 +1660,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         const auto* host_packet_option=std::getenv("MFQ_MOE_KV_HOST_PACKET");
         const auto* fused_copy_option=std::getenv("MFQ_MOE_FUSED_TRANSFER_COPY");
         cell.wire_fallback=(!wire_fallback || wire_fallback[0]!='0') && cell.tokens<=8 &&
-            cell.in_window && cell.phased_transfer && cell.skip_cpu_wait && cell.native_dma_mode &&
+            cell.graph_replay && cell.phased_transfer && cell.skip_cpu_wait && cell.native_dma_mode &&
             direct_enabled && bool(cache_->kv_expert_loan_) && bool(cell.transfer_route_plan) &&
             cell.fused->batch().resident_plan_overlap &&
             (!packet_option || packet_option[0]!='0') &&

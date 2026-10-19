@@ -671,6 +671,8 @@ if(BUILD_TESTING)
     if(MSVC)
         target_compile_options(mfq-ssd-expert-streaming-test PRIVATE /EHsc)
         target_compile_options(mfq-host-expert-cache-test PRIVATE /EHsc)
+        # Cancellation checks must unwind CUDA stream guards before recovery.
+        target_compile_options(mfq-nint-row-pipeline-test PRIVATE /EHsc)
     endif()
 
     add_executable(mfq-float-projection-test ${MFQ_CUDA_ROOT}/tests/float_projection_test.cpp)

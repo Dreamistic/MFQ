@@ -670,6 +670,7 @@ void MoeExpertCache::execute_ssd_expert_reads(SsdExpertReads& reads,mfq::HostPar
     ssd_scheduled_read_jobs_.fetch_add(reads.missing.size(),std::memory_order_relaxed);
     pool.run(0,int64_t(reads.missing.size()),1,workers,
         [&](int64_t begin,int64_t end) {
+            const mfq::MappedPrefetchScope copied(false,true);
             for(auto i=begin;i<end;++i) {
                 const auto index=reads.missing[i];
                 reads.leases[index]=reads.requests[index].first->acquire_expert(reads.requests[index].second,touch);
@@ -809,7 +810,7 @@ void MoeExpertCache::copy_ssd_experts(const std::vector<SsdExpertCopy>& requests
     }
     ssd_read_pool_->run(0,int64_t(jobs.size()),1,workers,
         [&](int64_t begin,int64_t end) {
-            const mfq::MappedPrefetchScope prefetch(true);
+            const mfq::MappedPrefetchScope prefetch(true,true);
             // A prompt scans most experts once. Reuse decoded images without
             // promoting that scan above the preceding decode's working set.
             for(auto job=begin;job<end;++job) {
@@ -2503,6 +2504,7 @@ void MoeExpertCache::prepare_direct_transfer_cache() {
     }
     bytes=bytes/mfq::cuda::KvExpertLoan::page*mfq::cuda::KvExpertLoan::page;
     if(!bytes)return;
+    reserve_workspace(bytes+(std::size_t(64)<<20));
     mfq::cuda::ResidentAllocationScope resident;
     pipeline_direct_cache_storage_=mfq_tensor_backend::empty({int64_t(bytes)},
         mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kUInt8));

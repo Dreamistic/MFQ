@@ -292,7 +292,8 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
                 loan_region=loan->add(loan_storage,loan_storage.numel(),1,true,1,true,true);
                 set_moe_kv_expert_loan(cache,loan);
             }
-            for(int tokens:{1,2,3,4,5,6,1,11,143,1})for(auto& ffn:layers) {
+            bool saw_prefill=false,loan_revoked=false;
+            for(int tokens:{1,2,3,4,5,6,1,11,143,1,1})for(auto& ffn:layers) {
                 if(ssd && tokens==11 && ffn.moe_layer==0)
                     release_moe_decode_buffers(cache);
                 std::fprintf(stderr,"clipped_check format=%s ssd=%d limit=%g tokens=%d layer=%d phase=reference\n",
@@ -325,12 +326,14 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
                 execution.force_moe_materialized_swiglu=false;
                 std::fprintf(stderr,"clipped_check phase=pipeline\n");
                 check_output(ffn.forward(execution,x,tb::tensor(input_ids).to(tb::kCUDA)),references.at(key));++cases;
-                if(loan && tokens==143 && ffn.moe_layer==1) {
+                if(tokens==143)saw_prefill=true;
+                if(loan && saw_prefill && tokens==1 && ffn.moe_layer==1 && !loan_revoked) {
                     // The final M=1 replay must refresh descriptors after KV
                     // growth revokes every borrowed expert page.
                     loan->remove(loan_region);
                     MFQ_CUDA_CHECK(cudaMemsetAsync(loan_storage.data_ptr(),0xa5,
                         loan_storage.numel(),mfq_current_cuda_stream()));
+                    loan_revoked=true;
                 }
             }
             check(cache->stats().pipeline_two_stage_serves>=16,
@@ -338,7 +341,8 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
             if(ssd && mixed && mfq::cuda::NativeDmaBatch::available()) {
                 check(cache->stats().pipeline_host_packet_serves>0,"private FFN graphs did not use host cache packets");
                 check(cache->stats().pipeline_kv_projection_hits>0,"private FFN graphs did not reuse borrowed GPU expert copies");
-                for(const auto& [name,bytes]:moe_expert_memory_metrics(cache))
+                const auto* fallback=std::getenv("MFQ_MOE_WIRE_FALLBACK");
+                if(fallback && fallback[0]=='0')for(const auto& [name,bytes]:moe_expert_memory_metrics(cache))
                     if(name=="expert_transfer_wire_bytes")
                         check(bytes<=16384,"direct FFN packets retained an unused full payload wire");
             }

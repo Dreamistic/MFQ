@@ -341,6 +341,8 @@ class Engram {
             std::move(projection), (query * key).contiguous()));
     }
 
+    int64_t layer_id() const { return config_.engram_layer_ids[hash_layer_]; }
+
     void prefetch(const EngramHashBatch& hashes) const {
         table_->prefetch(hashes.layer_data(hash_layer_),
             std::size_t(hashes.batch) * hashes.tokens * hashes.columns);

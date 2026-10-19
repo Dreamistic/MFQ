@@ -119,6 +119,8 @@ int main(int argc,char** argv)try {
         NintRowPipeline pipeline({table});const tb::Device device{tb::kCUDA,0};
         if(!pipeline.make_stage({1,1,4},device)->mapped_rows() ||
            !pipeline.make_stage({1,6,4},device)->mapped_rows() ||
+           !pipeline.make_stage({24},device)->mapped_rows() ||
+           pipeline.make_stage({1536},device)->mapped_rows() ||
            pipeline.make_stage({1,32,4},device)->mapped_rows() ||
            pipeline.make_stage({1,6,256},device)->mapped_rows())
             throw std::runtime_error("PLE automatic packet policy changed");
