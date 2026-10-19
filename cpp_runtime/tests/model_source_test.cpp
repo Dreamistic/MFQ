@@ -298,6 +298,18 @@ int main() {
             std::fill(received.begin(),received.end(),std::byte{0});large_batch(spans);
             for(const auto& span:spans)require(std::equal(span.destination,span.destination+span.size,expected.begin()+span.offset),
                     "mapped batch across pages/prefetch chunks differs");
+            auto sparse=std::vector<mfq::ReadSpan>(spans.begin(),spans.begin()+64);
+            std::reverse(sparse.begin(),sparse.end());
+            sparse.push_back(sparse.front());
+            sparse.push_back({0,nullptr,0});
+            for(int repeat=0;repeat<2;++repeat) {
+                std::fill(received.begin(),received.end(),std::byte{0});
+                mfq::MappedPrefetchScope transient(false,true);
+                large_batch(sparse);
+                for(const auto& span:sparse)if(span.size)
+                    require(std::equal(span.destination,span.destination+span.size,expected.begin()+span.offset),
+                            "sparse mapped page release changed reread data");
+            }
         }
 
         {

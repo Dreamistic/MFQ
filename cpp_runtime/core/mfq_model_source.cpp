@@ -55,7 +55,7 @@ thread_local bool mapped_release_context=false;
 
 class MappedTensorRange {
     void* view_=nullptr;
-    std::size_t mapped_bytes_=0,prefix_=0;
+    std::size_t mapped_bytes_=0,prefix_=0,page_bytes_=0;
     std::uint64_t bytes_=0;
     bool profile_=false;
     int prefetch_override_=-1;
@@ -90,6 +90,7 @@ public:
             if(!GetFileSizeEx(file_,&size) || size.QuadPart<0)throw std::runtime_error("mapped tensor file size unavailable");
             file_bytes=static_cast<std::uint64_t>(size.QuadPart);
             SYSTEM_INFO info{};GetSystemInfo(&info);granularity=info.dwAllocationGranularity;
+            page_bytes_=info.dwPageSize;
 #else
             file_=::open(record.source_path.c_str(),O_RDONLY);
             if(file_<0)throw std::system_error(errno,std::generic_category(),"open mapped tensor");
@@ -98,6 +99,7 @@ public:
             file_bytes=static_cast<std::uint64_t>(size.st_size);
             const auto page=::sysconf(_SC_PAGESIZE);
             if(page<=0)throw std::runtime_error("mapped tensor page size unavailable");
+            page_bytes_=static_cast<std::size_t>(page);
             granularity=static_cast<std::uint64_t>(page);
 #endif
             if(record.offset>file_bytes || bytes_>file_bytes-record.offset)throw std::out_of_range("mapped tensor exceeds file");
@@ -130,6 +132,36 @@ public:
         (void)::madvise(view_,mapped_bytes_,MADV_DONTNEED);
 #endif
         return true;
+    }
+    void release_read_pages(const std::vector<ReadSpan>& spans) const {
+        if(spans.empty())return;
+        // Large prefill batches benefit from one view-wide trim. For sparse
+        // decode rows, walking a multi-GiB view costs more than the reads:
+        // release just the touched pages, merging duplicate/adjacent ranges.
+        if(spans.size()>1024 || !page_bytes_) {release_pages();return;}
+        std::vector<std::pair<std::uintptr_t,std::uintptr_t>> pages;
+        pages.reserve(spans.size());
+        for(const auto& span:spans)if(span.size) {
+            const auto address=reinterpret_cast<std::uintptr_t>(view_)+prefix_+std::size_t(span.offset);
+            const auto begin=address/page_bytes_*page_bytes_;
+            const auto end=(address+span.size+page_bytes_-1)/page_bytes_*page_bytes_;
+            pages.emplace_back(begin,end);
+        }
+        if(pages.empty())return;
+        std::sort(pages.begin(),pages.end());
+        const auto release=[](std::uintptr_t begin,std::uintptr_t end) {
+#ifdef _WIN32
+            (void)VirtualUnlock(reinterpret_cast<void*>(begin),end-begin);
+#else
+            (void)::madvise(reinterpret_cast<void*>(begin),end-begin,MADV_DONTNEED);
+#endif
+        };
+        auto begin=pages.front().first,end=pages.front().second;
+        for(std::size_t i=1;i<pages.size();++i) {
+            if(pages[i].first<=end)end=std::max(end,pages[i].second);
+            else {release(begin,end);begin=pages[i].first;end=pages[i].second;}
+        }
+        release(begin,end);
     }
     void read(std::uint64_t offset,std::byte* destination,std::size_t size)const {
         if(offset>bytes_ || size>bytes_-offset)throw std::out_of_range("mapped tensor row range is out of bounds");
@@ -186,7 +218,7 @@ public:
         // Selected rows now belong to the bounded row cache/packet. Keeping
         // a second working-set copy of sparse pages across all Engram tables
         // can exhaust RAM despite a bounded expert cache.
-        if(mapped_release_context)release_pages();
+        if(mapped_release_context)release_read_pages(spans);
     }
 };
 
