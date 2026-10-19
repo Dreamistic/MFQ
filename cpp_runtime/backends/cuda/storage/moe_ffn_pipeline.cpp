@@ -3337,16 +3337,22 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         auto& loan=*cache_->kv_expert_loan_;
         // Reserve every routed hit before GU allocations can evict a Down
         // projection omitted from the read batch by the GPU's snapshot.
-        std::vector<mfq::cuda::KvExpertLoan::Key> protected_keys;
-        for(const auto& group:cell.plan.groups)if(group.kind==mfq::MoeDispatchKind::GpuTransfer)
-            for(int p=0;p<3;++p) {
-                const auto& source=*sources_[p];
-                const auto& sizes=source.cohorts_[source.expert_to_cohort_[group.expert]].bytes_per_expert;
-                protected_keys.push_back({source.id_,group.expert,-1});
-                for(std::size_t f=0;f<sizes.size();++f)if(sizes[f]>=int64_t(mfq::cuda::KvExpertLoan::page))
-                    protected_keys.push_back({source.id_,group.expert,int64_t(f)});
-            }
-        loan.protect_packet_fields(protected_keys);
+        if(!cell.ssd_gate_up_submitted && !cell.ssd_down_submitted) {
+            // Protection lasts through this packet. Subsequent allocations
+            // are born pinned to the same packet, so ready batches need not
+            // rebuild and rehash every routed field again.
+            auto& protected_keys=cell.transfer_scratch.protected_keys;
+            protected_keys.clear();
+            for(const auto& group:cell.plan.groups)if(group.kind==mfq::MoeDispatchKind::GpuTransfer)
+                for(int p=0;p<3;++p) {
+                    const auto& source=*sources_[p];
+                    const auto& sizes=source.cohorts_[source.expert_to_cohort_[group.expert]].bytes_per_expert;
+                    protected_keys.push_back({source.id_,group.expert,-1});
+                    for(std::size_t f=0;f<sizes.size();++f)if(sizes[f]>=int64_t(mfq::cuda::KvExpertLoan::page))
+                        protected_keys.push_back({source.id_,group.expert,int64_t(f)});
+                }
+            loan.protect_packet_fields(protected_keys);
+        }
         const auto begin=reinterpret_cast<uintptr_t>(cache_->pipeline_ram_complement_->data_ptr());
         const auto capacity=cache_->pipeline_ram_registered_bytes_;
         const auto ram_alias=[&](const void* pointer,std::size_t bytes)->CUdeviceptr {
