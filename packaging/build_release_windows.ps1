@@ -406,12 +406,34 @@ function Stage-LicenseNotices {
         }
 }
 
+function Assert-ReleaseEnvironmentAvailable {
+    param([Parameter(Mandatory)][hashtable] $Context)
+
+    $python = Join-Path $Context.VenvDirectory "Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+        return
+    }
+    $handle = $null
+    try {
+        $handle = [System.IO.File]::Open(
+            $python, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    }
+    catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+        Fail "release Python environment is in use or not writable; choose an unused -ReleaseVenv: $($Context.VenvDirectory)"
+    }
+    finally {
+        if ($null -ne $handle) { $handle.Dispose() }
+    }
+}
+
 function Initialize-PythonEnvironment {
     param(
         [Parameter(Mandatory)][hashtable] $Context,
         [Parameter(Mandatory)][string] $Version
     )
 
+    Assert-ReleaseEnvironmentAvailable $Context
     Invoke-Checked $Context.Tools.Uv @("venv", "--clear", "--python", $Version, $Context.VenvDirectory)
     $env:VIRTUAL_ENV = $Context.VenvDirectory
     Add-ToPath (Join-Path $Context.VenvDirectory "Scripts")
