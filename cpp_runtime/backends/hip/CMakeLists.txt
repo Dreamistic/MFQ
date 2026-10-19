@@ -329,6 +329,7 @@ if(BUILD_TESTING)
     # units: hipcc accepts <<<>>> launches, and tests/cuda_compat maps the
     # cuda_* runtime API names onto hip.
     set(MFQ_HIP_TEST_INCLUDES
+        ${MFQ_REPOSITORY_ROOT}/cpp_runtime/core
         ${MFQ_HIP_ROOT}/tests/cuda_compat
         ${MFQ_REPOSITORY_ROOT}/cpp_runtime/components/ggml/src/ggml-hip/vendors
         ${MFQ_REPOSITORY_ROOT}
@@ -379,7 +380,8 @@ if(BUILD_TESTING)
     mfq_add_hip_test(mfq-hip-nint-q8-test
         ${MFQ_HIP_ROOT}/tests/mfq_nint_q8_test.cu)
     target_link_libraries(mfq-hip-nint-q8-test PRIVATE
-        mfq-hip-core mfq-hip-native-kernels)
+        mfq-hip-core mfq-hip-native-kernels mfq-hip-storage
+        mfq-hip-runtime mfq-runtime-communication mfq-model-graph)
 
     mfq_add_hip_test(mfq-hip-nint-rows-test
         ${MFQ_HIP_ROOT}/tests/mfq_nint_rows_test.cu)

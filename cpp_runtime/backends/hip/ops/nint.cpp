@@ -7,7 +7,10 @@
 #include "packed_nint.h"
 #include "cpu_projection_rows.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 
 #if defined(__x86_64__) && defined(__GNUC__)
@@ -417,13 +420,25 @@ mfq_tensor_backend::Tensor nint_matmul(
     if (!w.q8_zero) {
         if (M <= 8) {
             Workspace & ws = w.workspace(M);
-            return profiler.measure("nint.matmul", [&]() {
-                if (w.aligned_q8) {
+            if (w.aligned_q8) {
+                return profiler.measure("nint.matmul", [&]() {
                     return nint_matmul_q8_ws_cuda(
                         w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                         w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
                         x, w.gs, ws.qx, ws.xscale);
-                }
+                });
+            }
+            if (M == 1 && w.fused_ok) {
+                return profiler.measure("nint.matmul.fused", [&]() {
+                    return nint_matmul_fused_decode_cuda(
+                        w.fused_q, w.fused_row_ids, w.neuron_scale,
+                        w.neuron_min, x, w.gs, w.fused_segment_bits,
+                        w.fused_segment_row_offsets,
+                        w.fused_segment_byte_offsets,
+                        w.fused_segment_slots, ws.qx, ws.xscale);
+                });
+            }
+            return profiler.measure("nint.matmul", [&]() {
                 return nint_matmul_ws_cuda(
                     w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                     w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
@@ -1225,6 +1240,155 @@ Nint8ZeroCpu slice_nint8_zero_cpu_input_groups(
     }
     return result;
 }
+namespace {
+int64_t align_up_4(int64_t value) {
+    return (value + 3) & ~int64_t(3);
+}
+
+// Copy one row's bit run to a byte-aligned staging buffer with 64-bit
+// funnel reads; per-group slots then copy from aligned staging bytes.
+void copy_row_bits(
+        const std::vector<uint8_t>& source,
+        uint64_t source_bit,
+        int64_t count_bits,
+        std::vector<uint8_t>& staging) {
+    const int64_t bytes = (count_bits + 7) / 8;
+    staging.assign(size_t(bytes) + 8, 0);
+    const uint64_t limit = source.size();
+    const unsigned shift = source_bit & 7u;
+    const uint8_t* base = source.data() + (source_bit >> 3);
+    if (shift == 0) {
+        std::memcpy(staging.data(), base, size_t(bytes));
+    } else {
+        for (int64_t index = 0; index < bytes; index += 8) {
+            uint64_t low = 0, high = 0;
+            const int64_t at = (source_bit >> 3) + index;
+            if (uint64_t(at) + 8 <= limit)
+                std::memcpy(&low, source.data() + at, 8);
+            else if (uint64_t(at) < limit)
+                std::memcpy(&low, source.data() + at,
+                            size_t(limit - uint64_t(at)));
+            if (uint64_t(at) + 16 <= limit)
+                std::memcpy(&high, source.data() + at + 8, 8);
+            else if (uint64_t(at) + 8 < limit)
+                std::memcpy(&high, source.data() + at + 8,
+                            size_t(limit - uint64_t(at) - 8));
+            const uint64_t window =
+                (low >> shift) | (high << (64u - shift));
+            const int64_t remain = bytes - index;
+            std::memcpy(staging.data() + index, &window,
+                        size_t(remain < 8 ? remain : 8));
+        }
+    }
+}
+
+// Build the fused single-row decode layout: rows grouped into uniform-bit
+// segments; per group one 4-byte-aligned slot [weight bits | pad | u16
+// scale/minimum]. Keeps the original packed tensors for all other paths.
+void build_fused_decode_layout(
+        NintWeight& w,
+        const NintCpu& c,
+        const std::function<bool()>& enabled) {
+    w.fused_ok = false;
+    if (!enabled() || w.aligned_q8 || c.gs < 4 || c.gs > 64 ||
+            c.gs % 4 != 0 || c.out <= 0 || c.ng <= 0 ||
+            c.row_q_bits.size() != size_t(c.out) ||
+            c.sub_scale.size() != size_t(c.out) * size_t(c.ng)) {
+        return;
+    }
+    int histogram[9] = {};
+    for (uint8_t bits : c.row_q_bits) {
+        if (bits < 2 || bits > 8) return;
+        ++histogram[bits];
+    }
+    const int64_t K = c.ng * c.gs;
+    std::vector<int64_t> segment_row_offsets = {0};
+    std::vector<int64_t> segment_byte_offsets = {0};
+    std::vector<int64_t> segment_bits, segment_slots;
+    for (int bits = 2; bits <= 8; ++bits) {
+        if (!histogram[bits]) continue;
+        const int64_t weight_bytes = (c.gs * bits + 7) / 8;
+        const int64_t slot = align_up_4(align_up_4(weight_bytes) + 2);
+        segment_bits.push_back(bits);
+        segment_slots.push_back(slot);
+        segment_row_offsets.push_back(
+            segment_row_offsets.back() + histogram[bits]);
+        segment_byte_offsets.push_back(
+            segment_byte_offsets.back() +
+            int64_t(histogram[bits]) * c.ng * slot);
+    }
+    const size_t total_bytes =
+        size_t(segment_byte_offsets.back());
+    std::vector<uint8_t> fused(total_bytes, 0);
+    std::vector<int32_t> row_ids;
+    row_ids.reserve(size_t(c.out));
+    std::vector<int64_t> filled(9, 0);
+    std::vector<uint8_t> staging;
+    for (int64_t row = 0; row < c.out; ++row) {
+        const int bits = c.row_q_bits[row];
+        const size_t segment =
+            size_t(std::find(segment_bits.begin(), segment_bits.end(), bits) -
+                   segment_bits.begin());
+        const int64_t slot = segment_slots[segment];
+        const int64_t slot_row = filled[bits]++;
+        uint8_t* row_base = fused.data() +
+            segment_byte_offsets[segment] +
+            size_t(slot_row) * size_t(c.ng) * size_t(slot);
+        copy_row_bits(
+            c.q_packed, uint64_t(c.row_q_bit_offsets[row]),
+            int64_t(c.ng) * c.gs * bits, staging);
+        const size_t group_bytes_row =
+            size_t((uint64_t(c.gs) * uint64_t(bits)) / 8u);
+        const bool group_aligned =
+            (uint64_t(c.gs) * uint64_t(bits)) % 8u == 0u;
+        const uint8_t* staged = staging.data();
+        const uint8_t* scale_src = c.sub_scale.data() +
+            size_t(row) * size_t(c.ng);
+        const uint8_t* min_src =
+            c.sub_min.data() + size_t(row) * size_t(c.ng);
+        const size_t copy_bytes =
+            size_t((uint64_t(c.gs) * uint64_t(bits) + 7u) / 8u);
+        for (int64_t group = 0; group < c.ng; ++group) {
+            uint8_t* slot_ptr = row_base + size_t(group) * size_t(slot);
+            if (group_aligned) {
+                std::memcpy(slot_ptr,
+                            staged + size_t(group) * group_bytes_row,
+                            group_bytes_row);
+            } else {
+                const uint64_t bit =
+                    uint64_t(group) * uint64_t(c.gs) * uint64_t(bits);
+                const size_t byte = size_t(bit / 8u);
+                const unsigned shift = unsigned(bit % 8u);
+                for (size_t index = 0; index < copy_bytes; ++index) {
+                    const unsigned value = shift == 0
+                        ? unsigned(staged[byte + index])
+                        : (unsigned(staged[byte + index]) >> shift) |
+                            (unsigned(staged[byte + index + 1])
+                             << (8u - shift));
+                    slot_ptr[index] = uint8_t(value);
+                }
+            }
+            const uint16_t scales =
+                uint16_t(scale_src[size_t(group)]) |
+                uint16_t(uint16_t(min_src[size_t(group)]) << 8);
+            std::memcpy(slot_ptr + slot - 2, &scales, sizeof(scales));
+        }
+        row_ids.push_back(int32_t(row));
+    }
+
+    const auto target = w.q_packed.device();
+    w.fused_q = cpu_u8_tensor(
+        fused, {int64_t(total_bytes)}).to(target).contiguous();
+    w.fused_row_ids = cpu_i32_tensor(
+        row_ids, {c.out}).to(target).contiguous();
+    w.fused_segment_bits = std::move(segment_bits);
+    w.fused_segment_row_offsets = std::move(segment_row_offsets);
+    w.fused_segment_byte_offsets = std::move(segment_byte_offsets);
+    w.fused_segment_slots = std::move(segment_slots);
+    w.fused_ok = true;
+}
+}  // namespace
+
 NintWeight to_device_nint(const NintCpu & c, bool cuda) {
     if (c.bits < 1 || c.bits > 8) throw std::runtime_error("unsupported NINT bits");
     require_canonical_nint_cpu(c);
@@ -1261,6 +1425,11 @@ NintWeight to_device_nint(const NintCpu & c, bool cuda) {
         w.sub_min = w.sub_min.to(target).contiguous();
         w.neuron_scale = w.neuron_scale.to(target).contiguous();
         w.neuron_min = w.neuron_min.to(target).contiguous();
+        build_fused_decode_layout(
+            w, c, [] {
+                const char* flag = std::getenv("MFQ_NINT_FUSED_DECODE");
+                return flag == nullptr || std::strcmp(flag, "0") != 0;
+            });
     }
     return w;
 }
