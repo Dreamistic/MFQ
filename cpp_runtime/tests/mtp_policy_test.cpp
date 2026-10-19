@@ -562,6 +562,7 @@ int main() {
     stats.cycles = 3;
     stats.drafted_tokens = 4;
     stats.accepted_tokens = 2;
+    stats.target_ms=12.5;stats.head_ms=3.25;stats.rollback_ms=.5;
     std::vector<std::pair<std::string, double>> metrics;
     append_generation_metrics(metrics, stats);
     const auto acceptance = std::find_if(
@@ -569,5 +570,10 @@ int main() {
             return metric.first == "mtp_acceptance_rate";
         });
     require(acceptance != metrics.end() && acceptance->second == .5);
+    for(const auto& [name,value]:std::vector<std::pair<std::string,double>>{
+            {"mtp_target_ms",12.5},{"mtp_head_ms",3.25},{"mtp_rollback_ms",.5}}) {
+        const auto found=std::find_if(metrics.begin(),metrics.end(),[&](const auto& metric){return metric.first==name;});
+        require(found!=metrics.end() && found->second==value);
+    }
     std::cout << "MTP sampling/acceptance/correction tests passed; 40000 exact grid checks\n";
 }

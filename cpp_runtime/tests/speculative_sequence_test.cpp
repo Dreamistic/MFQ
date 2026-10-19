@@ -171,6 +171,8 @@ void run(bool dspark,bool metal_policy=false,bool inherited_park=false) {
             model.cache_pos != request.sampling.max_tokens+2 || !Ops::defined(last_hidden))
         throw std::runtime_error("shared MTP output/cache boundary mismatch");
     const auto& stats = output.metrics.mtp;
+    if(stats.target_ms<=0 || stats.head_ms<=0 || stats.rollback_ms<0)
+        throw std::runtime_error("shared MTP phases were not measured");
     if(inherited_park && (stats.park_count!=1 || stats.reentry_probes!=0 || stats.standard_tokens==0))
         throw std::runtime_error("inherited Metal park was omitted from a short response's metrics");
     if (dspark ? stats.park_count != 0 || stats.standard_tokens != 0 :
@@ -212,6 +214,7 @@ void run_chunked_prompt_history(bool streaming, int reused) {
 }
 
 void run_prompt_snapshot_boundary() {
+    const auto wall_started=InferenceMetrics::Clock::now();
     Model model;Predictor mtp;
     InferenceRequest request;request.chat=false;request.prompt={0,0,0};
     request.sampling.max_tokens=8;request.sampling.mtp_max_draft_tokens=3;
@@ -235,6 +238,10 @@ void run_prompt_snapshot_boundary() {
     }
     if(!saw_boundary || output.result.completion_tokens!=8 || model.cache_pos!=10)
         throw std::runtime_error("prompt snapshot changed generation history");
+    const auto wall_ms=std::chrono::duration<double,std::milli>(InferenceMetrics::Clock::now()-wall_started).count();
+    const auto& phases=output.metrics.mtp;
+    if(phases.target_ms+phases.head_ms+phases.rollback_ms>wall_ms-15)
+        throw std::runtime_error("MTP phase timing included the paused output consumer");
 }
 
 void run_bootstrap_publication() {

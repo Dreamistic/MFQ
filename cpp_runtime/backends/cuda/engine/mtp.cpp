@@ -193,14 +193,12 @@ template <class Model> struct CudaMtpOps {
     return std::is_same_v<Model,mfq::cuda::Qwen4CausalLm> && (!option || option[0]!='0')?16:512;
   }
   void trace_cycle(uint64_t cycle,int depth,int accepted,double draft_ms,double verify_ms,double commit_ms) {
-    if constexpr(std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
       const auto* option=std::getenv("MFQ_PROFILE_MTP");
       const bool profile=option && option[0]=='1';
       if(profile || (cycle<=32 && draft_ms+verify_ms+commit_ms>=55.0))
         std::cerr<<(profile?"runtime_mtp_cycle_profile cycle=":"runtime_mtp_slow_cycle cycle=")<<cycle<<" depth="<<depth<<" accepted="<<accepted
             <<" draft_ms="<<draft_ms<<" verify_ms="<<verify_ms<<" commit_ms="<<commit_ms
             <<" target_transfer_mb="<<target_transfer_bytes/1048576.0<<'\n';
-    }
   }
 
   CudaMtpOps(Model &model, MtpModule &mtp, const CudaPreparedPrompt *prepared,
