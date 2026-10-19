@@ -452,7 +452,7 @@ template <class Model> struct CudaGenerationContext {
     Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
                      size_t reused, size_t stable) {
         if (batching) return batching->generate(request_id, input, output);
-        if(input.prompt.size()-reused>1024)
+        if(input.prompt.size()-reused>1024 || moe_expert_cache_ssd_experts(model.execution->moe_expert_cache))
             reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
         auto logical_chunk=config.generation.prefill_chunk_size;
         if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
@@ -474,7 +474,7 @@ template <class Model> struct CudaGenerationContext {
     }
     Generation speculate(mfq::engine::InferenceRequest &input, mfq::engine::InferenceOutput &output,
         size_t reused, Hidden restored, Hidden *committed) {
-        if(input.prompt.size()-reused>1024)
+        if(input.prompt.size()-reused>1024 || moe_expert_cache_ssd_experts(model.execution->moe_expert_cache))
             reserve_workspace(mfq::cuda::runtime_options::workspace_reserve_bytes());
         return run_mtp_generation(model,
             *mtp,

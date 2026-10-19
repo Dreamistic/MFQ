@@ -585,8 +585,28 @@ void MoeExpertCache::initialize_ssd_residency() {
     if(config_.moe_direct_ram) {
         std::size_t pinned=host_experts_->stats().budget_bytes;
         if(const auto available=mfq::cuda::shared_memory_available(mfq_current_cuda_device())) {
-            const auto reserve=std::size_t(mfq::cuda::runtime_options::moe_ram_pin_reserve_bytes().value_or(1LL<<30));
+            // Pinned expert storage and transfer packets share WDDM's
+            // non-local budget. Price the model's largest FFN bundle before
+            // committing the cache; these transient packets cannot be paged.
+            std::unordered_map<int,std::size_t> layer_bytes;
+            for(const auto& source:sources_) {
+                std::size_t largest=0;
+                for(const auto& cohort:source->cohorts_) {
+                    std::size_t bytes=0;
+                    for(auto field:cohort.bytes_per_expert)bytes+=(std::size_t(field)+255)&~std::size_t(255);
+                    largest=std::max(largest,bytes);
+                }
+                layer_bytes[source->layer_id_]+=largest;
+            }
+            std::size_t bundle=0;for(const auto& [layer,bytes]:layer_bytes)bundle=std::max(bundle,bytes);
+            const auto groups=std::getenv("MFQ_MOE_PREFILL_GROUP_SIZE")?
+                std::clamp(mfq::cuda::runtime_options::moe_prefill_group_size(),1,96):64;
+            const auto transient=bundle*std::max(2*groups,moe_decode_transfer_slots(8,10))+(std::size_t(256)<<20);
+            const auto reserve=std::size_t(mfq::cuda::runtime_options::moe_ram_pin_reserve_bytes().value_or(
+                std::int64_t(std::max(std::size_t(1)<<30,transient))));
             pinned=std::min(pinned,*available>reserve?*available-reserve:0);
+            std::cerr<<"moe_ssd_pinned_budget available_bytes="<<*available<<" transient_reserve_bytes="<<reserve
+                <<" expert_pinned_bytes="<<pinned<<'\n';
         }
         if(const auto limit=mfq::cuda::runtime_options::moe_ram_pin_bytes();limit && *limit>0)
             pinned=std::min(pinned,std::size_t(*limit));

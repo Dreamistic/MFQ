@@ -351,7 +351,7 @@ struct CudaEngineState {
         return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
     }
     ~CudaEngineState() {
-        if constexpr(std::is_same_v<Model,Qwen4CausalLm>)language.restore_decode_workspace={};
+        language.restore_decode_workspace={};
         try {release_graph_expert_space();}
         catch(const std::exception& error) {std::cerr<<"runtime_mtp_workspace_cache cleanup_error="<<error.what()<<'\n';}
         if(execution->kv_memory)execution->kv_memory->set_reservation({});

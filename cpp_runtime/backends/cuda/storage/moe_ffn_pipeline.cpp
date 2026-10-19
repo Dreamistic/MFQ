@@ -6,6 +6,7 @@
 #include "runtime/graph_registry.h"
 #include "runtime/moe_pipeline.h"
 #include "mfq_cuda_moe_ops.h"
+#include "mfq_cuda_activation_ops.h"
 #include "mfq_cuda_shared_gate.h"
 #include "runtime/decode_window.h"
 #include "runtime/dma_copy_batch.h"
@@ -136,8 +137,8 @@ CpuProjectionRows rows_plan(const MixedMoePool& p,bool up_half=false) {
 
 std::function<mfq::MoeCpuCalibration::Observation()> cpu_calibration_work(
         mfq::MoeCpuCostModel::Key key,std::array<MoeHostExpertCache::Lease,3> leases,
-        std::vector<float> input,int width,int intermediate,int count,double preparation_ns,bool combined=false) {
-    return [key,leases=std::move(leases),input=std::move(input),width,intermediate,count,preparation_ns,combined]() {
+        std::vector<float> input,int width,int intermediate,int count,double preparation_ns,bool combined=false,double swiglu_limit=0) {
+    return [key,leases=std::move(leases),input=std::move(input),width,intermediate,count,preparation_ns,combined,swiglu_limit]() {
         const auto started=std::chrono::steady_clock::now();
         const std::array<CpuProjectionRows,3> rows{
             rows_plan(leases[0]->weights),rows_plan(leases[1]->weights,combined),rows_plan(leases[2]->weights)};
@@ -149,6 +150,11 @@ std::function<mfq::MoeCpuCalibration::Observation()> cpu_calibration_work(
             for(int row=0;row<count;++row)for(int column=int(begin);column<int(end);++column) {
                 const auto i=size_t(row)*intermediate+column;
                 const mfq_half g(gate[i]),u(up[i]);
+                if(swiglu_limit>0) {
+                    const auto clipped=std::min(float(g),float(swiglu_limit));
+                    const auto value=std::clamp(float(u),-float(swiglu_limit),float(swiglu_limit));
+                    hidden[i]=float(mfq_half((clipped/(1.0f+std::exp(-clipped)))*value));continue;
+                }
                 const mfq_half sigmoid(1.0/(1.0+std::exp(-double(float(g)))));
                 const mfq_half first(float(g)*float(sigmoid));
                 hidden[i]=float(mfq_half(float(first)*float(u)));
@@ -323,6 +329,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     std::array<std::shared_ptr<MoeCachedSource>,3> sources_;
     MoeExpertCache* cache_;
     MoeFfnShared shared_;
+    double swiglu_limit_=0;
     MoeFfnSharedWeights shared_weights_;
     MoeFfnDispatchObserver observer_;
     std::map<std::tuple<int,int,const void*,bool,int>,std::unique_ptr<Cell>> cells_;
@@ -453,7 +460,10 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             };
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
             const auto context=mfq::cuda::default_context(ids.get_device());
-            const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes()/2;
+            // SSD rings are additional to attention/hidden-state scratch.
+            // Consuming half that budget here can prevent the next layer from
+            // allocating its FP32 query and attention output.
+            const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes()/(cache_->ssd_experts()?1:2);
             auto available=context->available_memory()+context->workspace_available();
             const auto requested=std::size_t(ring_bytes(capacity))+reserve;
             if(cache_->ssd_experts() && available<requested && cache_->reserve_workspace_) {
@@ -478,7 +488,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             for(auto& cohort:sources_[p]->cohorts_)
                 stages[p].push_back(&prefill_stage(p,cohort,stage_offset,cache_->ssd_experts()?1:capacity));
         }
-        if(execution.config.moe_ffn_fused_activation && !cache_->pipeline_sigmoid_table_.defined())
+        if(swiglu_limit_<=0 && execution.config.moe_ffn_fused_activation && !cache_->pipeline_sigmoid_table_.defined())
             cache_->pipeline_sigmoid_table_=moe_swiglu_sigmoid_table_cuda();
         int map_count=0;
         for(const auto& source:sources_)map_count+=2*int(source->cohorts_.size())*prefill_group_size;
@@ -988,9 +998,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             auto gate=projection(0,x);
             auto up=combined_gate_up_ ? gate.narrow(-1,ff_,ff_).contiguous() : projection(1,x);
             if(combined_gate_up_)gate=gate.narrow(-1,0,ff_).contiguous();
-            auto hidden=execution.config.moe_ffn_fused_activation
-                ? moe_swiglu_rounded_cuda(gate,up,cache_->pipeline_sigmoid_table_)
-                : (gate*tb::sigmoid(gate))*up;
+            auto hidden=activation(gate,up,execution.config.moe_ffn_fused_activation);
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(stream_,buffer.down_ready.get(),0));
             auto down=projection(2,hidden).reshape({group.rows,width_});
             parts.index_copy_(0,pair_device.narrow(0,group.begin,group.rows),down);
@@ -1226,7 +1234,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             initialize_mixed_nvq_dispatch(runtime,execution.config,!compact || *compact!=0,
                 !host_maps_option || *host_maps_option?&host_maps:nullptr);
         }
-        if(execution.config.moe_ffn_fused_activation && !cache_->pipeline_sigmoid_table_.defined())
+        if(swiglu_limit_<=0 && execution.config.moe_ffn_fused_activation && !cache_->pipeline_sigmoid_table_.defined())
             cache_->pipeline_sigmoid_table_=moe_swiglu_sigmoid_table_cuda();
         prefill_layer_=std::move(prepared);
         cache_->pipeline_prefill_release_.push_back([owner=weak_from_this()] {
@@ -1429,9 +1437,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         auto gate=projection(0,input);
         auto up=combined_gate_up_ ? gate.narrow(-1,ff_,ff_).contiguous() : projection(1,input);
         if(combined_gate_up_)gate=gate.narrow(-1,0,ff_).contiguous();
-        auto hidden=execution.config.moe_ffn_fused_activation
-            ? moe_swiglu_rounded_cuda(gate,up,cache_->pipeline_sigmoid_table_)
-            : (gate*tb::sigmoid(gate))*up;
+        auto hidden=activation(gate,up,execution.config.moe_ffn_fused_activation);
         if(cache_->pipeline_prefill_layer_overlap_) {
             // Submit Gate/Up independently of Down's completion on WDDM.
             if(prefill_layer_flush())mfq::cuda::check_stream_progress(stream_);
@@ -1491,6 +1497,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         for(const auto& source:cache_->sources_)if(pipeline_source(*source))for(const auto& c:source->cohorts_)
             if(c.arena->signature==cohort.arena->signature)arena->slots=std::max(arena->slots,c.cpu->local_experts);
         arena->slots=std::min(arena->slots,requested_slots);
+        // First decode can create these arenas after spare VRAM was lent to
+        // experts. Return the borrowed pages before allocating their fields.
+        cache_->reserve_workspace(std::size_t(arena->slots)*arena->slot_bytes+(std::size_t(64)<<20));
         if(std::getenv("MFQ_TRACE_RESIDENCY_MEMORY"))
             std::cerr<<"moe_transfer_arena key="<<key<<" slots="<<arena->slots
                 <<" bytes="<<arena->slots*arena->slot_bytes<<'\n';
@@ -1519,7 +1528,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             cell.x.borrow(workspace->x);cell.host_ids.borrow(workspace->ids);cell.cpu.borrow(workspace->cpu);
         }
         cell.ready_writer=window?stream_flag_writer():nullptr;
-        cell.two_stage=execution.config.moe_two_stage_ffn && cell.batch_decode && cell.routes+(shared_?1:0)<=32 &&
+        cell.two_stage=swiglu_limit_<=0 && execution.config.moe_two_stage_ffn && cell.batch_decode && cell.routes+(shared_?1:0)<=32 &&
             execution.kl_mmq.mode==KlMmqMode::Default;
         for(const auto& source:sources_)for(const auto& cohort:source->cohorts_)
             cell.two_stage=cell.two_stage && (cohort.active.family==MixedMoeFamily::Nint || cohort.active.family==MixedMoeFamily::Nvq);
@@ -1558,7 +1567,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 [](const auto& record){return record.cpu.empty();});
         if(!cell.skip_gpu_timing)cell.timing.initialize();
         cell.gpu_resident_dispatch=execution.config.moe_gpu_resident_dispatch && cell.tokens<=8;
-        cell.fused_activation=execution.config.moe_ffn_fused_activation;
+        cell.fused_activation=swiglu_limit_<=0 && execution.config.moe_ffn_fused_activation;
         if((cell.fused_activation || cell.two_stage) && !cache_->pipeline_sigmoid_table_.defined())
             cache_->pipeline_sigmoid_table_=moe_swiglu_sigmoid_table_cuda();
         if(cell.two_stage) {
@@ -1672,7 +1681,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 runtime->neuron_len=source.cpu_->neuron_len;runtime->partial_experts=true;
             }
             for(auto& cohort:source.cohorts_) {
-                auto& temporary=stage(projection,cohort,cell.tokens<=8?moe_decode_transfer_slots(8,cell.routes):experts_);binding.stages.push_back(&temporary);
+                const int slots=cell.batch_decode?cell.entries:experts_;
+                auto& temporary=stage(projection,cohort,slots);binding.stages.push_back(&temporary);
                 auto hot=cohort.active;hot.expert_local=tb::full({experts_},-1,cell.ids.options());
                 auto transfer=fields_pool(cohort.active,temporary.fields,temporary.slots,source.cpu_->out_per_expert);
                 transfer.expert_local=tb::full({experts_},-1,cell.ids.options());
@@ -1719,8 +1729,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     reinterpret_cast<int64_t>(workspace.xscale.data_ptr()),geometry.groups,geometry.gs});
                 cell.shared_input_groups+=geometry.groups;
             }
-            if(descriptors.empty())throw std::runtime_error("shared FFN input has no quantization geometry");
-            cell.shared_input_descriptors=tb::tensor(descriptors).reshape({int64_t(geometries.size()),4}).to(tb::kCUDA);
+            cell.shared_input=!descriptors.empty();
+            if(cell.shared_input)
+                cell.shared_input_descriptors=tb::tensor(descriptors).reshape({int64_t(geometries.size()),4}).to(tb::kCUDA);
         }
         std::vector<int64_t> dispatch;
         const auto pointer=[&](const auto* p){dispatch.push_back(reinterpret_cast<int64_t>(p));};
@@ -1972,6 +1983,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         std::string error;
         if(!cell.graphs->record(1,cell.tokens,[&]{launch_body(cell,execution);},error))throw std::runtime_error(error);
     }
+    tb::Tensor activation(const tb::Tensor& gate,const tb::Tensor& up,bool fused) {
+        if(swiglu_limit_>0)return clipped_silu_mul_cuda(gate,up,swiglu_limit_);
+        if(fused)return moe_swiglu_rounded_cuda(gate,up,cache_->pipeline_sigmoid_table_);
+        return (gate*tb::sigmoid(gate))*up;
+    }
     tb::Tensor gpu_ffn(Cell& cell,CudaExecutionContext& execution,bool transfer,const MoeRoutePlan& route) {
         auto projection=[&](int i,const tb::Tensor& x) {
             auto& binding=cell.binding[i];auto& runtime=transfer ? binding.transfer : binding.hot;
@@ -1979,8 +1995,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 execution.force_moe_pool_path,x,route,cell.shared_input && i<2);
         };
         auto gate_output=projection(0,cell.input),up_output=projection(1,cell.input);
-        if(cell.fused_activation)
-            return projection(2,moe_swiglu_rounded_cuda(gate_output,up_output,cache_->pipeline_sigmoid_table_));
+        if(swiglu_limit_>0 || cell.fused_activation)
+            return projection(2,activation(gate_output,up_output,cell.fused_activation));
         auto gu=tb::cat({gate_output,up_output},-1);
         auto gate=gu.narrow(-1,0,ff_),up=gu.narrow(-1,ff_,ff_);
         return projection(2,(gate*tb::sigmoid(gate))*up);
@@ -3692,6 +3708,11 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 for(int row=0;row<job.count;++row)for(int col=first;col<last;++col) {
                     const auto i=std::size_t(job.offset+row)*ff_+col;
                     const mfq_half g(cell.g[i]),u(cell.u[i]);
+                    if(swiglu_limit_>0) {
+                        const auto clipped=std::min(float(g),float(swiglu_limit_));
+                        const auto value=std::clamp(float(u),-float(swiglu_limit_),float(swiglu_limit_));
+                        cell.hidden[i]=float(mfq_half((clipped/(1.0f+std::exp(-clipped)))*value));continue;
+                    }
                     const mfq_half sigmoid(1.0/(1.0+std::exp(-double(float(g)))));
                     const mfq_half first(float(g)*float(sigmoid));
                     cell.hidden[i]=float(mfq_half(float(first)*float(u)));
@@ -3871,7 +3892,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             const auto preparation_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now()-prepared).count();
             auto work=cpu_calibration_work(cpu_cost_key(*found),std::move(leases),std::move(input),
-                width_,ff_,int(found->positions.size()),double(preparation_ns),combined_gate_up_);
+                width_,ff_,int(found->positions.size()),double(preparation_ns),combined_gate_up_,swiglu_limit_);
             cache_->pipeline_cpu_calibration_.start(std::move(work));
         }
         time(stats.pipeline_cpu_ns,[&]{cpu(cell,ssd_reads.get());});
@@ -4126,10 +4147,11 @@ public:
         if(cache_->weight_stream_)(void)cudaStreamSynchronize(cache_->weight_stream_);
     }
     MoeFfnPipeline(std::array<std::shared_ptr<MoeCachedSource>,3> sources,MoeFfnShared shared,MoeFfnDispatchObserver observer,
-            MoeFfnSharedWeights shared_weights)
+            MoeFfnSharedWeights shared_weights,double swiglu_limit)
         :sources_(std::move(sources)),cache_(sources_[0]->cache_),shared_(std::move(shared)),shared_weights_(std::move(shared_weights)),observer_(std::move(observer)),
         width_(sources_[0]->cpu_->neuron_len),ff_(sources_[2]->cpu_->neuron_len),experts_(sources_[0]->n_experts()),
         combined_gate_up_(sources_[0]==sources_[1]) {
+        swiglu_limit_=swiglu_limit;
         const auto trace=mfq::cuda::runtime_options::trace_moe_serve();
         trace_serve_=trace && *trace;
         for(const auto& s:sources_)if(!s->quant_source_ || s->cache_!=cache_ || s->n_experts()!=experts_)
@@ -4305,12 +4327,12 @@ public:
         return cell->output;
     }
     friend MoeFfnForward make_moe_ffn_pipeline(const std::vector<std::shared_ptr<MfeWeight>>&,
-        const std::vector<std::shared_ptr<MfeWeight>>&,MoeFfnShared,MoeFfnDispatchObserver,MoeFfnSharedWeights,MoeFfnPrefetch*);
+        const std::vector<std::shared_ptr<MfeWeight>>&,MoeFfnShared,MoeFfnDispatchObserver,MoeFfnSharedWeights,MoeFfnPrefetch*,double);
 };
 
 MoeFfnForward make_moe_ffn_pipeline(const std::vector<std::shared_ptr<MfeWeight>>& gate_up,
         const std::vector<std::shared_ptr<MfeWeight>>& down,MoeFfnShared shared,MoeFfnDispatchObserver observer,
-        MoeFfnSharedWeights shared_weights,MoeFfnPrefetch* prefetch) {
+        MoeFfnSharedWeights shared_weights,MoeFfnPrefetch* prefetch,double swiglu_limit) {
     if((gate_up.size()!=1 && gate_up.size()!=2) || down.size()!=1)return {};
     const auto& up=gate_up.back();
     for(const auto& w:{gate_up[0],up,down[0]})if(!w || !w->cached_source)return {};
@@ -4324,7 +4346,7 @@ MoeFfnForward make_moe_ffn_pipeline(const std::vector<std::shared_ptr<MfeWeight>
     }
     if(!gate_up[0]->cached_source->pipeline_enabled())return {};
     auto runtime=std::make_shared<MoeFfnPipeline>(std::array<std::shared_ptr<MoeCachedSource>,3>{
-        gate_up[0]->cached_source,up->cached_source,down[0]->cached_source},std::move(shared),std::move(observer),std::move(shared_weights));
+        gate_up[0]->cached_source,up->cached_source,down[0]->cached_source},std::move(shared),std::move(observer),std::move(shared_weights),swiglu_limit);
     runtime->register_idle_reclaimer();
     if(prefetch)*prefetch=[runtime](const tb::Tensor& ids){return runtime->prediction(ids);};
     return [runtime](CudaExecutionContext& execution,const tb::Tensor& input,const tb::Tensor& ids,const tb::Tensor& weights){

@@ -10,15 +10,55 @@ import pytest
 from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.formats.mfe import MfePool, MfeTensor
+from mfq.formats.mx import MxTensor
 from mfq.formats.nint import NintSpec
 from mfq.quantize.nint_quant import quantize
-from tests.mixed_family_fixtures import make_flat_family
+from mfq.formats.nvq import D4_256, NVQ3_D4, NvqJscTensor
+
+
+def test_clipped_generic_ssd_ffn(tmp_path):
+    executable = os.environ.get("MFQ_CUDA_SSD_EXPERT_TEST")
+    if not executable:
+        pytest.skip("MFQ_CUDA_SSD_EXPERT_TEST required")
+    rng = np.random.default_rng(2038)
+    for family in ("nint", "nvq3j", "mxfp4"):
+        experts, width = (3, 128) if family == "mxfp4" else (64, 96)
+        for projection in range(3):
+            if family == "mxfp4":
+                value = MxTensor("MXFP4", (experts * width, width),
+                    rng.integers(0, 256, (experts * width, width // 2), dtype=np.uint8),
+                    rng.integers(122, 128, (experts * width, width // 32), dtype=np.uint8))
+                ids = np.array([2, 0, 1], dtype=np.int32)
+            else:
+                rows = experts * width
+                if family == "nint":
+                    value = quantize(rng.normal(0, .03, (rows, width)).astype(np.float32),
+                                     NintSpec(4, 24, 6))
+                else:
+                    books = np.stack((D4_256, np.roll(D4_256, 1, axis=0))).astype(np.int16) * 8
+                    value = NvqJscTensor((rows, width), 0, width,
+                        rng.uniform(.005, .05, rows).astype(np.float32),
+                        np.arange(16, dtype=np.float32), np.arange(16, dtype=np.uint8) & 1,
+                        rng.integers(1, 16, (rows, width // 24), dtype=np.uint8),
+                        rng.integers(0, 256, (rows, width // 4), dtype=np.uint8),
+                        rng.integers(0, 128, (rows, width // 8), dtype=np.uint8),
+                        books.astype(np.int8), base_spec=NVQ3_D4)
+                ids = np.arange(experts, dtype=np.int32)
+            save(tmp_path / f"{family}-{projection}.mfq", FileHeader(version=2, model_arch="deepseek_v41"),
+                 {"linear.weight": MfeTensor((experts, width, width), (MfePool(ids, value),))})
+    env = dict(os.environ, MFQ_MOE_SSD_EXPERTS="1", MFQ_MOE_NVQ_DENSE="0",
+               MFQ_MOE_PREFILL_LAYER="0", MFQ_MOE_PREFILL_GROUPS="1")
+    result = subprocess.run([executable, str(tmp_path), "--clipped-check"],
+                            env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "generic_clipped_ffn_cases=96" in result.stdout
 
 
 @pytest.mark.parametrize("pcie_fraction,read_mode,native_dma,ram_pin_bytes", [
     (1.0,"buffered","1","0"),(0.5,"buffered","1","0"),(1.0,"direct","1","0"),
     (1.0,"buffered","0","0"),(1.0,"buffered","1","16384")])
 def test_ssd_expert_streaming(tmp_path, pcie_fraction,read_mode,native_dma,ram_pin_bytes):
+    from tests.mixed_family_fixtures import make_flat_family
     executable = os.environ.get("MFQ_CUDA_SSD_EXPERT_TEST")
     if not executable:
         pytest.skip("MFQ_CUDA_SSD_EXPERT_TEST required")

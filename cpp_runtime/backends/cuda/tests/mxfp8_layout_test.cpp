@@ -1,5 +1,7 @@
 #include "mx.h"
 #include "mfq_cuda_quant_ops.h"
+#include "mfq/runtime.h"
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -72,7 +74,27 @@ void check(int block_rows,int block_columns,int outputs,int width,int groups=1) 
     std::cout<<"MXFP8 "<<block_rows<<'x'<<block_columns<<" outputs="<<outputs<<" width="<<width<<" groups="<<groups<<" PASS\n";
 }
 }
-int main() try {
+void benchmark_prefill(bool only_ffn=false) {
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kUInt8);
+    for(const auto shape:{std::array<int,3>{4080,1536,32768},std::array<int,3>{4080,5120,2304}}) {
+        const auto [rows,width,outputs]=shape;
+        if(only_ffn && outputs==32768)continue;
+        auto values=tb::full({outputs,width},0x38,options);
+        auto scales=tb::full({outputs/32,width/32},127,options);
+        auto input=tb::full({rows,width},.03125,options.dtype(tb::kFloat16));
+        cudaEvent_t start,stop;MFQ_CUDA_CHECK(cudaEventCreate(&start));MFQ_CUDA_CHECK(cudaEventCreate(&stop));
+        MFQ_CUDA_CHECK(cudaEventRecord(start,mfq_current_cuda_stream()));
+        auto result=mxfp8_matmul_f16_cuda(values,scales,input);
+        MFQ_CUDA_CHECK(cudaEventRecord(stop,mfq_current_cuda_stream()));MFQ_CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms=0;MFQ_CUDA_CHECK(cudaEventElapsedTime(&ms,start,stop));
+        auto sample=result.select(0,0).to(tb::kCPU).to(tb::kFloat32).contiguous();
+        for(int n=0;n<outputs;++n)require(sample.data_ptr<float>()[n]==width*.03125f,"MXFP8 large prefill oracle differs");
+        std::cout<<"mxfp8_prefill rows="<<rows<<" width="<<width<<" outputs="<<outputs<<" ms="<<ms<<'\n';
+        MFQ_CUDA_CHECK(cudaEventDestroy(start));MFQ_CUDA_CHECK(cudaEventDestroy(stop));
+    }
+}
+int main(int argc,char** argv) try {
+    if(argc>=2 && std::string(argv[1])=="--bench-prefill") {benchmark_prefill(argc==3);return 0;}
     check(128,128,137,256);
     check(32,32,65,96);
     check(1,32,65,96);

@@ -20,6 +20,7 @@ FFN load_moe_at(CudaExecutionContext &execution, const mfq::ModelSource &model,
     result.moe_router_scale = config.routed_scaling;
     result.swiglu_limit = config.swiglu_limit;
     result.shared->swiglu_limit = config.swiglu_limit;
+    result.prepare_moe_pipeline(execution);
     return result;
 }
 

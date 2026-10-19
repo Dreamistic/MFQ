@@ -107,8 +107,10 @@ struct DeepseekV41Dspark final : MtpModule {
             load_quant_linear(execution, model, prefix + "attention.output_a.weight");
         result->output_b =
             load_quant_linear(execution, model, prefix + "attention.output_b.weight");
+        // Predictor bundles must not extend the backbone's final-layer marker:
+        // residency updates also run when ordinary decoding skips DSpark.
         result->mlp = load_moe_at(execution, model, config, prefix + "mlp.",
-                                  config.n_layers + stage, config.dspark_top_k);
+                                  -1 - stage, config.dspark_top_k);
         result->rope = Dsv4RopeTable(config.max_position_embeddings, config.rope_theta, 0);
         result->cuda_device = execution.layer_placement.primary_device();
 

@@ -9,6 +9,8 @@
 #include "mfq_cuda_context.h"
 #include "mfq/runtime.h"
 #include "nint_prefill_cache.h"
+#include "core/ffn.h"
+#include "mfq_cuda_activation_ops.h"
 #include "format.h"
 #include <array>
 #include <chrono>
@@ -223,6 +225,96 @@ void check_output(const tb::Tensor& actual,const tb::Tensor& expected) {
                 " actual="+std::to_string(x)+" expected="+std::to_string(y));
     }
 }
+void check_clipped_pipeline(const std::filesystem::path& root) {
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16);
+    std::vector<float> values{-65504,-100,-11,-10,-1,-0.0f,0,1,9.99f,10,11,100,65504};
+    auto gate=tb::tensor(values).to(options);
+    std::reverse(values.begin(),values.end());
+    auto up=tb::tensor(values).to(options);
+    auto expected_gate=tb::clamp_max(gate.to(tb::kFloat32),10);
+    auto expected_up=tb::clamp(up.to(tb::kFloat32),-10,10);
+    check_output(clipped_silu_mul_cuda(gate,up,10),
+        (tb::silu(expected_gate)*expected_up).to(tb::kFloat16));
+    int cases=0;
+    for(const char* format:{"nint","nvq3j","mxfp4"}) {
+        if(const auto* selected=std::getenv("MFQ_SSD_EXPERT_TEST_FORMAT");selected &&
+                std::string(selected).find(format)==std::string::npos)continue;
+        if(!std::filesystem::exists(root/(std::string(format)+"-0.mfq")))continue;
+        std::map<std::tuple<double,int,int>,tb::Tensor> references;
+        for(bool ssd:{false,true})for(double limit:{.01,10.}) {
+            CudaExecutionContext execution;auto& config=execution.config;
+            config.moe_pipeline=true;config.moe_two_stage_ffn=true;
+            config.moe_ram_pcie=true;config.moe_direct_ram=true;config.moe_ram_pcie_fraction=1.;
+            config.moe_preload_all=!ssd;config.moe_assert_resident=!ssd;
+            config.moe_residency_adapt=false;config.moe_residency_warm=false;
+            config.moe_host_cache_bytes=ssd?32768:16*1024*1024;
+            auto cache=make_moe_expert_cache(32768,config);
+            std::array<MfeWeight,3> resident;
+            if(!ssd)for(int p=0;p<3;++p) {
+                auto model=mfq::open_model_source((root/(std::string(format)+"-"+std::to_string(p)+".mfq")).string());
+                resident[p]=load_mfe_gpu(execution,*model,"linear.weight");
+            }
+            std::array<FFN,2> layers;
+            int width=0,experts=0;
+            for(int layer=0;layer<2;++layer) {
+                auto& ffn=layers[layer];ffn.is_moe=true;ffn.moe_split_gate_up=true;
+                ffn.moe_layer=layer;ffn.moe_top_k=2;ffn.moe_normalize=true;ffn.moe_delayed_softmax=false;
+                ffn.moe_shared_ungated=true;ffn.swiglu_limit=limit;
+                for(int p=0;p<3;++p) {
+                    auto quant=source(root/(std::string(format)+"-"+std::to_string(p)+".mfq"));
+                    auto weight=cache_quant_moe_weight(cache,std::to_string(layer)+"/"+std::to_string(p),
+                        quant,1,layer,std::to_string(p));
+                    if(p==0){width=quant->metadata()->neuron_len;experts=quant->metadata()->n_experts;}
+                    (p==0?ffn.moe_gate:p==1?ffn.moe_up:ffn.moe_down)=std::move(weight);
+                }
+                ffn.moe_router=tb::zeros({experts,width},options.dtype(tb::kFloat32));
+                ffn.moe_hash_ids=tb::tensor(std::vector<int32_t>{0,1}).reshape({1,2}).to(tb::kCUDA);
+                ffn.shared=std::make_unique<FFN>();ffn.shared->swiglu_limit=limit;
+                auto dense=[&](int out,int in) {
+                    QuantLinear value;value.kind=QuantLinearKind::Dense;
+                    value.logical_out=out;value.logical_neuron_len=in;
+                    value.dense=tb::full({out,in},.003,options);return value;
+                };
+                ffn.shared->gate_up.layers={dense(16,width),dense(16,width)};
+                ffn.shared->gate_up.outs={16,16};ffn.shared->down=dense(width,16);
+                ffn.prepare_moe_pipeline(execution);
+                check(bool(ffn.moe_pipeline_forward),"generic FFN did not register its SSD pipeline");
+            }
+            finalize_moe_expert_cache(cache);
+            for(int tokens:{1,6,11,143})for(auto& ffn:layers) {
+                std::fprintf(stderr,"clipped_check format=%s ssd=%d limit=%g tokens=%d layer=%d phase=reference\n",
+                    format,int(ssd),limit,tokens,ffn.moe_layer);
+                std::vector<float> input(tokens*width);
+                const float amplitude=std::string(format)=="nvq3j"?.003f:.3f;
+                for(std::size_t i=0;i<input.size();++i)input[i]=std::sin(float(i)*.13f)*amplitude;
+                auto x=tb::tensor(input).reshape({tokens,width}).to(options);
+                const auto key=std::make_tuple(limit,tokens,ffn.moe_layer);
+                if(!ssd) {
+                    std::vector<int32_t> selected(tokens*2);
+                    for(int i=0;i<tokens*2;++i)selected[i]=i%2;
+                    auto ids=tb::tensor(selected).reshape({tokens,2}).to(tb::kCUDA);
+                    auto route=build_moe_route_plan(ids,experts);
+                    auto weights=moe_sqrtsoftplus_weights_cuda(tb::zeros({tokens,experts},options.dtype(tb::kFloat32)),ids,1e-20,1);
+                    auto g=resident[0].forward(execution,x,route),u=resident[1].forward(execution,x,route);
+                    tb::Tensor hidden;
+                    if(limit>0) {
+                        g=tb::clamp_max(g.to(tb::kFloat32),limit);
+                        u=tb::clamp(u.to(tb::kFloat32),-limit,limit);
+                        hidden=(tb::silu(g)*u).to(tb::kFloat16).contiguous();
+                    } else hidden=moe_swiglu_split_cuda(tb::cat({g,u},-1).contiguous());
+                    auto routed=moe_weighted_reduce_cuda(resident[2].forward(execution,hidden,route),weights);
+                    references[key]=(routed+ffn.shared->forward(execution,x)).cpu().clone();
+                }
+                execution.force_moe_materialized_swiglu=false;
+                std::fprintf(stderr,"clipped_check phase=pipeline\n");
+                check_output(ffn.forward(execution,x,tb::zeros({tokens},options.dtype(tb::kInt64))),references.at(key));++cases;
+            }
+            release_moe_prefill_buffers(cache);
+        }
+    }
+    check(cases>0,"missing clipped FFN fixtures");
+    std::cout<<"generic_clipped_ffn_cases="<<cases<<" ordinary/pipeline RAM/SSD multi-layer PASS\n";
+}
 void check_ssd_predictor_overlap(const std::filesystem::path& root) {
     for(int variant:{0,1,2,3}) {
         const bool shared_arena=variant!=0,wide=variant>=2,fail_image=variant==3;
@@ -346,6 +438,9 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
 }
 }
 int main(int argc,char** argv)try {
+    if(argc==3 && std::string(argv[2])=="--clipped-check") {
+        check_clipped_pipeline(argv[1]);return 0;
+    }
     std::set_terminate([] {
         if(auto error=std::current_exception())try {std::rethrow_exception(error);}
         catch(const std::exception& value){std::fprintf(stderr,"SSD test terminated: %s\n",value.what());}

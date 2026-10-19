@@ -777,8 +777,10 @@ struct Block final : ::Block {
                                             : "deepseek_v41.mhc.mlp.collapse");
             },
             [&](Tensor value) {
-                return attention_forward(execution, value, positions, cache_position,
-                                         sequence_lengths, truncated_local);
+                return profiler.measure("deepseek_v41.attention", [&] {
+                    return attention_forward(execution, value, positions, cache_position,
+                                             sequence_lengths, truncated_local);
+                });
             },
             [&](Tensor value, Tensor residual, const auto &mix, int branch) {
                 return expand(profiler, value, residual, mix,
@@ -786,8 +788,10 @@ struct Block final : ::Block {
                                           : "deepseek_v41.mhc.mlp.expand");
             },
             [&](Tensor value) {
-                return mlp.forward(execution, value.reshape({-1, config.hidden}), current_ids)
-                    .reshape({batch, tokens, config.hidden});
+                return profiler.measure("deepseek_v41.mlp", [&] {
+                    return mlp.forward(execution, value.reshape({-1, config.hidden}), current_ids)
+                        .reshape({batch, tokens, config.hidden});
+                });
             });
     }
 };

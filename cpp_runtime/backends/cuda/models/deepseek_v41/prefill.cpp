@@ -44,6 +44,9 @@ Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
     auto scope = model.execution_scope();
     ids = model.device_ids(std::move(ids));
     const auto batch = ids.size(0), tokens = ids.size(1);
+    const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");
+    const bool trace=profile && profile[0]=='1';
+    if(trace)std::cerr<<"runtime_deepseek_v41_prefill phase=prepare tokens="<<tokens<<'\n';
     MFQ_RUNTIME_CHECK(model.shared && batch > 0 && tokens > 0 && compute_chunk > 0 &&
                           model.speculative_start < 0 &&
                           model.cache_pos + tokens <= model.max_position_embeddings(),
@@ -63,6 +66,19 @@ Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
         model.reset(batch);
         return true;
     };
+    const auto* profile_layer=std::getenv("MFQ_PROFILE_DSV41_LAYER");
+    const auto apply_layer=[&](auto& ops,int64_t layer,Tensor hidden) {
+        auto& profiler=model.execution->profiler;
+        const bool selected=profile_layer && layer==std::atoi(profile_layer);
+        const bool previous=profiler.enabled;
+        if(selected) {profiler.reset();profiler.enabled=true;}
+        try {
+            hidden=ops.layer(model.blocks.at(layer),std::move(hidden));
+            if(selected)profiler.report("deepseek_v41.layer."+std::to_string(layer));
+        } catch(...) {profiler.enabled=previous;throw;}
+        profiler.enabled=previous;
+        return hidden;
+    };
     for (int64_t offset = 0; offset < tokens; offset += compute_chunk) {
         if (cancelled()) return {};
         const auto count = std::min(compute_chunk, tokens - offset);
@@ -77,7 +93,8 @@ Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
         model.adapter_begin_forward(raw_hidden != nullptr);
         for (int64_t layer = 0; layer < split; ++layer) {
             if (cancelled()) return {};
-            hidden = ops.layer(model.blocks.at(layer), std::move(hidden));
+            if(trace)std::cerr<<"runtime_deepseek_v41_prefill phase=encoder layer="<<layer<<" tokens="<<count<<'\n';
+            hidden = apply_layer(ops,layer,std::move(hidden));
         }
         // Decoder global KV comes from the encoder boundary for every prompt token.
         // Decoder attention and FFNs run only over the bounded local replay below.
@@ -118,10 +135,11 @@ Tensor deepseek_v41_prefill_hidden(DeepseekV41CausalLm& model, Tensor ids,
         ops.cpu_ids = ops.ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
     for (int64_t layer = split; layer < model.num_hidden_layers(); ++layer) {
         if (cancelled()) return {};
+        if(trace)std::cerr<<"runtime_deepseek_v41_prefill phase=decoder layer="<<layer<<" tokens="<<replay_tokens<<'\n';
         auto& block = dynamic_cast<deepseek_v41_runtime::Block&>(*model.blocks.at(layer));
         block.state.position = replay_begin;
         block.replay_local_window = truncated_local;
-        tail_hidden = ops.layer(model.blocks.at(layer), std::move(tail_hidden));
+        tail_hidden = apply_layer(ops,layer,std::move(tail_hidden));
     }
     model.adapter_finish_forward(ops.full_positions, batch, replay_tokens);
     model.cache_pos = end;
