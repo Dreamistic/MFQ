@@ -2837,6 +2837,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             const bool consume_loan=direct_enabled && cell.graph_replay &&
                 cell.skip_cpu_wait && cell.two_stage && cell.transfer_cache && cell.kv_loan_table;
             auto& projection_copies=scratch.projection_copies;
+            std::array<std::vector<mfq::HostCopy>,2> projection_host_copies;
             std::size_t submitted_projection_copies=0;
             bool projection_gu_submitted=false;
             const auto* overlap_option=std::getenv("MFQ_MOE_GU_BUILD_OVERLAP");
@@ -2867,6 +2868,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                         // Start its upload while the CPU allocates Down's pages.
                         // Readiness still follows the complete descriptor image,
                         // including Down metadata needed by hidden quantization.
+                        mfq::copy_host_ranges(projection_host_copies[0]);
+                        projection_host_copies[0].clear();
                         const auto& copies=projection_copies[0];
                         if(mfq::cuda::NativeDmaBatch::submit(copies,cache_->weight_stream_,cell.native_dma_mode,native_alias)) {
                             ++cache_->stats_.pipeline_native_dma_batches;
@@ -2899,7 +2902,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                                     host_offset=(host_offset+15)&~int64_t(15);
                                     if(f.bytes>host_limit-host_offset)
                                         throw std::logic_error("KV projection upload exceeds pinned stage geometry");
-                                    origin=packed+host_offset;std::memcpy(packed+host_offset,f.source,std::size_t(f.bytes));
+                                    origin=packed+host_offset;
+                                    projection_host_copies[phase].push_back({packed+host_offset,f.source,std::size_t(f.bytes)});
                                     host_offset+=f.bytes;staged_bytes+=f.bytes;
                                 }
                                 auto* target=static_cast<uint8_t*>(destination)+offsets[f.field];
@@ -2956,6 +2960,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                     first=last;
                 }
             }
+            // Every staged source must be ready before either phase submits
+            // its DMA, including the early Gate/Up submission above.
+            for(const auto& host_copies:projection_host_copies)mfq::copy_host_ranges(host_copies);
             // A packet boundary separates Gate/Up from Down. Cache ownership,
             // original RAM leases and the final completion event are shared.
             for(int phase=0;phase<2;++phase) {
