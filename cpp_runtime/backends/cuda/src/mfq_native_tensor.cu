@@ -2,6 +2,7 @@
 #include "mfq_weight_memory.h"
 
 #include "mfq_cuda_context.h"
+#include "mfq/runtime.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -99,7 +100,7 @@ std::shared_ptr<TensorStorage> allocate_pinned_storage(std::size_t bytes) {
             // Allocation rejection is recoverable. Do not leave the driver's
             // last error for an unrelated kernel launch or state restoration.
             (void)cudaGetLastError();
-            throw Error("CUDA pinned allocation failed: requested="+std::to_string(bytes)+
+            throw MfqResourceExhausted("CUDA pinned allocation failed: requested="+std::to_string(bytes)+
                 " host_allocated="+std::to_string(tensor_host_bytes.load()));
         }
         MFQ_NATIVE_CUDA_CHECK(result);

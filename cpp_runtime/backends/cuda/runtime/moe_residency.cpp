@@ -533,6 +533,11 @@ MoeResidencyManager::MoeResidencyManager(MoeExpertCache* cache,Observer observer
         const auto options=tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true);
         for(capacity=capacity/4096*4096;capacity;capacity=capacity/2/4096*4096) {
             try {
+                // Optional exchange buffers must leave pinned capacity for
+                // the decode/verification packets prepared after this stage.
+                // The driver may impose a tighter quota than free host RAM.
+                auto headroom=tb::empty({std::int64_t(std::max<std::uint64_t>(
+                    std::uint64_t(256)<<20,2*capacity))},options);
                 s.backup=tb::empty({std::int64_t(capacity)},options);
                 s.upload=tb::empty({std::int64_t(capacity)},options);
                 s.ssd_stage_capacity=std::size_t(capacity);break;

@@ -1689,8 +1689,10 @@ void qwen4_warmup_decode_graphs(Qwen4CausalLm& model,MtpModule* mtp,int maximum_
     if(predictor) {
         MtpTarget target(model);
         predictor->reset(1);
-        for(int row=0;row<16;row+=4)
-            (void)predictor->evaluate(target,raw.narrow(1,row,4),ids.narrow(1,row,4));
+        // Full predictor drafts consume one row. Bootstrap the same shape so
+        // startup does not retain multi-row expert and pinned transfer arenas.
+        for(int row=0;row<16;++row)
+            (void)predictor->evaluate(target,raw.narrow(1,row,1),ids.narrow(1,row,1));
         release_moe_decode_buffers(model.execution->moe_expert_cache);
         default_context(model.execution->layer_placement.primary_device())->reclaim_idle_memory();
         // Production drafts run one full predictor row. Committed history
