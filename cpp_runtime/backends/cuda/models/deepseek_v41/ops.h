@@ -784,6 +784,17 @@ struct Block final : ::Block {
             [&](Tensor attended) { return output_projection(execution, attended); });
     }
 
+    Tensor forward_context(CudaExecutionContext& execution,Tensor hidden,
+            const ::Block::Context& context,const RopeCache& rope) override {
+        if(context.confirmed_prefix>0) {
+            // A joint pass writes pending and draft rows. Protect their whole
+            // physical window; rollback retains the confirmed prefix as well.
+            begin_speculative(hidden.size(1));
+            if(layer==0)shared->begin_speculative();
+        }
+        return ::Block::forward_context(execution,std::move(hidden),context,rope);
+    }
+
     Tensor forward(CudaExecutionContext &execution, Tensor hidden, Tensor positions,
                    std::int64_t cache_position, const MfqOptional<Tensor> &sequence_lengths,
                    const RopeCache &, const MfqOptional<Tensor> &cache_positions = mfq_nullopt,
@@ -874,6 +885,7 @@ inline int run_self_check() {
 namespace mfq::cuda {
 
 struct DeepseekV41Model : CausalResources {
+    static constexpr bool joint_speculation_supported=true;
     bool adapter_prefetch_token_rows(DeepseekV41CausalLm&,const mfq_tensor_backend::Tensor&);
     template <class Backend> using CausalModel = mfq::models::deepseek_v41::CausalLm<Backend>;
     mfq::models::deepseek_v41::Config config;

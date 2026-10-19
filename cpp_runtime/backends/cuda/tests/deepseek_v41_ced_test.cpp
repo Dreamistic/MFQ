@@ -136,21 +136,29 @@ void check_retained_prefix() {
         const auto error=(a.to(tb::kFloat32)-b.to(tb::kFloat32)).abs().max().item<double>();
         require(std::isfinite(error) && error<.005,message);
     };
-    for(int ratio:{2,4})for(int context:{15,16,127,128,129})for(int kept:{0,1,2,3}) {
+    for(bool joint:{false,true})for(int ratio:{2,4})for(int context:{15,16,127,128,129})for(int kept:{0,1,2,3}) {
         auto reference=make_model(execution,ratio),candidate=make_model(execution,ratio);
-        auto prompt=ids(context),draft=ids(3);
+        const int confirmed=joint?1:0;
+        auto prompt=ids(context),draft=ids(3+confirmed);
         reference.hidden_forward(prompt);candidate.hidden_forward(prompt);
-        tb::Tensor expected;
-        if(kept)expected=reference.hidden_forward(draft.narrow(1,0,kept));
-        candidate.begin_speculative_suffix(3);
-        auto verified=candidate.hidden_forward_speculative_suffix(draft);
-        if(kept)same(verified.narrow(1,0,kept),expected,"verified retained prefix differs from causal forward");
-        candidate.rollback_speculative(kept);
-        check_positions(candidate,context+kept);
+        tb::Tensor expected,pending,verified;
+        if(joint)pending=reference.hidden_forward(draft.narrow(1,0,1));
+        if(kept)expected=reference.hidden_forward(draft.narrow(1,confirmed,kept));
+        if(joint) {
+            verified=candidate.hidden_forward(draft,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,nullptr,1);
+            same(verified.narrow(1,0,1),pending,"joint verification changed the confirmed token");
+        }else {
+            candidate.begin_speculative_suffix(3);
+            verified=candidate.hidden_forward_speculative_suffix(draft);
+        }
+        if(kept)same(verified.narrow(1,confirmed,kept),expected,"verified retained prefix differs from causal forward");
+        if(joint && kept==3)candidate.commit_speculative();
+        else candidate.rollback_speculative(kept);
+        check_positions(candidate,context+confirmed+kept);
         for(std::size_t layer=0;layer<candidate.blocks.size();++layer) {
             const auto& actual=dynamic_cast<const deepseek_v41_runtime::Block&>(*candidate.blocks[layer]);
             const auto& wanted=dynamic_cast<const deepseek_v41_runtime::Block&>(*reference.blocks[layer]);
-            const int64_t end=context+kept,begin=std::max<int64_t>(0,end-128);
+            const int64_t end=context+confirmed+kept,begin=std::max<int64_t>(0,end-128);
             auto slots=tb::arange(begin,end,actual.state.local_kv.options().dtype(tb::kInt64))
                 .remainder(128.).to(tb::kInt64);
             same(actual.state.local_kv.index_select(1,slots),wanted.state.local_kv.index_select(1,slots),
@@ -176,7 +184,7 @@ void check_retained_prefix() {
                 "retained prefix changed Engram ngram history");
         ++cases;
     }
-    std::cout<<"retained_prefix_cases="<<cases<<" compressor/ring/Engram/decode PASS\n";
+    std::cout<<"retained_prefix_cases="<<cases<<" suffix/joint compressor/ring/Engram/decode PASS\n";
 }
 }
 int main() try {
