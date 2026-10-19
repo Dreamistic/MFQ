@@ -82,6 +82,8 @@ __device__ __forceinline__ void nvq_token_dot(const MfePackedProjection& d,int l
     constexpr int bits=packed_nvq::format_index_bits(Format);
     const int lane=threadIdx.x&(Lanes-1),row=threadIdx.x/Lanes;
     const auto* stream=static_cast<const uint8_t*>(d.fields[0]);
+    const auto* auxiliary=static_cast<const uint8_t*>(d.fields[1]);
+    const auto* states=static_cast<const uint8_t*>(d.fields[2]);
     const auto* anchors=static_cast<const float*>(d.fields[3]);
     const auto* codebook=static_cast<const int8_t*>(d.fields[4]);
     const int neuron=local*d.output_rows+first+row;
@@ -95,7 +97,25 @@ __device__ __forceinline__ void nvq_token_dot(const MfePackedProjection& d,int l
     for(int group=lane;group<d.groups;group+=Lanes) {
         int2 weight[3]{};float weight_scale=0.f;
         if(first+row<d.output_rows) {
-            if constexpr(d4) {
+            if(!Compact && !(d4?d.d4_dense_groups:d.e8_dense_groups)) {
+                // The source layout keeps indices, parity and joint states in
+                // separate packed streams. Decode the same register group as
+                // the scalar path, then reuse it for every routed token.
+                const auto state=packed_nvq::load_nvq_state<Format>(stream,d.sizes[0],states,d.sizes[2],
+                    int64_t(neuron)*d.groups+group,d.sub_bits,d.groups);
+                const auto* bank=packed_nvq::active_codebook<Format>(codebook,state);
+                const auto signs=packed_nvq::load_packed_group_window<21>(auxiliary,
+                    (int64_t(neuron)*d.nsign+group*3)*7,d.sizes[1]);
+                constexpr int vectors=d4?6:3;
+                const auto indices=packed_nvq::load_packed_group_window<bits*vectors>(stream,
+                    (int64_t(neuron)*d.nvec+group*vectors)*bits,d.sizes[0]);
+                weight_scale=packed_nvq::format_scale<Format>(anchor,state,codebook);
+#pragma unroll
+                for(int segment=0;segment<3;++segment)
+                    weight[segment]=packed_nvq::load_nvq_group_vec8<Format,true>(stream,d.sizes[0],
+                        auxiliary,d.sizes[1],codebook,bank,neuron,group,segment,d.groups,d.nvec,
+                        d.nsign,d.sign_mode,state,uint32_t(signs),indices,nullptr,0).values;
+            }else if constexpr(d4) {
                 packed_nvq::DenseD4Group<bits> packed;
                 if(Compact || narrow) {
                     const auto words=packed_nvq::load_dense_window32<4+3*(2*bits+7)>(local_stream,expert_bytes,
@@ -173,13 +193,19 @@ __device__ __forceinline__ void token_project(const MfePackedProjection* d,int l
         const __half* original,int original_stride,const int* slots,int slot_divisor) {
     if(d && local>=0 && local<d->local_experts) {
         if(d->family==3) {
-#pragma unroll
-            for(int k=0;k<Capacity;++k)if(k<count) {
-                const auto* source=original+int64_t(slots[k]/slot_divisor)*original_stride;
+            if constexpr(Capacity==1) {
+                const auto* source=original?original+int64_t(slots[0]/slot_divisor)*original_stride:nullptr;
 #pragma unroll
                 for(int pair=0;pair<Rows/2;++pair)
-                    mfe_mxfp4_pair(*d,local,first+pair*2,source,result[k]+pair*2);
+                    mfe_mxfp4_pair(*d,local,first+pair*2,source,result[0]+pair*2);
+                return;
             }
+            const __half* sources[Capacity]{};
+#pragma unroll
+            for(int k=0;k<Capacity;++k)if(k<count) {
+                sources[k]=original?original+int64_t(slots[k]/slot_divisor)*original_stride:nullptr;
+            }
+            mfe_mxfp4_tokens<Capacity,Rows>(*d,local,first,sources,count,result);
             return;
         }
         if(d->family==2) {
@@ -187,7 +213,7 @@ __device__ __forceinline__ void token_project(const MfePackedProjection* d,int l
             if(Compact || !canonical || Rows==2) {
                 if(d->format==1){nvq1_token_dot<1,lanes,Capacity>(*d,local,first,inputs,scales,count,result);return;}
                 if(d->format==8){nvq1_token_dot<8,lanes,Capacity>(*d,local,first,inputs,scales,count,result);return;}
-#define MFQ_TOKEN_NVQ(F,DENSE) case F: if(Compact || d->DENSE) {nvq_token_dot<F,lanes,Capacity,Compact>(*d,local,first,inputs,scales,count,result,narrow);return;}break
+#define MFQ_TOKEN_NVQ(F,DENSE) case F: if(Capacity>1 || Compact || d->DENSE) {nvq_token_dot<F,lanes,Capacity,Compact>(*d,local,first,inputs,scales,count,result,narrow);return;}break
                 switch(d->format) {
                     MFQ_TOKEN_NVQ(5,e8_dense_groups);MFQ_TOKEN_NVQ(13,e8_dense_groups);MFQ_TOKEN_NVQ(14,e8_dense_groups);
                     MFQ_TOKEN_NVQ(10,d4_dense_groups);MFQ_TOKEN_NVQ(11,d4_dense_groups);

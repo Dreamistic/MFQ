@@ -2384,6 +2384,12 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             }
             if(matched!=replay.cpu.size())throw std::runtime_error("MFQ dispatch replay CPU expert missing from routes");
         }
+        if(cell.batch_decode && cell.tokens>1) {
+            const int phase=sources_[0]->layer_id_<0;
+            cache_->stats_.pipeline_multi_unique_routes[phase]+=cell.plan.groups.size();
+            for(const auto& group:cell.plan.groups)
+                cache_->stats_.pipeline_multi_route_positions[phase]+=group.positions.size();
+        }
         // Explicit quotas also share the CPU pool. An unfinished calibration
         // cannot be followed by inference work queued behind that calibration.
         if(calibration_busy)for(auto& group:cell.plan.groups)

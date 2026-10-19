@@ -9,6 +9,7 @@
 #include "mfq_cuda_context.h"
 #include "mfq/runtime.h"
 #include "nint_prefill_cache.h"
+#include "mfe_ffn_runtime.h"
 #include "core/ffn.h"
 #include "mfq_cuda_activation_ops.h"
 #include "format.h"
@@ -236,6 +237,75 @@ void check_output(const tb::Tensor& actual,const tb::Tensor& expected) {
                 " actual="+std::to_string(x)+" expected="+std::to_string(y));
     }
 }
+void check_token_reuse(const std::filesystem::path& root,const std::string& format) {
+    CudaExecutionContext execution;
+    std::array<std::shared_ptr<MixedMoeRuntime>,3> projections;
+    for(int p=0;p<3;++p) {
+        auto model=mfq::open_model_source((root/(format+"-"+std::to_string(p)+".mfq")).string());
+        projections[p]=make_mixed_moe_runtime(load_mfe_cpu(*model,"linear.weight"),true,execution.config);
+        if(format=="nvq")for(const auto& pool:projections[p]->pools)
+            check(!pool.nvq.dense_groups,"raw NVQ benchmark silently used a repacked layout");
+    }
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16);
+    const auto sigmoid=moe_swiglu_sigmoid_table_cuda();
+    const int width=projections[0]->neuron_len,experts=projections[0]->n_experts;
+    const auto* previous=std::getenv("MFQ_MFE_TOKEN_GROUPS");
+    const std::string old=previous?previous:"";
+    const auto select=[](const char* mode) {
+#ifdef _WIN32
+        _putenv_s("MFQ_MFE_TOKEN_GROUPS",mode);
+#else
+        if(*mode)setenv("MFQ_MFE_TOKEN_GROUPS",mode,1);else unsetenv("MFQ_MFE_TOKEN_GROUPS");
+#endif
+    };
+    int cases=0;
+    const auto* rows_option=std::getenv("MFQ_TOKEN_REUSE_TEST_ROWS");
+    const int only_rows=rows_option?std::atoi(rows_option):0;
+    for(int rows:{2,3,4,6,8,16,32})for(int sharing:{0,1,2}) {
+        if(only_rows && rows!=only_rows)continue;
+        std::vector<float> values(rows*width),weights(rows*3,1.f/3);
+        std::vector<int32_t> ids(rows*3);
+        for(std::size_t i=0;i<values.size();++i)values[i]=std::sin(float(i)*.017f)*.03f;
+        for(int t=0;t<rows;++t)for(int r=0;r<3;++r)
+            ids[t*3+r]=sharing==0?r:sharing==1?(t+r)%experts:(t*3+r)%experts;
+        if(sharing==2)ids.back()=-1;
+        auto x=tb::tensor(values).reshape({rows,width}).to(options);
+        auto routed=tb::tensor(ids).reshape({rows,3}).to(tb::kCUDA);
+        auto route_weights=tb::tensor(weights).reshape({rows,3}).to(tb::kCUDA);
+        MfeFfnRuntime runtime({projections[0].get(),projections[1].get(),projections[2].get()},x,routed,route_weights,sigmoid,
+            {},{},0,0,nullptr,false,false,0,10);
+        check(runtime.batch().token_group_counts!=nullptr,"packed expert format omitted token grouping");
+        if(!cases) {
+            select("1");for(int warm=0;warm<100;++warm)runtime.run();mfq_cuda_synchronize();
+        }
+        std::array<float,2> elapsed{};tb::Tensor expected;
+        for(int mode=0;mode<2;++mode) {
+            select(mode?"1":"0");runtime.run();mfq_cuda_synchronize();
+            if(!mode)expected=runtime.output().cpu().clone();else check_output(runtime.output(),expected);
+            cudaGraph_t graph;cudaGraphExec_t replay;
+            MFQ_CUDA_CHECK(cudaStreamBeginCapture(mfq_current_cuda_stream(),cudaStreamCaptureModeThreadLocal));
+            runtime.run();MFQ_CUDA_CHECK(cudaStreamEndCapture(mfq_current_cuda_stream(),&graph));
+            MFQ_CUDA_CHECK(cudaGraphInstantiate(&replay,graph,0));
+            for(int warm=0;warm<3;++warm)MFQ_CUDA_CHECK(cudaGraphLaunch(replay,mfq_current_cuda_stream()));
+            mfq_cuda_synchronize();
+            cudaEvent_t begin,end;
+            MFQ_CUDA_CHECK(cudaEventCreate(&begin));MFQ_CUDA_CHECK(cudaEventCreate(&end));
+            MFQ_CUDA_CHECK(cudaEventRecord(begin,mfq_current_cuda_stream()));
+            for(int repeat=0;repeat<20;++repeat)MFQ_CUDA_CHECK(cudaGraphLaunch(replay,mfq_current_cuda_stream()));
+            MFQ_CUDA_CHECK(cudaEventRecord(end,mfq_current_cuda_stream()));
+            MFQ_CUDA_CHECK(cudaEventSynchronize(end));
+            MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed[mode],begin,end));
+            cudaEventDestroy(begin);cudaEventDestroy(end);
+            cudaGraphExecDestroy(replay);cudaGraphDestroy(graph);
+            elapsed[mode]/=20;
+        }
+        std::cout<<format<<"_token_reuse M="<<rows<<" sharing="<<sharing
+            <<" ordinary_ms="<<elapsed[0]<<" grouped_ms="<<elapsed[1]
+            <<" speedup="<<elapsed[0]/elapsed[1]<<" graph_replay=1\n";++cases;
+    }
+    select(old.c_str());
+    std::cout<<format<<"_token_reuse_cases="<<cases<<" PASS\n";
+}
 void check_clipped_pipeline(const std::filesystem::path& root) {
     const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat16);
     std::vector<float> values{-65504,-100,-11,-10,-1,-0.0f,0,1,9.99f,10,11,100,65504};
@@ -387,6 +457,9 @@ void check_clipped_pipeline(const std::filesystem::path& root) {
             }
             check(cache->stats().pipeline_two_stage_serves>=16,
                 "clipped FFN did not execute its two-stage kernels");
+            check(cache->stats().pipeline_multi_route_positions[0]>cache->stats().pipeline_multi_unique_routes[0] &&
+                    cache->stats().pipeline_multi_unique_routes[0]>0,
+                "multi-token route sharing was not measured");
             check(!retained || restored,"retained private FFN was not replayed after prefill");
             if(retained) {
                 // A different loan owns different publication observers. Its
@@ -550,6 +623,12 @@ void check_ssd_predictor_overlap(const std::filesystem::path& root) {
 }
 }
 int main(int argc,char** argv)try {
+    if(argc==3 && std::string(argv[2])=="--mxfp4-token-reuse") {
+        check_token_reuse(argv[1],"mx4");return 0;
+    }
+    if(argc==3 && std::string(argv[2])=="--nvq-token-reuse") {
+        check_token_reuse(argv[1],"nvq");return 0;
+    }
     if(argc==3 && std::string(argv[2])=="--clipped-check") {
         check_clipped_pipeline(argv[1]);return 0;
     }

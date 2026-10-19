@@ -244,14 +244,15 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         }
     }
     constexpr uint32_t grouped_formats=0xfd22u;
-    batch_.token_group_compact=!combined_gate_up_ && batch_.default_math &&
+    const bool grouped_math=!combined_gate_up_ && batch_.default_math &&
         !batch_.shared_dense_math && !batch_.warp_multi_sum &&
         !(batch_.nvq_format_mask&~grouped_formats) &&
-        (!(batch_.nvq_format_mask&compact_formats) || batch_.compact_nvq) &&
         std::all_of(views.begin(),views.end(),[](const View& d) {
             return d.family==2 || d.family==3 || (d.family==1 &&
                 (d.group_size==24 || d.group_size==28 || d.group_size==32));
         });
+    batch_.token_group_compact=grouped_math &&
+        (!(batch_.nvq_format_mask&compact_formats) || batch_.compact_nvq);
     descriptors_=upload(views);cohorts_=tb::tensor(mapping).to(tb::kCUDA);
     std::vector<mfq::cuda::MfeInputQuantization> quantization;
     for(const auto& entry:quantizers) {
@@ -281,12 +282,13 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
     batch_.output=output_.data_ptr();
     // Pure NINT speculative batches retain the measured faster routed kernels;
     // independent eight-row decode tiles may request expert reuse explicitly.
+    const bool has_mxfp4=std::any_of(views.begin(),views.end(),[](const View& view){return view.family==3;});
     if(batch_.tokens>=2 && batch_.tokens<=32 &&
-       (batch_.nvq_format_mask || batch_.tokens>8 || token_group_capacity_hint>=4)) {
+       (batch_.nvq_format_mask || has_mxfp4 || batch_.tokens>8 || token_group_capacity_hint>=4)) {
         // Three/four-row compact batches reuse decoded weights across the
         // complete small window. Other shapes retain their previous capacity.
         const auto* wide_compact=std::getenv("MFQ_MFE_TOKEN_WIDE_COMPACT");
-        const bool wide_default=(!wide_compact || wide_compact[0]!='0') && batch_.token_group_compact &&
+        const bool wide_default=(!wide_compact || wide_compact[0]!='0') && grouped_math &&
             (batch_.tokens==3 || batch_.tokens==4);
         batch_.token_group_capacity=batch_.tokens<=8?(wide_default?4:2):8;
         if(token_group_capacity_hint==4 || token_group_capacity_hint==8)
@@ -310,13 +312,13 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         batch_.token_group_counts=token_group_counts_.data_ptr<int32_t>();
         batch_.token_group_slots=token_group_slots_.data_ptr<int32_t>();
         const auto aligned_gu=mfq::cuda::runtime_options::mfe_token_aligned_gu();
-        // Short compact mixed batches are dominated by singleton/pair groups.
+        // Short grouped mixed batches are dominated by singleton/pair groups.
         // Their smaller independent Gate/Up CTAs outperform the aligned CTA,
         // including its fused quantizer. Keep the existing explicit override.
-        const bool short_compact=batch_.tokens==4 && batch_.token_group_compact && batch_.nvq_format_mask;
+        const bool short_grouped=batch_.tokens==4 && grouped_math && batch_.nvq_format_mask;
         batch_.token_group_aligned_gu=batch_.tokens<=8 &&
-            (aligned_gu?*aligned_gu:batch_.tokens==4 && !short_compact);
-        if(short_compact && !aligned_gu && !batch_.token_group_aligned_gu) {
+            (aligned_gu?*aligned_gu:batch_.tokens==4 && !short_grouped);
+        if(short_grouped && !aligned_gu && !batch_.token_group_aligned_gu) {
             static std::atomic<bool> reported{false};
             if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
                 "mfe_short_gu_dispatch scope=first_eligible_batch enabled=1 tokens=4 aligned=0 capacity=%d mask=%u\n",
@@ -344,6 +346,19 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         }
         resident_pairs_=tb::empty({batch_.tokens,batch_.routes+(shared[0]?1:0),batch_.output_width},input.options());
         batch_.resident_pairs=reinterpret_cast<__half*>(resident_pairs_.data_ptr());
+        const auto* profile=std::getenv("MFQ_PROFILE_SSD_EXPERTS");
+        const auto* enabled=std::getenv("MFQ_MFE_TOKEN_GROUPS");
+        const auto* group_dot=std::getenv("MFQ_MFE_GROUP_DOT");
+        if(profile && profile[0]=='1' && grouped_math && (!enabled || enabled[0]!='0') &&
+                (!group_dot || group_dot[0]!='0') && std::any_of(views.begin(),views.end(),[](const View& d) {
+                    return d.family==2 && (compact_formats&(1u<<d.format)) &&
+                        !d.e8_dense_groups && !d.d4_dense_groups;
+                })) {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                "mfe_raw_nvq_token_reuse_dispatch scope=first_eligible_batch enabled=1 tokens=%d capacity=%d mask=%u expanded=0\n",
+                batch_.tokens,batch_.token_group_capacity,batch_.nvq_format_mask);
+        }
     }
 }
 void MfeFfnRuntime::cpu_results(const tb::Tensor& kinds,const tb::Tensor& pairs,const uint32_t* ready) {

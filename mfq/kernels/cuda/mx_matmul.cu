@@ -11,39 +11,13 @@
 #include <type_traits>
 
 #include "packed_backward.cuh"
+#include "mx_float_decode.cuh"
 
 namespace {
 
-__device__ __forceinline__ float decode_e8m0(std::uint8_t raw) {
-    if (raw == 255u) {
-        return __int_as_float(0x7fffffff);
-    }
-    // E8M0 stores the unbiased power-of-two exponent with the same bias
-    // as FP32.  Constructing the FP32 exponent is exact and avoids an
-    // expensive per-block ldexpf call.  raw=0 denotes 2^-127, the largest
-    // FP32 subnormal power of two.
-    return raw == 0u
-        ? __int_as_float(0x00400000)
-        : __int_as_float(unsigned(raw) << 23u);
-}
-
-__device__ __forceinline__ float decode_e4m3fn(std::uint8_t raw) {
-    const unsigned exponent = (unsigned(raw) >> 3u) & 15u;
-    const unsigned mantissa = unsigned(raw) & 7u;
-    if (exponent == 15u && mantissa == 7u) {
-        return __int_as_float(0x7fffffff);
-    }
-    // Normal E4M3FN numbers map exactly to FP32 by rebiasing the exponent
-    // and shifting the three mantissa bits.  Subnormals are integer
-    // multiples of 2^-9.  This removes one transcendental instruction per
-    // weight while preserving every represented value exactly.
-    const float magnitude = exponent == 0u
-        ? float(mantissa) * 0.001953125f
-        : __int_as_float(
-            ((exponent + 120u) << 23u) |
-            (mantissa << 20u));
-    return (raw & 128u) == 0u ? magnitude : -magnitude;
-}
+using mfq::cuda::mx::decode_e8m0;
+using mfq::cuda::mx::decode_e4m3fn;
+using mfq::cuda::mx::decode_mxfp4_e2m1;
 
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
@@ -603,13 +577,6 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_small_m_f32_cuda(
 }
 
 namespace {
-
-__device__ __forceinline__ float decode_mxfp4_e2m1(std::uint8_t code) {
-    const unsigned magnitude=code&7u;
-    const unsigned bits=magnitude<2u ? magnitude*0x3f000000u :
-        ((126u+(magnitude>>1u))<<23u)|((magnitude&1u)<<22u);
-    return __uint_as_float(bits|((unsigned(code)&8u)<<28u));
-}
 
 __global__ void mxfp4_dequant_kernel(
         const std::uint8_t * __restrict__ values,
