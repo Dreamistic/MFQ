@@ -20,6 +20,26 @@ QuantLinear dense(int out,int in) {
     return linear;
 }
 
+void check_tail_rope() {
+    const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kFloat32);
+    int cases=0;
+    for(auto dtype:{tb::kFloat16,tb::kFloat32})for(int tokens:{1,6,129,4080}) {
+        const int heads=tokens==4080?64:3,width=tokens==4080?512:96;
+        auto x=tb::full({1,tokens,heads,width},.25,options.dtype(dtype)).transpose(1,2);
+        auto positions=tb::arange(tokens,options.dtype(tb::kInt64));
+        auto angles=tb::arange(tokens*32,options).reshape({tokens,32})*.013;
+        auto cosine=tb::cos(angles),sine=tb::sin(angles);
+        auto head=x.slice(-1,0,width-64).contiguous(),tail=x.slice(-1,width-64,width).contiguous();
+        auto rotated=glm_interleaved_rope_cuda(tail,positions,cosine,sine,64);
+        auto expected=tb::cat({head,rotated},-1).contiguous();
+        auto actual=dsv4_tail_rope_cuda(x,positions,cosine,sine,64);
+        require((actual.to(tb::kFloat32)-expected.to(tb::kFloat32)).abs().max().item<float>()==0,
+            "fused strided tail RoPE differs from materialized rotation");
+        ++cases;
+    }
+    std::cout<<"tail_rope_cases="<<cases<<" FP16/FP32 strided/large-grid exact PASS\n";
+}
+
 DeepseekV41CausalLm make_model(CudaExecutionContext& execution) {
     tb::manual_seed(91);
     DeepseekV41CausalLm model;
@@ -113,7 +133,7 @@ void check_long_and_cancel() {
 int main() try {
     int devices=0;
     if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
-    check_exact_short();check_long_and_cancel();run_dspark_self_check();
+    check_tail_rope();check_exact_short();check_long_and_cancel();run_dspark_self_check();
     std::cout<<"DeepSeek-V4.1 CED numerical/cache tests passed\n";return 0;
 } catch(const std::exception& error) {
     std::cerr<<error.what()<<'\n';return 1;
