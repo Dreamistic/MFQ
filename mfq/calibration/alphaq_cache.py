@@ -127,7 +127,9 @@ def collect_statistics(root, plans, cache, device, *, mapper=None, column_energy
                    (column_energy and not saved['tensors'][item.name].get('column_energy'))]
         if missing:
             # Validate existing entries before starting any missing GPU work.
-            collect_statistics(root, [p for p in plans if p.name in saved['tensors']], cache, device)
+            missing_names = {item.name for item in missing}
+            collect_statistics(root, [p for p in plans if p.name not in missing_names],
+                               cache, device, column_energy=column_energy)
             operation = 'statistics-energy' if column_energy else 'statistics'
             for item, value in mapper(operation, missing):
                 if value.name != item.name:

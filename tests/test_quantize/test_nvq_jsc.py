@@ -649,3 +649,17 @@ def test_optional_cuda_sse_only_ignores_missing_triton(monkeypatch, missing):
     else:
         with pytest.raises(ModuleNotFoundError):
             _load_cuda_row_sse()
+
+
+def test_fixed_quantizer_does_not_build_autograd_graph():
+    weight = torch.randn((2, 24), generator=torch.Generator().manual_seed(801),
+                         requires_grad=True)
+    tables = initial_jsc_tables(NvqJscConfig(iterations=0))
+    error = quantize_nvq_jsc_fixed(
+        weight, tables, assignment_refine_steps=0, search_steps=3,
+        device='cpu', row_sse_only=True,
+    )
+    assert torch.isfinite(error).all()
+    assert not error.requires_grad
+    assert error.grad_fn is None
+    assert weight.grad is None

@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 from types import SimpleNamespace
 
@@ -93,6 +94,40 @@ def test_parallel_statistics_request_includes_energy(bank):
     )
     assert operations == ['statistics-energy']
     np.testing.assert_allclose(result[0].column_energy, weight.square().sum(dim=1).numpy())
+
+
+def test_parallel_statistics_validates_cached_energy_before_worker_dispatch(bank):
+    root, item, cache, _ = bank
+    alphaq_cache.collect_statistics(root, [item], cache, 'cpu', column_energy=True)
+    document = json.loads((cache / 'statistics.json').read_text())
+    energy = cache / document['tensors'][item.name]['column_energy']['path']
+    energy.write_bytes(b'corrupt')
+    missing = SimpleNamespace(name=item.name.replace('.gate.', '.up.'), shape=item.shape)
+    with pytest.raises(ValueError, match='checksum differs'):
+        alphaq_cache.collect_statistics(
+            root, [item, missing], cache, 'cpu', mapper=forbidden, column_energy=True
+        )
+
+
+def test_parallel_energy_upgrade_uses_worker_without_repeating_svd(bank, monkeypatch):
+    root, item, cache, weight = bank
+    original = alphaq_cache.collect_statistics(root, [item], cache, 'cpu')[0]
+    monkeypatch.setattr(alphaq_cache, '_collect', forbidden)
+    monkeypatch.setattr(alphaq_cache, '_collect_energy', forbidden)
+    operations = []
+    energy = weight.square().sum(dim=1).numpy()
+
+    def mapper(operation, items):
+        operations.append(operation)
+        assert items == [item]
+        yield item, replace(original, column_energy=energy)
+
+    result = alphaq_cache.collect_statistics(
+        root, [item], cache, 'cpu', mapper=mapper, column_energy=True
+    )
+    assert operations == ['statistics-energy']
+    assert result[0] == original
+    np.testing.assert_array_equal(result[0].column_energy, energy)
 
 
 def test_statistics_batch_uses_requested_devices_free_memory(monkeypatch):

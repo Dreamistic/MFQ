@@ -753,7 +753,6 @@ def _validate_tables(
     return np.ascontiguousarray(alpha), bank, codebooks, tables.spec
 
 
-@torch.inference_mode()
 def _load_cuda_row_sse():
     try:
         from mfq.quantize.cuda.nvq_sse import jsc_row_sse
@@ -764,6 +763,7 @@ def _load_cuda_row_sse():
     return jsc_row_sse
 
 
+@torch.inference_mode()
 def quantize_nvq_jsc_fixed(
     weight: torch.Tensor,
     tables: NvqJscTables,
