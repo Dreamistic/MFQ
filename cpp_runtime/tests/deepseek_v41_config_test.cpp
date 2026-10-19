@@ -1,11 +1,14 @@
 #include "models/deepseek_v41/config.h"
+#include "models/deepseek_v41/causal_lm.h"
 #include "models/deepseek_v41/engram.h"
 
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -144,6 +147,40 @@ void check_retained_engram_history() {
                 "partial Engram rollback changed batched/multi-forward ngram history");
     }
 }
+
+void check_dspark_requested_head() {
+    for(int width:{1,2,5})for(int stages:{1,3}) {
+        auto run=[&](int requested) {
+            return mfq::models::deepseek_v41::dspark_draft(width,requested,stages,
+                [](int64_t count) {
+                    std::vector<int> rows(count);
+                    for(int i=0;i<count;++i)rows[i]=i+1;
+                    return rows;
+                },
+                [](const auto& rows){return rows;},
+                [](const auto&){return 1;},
+                [&](std::size_t stage,auto rows,int& pre) {
+                    require(rows.size()==std::size_t(width),"DSpark stage lost physical block rows");
+                    int total=0;for(auto value:rows)total+=value;
+                    for(auto& value:rows)value+=total+int(stage)+pre;
+                    ++pre;return rows;
+                },
+                [](auto rows,int pre){for(auto& value:rows)value*=pre;return rows;},
+                [&](auto rows) {
+                    require(rows.size()==std::size_t(requested),"DSpark projected unused vocabulary rows");
+                    for(auto& value:rows)value=value*17+3;
+                    return rows;
+                },
+                [](auto rows,int64_t count){rows.resize(count);return rows;});
+        };
+        const auto full=run(width);
+        for(int requested=1;requested<=width;++requested) {
+            const auto prefix=run(requested);
+            require(std::equal(prefix.begin(),prefix.end(),full.begin()),
+                    "DSpark head pruning changed requested logits");
+        }
+    }
+}
 } // namespace
 
 int main() {
@@ -185,7 +222,8 @@ int main() {
             },
             "unsupported source encoding was accepted");
 
-        std::cout << "DeepSeek-V4.1 common config tests passed\n";
+        check_dspark_requested_head();
+        std::cout << "DeepSeek-V4.1 common config and requested DSpark head tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "DeepSeek-V4.1 common config test failed: "
