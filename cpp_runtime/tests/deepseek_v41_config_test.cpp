@@ -1,4 +1,5 @@
 #include "models/deepseek_v41/config.h"
+#include "models/deepseek_v41/engram.h"
 
 #include "nlohmann/json.hpp"
 
@@ -108,10 +109,35 @@ void require_rejected(Mutator mutate, const char* message) {
     throw std::runtime_error(message);
 }
 
+void check_retained_engram_history() {
+    using mfq::models::deepseek_v41::EngramHashState;
+    const auto make=[] {return EngramHashState(8,3,2,0,{1},{36},{5,7,11,13},
+        {0,5,12,23},{3,5,7},{0,1,2,3,4,5,6,7});};
+    const auto tokens=[](int batch,int count,int offset) {
+        std::vector<int64_t> result(batch*count);
+        for(int b=0;b<batch;++b)for(int i=0;i<count;++i)result[b*count+i]=(b*3+offset+i)%8;
+        return result;
+    };
+    for(int batch:{1,2})for(int kept=0;kept<=5;++kept) {
+        auto reference=make(),candidate=make();
+        auto prompt=tokens(batch,3,0);
+        reference.forward(prompt.data(),batch,3,0);candidate.forward(prompt.data(),batch,3,0);
+        candidate.begin_speculative();
+        auto first=tokens(batch,2,3),second=tokens(batch,3,5);
+        candidate.forward(first.data(),batch,2,3);candidate.forward(second.data(),batch,3,5);
+        if(kept) {auto accepted=tokens(batch,kept,3);reference.forward(accepted.data(),batch,kept,3);}
+        candidate.rollback_speculative(3+kept);
+        auto next=tokens(batch,2,7);
+        require(candidate.forward(next.data(),batch,2,3+kept).values==
+                    reference.forward(next.data(),batch,2,3+kept).values,
+                "partial Engram rollback changed batched/multi-forward ngram history");
+    }
+}
 } // namespace
 
 int main() {
     try {
+        check_retained_engram_history();
         const auto config = Config::from_json(valid_config);
         require(config.causal_encoder_layers == 2, "CED split changed");
         require(config.compress_ratios.size() == 7, "compression schedule changed");

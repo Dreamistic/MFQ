@@ -40,7 +40,7 @@ void check_tail_rope() {
     std::cout<<"tail_rope_cases="<<cases<<" FP16/FP32 strided/large-grid exact PASS\n";
 }
 
-DeepseekV41CausalLm make_model(CudaExecutionContext& execution) {
+DeepseekV41CausalLm make_model(CudaExecutionContext& execution,int ratio=2) {
     tb::manual_seed(91);
     DeepseekV41CausalLm model;
     model.execution=&execution;
@@ -51,7 +51,7 @@ DeepseekV41CausalLm make_model(CudaExecutionContext& execution) {
     c.q_lora_rank=32;c.o_groups=8;c.o_lora_rank=8;
     c.index_n_heads=32;c.index_head_dim=128;c.index_topk=16;
     c.candidate_source_layer=2;c.candidate_block_size=8;c.candidate_topk_blocks=8;
-    c.compress_ratios={0,2,1,1};c.kv_source_layers={1,2};c.index_source_layers={1,2,3};
+    c.compress_ratios={0,ratio,1,1};c.kv_source_layers={1,2};c.index_source_layers={1,2,3};
     c.sliding_window=128;c.max_position_embeddings=1024;c.dspark_target_layer_ids={2,3};
     model.metadata.hidden_size=c.hidden;model.metadata.vocab_size=c.vocab;
     model.metadata.num_hidden_layers=c.n_layers;model.metadata.hc_mult=4;
@@ -129,11 +129,60 @@ void check_long_and_cancel() {
     require(!cancelled.defined(),"CED cancellation returned partial output");
     check_positions(model,0);
 }
+void check_retained_prefix() {
+    CudaExecutionContext execution;
+    int cases=0;
+    const auto same=[](const tb::Tensor& a,const tb::Tensor& b,const char* message) {
+        const auto error=(a.to(tb::kFloat32)-b.to(tb::kFloat32)).abs().max().item<double>();
+        require(std::isfinite(error) && error<.005,message);
+    };
+    for(int ratio:{2,4})for(int context:{15,16,127,128,129})for(int kept:{0,1,2,3}) {
+        auto reference=make_model(execution,ratio),candidate=make_model(execution,ratio);
+        auto prompt=ids(context),draft=ids(3);
+        reference.hidden_forward(prompt);candidate.hidden_forward(prompt);
+        tb::Tensor expected;
+        if(kept)expected=reference.hidden_forward(draft.narrow(1,0,kept));
+        candidate.begin_speculative_suffix(3);
+        auto verified=candidate.hidden_forward_speculative_suffix(draft);
+        if(kept)same(verified.narrow(1,0,kept),expected,"verified retained prefix differs from causal forward");
+        candidate.rollback_speculative(kept);
+        check_positions(candidate,context+kept);
+        for(std::size_t layer=0;layer<candidate.blocks.size();++layer) {
+            const auto& actual=dynamic_cast<const deepseek_v41_runtime::Block&>(*candidate.blocks[layer]);
+            const auto& wanted=dynamic_cast<const deepseek_v41_runtime::Block&>(*reference.blocks[layer]);
+            const int64_t end=context+kept,begin=std::max<int64_t>(0,end-128);
+            auto slots=tb::arange(begin,end,actual.state.local_kv.options().dtype(tb::kInt64))
+                .remainder(128.).to(tb::kInt64);
+            same(actual.state.local_kv.index_select(1,slots),wanted.state.local_kv.index_select(1,slots),
+                 "retained local KV ring changed accepted rows");
+            if(actual.kv_source()) {
+                require(actual.state.partial_length==wanted.state.partial_length,"retained compressor count differs");
+                const auto count=actual.state.compressed_length;
+                same(actual.state.compressed_kv.narrow(1,0,count),wanted.state.compressed_kv.narrow(1,0,count),
+                     "retained compressed KV rows changed");
+                same(actual.state.index_k.narrow(1,0,count),wanted.state.index_k.narrow(1,0,count),
+                     "retained indexer rows changed");
+                if(actual.state.partial_length) {
+                    same(actual.state.partial_kv.narrow(1,0,actual.state.partial_length),
+                         wanted.state.partial_kv.narrow(1,0,wanted.state.partial_length),"retained partial KV differs");
+                    same(actual.state.partial_score.narrow(1,0,actual.state.partial_length),
+                         wanted.state.partial_score.narrow(1,0,wanted.state.partial_length),"retained partial scores differ");
+                }
+            }
+        }
+        same(candidate.hidden_forward(ids(1)),reference.hidden_forward(ids(1)),
+             "decode after retained speculative prefix differs");
+        require(candidate.shared->engram_hashes.values==reference.shared->engram_hashes.values,
+                "retained prefix changed Engram ngram history");
+        ++cases;
+    }
+    std::cout<<"retained_prefix_cases="<<cases<<" compressor/ring/Engram/decode PASS\n";
+}
 }
 int main() try {
     int devices=0;
     if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
-    check_tail_rope();check_exact_short();check_long_and_cancel();run_dspark_self_check();
+    check_tail_rope();check_exact_short();check_long_and_cancel();check_retained_prefix();run_dspark_self_check();
     std::cout<<"DeepSeek-V4.1 CED numerical/cache tests passed\n";return 0;
 } catch(const std::exception& error) {
     std::cerr<<error.what()<<'\n';return 1;

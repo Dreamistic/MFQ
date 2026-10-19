@@ -236,9 +236,9 @@ void DeepseekV41Model::adapter_commit_speculative() {
     shared->commit_speculative();
 }
 
-void DeepseekV41Model::adapter_rollback_speculative(int64_t) {
+void DeepseekV41Model::adapter_rollback_speculative(int64_t position) {
     MFQ_RUNTIME_CHECK(shared, "DeepSeek-V4.1 speculative state is unavailable");
-    shared->rollback_speculative();
+    shared->rollback_speculative(position);
 }
 
 } // namespace mfq::cuda

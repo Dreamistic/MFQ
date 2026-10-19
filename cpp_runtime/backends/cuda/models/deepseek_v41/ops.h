@@ -94,9 +94,9 @@ struct SharedState {
             engram_hash->commit_speculative();
     }
 
-    void rollback_speculative() {
+    void rollback_speculative(int64_t position) {
         MFQ_RUNTIME_CHECK(engram_hash, "DeepSeek-V4.1 Engram state is unavailable");
-        engram_hash->rollback_speculative();
+        engram_hash->rollback_speculative(position);
     }
 
     void reset_session(std::int64_t current_batch) {
@@ -358,6 +358,8 @@ struct Block final : ::Block {
     Tensor speculative_slot_ids;
     Tensor speculative_partial_kv;
     Tensor speculative_partial_score;
+    Tensor speculative_projected_kv;
+    Tensor speculative_projected_score;
     std::int64_t speculative_position = -1;
     std::int64_t speculative_compressed_length = 0;
     std::int64_t speculative_partial_length = 0;
@@ -399,6 +401,8 @@ struct Block final : ::Block {
         speculative_slot_ids = Tensor();
         speculative_partial_kv = Tensor();
         speculative_partial_score = Tensor();
+        speculative_projected_kv = Tensor();
+        speculative_projected_score = Tensor();
         speculative_position = -1;
         speculative_pending = false;
         prefilled_global_end = -1;
@@ -436,21 +440,44 @@ struct Block final : ::Block {
         speculative_slot_ids = Tensor();
         speculative_partial_kv = Tensor();
         speculative_partial_score = Tensor();
+        speculative_projected_kv = Tensor();
+        speculative_projected_score = Tensor();
         speculative_position = -1;
     }
 
     void rollback_speculative(std::int64_t position) override {
-        MFQ_RUNTIME_CHECK(speculative_pending && position == speculative_position &&
+        MFQ_RUNTIME_CHECK(speculative_pending && position >= speculative_position &&
+                              position <= state.position &&
                               speculative_local_slots.defined() && speculative_slot_ids.defined(),
                           "DeepSeek-V4.1 speculative checkpoint is unavailable");
-        state.local_kv.index_copy_(1, speculative_slot_ids, speculative_local_slots);
+        const auto kept=position-speculative_position;
+        MFQ_RUNTIME_CHECK(kept<=speculative_slot_ids.numel(),"DeepSeek-V4.1 retained prefix is out of range");
+        const auto rejected=speculative_slot_ids.numel()-kept;
+        if(rejected)state.local_kv.index_copy_(1,speculative_slot_ids.narrow(0,kept,rejected),
+            speculative_local_slots.narrow(1,kept,rejected));
         if (speculative_partial_kv.defined()) {
             state.partial_kv.copy_(speculative_partial_kv);
             state.partial_score.copy_(speculative_partial_score);
         }
-        state.position = speculative_position;
+        state.position = position;
         state.compressed_length = speculative_compressed_length;
         state.partial_length = speculative_partial_length;
+        if(kept && kv_source()) {
+            const auto total=speculative_partial_length+kept;
+            state.compressed_length+=total/ratio;
+            state.partial_length=total%ratio;
+            // Complete compressed rows already contain the accepted prefix.
+            // Rebuild only its unfinished group from the saved projections;
+            // this needs no attention, projection or expert recomputation.
+            for(int64_t slot=0;slot<state.partial_length;++slot) {
+                const auto source=total-state.partial_length+slot-speculative_partial_length;
+                if(source<0)continue; // The original partial group was restored above.
+                MFQ_RUNTIME_CHECK(speculative_projected_kv.defined() && speculative_projected_score.defined(),
+                                  "DeepSeek-V4.1 retained compressor projections are unavailable");
+                state.partial_kv.narrow(1,slot,1).copy_(speculative_projected_kv.narrow(1,source,1));
+                state.partial_score.narrow(1,slot,1).copy_(speculative_projected_score.narrow(1,source,1));
+            }
+        }
         commit_speculative();
     }
 
@@ -506,6 +533,10 @@ struct Block final : ::Block {
                 projected_score = compressor_gate.forward(execution, input)
                                       .to(mfq_tensor_backend::kFloat32)
                                       .contiguous();
+                if(speculative_pending) {
+                    speculative_projected_kv=projected_kv;
+                    speculative_projected_score=projected_score;
+                }
             },
             [&](int64_t complete, int64_t cutoff) {
                 auto kv_groups = projected_kv.narrow(1, 0, cutoff)

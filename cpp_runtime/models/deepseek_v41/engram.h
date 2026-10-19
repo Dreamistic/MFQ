@@ -51,6 +51,7 @@ class EngramHashState {
         context_.assign(static_cast<std::size_t>(batch * (max_ngram_size_ - 1)), pad_id_);
         speculative_context_.reset();
         speculative_position_ = -1;
+        speculative_tokens_.clear();
     }
 
     void begin_speculative() {
@@ -59,21 +60,34 @@ class EngramHashState {
         }
         speculative_position_ = position_;
         speculative_context_ = context_;
+        speculative_tokens_.clear();
     }
 
     void commit_speculative() noexcept {
         speculative_context_.reset();
         speculative_position_ = -1;
+        speculative_tokens_.clear();
     }
 
-    void rollback_speculative() {
+    void rollback_speculative(std::int64_t position = -1) {
         if (!speculative_context_.has_value() || speculative_position_ < 0) {
             throw std::runtime_error("DeepSeek-V4.1 Engram speculative checkpoint is unavailable");
         }
-        context_ = std::move(*speculative_context_);
-        position_ = speculative_position_;
-        speculative_context_.reset();
-        speculative_position_ = -1;
+        if(position<0)position=speculative_position_;
+        if(position<speculative_position_ || position>position_)
+            throw std::out_of_range("Engram retained prefix is outside its checkpoint");
+        const auto kept=position-speculative_position_,drafted=position_-speculative_position_;
+        if(kept && speculative_tokens_.size()!=std::size_t(batch_)*drafted)
+            throw std::runtime_error("Engram speculative token history is incomplete");
+        const int prefix=max_ngram_size_-1;
+        for(int batch=0;batch<batch_;++batch)for(int column=0;column<prefix;++column) {
+            const auto index=kept+column;
+            context_[std::size_t(batch)*prefix+column]=index<prefix?
+                (*speculative_context_)[std::size_t(batch)*prefix+index]:
+                speculative_tokens_[std::size_t(batch)*drafted+index-prefix];
+        }
+        position_=position;
+        commit_speculative();
     }
 
     EngramHashBatch forward(const int64_t *ids, int batch, int tokens, int64_t pos0) {
@@ -92,6 +106,19 @@ class EngramHashState {
                 throw std::out_of_range("DeepSeek-V4.1 Engram token ID is outside the vocabulary");
             }
             compressed[index] = token_map_[static_cast<std::size_t>(token)];
+        }
+
+        if(speculative_context_) {
+            const auto previous=std::size_t(position_-speculative_position_);
+            const auto count=previous+std::size_t(tokens);
+            std::vector<std::int64_t> saved(std::size_t(batch)*count);
+            for(int bi=0;bi<batch;++bi) {
+                if(previous)std::copy_n(speculative_tokens_.data()+std::size_t(bi)*previous,
+                    previous,saved.data()+std::size_t(bi)*count);
+                std::copy_n(compressed.data()+std::size_t(bi)*tokens,tokens,
+                    saved.data()+std::size_t(bi)*count+previous);
+            }
+            speculative_tokens_=std::move(saved);
         }
 
         const int prefix = max_ngram_size_ - 1;
@@ -180,6 +207,7 @@ class EngramHashState {
     std::int64_t position_ = 0;
     std::vector<std::int64_t> context_;
     std::optional<std::vector<std::int64_t>> speculative_context_;
+    std::vector<std::int64_t> speculative_tokens_;
     std::int64_t speculative_position_ = -1;
 };
 
