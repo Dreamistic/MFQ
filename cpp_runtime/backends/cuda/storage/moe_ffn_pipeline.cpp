@@ -1,5 +1,6 @@
 #include "../runtime/execution_options.h"
 #include "moe_ffn_pipeline.h"
+#include "mfq/host_copy.h"
 #include "moe_cached_source_internal.h"
 #include "cpu_projection_rows.h"
 #include "mfq/cpu_expert_pool.h"
@@ -3371,6 +3372,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                 ?reinterpret_cast<CUdeviceptr>(cache_->pipeline_host_stage_alias_)+(address-host_begin):0;
         };
         std::vector<mfq::cuda::DmaCopy> copies;
+        std::vector<mfq::HostCopy> host_copies;
         std::size_t bytes=0,staged_bytes=0;
         const bool down=!ready.empty() && ready.front()>=reads.gate_up_requests;
         for(const auto i:ready) {
@@ -3410,7 +3412,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
                         const void* origin=fields[f].data_ptr();
                         if(!ram_alias(origin,std::size_t(sizes[f]))) {
                             auto* staged=host+cell.ssd_gate_up_host_tail+staging_offset;
-                            std::memcpy(staged,origin,std::size_t(sizes[f]));origin=staged;
+                            host_copies.push_back({staged,origin,std::size_t(sizes[f])});origin=staged;
                             staging_offset+=((std::size_t(sizes[f])+15)&~std::size_t(15));
                             staged_bytes+=std::size_t(sizes[f]);
                         }
@@ -3431,6 +3433,7 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
             if(cached && !hit)++cache_->stats_.pipeline_kv_projection_misses;
         }
         if(copies.empty())return;
+        mfq::copy_host_ranges(host_copies);
         if(staged_bytes && !cache_->pipeline_host_stage_alias_)
             MFQ_CUDA_CHECK(cudaHostGetDevicePointer(&cache_->pipeline_host_stage_alias_,host,0));
         if(mfq::cuda::NativeDmaBatch::submit(copies,cache_->weight_stream_,cell.native_dma_mode,alias)) {

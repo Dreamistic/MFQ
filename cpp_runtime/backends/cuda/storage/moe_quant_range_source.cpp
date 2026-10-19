@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
@@ -115,23 +116,45 @@ MixedMoePool MoeQuantRangeSource::allocate_expert(int expert) const {
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
     {
         auto block=pinned_arena_?pinned_arena_->allocate(arena_bytes_.at(index)):nullptr;
-        std::shared_ptr<void> owner;
-        std::uint8_t* base=nullptr;
-        if(block) {owner=block;base=block->data();}
-        else {
-            // A fragmented or leased interval must retain the same direct
-            // field codec. One pageable allocation avoids constructing and
-            // cloning a second complete set of runtime tensors on this miss.
-            auto storage=std::make_shared<tb::Tensor>(tb::empty({std::int64_t(arena_bytes_.at(index))},
+        const auto& layouts=field_layouts_.at(index);
+        std::vector<std::shared_ptr<MoePinnedExpertArena::Block>> pinned_fields;
+        std::vector<std::size_t> pageable_offsets;
+        std::shared_ptr<tb::Tensor> pageable;
+        if(!block) {
+            // Large expert images can fail despite smaller free intervals.
+            // Retain any fields that fit there; only the remaining fields
+            // need pageable storage and the later DMA staging copy.
+            pinned_fields.resize(layouts.size());pageable_offsets.resize(layouts.size());
+            std::size_t bytes=0,pinned_bytes=0;
+            for(std::size_t f=0;f<layouts.size();++f) {
+                if(pinned_arena_)pinned_fields[f]=pinned_arena_->allocate(layouts[f].bytes);
+                if(pinned_fields[f])pinned_bytes+=layouts[f].bytes;
+                else {
+                    bytes=(bytes+15)&~std::size_t(15);pageable_offsets[f]=bytes;bytes+=layouts[f].bytes;
+                }
+            }
+            pageable=std::make_shared<tb::Tensor>(tb::empty({std::int64_t(bytes)},
                 tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8)));
-            owner=storage;base=static_cast<std::uint8_t*>(storage->data_ptr());
+            if(pinned_bytes) {
+                static std::atomic<bool> reported{false};
+                if(!reported.exchange(true,std::memory_order_relaxed))std::fprintf(stderr,
+                    "moe_partial_pinned_expert scope=first_fragmented_allocation enabled=1 pinned_bytes=%zu pageable_bytes=%zu\n",
+                    pinned_bytes,bytes);
+            }
         }
-        for(const auto& layout:field_layouts_.at(index)) {
+        for(std::size_t f=0;f<layouts.size();++f) {
+            const auto& layout=layouts[f];
             auto storage=std::make_shared<tb::TensorStorage>();
             const auto device=tb::Device{tb::kCPU,0};
-            auto* address=base+layout.offset;
-            storage->owner=owner;storage->base=address;storage->bytes=layout.bytes;
-            storage->device=device;storage->pinned=bool(block);
+            std::uint8_t* address=nullptr;
+            if(block){storage->owner=block;address=block->data()+layout.offset;}
+            else if(pinned_fields[f]){storage->owner=pinned_fields[f];address=pinned_fields[f]->data();}
+            else {
+                storage->owner=pageable;
+                if(layout.bytes)address=static_cast<std::uint8_t*>(pageable->data_ptr())+pageable_offsets[f];
+            }
+            storage->base=address;storage->bytes=layout.bytes;
+            storage->device=device;storage->pinned=bool(block) || bool(pinned_fields[f]);
             fields.emplace_back(storage,tb::make_contiguous_view(address,layout.shape,layout.dtype,device));
         }
     }

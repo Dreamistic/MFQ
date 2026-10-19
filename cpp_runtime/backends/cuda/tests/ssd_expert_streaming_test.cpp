@@ -799,6 +799,31 @@ int main(int argc,char** argv)try {
                     !std::memcmp(actual[f].data_ptr(),decoded[f].data_ptr(),actual[f].numel()*actual[f].element_size())),
                     "pageable expert fields changed when the pinned arena could not fit an expert");
         }
+        {
+            auto partial=std::make_shared<MoeQuantRangeSource>(
+                std::make_shared<mfq::MfeQuantExpertStore>(candidate.sources[0]->store()));
+            const auto expert=31%experts;
+            const auto decoded=moe_cache_fields(partial->decode_expert(expert,partial->store().read_expert(expert)));
+            std::size_t largest=0;
+            for(const auto& field:decoded)largest=std::max(largest,std::size_t(field.nbytes()));
+            auto arena=std::make_shared<MoePinnedExpertArena>((largest+15)&~std::size_t(15));
+            partial->bind_pinned_arena(arena);
+            {
+                const auto actual=moe_cache_fields(partial->read_expert(expert));
+                check(actual.size()==decoded.size(),"partially pinned expert lost a field");
+                bool pinned=false,pageable=false;
+                for(std::size_t f=0;f<actual.size();++f) {
+                    if(!actual[f].nbytes())continue;
+                    pinned|=actual[f].options().pinned();pageable|=!actual[f].options().pinned();
+                    check(actual[f].nbytes()==decoded[f].nbytes() &&
+                          !std::memcmp(actual[f].data_ptr(),decoded[f].data_ptr(),actual[f].nbytes()),
+                          "partially pinned expert changed decoded field bytes");
+                }
+                check(pinned && pageable && arena->used_bytes()<=arena->bytes(),
+                      "fragmented expert allocation did not use bounded mixed storage");
+            }
+            check(arena->used_bytes()==0,"partially pinned expert leaked field leases");
+        }
         if(candidate.hybrid)for(std::size_t p=0;p<candidate.sources.size();++p)for(const int e:{31%experts,32%experts}) {
             const auto& source=candidate.sources[p];
             const auto direct=source->read_expert(e);
