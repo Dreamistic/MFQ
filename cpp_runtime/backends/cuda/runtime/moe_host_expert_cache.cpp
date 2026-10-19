@@ -336,9 +336,11 @@ void MoeHostExpertCache::commit_speculative_learning(const std::vector<mfq::MoeC
         auto& entry=found->second;
         if(entry.birth_epoch!=state.learning_epoch || state.ghosts.contains(key))state.touch(key,entry);
         else {
-            // A newly loaded image has one confirmed use, even when several
-            // speculative rows selected it. It remains on probation.
+            // The first accepted token confirms admission. A later accepted
+            // token can promote this image just as a second ordinary decode
+            // would; rejected rows never appear in this ordered sequence.
             state.lru.splice(state.lru.begin(),state.lru,entry.position);
+            entry.birth_epoch=0;
             entry.ghost_eligible=true;
             if(entry.device_duplicate){state.device_duplicate(entry,false);state.device_duplicate(entry,true);}
         }

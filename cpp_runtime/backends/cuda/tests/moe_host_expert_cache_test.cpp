@@ -195,7 +195,7 @@ int main() try {
         cache.begin_speculative_learning();
         cache.acquire(key(0),64,[]{return weight(64,1);});cache.acquire(key(1),64,[]{return weight(64,2);});
         cache.commit_speculative_learning({key(0),key(0)});
-        check(!cache.stats().reuse_promotions,"one verification window promoted a newly loaded RAM image twice");
+        check(cache.stats().reuse_promotions==1,"two accepted tokens did not confirm RAM image reuse");
         cache.acquire(key(2),64,[]{return weight(64,3);});
         check(cache.contains(key(0)) && !cache.contains(key(1)),"accepted first use lost recency to a rejected image");
         cache.begin_speculative_learning();bytes_equal(cache.find(key(0)),1);
@@ -205,6 +205,26 @@ int main() try {
             "speculative RAM learning/cancellation counters differ");
         cache.acquire(key(3),64,[]{return weight(64,4);});
         check(cache.contains(key(0)) && !cache.contains(key(2)),"cancelled verification protected its RAM accesses");
+    }
+    {
+        MoeHostExpertCache ordinary(256),batched(256);
+        ordinary.enable_reuse_priority();batched.enable_reuse_priority();
+        ordinary.acquire(key(0),64,[]{return weight(64,1);});
+        ordinary.acquire(key(1),64,[]{return weight(64,2);});
+        bytes_equal(ordinary.find(key(0)),1);
+        ordinary.acquire(key(2),64,[]{return weight(64,3);});
+        batched.begin_speculative_learning();
+        for(int e:{0,1,2})batched.acquire(key(e),64,[e]{return weight(64,e+1);});
+        batched.commit_speculative_learning({key(0),key(1),key(0),key(2)});
+        check(ordinary.stats().reuse_promotions==batched.stats().reuse_promotions &&
+              ordinary.stats().reuse_protected_bytes==batched.stats().reuse_protected_bytes,
+              "accepted-token batching changed RAM reuse learning");
+        for(int e:{3,4,5}) {
+            ordinary.acquire(key(e),64,[e]{return weight(64,e+1);});
+            batched.acquire(key(e),64,[e]{return weight(64,e+1);});
+            for(int k=0;k<=e;++k)check(ordinary.contains(key(k))==batched.contains(key(k)),
+                "accepted-token batching changed later RAM eviction order");
+        }
     }
     {
         MoeHostExpertCache cache(128);cache.enable_reuse_priority();
