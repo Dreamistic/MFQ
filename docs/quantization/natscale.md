@@ -90,6 +90,9 @@ not claimed.
 
 Use the same checkout, source, imatrix, profiles and cache for all commands:
 
+Exports retain the existing text-only AlphaQ defaults. Include auxiliary
+weights explicitly with `--alphaq-vision native` and `--alphaq-mtp quantize`.
+
 ```bash
 mfq calibrate natscale-errors --model MODEL --imatrix IMATRIX --cache CACHE \
   --backend cuda --device cuda:0
